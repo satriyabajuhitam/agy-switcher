@@ -1,0 +1,12 @@
+{
+  "name": "agy-switch",
+  "displayName": "AGY Switcher",
+  "version": "0.1.0",
+  "description": "Seamless multi-account switcher for Antigravity 2.0 Desktop and CLI with atomic vault storage, safety guards, and quota rankings",
+  "suggestedPrompts": [
+    "List all Antigravity accounts",
+    "Check Antigravity system and account status",
+    "Switch active Antigravity account to <name>",
+    "Check Antigravity account quota overview"
+  ]
+}
