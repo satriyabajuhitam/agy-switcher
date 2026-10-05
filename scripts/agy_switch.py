@@ -19,6 +19,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -718,9 +721,106 @@ class AgySwitchEngine:
             "server_busy": busy,
         }
 
-    def load_quota_cache(self) -> dict[str, Any]:
-        """Loads cached quota data from vault cache or legacy quota checker fallback."""
-        if hasattr(self, "cache_file") and self.cache_file.is_file():
+class QuotaClient:
+    def __init__(
+        self,
+        client_id: str = "32555940559.apps.googleusercontent.com",
+        client_secret: str = "ZmssLNjJy2998hD4CTg2ejr2",
+        timeout: float = 2.0,
+        cache_dir: Path | None = None,
+    ) -> None:
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.timeout = timeout
+        self.token_endpoint = "https://oauth2.googleapis.com/token"
+        self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+        self.cache_dir = cache_dir or (Path.home() / ".antigravity-vault" / "cache")
+        self.cache_file = self.cache_dir / "last_known_quota.json"
+
+    def refresh_access_token(self, refresh_token: str) -> str | None:
+        """Refreshes the OAuth access token."""
+        data = urllib.parse.urlencode({
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }).encode("utf-8")
+
+        req = urllib.request.Request(self.token_endpoint, data=data, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8")
+                token_data = json.loads(body)
+                return token_data.get("access_token")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
+            return None
+
+    def parse_quota_response(self, raw_resp: dict[str, Any]) -> dict[str, Any]:
+        """Parses CloudCode response into the standardized cache schema."""
+        result = {}
+        for group in raw_resp.get("groups", []):
+            group_name = group.get("group", "")
+            if "Gemini" in group_name:
+                key = "gemini"
+            elif "Claude" in group_name:
+                key = "claude"
+            else:
+                continue
+
+            buckets = group.get("buckets", [])
+            if not buckets:
+                continue
+            
+            worst_bucket = min(buckets, key=lambda b: b.get("remainingFraction", 1.0))
+            quota_pct = int(worst_bucket.get("remainingFraction", 1.0) * 100)
+            reset_time_str = worst_bucket.get("resetTime")
+            reset_time = 0
+            if reset_time_str:
+                try:
+                    rt = reset_time_str.replace("Z", "+00:00")
+                    # Using datetime.fromisoformat with "+00:00" allows python 3.10 parsing
+                    reset_time = int(datetime.fromisoformat(rt).timestamp())
+                except Exception:
+                    pass
+            
+            result[key] = {
+                "quota": quota_pct,
+                "reset_time": reset_time,
+            }
+        return result
+
+    def fetch_quota(self, access_token: str, refresh_token: str | None = None) -> dict[str, Any]:
+        """Fetches quota from the internal CloudCode API."""
+        req = urllib.request.Request(
+            self.quota_endpoint,
+            data=b'{"project": ""}',
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "Antigravity/2.5.5",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8")
+                raw_data = json.loads(body)
+                return self.parse_quota_response(raw_data)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and refresh_token:
+                new_access_token = self.refresh_access_token(refresh_token)
+                if new_access_token:
+                    return self.fetch_quota(new_access_token, refresh_token=None)
+            print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
+            return {}
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
+            return {}
+
+    def load_cache(self) -> dict[str, Any]:
+        """Loads cached quota data from vault cache or legacy fallback."""
+        if self.cache_file.is_file():
             try:
                 return json.loads(self.cache_file.read_text(encoding="utf-8"))
             except Exception:
@@ -733,13 +833,19 @@ class AgySwitchEngine:
                 return {}
         return {}
 
-    def save_quota_cache(self, data: dict[str, Any]) -> None:
+    def save_cache(self, data: dict[str, Any]) -> None:
         """Atomically saves quota cache to vault cache directory."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.cache_dir, 0o700)
+        except OSError:
+            pass
+        
+        try:
             tmp_fd, tmp_file = tempfile.mkstemp(dir=self.cache_dir, prefix="quota-cache-", suffix=".tmp")
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            os.chmod(tmp_file, 0o600)
             os.replace(tmp_file, self.cache_file)
         except Exception:
             pass
@@ -814,7 +920,6 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
         
         # Wire in QuotaClient and RotationEngine
         try:
-            from quota_client import QuotaClient
             from rotation_engine import RotationEngine
             
             active_name = engine.get_active_name()

@@ -1,7 +1,10 @@
 """Tests for Fast Quota Telemetry Client."""
 
 import json
+import os
+import stat
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -10,12 +13,14 @@ from unittest.mock import MagicMock, patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from quota_client import QuotaClient
+from agy_switch import QuotaClient
 
 
 class TestQuotaClient(unittest.TestCase):
     def setUp(self):
-        self.client = QuotaClient(timeout=0.1)
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self.test_dir.name) / "cache"
+        self.client = QuotaClient(timeout=0.1, cache_dir=self.cache_dir)
         self.access_token = "ya29.fake_access"
         self.refresh_token = "1//fake_refresh"
         self.mock_quota_resp = {
@@ -29,6 +34,10 @@ class TestQuotaClient(unittest.TestCase):
                 }
             ]
         }
+        self.expected_parsed_resp = {"gemini": {"quota": 80, "reset_time": 1791201600}}
+
+    def tearDown(self):
+        self.test_dir.cleanup()
 
     @patch("urllib.request.urlopen")
     def test_fetch_quota_success(self, mock_urlopen):
@@ -38,7 +47,7 @@ class TestQuotaClient(unittest.TestCase):
         mock_urlopen.return_value = mock_resp
 
         res = self.client.fetch_quota(self.access_token)
-        self.assertEqual(res, self.mock_quota_resp)
+        self.assertEqual(res, self.expected_parsed_resp)
 
         req_arg = mock_urlopen.call_args[0][0]
         self.assertEqual(req_arg.full_url, self.client.quota_endpoint)
@@ -72,7 +81,7 @@ class TestQuotaClient(unittest.TestCase):
         mock_urlopen.side_effect = [mock_401, mock_refresh_resp, mock_quota_success]
 
         res = self.client.fetch_quota(self.access_token, refresh_token=self.refresh_token)
-        self.assertEqual(res, self.mock_quota_resp)
+        self.assertEqual(res, self.expected_parsed_resp)
         self.assertEqual(mock_urlopen.call_count, 3)
 
     @patch("urllib.request.urlopen")
@@ -86,6 +95,26 @@ class TestQuotaClient(unittest.TestCase):
         res = self.client.fetch_quota(self.access_token, refresh_token=self.refresh_token)
         self.assertEqual(res, {})
         self.assertEqual(mock_urlopen.call_count, 2)
+
+    def test_cache_permissions_and_io(self):
+        # Test save
+        test_data = {"test_key": "test_val"}
+        self.client.save_cache(test_data)
+        
+        # Verify directory permissions
+        self.assertTrue(self.cache_dir.is_dir())
+        dir_stat = os.stat(self.cache_dir)
+        self.assertEqual(stat.S_IMODE(dir_stat.st_mode), 0o700)
+
+        # Verify file permissions
+        cache_file = self.client.cache_file
+        self.assertTrue(cache_file.is_file())
+        file_stat = os.stat(cache_file)
+        self.assertEqual(stat.S_IMODE(file_stat.st_mode), 0o600)
+
+        # Test load
+        loaded = self.client.load_cache()
+        self.assertEqual(loaded, test_data)
 
 
 if __name__ == "__main__":
