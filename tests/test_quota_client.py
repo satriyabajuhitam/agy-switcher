@@ -54,6 +54,27 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(req_arg.headers.get("Authorization"), f"Bearer {self.access_token}")
 
     @patch("urllib.request.urlopen")
+    def test_fetch_quota_success_display_name_schema(self, mock_urlopen):
+        # Real CloudCode API returns displayName instead of group
+        real_cloudcode_resp = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "five_hour", "remainingFraction": 0.75, "resetTime": "2026-10-05T12:00:00Z"},
+                    ]
+                }
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(real_cloudcode_resp).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.client.fetch_quota(self.access_token)
+        self.assertEqual(res, {"gemini": {"quota": 75, "reset_time": 1791201600}})
+
+    @patch("urllib.request.urlopen")
     def test_fetch_quota_network_error_fails_gracefully(self, mock_urlopen):
         mock_urlopen.side_effect = urllib.error.URLError("Network unreachable")
         res = self.client.fetch_quota(self.access_token)
