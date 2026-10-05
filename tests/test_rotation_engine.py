@@ -7,7 +7,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from rotation_engine import RotationEngine, QuotaStatus
+from agy_switch import RotationEngine, QuotaStatus
 
 class TestRotationEngine(unittest.TestCase):
     def setUp(self):
