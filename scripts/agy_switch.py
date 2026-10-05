@@ -263,6 +263,44 @@ class AgySwitchEngine:
             if temp_file.exists():
                 temp_file.unlink(missing_ok=True)
 
+    def update_account_access_token(self, name: str, access_token: str) -> bool:
+        """Updates the access token in vault and syncs to active targets if current."""
+        token_path = self.accounts_dir / name / "token.json"
+        if not token_path.is_file():
+            return False
+        try:
+            raw = token_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if "token" not in data or not isinstance(data["token"], dict):
+                return False
+            data["token"]["access_token"] = access_token
+            self._atomic_write_json(token_path, data)
+
+            if name == self.get_active_name():
+                token_payload = json.dumps(data, indent=2) + "\n"
+                jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
+                temp_jetski = jetski_token_path.with_suffix(f".tmp.{os.getpid()}")
+                try:
+                    temp_jetski.write_text(token_payload, encoding="utf-8")
+                    os.chmod(temp_jetski, 0o600)
+                    os.replace(temp_jetski, jetski_token_path)
+                finally:
+                    if temp_jetski.exists():
+                        temp_jetski.unlink(missing_ok=True)
+
+                cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+                temp_cli = cli_token_path.with_suffix(f".tmp.{os.getpid()}")
+                try:
+                    temp_cli.write_text(token_payload, encoding="utf-8")
+                    os.chmod(temp_cli, 0o600)
+                    os.replace(temp_cli, cli_token_path)
+                finally:
+                    if temp_cli.exists():
+                        temp_cli.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
+
     def load_config(self) -> dict[str, Any]:
         """Loads vault configuration from ~/.antigravity-vault/config.json."""
         if self.config_file.is_file():
@@ -724,8 +762,8 @@ class AgySwitchEngine:
 class QuotaClient:
     def __init__(
         self,
-        client_id: str = "32555940559.apps.googleusercontent.com",
-        client_secret: str = "ZmssLNjJy2998hD4CTg2ejr2",
+        client_id: str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+        client_secret: str = "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",
         timeout: float = 2.0,
         cache_dir: Path | None = None,
     ) -> None:
@@ -760,7 +798,7 @@ class QuotaClient:
         """Parses CloudCode response into the standardized cache schema."""
         result = {}
         for group in raw_resp.get("groups", []):
-            group_name = group.get("group", "")
+            group_name = group.get("displayName") or group.get("group", "")
             if "Gemini" in group_name:
                 key = "gemini"
             elif "Claude" in group_name:
@@ -790,7 +828,12 @@ class QuotaClient:
             }
         return result
 
-    def fetch_quota(self, access_token: str, refresh_token: str | None = None) -> dict[str, Any]:
+    def fetch_quota(
+        self,
+        access_token: str,
+        refresh_token: str | None = None,
+        on_refresh: Any | None = None,
+    ) -> dict[str, Any]:
         """Fetches quota from the internal CloudCode API."""
         req = urllib.request.Request(
             self.quota_endpoint,
@@ -811,6 +854,11 @@ class QuotaClient:
             if e.code == 401 and refresh_token:
                 new_access_token = self.refresh_access_token(refresh_token)
                 if new_access_token:
+                    if on_refresh:
+                        try:
+                            on_refresh(new_access_token)
+                        except Exception:
+                            pass
                     return self.fetch_quota(new_access_token, refresh_token=None)
             print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
             return {}
@@ -875,11 +923,21 @@ def fetch_account_quota(
     if not tokens or not tokens.get("access_token"):
         return acc_name, {"error": "No token"}
 
+    def _on_token_refreshed(new_tok: str) -> None:
+        engine.update_account_access_token(acc_name, new_tok)
+
     try:
-        quota_res = client.fetch_quota(
-            tokens["access_token"],
-            refresh_token=tokens.get("refresh_token"),
-        )
+        try:
+            quota_res = client.fetch_quota(
+                tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                on_refresh=_on_token_refreshed,
+            )
+        except TypeError:
+            quota_res = client.fetch_quota(
+                tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+            )
         return acc_name, quota_res if quota_res else {"error": "Fetch failed"}
     except Exception as e:
         return acc_name, {"error": str(e)}
@@ -1085,7 +1143,8 @@ class RotationEngine:
             target_prefix = "Claude" if "claude" in m_key.lower() else "Gemini"
             target_group = None
             for group in quota_data.get("groups", []):
-                if group.get("group", "").startswith(target_prefix):
+                g_name = group.get("displayName") or group.get("group", "")
+                if g_name.startswith(target_prefix):
                     target_group = group
                     break
 
