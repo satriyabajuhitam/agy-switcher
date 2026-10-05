@@ -60,6 +60,10 @@ class RotationEngine:
             return False
         return status.fraction <= 0.0
 
+    def calculate_reset_delta(self, reset_time: datetime.datetime, current_time: datetime.datetime) -> float:
+        """Calculates reset delta in minutes."""
+        return (reset_time - current_time).total_seconds() / 60.0
+
     def evaluate(self, accounts: dict, current_time: datetime.datetime = None) -> str:
         """
         accounts: dict mapping account_id -> quota JSON
@@ -68,10 +72,12 @@ class RotationEngine:
             current_time = datetime.datetime.now(datetime.timezone.utc)
             
         evaluated = {}
+        reset_deltas = {}
         for acc_id, quota_data in accounts.items():
             status = self.get_quota_status(quota_data)
             if status is not None:
                 evaluated[acc_id] = status
+                reset_deltas[acc_id] = self.calculate_reset_delta(status.reset_time, current_time)
                 
         if not evaluated:
             return self.active_account_id
@@ -84,7 +90,7 @@ class RotationEngine:
             
         # 2. drain_window heuristic
         if active_status is not None and active_status.fraction > 0.05:
-            reset_delta = (active_status.reset_time - current_time).total_seconds() / 60.0
+            reset_delta = reset_deltas.get(self.active_account_id, float("inf"))
             if reset_delta <= 30:
                 return self.active_account_id
                 
@@ -94,7 +100,7 @@ class RotationEngine:
         best_normal_frac = -1.0
         
         for acc_id, status in evaluated.items():
-            reset_delta = (status.reset_time - current_time).total_seconds() / 60.0
+            reset_delta = reset_deltas[acc_id]
             
             if reset_delta <= 45 and status.fraction > 0.10:
                 if status.fraction > best_imminent_frac:

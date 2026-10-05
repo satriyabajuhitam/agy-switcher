@@ -7,6 +7,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import sys
 
@@ -67,6 +68,57 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.vault_dir.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((self.vault_dir / "accounts").stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((self.vault_dir / "cache").stat().st_mode), 0o700)
+
+    def test_vault_directories_mkdir_passes_mode_700(self):
+        """init_vault() must pass mode=0o700 directly to mkdir to close TOCTOU window."""
+        mkdir_calls = []
+        orig_mkdir = Path.mkdir
+
+        def tracking_mkdir(path_self, *args, **kwargs):
+            mkdir_calls.append((path_self, kwargs.get("mode")))
+            return orig_mkdir(path_self, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", side_effect=tracking_mkdir, autospec=True):
+            test_vdir = self.base_path / "test_vault_mode"
+            engine = AgySwitchEngine(vault_dir=test_vdir, gemini_dir=self.gemini_dir)
+
+        accounts_dir = test_vdir / "accounts"
+        cache_dir = test_vdir / "cache"
+
+        # Check that accounts_dir and cache_dir mkdir were called with mode=0o700
+        accounts_called_mode = [mode for p, mode in mkdir_calls if p == accounts_dir]
+        cache_called_mode = [mode for p, mode in mkdir_calls if p == cache_dir]
+
+        self.assertTrue(accounts_called_mode, "accounts_dir.mkdir was not called")
+        self.assertEqual(accounts_called_mode[0], 0o700)
+        self.assertTrue(cache_called_mode, "cache_dir.mkdir was not called")
+        self.assertEqual(cache_called_mode[0], 0o700)
+
+    def test_get_account_tokens(self):
+        """get_account_tokens encapsulates token extraction from token.json."""
+        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+
+        # 1. Non-existent account
+        self.assertIsNone(engine.get_account_tokens("non_existent"))
+
+        # 2. Valid account
+        acc_dir = self.vault_dir / "accounts" / "valid_user"
+        acc_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        sample = create_sample_token("valid_user@example.com")
+        sample["token"]["access_token"] = "mock_access_123"
+        sample["token"]["refresh_token"] = "mock_refresh_456"
+        (acc_dir / "token.json").write_text(json.dumps(sample), encoding="utf-8")
+
+        tokens = engine.get_account_tokens("valid_user")
+        self.assertIsNotNone(tokens)
+        self.assertEqual(tokens.get("access_token"), "mock_access_123")
+        self.assertEqual(tokens.get("refresh_token"), "mock_refresh_456")
+
+        # 3. Invalid token file
+        invalid_dir = self.vault_dir / "accounts" / "invalid_user"
+        invalid_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (invalid_dir / "token.json").write_text("{bad json", encoding="utf-8")
+        self.assertIsNone(engine.get_account_tokens("invalid_user"))
 
     def test_auto_migration_discovers_and_copies_accounts(self):
         """Engine should auto-migrate accounts from legacy agy-cli-manager accounts folder."""

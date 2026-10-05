@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
@@ -106,6 +107,21 @@ class TestRotationEngine(unittest.TestCase):
         }
         result = engine.evaluate(accounts, current_time=self.base_time)
         self.assertEqual(result, "acc1")
+
+    def test_reset_delta_calculated_once_per_account(self):
+        """reset_delta must only be calculated once per account status during evaluate."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        accounts = {
+            # fraction 0.06 (>0.05) checks drain window, but reset=35 (>30) so continues to step 3 loop
+            "acc1": self._make_quota(gemini_frac=0.06, gemini_reset=35),
+            "acc2": self._make_quota(gemini_frac=0.50, gemini_reset=120),
+        }
+
+        with patch.object(engine, "calculate_reset_delta", wraps=engine.calculate_reset_delta) as spy:
+            result = engine.evaluate(accounts, current_time=self.base_time)
+
+        self.assertEqual(result, "acc2")
+        self.assertEqual(spy.call_count, 2, f"Expected exactly 2 reset_delta calculations (1 per account), got {spy.call_count}")
 
 if __name__ == "__main__":
     unittest.main()

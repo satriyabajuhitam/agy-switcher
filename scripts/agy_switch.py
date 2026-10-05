@@ -77,17 +77,17 @@ class AgySwitchEngine:
 
     def init_vault(self) -> None:
         """Ensures ~/.antigravity-vault/ and required subdirectories exist."""
-        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             os.chmod(self.vault_dir, 0o700)
         except OSError:
             pass
-        self.accounts_dir.mkdir(parents=True, exist_ok=True)
+        self.accounts_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             os.chmod(self.accounts_dir, 0o700)
         except OSError:
             pass
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             os.chmod(self.cache_dir, 0o700)
         except OSError:
@@ -127,6 +127,25 @@ class AgySwitchEngine:
             raise InvalidTokenError(f"Failed to read/parse token JSON: {e}") from e
 
         return self.validate_token_dict(data)
+
+    def get_account_tokens(self, name: str) -> dict[str, str | None] | None:
+        """Retrieves and returns access_token and refresh_token for a given account.
+
+        Returns a dict with 'access_token' and 'refresh_token', or None if account
+        or token file does not exist or is invalid.
+        """
+        token_path = self.accounts_dir / name / "token.json"
+        if not token_path.is_file():
+            return None
+        try:
+            token_data = self.validate_token_file(token_path)
+            token_payload = token_data.get("token", {})
+            return {
+                "access_token": token_payload.get("access_token"),
+                "refresh_token": token_payload.get("refresh_token"),
+            }
+        except InvalidTokenError:
+            return None
 
     def extract_email_from_jwt(self, id_token: str) -> str | None:
         """Decodes JWT payload to extract user email without external dependencies."""
@@ -791,26 +810,28 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 acc_name = acc.get("name")
                 if not acc_name:
                     continue
-                token_path = engine.accounts_dir / acc_name / "token.json"
-                if token_path.is_file():
-                    token_data = engine.validate_token_file(token_path)
-                    token_payload = token_data.get("token", {})
-                    access_token = token_payload.get("access_token")
-                    refresh_token = token_payload.get("refresh_token")
-                    if access_token:
-                        quota_res = client.fetch_quota(access_token, refresh_token=refresh_token)
-                        if quota_res:
-                            quotas[acc_name] = quota_res
+                tokens = engine.get_account_tokens(acc_name)
+                if tokens and tokens.get("access_token"):
+                    quota_res = client.fetch_quota(tokens["access_token"], refresh_token=tokens.get("refresh_token"))
+                    if quota_res:
+                        quotas[acc_name] = quota_res
                             
             rot_engine = RotationEngine(model_name=model_name, active_account_id=active_name)
             target_account = rot_engine.evaluate(quotas)
             
             print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account}", file=sys.stderr)
             
-            # Check if the chosen account is exhausted
-            is_exhausted = rot_engine.is_exhausted(quotas.get(target_account, {}))
+            # Check if all network quotas failed or all accounts are exhausted
+            all_exhausted = (
+                not quotas
+                or not any(
+                    (st := rot_engine.get_quota_status(q)) is not None and st.fraction > 0.0
+                    for q in quotas.values()
+                )
+                or rot_engine.is_exhausted(quotas.get(target_account, {}))
+            )
             
-            if is_exhausted:
+            if all_exhausted:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {

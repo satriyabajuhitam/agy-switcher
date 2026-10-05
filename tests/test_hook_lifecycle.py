@@ -153,6 +153,103 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             except json.JSONDecodeError as e:
                 self.fail(f"stdout is not valid JSON for input {bad_input!r}: {proc.stdout!r}, error: {e}")
 
+    def test_hook_pre_invocation_empty_quotas_warns_exhausted(self):
+        """When auto-switch is on and all network quotas fail (empty quotas), output exhausted warning ephemeralMessage."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        # Register an account
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "token1", "refresh_token": "r1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.signature",
+        }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+
+        # Mock QuotaClient.fetch_quota to return empty dict (simulating network failure)
+        with patch("quota_client.QuotaClient.fetch_quota", return_value={}):
+            with patch("sys.stdin", io.StringIO(input_payload)):
+                out_capture = io.StringIO()
+                with patch("sys.stdout", out_capture):
+                    ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output, "Hook should output injectSteps warning when quotas are empty")
+        self.assertEqual(len(output["injectSteps"]), 1)
+        step = output["injectSteps"][0]
+        self.assertEqual(step.get("type"), "ephemeralMessage")
+        self.assertIn("exhausted their gemini-1.5-pro quota", step.get("message", ""))
+
+    def test_hook_pre_invocation_all_quotas_zero_warns_exhausted(self):
+        """When auto-switch is on and all accounts have 0 quota, output exhausted warning ephemeralMessage."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "token1", "refresh_token": "r1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.signature",
+        }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        zero_quota = {
+            "groups": [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [{"bucketId": "five_hour", "remainingFraction": 0.0, "resetTime": "2026-10-05T15:00:00Z"}]
+                }
+            ]
+        }
+
+        with patch("quota_client.QuotaClient.fetch_quota", return_value=zero_quota):
+            with patch("sys.stdin", io.StringIO(input_payload)):
+                out_capture = io.StringIO()
+                with patch("sys.stdout", out_capture):
+                    ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        step = output["injectSteps"][0]
+        self.assertEqual(step.get("type"), "ephemeralMessage")
+        self.assertIn("exhausted their gemini-1.5-pro quota", step.get("message", ""))
+
+    def test_hook_pre_invocation_uses_get_account_tokens(self):
+        """Hook must call engine.get_account_tokens instead of directly parsing token dicts."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "token1", "refresh_token": "r1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.signature",
+        }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+
+        with patch.object(self.engine, "get_account_tokens", wraps=self.engine.get_account_tokens) as spy_tokens:
+            with patch("quota_client.QuotaClient.fetch_quota", return_value={}):
+                with patch("sys.stdin", io.StringIO(input_payload)):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        handle_pre_invocation_hook(self.engine)
+
+        self.assertTrue(spy_tokens.called, "Hook must invoke engine.get_account_tokens()")
+
 
 if __name__ == "__main__":
     unittest.main()
