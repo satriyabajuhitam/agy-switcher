@@ -20,8 +20,9 @@ Usage:
   bash install.sh [OPTIONS]
 
 Options:
-  -l, --local           Install to current workspace (.agents/plugins/agy-switch)
-  -g, --global          Install to global Antigravity config (~/.gemini/config/plugins/agy-switch)
+  -l, --local           Install or uninstall for current workspace (.agents/plugins/agy-switch)
+  -g, --global          Install or uninstall for user home (~/.gemini/config/plugins/agy-switch)
+  -a, --all             Uninstall both local and global installations (with --uninstall)
   -c, --copy            Copy files physically instead of symlinking (default is symlink)
   -s, --symlink         Explicitly force symlink installation (default behavior)
   -u, --uninstall       Remove installed plugin and clean up launcher
@@ -33,7 +34,8 @@ Interactive Mode:
   2) Install Globally (User Home: ~/.gemini/config/plugins/agy-switch)
   3) Uninstall Local Installation
   4) Uninstall Global Installation
-  5) Exit
+  5) Uninstall All (Local & Global)
+  6) Exit
 EOF
 }
 
@@ -43,14 +45,16 @@ interactive_menu() {
     echo "2) Install Globally (User Home: ~/.gemini/config/plugins/agy-switch)"
     echo "3) Uninstall Local Installation"
     echo "4) Uninstall Global Installation"
-    echo "5) Exit"
-    read -p "Select an option [1-5]: " choice
+    echo "5) Uninstall All (Local & Global)"
+    echo "6) Exit"
+    read -p "Select an option [1-6]: " choice
     case "$choice" in
         1) TARGET="local";;
         2) TARGET="global";;
         3) TARGET="local"; UNINSTALL=1;;
         4) TARGET="global"; UNINSTALL=1;;
-        5) exit 0;;
+        5) TARGET="all"; UNINSTALL=1;;
+        6) exit 0;;
         *) echo "Invalid option"; exit 1;;
     esac
 }
@@ -64,10 +68,11 @@ if [ "$#" -eq 0 ]; then
         exit 1
     fi
 else
-    while [[ "$#" -gt 0 ]]; do
+    while [ "$#" -gt 0 ]; do
         case $1 in
             -l|--local) TARGET="local" ;;
             -g|--global) TARGET="global" ;;
+            -a|--all) TARGET="all" ;;
             -c|--copy) INSTALL_MODE="copy" ;;
             -s|--symlink) INSTALL_MODE="symlink" ;;
             -u|--uninstall) UNINSTALL=1 ;;
@@ -79,8 +84,13 @@ else
 fi
 
 if [ -z "$TARGET" ]; then
-    echo "Error: Must specify --local or --global (or use interactive menu)."
-    exit 1
+    if [ "$UNINSTALL" -eq 1 ]; then
+        # Default uninstall without explicit target cleans up both to prevent orphaned files
+        TARGET="all"
+    else
+        echo "Error: Must specify --local or --global (or use interactive menu)."
+        exit 1
+    fi
 fi
 
 get_local_dest() {
@@ -88,7 +98,7 @@ get_local_dest() {
     local root_dir
     root_dir="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -z "$root_dir" ]; then
-        root_dir="$(cd "$SCRIPT_DIR/../.." && pwd)"
+        root_dir="$(pwd)"
     fi
     echo "$root_dir/.agents/plugins/agy-switch"
 }
@@ -97,26 +107,62 @@ get_global_dest() {
     echo "${HOME}/.gemini/config/plugins/agy-switch"
 }
 
+matches_dest() {
+    local path="$1"
+    local prefix="$2"
+    [ -n "$prefix" ] && case "$path" in "$prefix"*) return 0 ;; esac
+    return 1
+}
+
+matches_agy() {
+    local path="$1"
+    case "$path" in
+        *"/agy-switch/"*|*"/agy_switch.py"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 manage_launcher() {
     local action="$1"
+    local target_dest="${2:-}"
     local bin_dir="${HOME}/.local/bin"
     local bin_link="$bin_dir/agy-switch"
 
     if [ "$action" = "install" ]; then
         mkdir -p "$bin_dir"
-        local script_target="$DEST/scripts/agy_switch.py"
+        local script_target="$target_dest/scripts/agy_switch.py"
         # Ensure executable
-        chmod +x "$script_target"
+        chmod +x "$script_target" 2>/dev/null || true
         
         # Link
         ln -sf "$script_target" "$bin_link"
         echo "Created launcher symlink: $bin_link -> $script_target"
     elif [ "$action" = "uninstall" ]; then
-        if [ -L "$bin_link" ]; then
+        if [ -L "$bin_link" ] || [ -e "$bin_link" ]; then
             local current_target
-            current_target="$(readlink "$bin_link")"
-            # If the current target starts with our DEST, remove the link
-            if [[ "$current_target" == "$DEST"* ]]; then
+            current_target="$(readlink "$bin_link" 2>/dev/null || true)"
+            local canonical_target
+            canonical_target="$(readlink -f "$bin_link" 2>/dev/null || true)"
+
+            local should_remove=0
+            if matches_dest "$current_target" "$target_dest" || matches_dest "$canonical_target" "$target_dest"; then
+                should_remove=1
+            fi
+
+            if [ "$TARGET" = "all" ]; then
+                if matches_agy "$current_target" || matches_agy "$canonical_target" || matches_dest "$canonical_target" "$BOOSTER_ROOT"; then
+                    should_remove=1
+                fi
+            fi
+
+            # Clean up broken symlink pointing to agy-switch
+            if [ -L "$bin_link" ] && [ ! -e "$bin_link" ]; then
+                if matches_agy "$current_target"; then
+                    should_remove=1
+                fi
+            fi
+
+            if [ "$should_remove" -eq 1 ]; then
                 rm -f "$bin_link"
                 echo "Removed launcher symlink: $bin_link"
             fi
@@ -124,45 +170,61 @@ manage_launcher() {
     fi
 }
 
-if [ "$TARGET" = "local" ]; then
-    DEST="$(get_local_dest)"
-elif [ "$TARGET" = "global" ]; then
-    DEST="$(get_global_dest)"
-fi
+uninstall_target() {
+    local dest="$1"
+    echo "Uninstalling agy-switch from $dest"
+    manage_launcher "uninstall" "$dest"
+
+    if [ -L "$dest" ] || [ -d "$dest" ]; then
+        rm -rf "$dest"
+        echo "Removed plugin at $dest"
+    else
+        echo "Plugin not found at $dest, nothing to do."
+    fi
+}
+
+install_target() {
+    local dest="$1"
+    echo "Installing agy-switch to $dest (mode: $INSTALL_MODE)"
+
+    # Clean up existing before installing
+    if [ -L "$dest" ] || [ -d "$dest" ]; then
+        rm -rf "$dest"
+    fi
+    mkdir -p "$(dirname "$dest")"
+
+    # Ensure source script is executable
+    chmod +x "$BOOSTER_ROOT/scripts/agy_switch.py"
+
+    if [ "$INSTALL_MODE" = "symlink" ]; then
+        ln -sf "$BOOSTER_ROOT" "$dest"
+        echo "Symlinked: $dest"
+    else
+        mkdir -p "$dest"
+        cp -r "$BOOSTER_ROOT/." "$dest/"
+        echo "Copied to: $dest"
+    fi
+
+    manage_launcher "install" "$dest"
+    echo "Installation complete."
+}
 
 if [ "$UNINSTALL" -eq 1 ]; then
-    echo "Uninstalling agy-switch from $DEST"
-    manage_launcher "uninstall"
-    
-    if [ -L "$DEST" ] || [ -d "$DEST" ]; then
-        rm -rf "$DEST"
-        echo "Removed plugin at $DEST"
-    else
-        echo "Plugin not found at $DEST, nothing to do."
+    if [ "$TARGET" = "local" ]; then
+        uninstall_target "$(get_local_dest)"
+    elif [ "$TARGET" = "global" ]; then
+        uninstall_target "$(get_global_dest)"
+    elif [ "$TARGET" = "all" ]; then
+        uninstall_target "$(get_local_dest)"
+        uninstall_target "$(get_global_dest)"
+        # Final pass to ensure launcher is gone if TARGET was all
+        manage_launcher "uninstall" ""
     fi
     echo "Uninstall complete. (Note: ~/.antigravity-vault/ is intentionally kept untouched)."
 else
-    echo "Installing agy-switch to $DEST (mode: $INSTALL_MODE)"
-    
-    # Clean up existing before installing
-    if [ -L "$DEST" ] || [ -d "$DEST" ]; then
-        rm -rf "$DEST"
+    if [ "$TARGET" = "local" ]; then
+        install_target "$(get_local_dest)"
+    elif [ "$TARGET" = "global" ]; then
+        install_target "$(get_global_dest)"
     fi
-    mkdir -p "$(dirname "$DEST")"
-
-    if [ "$INSTALL_MODE" = "symlink" ]; then
-        ln -s "$BOOSTER_ROOT" "$DEST"
-        echo "Symlinked: $DEST"
-    else
-        cp -r "$BOOSTER_ROOT" "$DEST"
-        echo "Copied to: $DEST"
-    fi
-
-    # Set executable on the script in the source BEFORE copying/linking, 
-    # but since it's already there or copied, let's just make it executable in source 
-    # so the copied version also has it, or if symlink, it works.
-    chmod +x "$BOOSTER_ROOT/scripts/agy_switch.py"
-
-    manage_launcher "install"
-    echo "Installation complete."
 fi
