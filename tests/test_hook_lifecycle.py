@@ -250,6 +250,41 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
 
         self.assertTrue(spy_tokens.called, "Hook must invoke engine.get_account_tokens()")
 
+    def test_hook_pre_invocation_uses_semantic_quota_methods(self):
+        """Hook must use semantic methods on RotationEngine/QuotaStatus rather than raw fraction access."""
+        from agy_switch import handle_pre_invocation_hook
+        from rotation_engine import RotationEngine
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "token1", "refresh_token": "r1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.signature",
+        }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        dummy_quota = {
+            "groups": [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [{"bucketId": "five_hour", "remainingFraction": 0.8, "resetTime": "2026-10-05T15:00:00Z"}]
+                }
+            ]
+        }
+
+        with patch("quota_client.QuotaClient.fetch_quota", return_value=dummy_quota):
+            with patch.object(RotationEngine, "has_available_quota", return_value=True) as spy_has_quota:
+                with patch("sys.stdin", io.StringIO(input_payload)):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        handle_pre_invocation_hook(self.engine)
+
+        self.assertTrue(spy_has_quota.called, "Hook must invoke rot_engine.has_available_quota()")
+
 
 if __name__ == "__main__":
     unittest.main()

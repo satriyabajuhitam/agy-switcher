@@ -267,6 +267,18 @@ class TestAtomicDualSwapper(unittest.TestCase):
         cli_data = json.loads(cli_token.read_text(encoding="utf-8"))
         self.assertIn("quickstart", cli_data["token"]["access_token"])
 
+    def test_switch_tokens_explicitly_calls_os_replace_for_both_targets(self):
+        """switch_tokens must explicitly invoke os.replace for both target credential files."""
+        with patch("os.replace", wraps=os.replace) as mock_replace:
+            self.engine.switch_tokens("quickstart", restart_server=False)
+
+            replaced_targets = [str(call.args[1]) for call in mock_replace.call_args_list if len(call.args) >= 2]
+            jetski_target = str(self.gemini_dir / "jetski-standalone-oauth-token")
+            cli_target = str(self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token")
+
+            self.assertIn(jetski_target, replaced_targets, "os.replace was not called for jetski token target")
+            self.assertIn(cli_target, replaced_targets, "os.replace was not called for cli token target")
+
     def test_switch_tokens_nonexistent_account_raises_error(self):
         """Switching to non-existent account must raise AccountNotFoundError."""
         with self.assertRaises(AccountNotFoundError):

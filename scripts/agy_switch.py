@@ -392,14 +392,31 @@ class AgySwitchEngine:
 
         # Validate token payload before touching live target files
         token_data = self.validate_token_file(token_file)
+        token_payload = json.dumps(token_data, indent=2) + "\n"
 
         # 1. Update Antigravity 2.0 (WSL / Desktop) token
         jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
-        self._atomic_write_json(jetski_token_path, token_data)
+        jetski_token_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_jetski = jetski_token_path.with_suffix(f".tmp.{os.getpid()}")
+        try:
+            temp_jetski.write_text(token_payload, encoding="utf-8")
+            os.chmod(temp_jetski, 0o600)
+            os.replace(temp_jetski, jetski_token_path)
+        finally:
+            if temp_jetski.exists():
+                temp_jetski.unlink(missing_ok=True)
 
         # 2. Update Antigravity CLI token
         cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
-        self._atomic_write_json(cli_token_path, token_data)
+        cli_token_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_cli = cli_token_path.with_suffix(f".tmp.{os.getpid()}")
+        try:
+            temp_cli.write_text(token_payload, encoding="utf-8")
+            os.chmod(temp_cli, 0o600)
+            os.replace(temp_cli, cli_token_path)
+        finally:
+            if temp_cli.exists():
+                temp_cli.unlink(missing_ok=True)
 
         # 3. Update vault active marker
         self.set_active_name(name)
@@ -824,10 +841,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
             # Check if all network quotas failed or all accounts are exhausted
             all_exhausted = (
                 not quotas
-                or not any(
-                    (st := rot_engine.get_quota_status(q)) is not None and st.fraction > 0.0
-                    for q in quotas.values()
-                )
+                or not any(rot_engine.has_available_quota(q) for q in quotas.values())
                 or rot_engine.is_exhausted(quotas.get(target_account, {}))
             )
             
@@ -847,7 +861,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 engine.switch_tokens(target_account, restart_server=False, force=True)
                 
                 status = rot_engine.get_quota_status(quotas.get(target_account, {}))
-                pct = int(status.fraction * 100) if status is not None else "Unknown"
+                pct = status.remaining_percentage() if status is not None else "Unknown"
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {

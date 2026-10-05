@@ -7,6 +7,22 @@ class QuotaStatus:
     fraction: float
     reset_time: datetime.datetime
 
+    def get_reset_delta_minutes(self, current_time: datetime.datetime) -> float:
+        """Calculates reset delta in minutes relative to current_time."""
+        return (self.reset_time - current_time).total_seconds() / 60.0
+
+    def is_exhausted(self) -> bool:
+        """Returns True if the quota is exhausted (<= 0% remaining)."""
+        return self.fraction <= 0.0
+
+    def has_available_quota(self) -> bool:
+        """Returns True if there is positive quota remaining (> 0%)."""
+        return self.fraction > 0.0
+
+    def remaining_percentage(self) -> int:
+        """Returns remaining quota as an integer percentage (0-100)."""
+        return int(self.fraction * 100)
+
 class RotationEngine:
     def __init__(self, model_name: str, active_account_id: str):
         self.model_name = model_name
@@ -58,11 +74,18 @@ class RotationEngine:
         status = self.get_quota_status(quota_data)
         if status is None:
             return False
-        return status.fraction <= 0.0
+        return status.is_exhausted()
+
+    def has_available_quota(self, quota_data: dict) -> bool:
+        """Returns True if the relevant quota has positive remaining quota."""
+        status = self.get_quota_status(quota_data)
+        if status is None:
+            return False
+        return status.has_available_quota()
 
     def calculate_reset_delta(self, reset_time: datetime.datetime, current_time: datetime.datetime) -> float:
         """Calculates reset delta in minutes."""
-        return (reset_time - current_time).total_seconds() / 60.0
+        return QuotaStatus(fraction=0.0, reset_time=reset_time).get_reset_delta_minutes(current_time)
 
     def evaluate(self, accounts: dict, current_time: datetime.datetime = None) -> str:
         """

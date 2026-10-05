@@ -7,7 +7,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from rotation_engine import RotationEngine
+from rotation_engine import RotationEngine, QuotaStatus
 
 class TestRotationEngine(unittest.TestCase):
     def setUp(self):
@@ -123,5 +123,46 @@ class TestRotationEngine(unittest.TestCase):
         self.assertEqual(result, "acc2")
         self.assertEqual(spy.call_count, 2, f"Expected exactly 2 reset_delta calculations (1 per account), got {spy.call_count}")
 
+    def test_quota_status_encapsulates_reset_delta_minutes(self):
+        """QuotaStatus must encapsulate its own reset delta calculation in minutes."""
+        from datetime import timedelta
+        reset_time = self.base_time + timedelta(minutes=45)
+        status = QuotaStatus(fraction=0.5, reset_time=reset_time)
+        delta = status.get_reset_delta_minutes(self.base_time)
+        self.assertAlmostEqual(delta, 45.0)
+
+    def test_quota_status_semantic_methods(self):
+        """QuotaStatus provides semantic helper methods instead of primitive fraction access."""
+        from datetime import timedelta
+        reset_time = self.base_time + timedelta(minutes=30)
+        
+        status_full = QuotaStatus(fraction=1.0, reset_time=reset_time)
+        self.assertFalse(status_full.is_exhausted())
+        self.assertTrue(status_full.has_available_quota())
+        self.assertEqual(status_full.remaining_percentage(), 100)
+
+        status_zero = QuotaStatus(fraction=0.0, reset_time=reset_time)
+        self.assertTrue(status_zero.is_exhausted())
+        self.assertFalse(status_zero.has_available_quota())
+        self.assertEqual(status_zero.remaining_percentage(), 0)
+
+        status_partial = QuotaStatus(fraction=0.456, reset_time=reset_time)
+        self.assertFalse(status_partial.is_exhausted())
+        self.assertTrue(status_partial.has_available_quota())
+        self.assertEqual(status_partial.remaining_percentage(), 45)
+
+    def test_rotation_engine_has_available_quota(self):
+        """RotationEngine provides has_available_quota encapsulating status retrieval."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        has_quota_data = self._make_quota(gemini_frac=0.5)
+        zero_quota_data = self._make_quota(gemini_frac=0.0)
+        empty_data = {}
+
+        self.assertTrue(engine.has_available_quota(has_quota_data))
+        self.assertFalse(engine.has_available_quota(zero_quota_data))
+        self.assertFalse(engine.has_available_quota(empty_data))
+
+
 if __name__ == "__main__":
     unittest.main()
+
