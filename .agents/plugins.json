@@ -1,0 +1,10 @@
+{
+  "entries": [
+    {
+      "path": "/srv/agy-workspaces/booster",
+      "include_only": [
+        "agy-pocock"
+      ]
+    }
+  ]
+}

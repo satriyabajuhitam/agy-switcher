@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "agy-memory": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "agy_memory.server.mcp_server"
+      ],
+      "env": {
+        "PYTHONPATH": "/home/agyuser/.gemini/config/plugins/agy-memory/src",
+        "AGY_WORKSPACE_ROOT": "/srv/agy-workspaces/booster/agy-switcher"
+      }
+    }
+  }
+}

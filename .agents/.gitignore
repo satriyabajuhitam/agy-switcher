@@ -1,0 +1,7 @@
+# agy-memory private state — do not commit
+memory/store.db*
+memory/MEMORY.md
+memory/failures.md
+memory/.hook_cache.json
+memory/.init.lock
+identity/

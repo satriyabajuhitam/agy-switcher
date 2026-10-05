@@ -1,0 +1,12 @@
+# agy-memory runtime & local identity state
+.agents/memory/
+.agents/identity/
+.agents/.init.lock
+.scratch/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Vault local caches
+.vault_cache/
