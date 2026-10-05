@@ -1,8 +1,26 @@
 # Antigravity Multi-Account Switcher (`agy-switch`)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python: 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#zero-dependencies--privacy-guarantees)
+
 `agy-switch` is a zero-dependency, high-reliability account manager, credential vault, and quota inspector for **Google Antigravity 2.0** (Desktop Electron / WSL Remote-Control) and **Antigravity CLI** (`agy`).
 
-It completely supersedes legacy token managers with an isolated vault, atomic dual-destination sync, active-turn process guards, interactive sandboxed onboarding, and real-time quota decision ranking.
+It completely supersedes legacy token managers with an isolated local vault, atomic dual-destination sync, active-turn process guards, interactive sandboxed onboarding, intelligent auto-rotation heuristics, and real-time quota decision ranking.
+
+---
+
+## Zero-Dependencies & Privacy Guarantees
+
+`agy-switch` is engineered from the ground up for absolute confidentiality, operational safety, and zero external baggage:
+
+- **Zero External Dependencies**: Built strictly on the Python 3.10+ standard library and standard POSIX bash. No external pip packages, no npm modules, no virtual environment overhead, and no background daemon managers.
+- **100% Local Offline Vault (`~/.antigravity-vault/`)**: All credentials and configuration reside strictly on your local machine. Directory permissions are locked to `0700` and credential JSON files to `0600` (`chmod` enforced at every access).
+- **Absolute Privacy & Zero Telemetry**:
+  - **No Telemetry or Tracking**: `agy-switch` never phones home or collects analytics.
+  - **Direct Google Authentication Only**: Zero cloud token intermediaries or proxies. OAuth credentials communicate directly with official Google endpoints solely when refreshing tokens or probing quota limits.
+- **Atomic Credential Swaps**: Credential propagation uses POSIX atomic filesystem replacement (`os.replace`), preventing partial writes, race conditions, or token corruption between Antigravity 2.0 Desktop and the Antigravity CLI.
+- **Process Turn Safety Guard**: The process supervisor monitors running `language_server` instances and active agent turns before triggering server restarts, ensuring in-flight agent tasks are never prematurely killed or corrupted.
 
 ---
 
@@ -29,43 +47,83 @@ It completely supersedes legacy token managers with an isolated vault, atomic du
    - Validates JWT tokens, extracts email identity, guards against collisions (`[y/N]`), and saves new accounts in `Standby` status.
 
 5. **Real-Time Quota Overview & Decision Ranking (`quota`)**:
-   - Inspects real-time quotas (Gemini & Claude/GPT 5-Hour and Weekly limits) across all vault accounts.
+   - Inspects real-time quotas (Gemini & Claude/GPT 5-Hour and Weekly limits) across all vault accounts via fast direct telemetry (`QuotaClient`).
    - Deterministic sorting: Highest Gemini Weekly Limit followed by highest Gemini 5-Hour Limit.
    - Computes reset times and countdowns (e.g. `~3 jam 20 menit lagi`).
    - Actionable recommendation banner highlighting the highest-capacity standby account.
    - Persistent cache fallback (`~/.antigravity-vault/cache/last_known_quota.json`) when network probes temporarily timeout.
 
-6. **Zero Dependencies**:
-   - Built entirely on Python 3.10+ standard libraries (`pathlib`, `json`, `shutil`, `signal`, `subprocess`, `tempfile`, `argparse`, `re`, `datetime`). Zero `pip install` required.
+6. **Automatic Rotation Engine & PreInvocation Hook (`hook`)**:
+   - Evaluates remaining model quota before each agent turn via Antigravity lifecycle hooks (`PreInvocation`).
+   - Supports intelligent rotation strategies (`cache_optimized`, `drain_window`, `auto_highest`).
+   - Seamlessly auto-switches to the healthiest account when capacity drops below threshold.
 
 ---
 
 ## Installation & Setup
 
-To install the `agy-switch` booster and bootstrap the vault:
+`agy-switch` uses a unified installer script (`install.sh`) that installs the Antigravity Booster Plugin and registers the standalone terminal CLI wrapper (`~/.local/bin/agy-switch`) simultaneously in a single step.
+
+### Quick Start
 
 ```bash
-# Interactive menu (recommended for manual installation)
-bash booster/agy-switch/install.sh
+# Clone the repository (active dev branch)
+git clone -b dev https://github.com/satriyabajuhitam/agy-switcher.git
+cd agy-switcher
 
-# Install locally to the current workspace (.agents/plugins/agy-switch)
-bash booster/agy-switch/install.sh --local
-
-# Install globally for all workspaces (~/.gemini/config/plugins/agy-switch)
-bash booster/agy-switch/install.sh --global
-
-# Physical copy instead of symlink
-bash booster/agy-switch/install.sh --local --copy
-
-# Uninstall (safely cleans up links and binaries, keeps vault intact)
-bash booster/agy-switch/install.sh --uninstall --local
+# Interactive Menu (Recommended for manual installation)
+bash install.sh
 ```
 
-This sets up:
-- Directory: `~/.antigravity-vault/accounts/` (`0700`)
-- Active marker: `~/.antigravity-vault/active`
-- Cache directory: `~/.antigravity-vault/cache/`
-- Symlink: `~/.local/bin/agy-switch -> .../agy_switch.py`
+### Scripted Installation Options
+
+```bash
+# Option A: Local Workspace Installation (Default for workspace-isolated agents)
+# Installs plugin to .agents/plugins/agy-switch and links CLI to ~/.local/bin/agy-switch
+bash install.sh --local
+
+# Option B: Global Installation (Available to all workspaces and user sessions)
+# Installs plugin to ~/.gemini/config/plugins/agy-switch and links CLI to ~/.local/bin/agy-switch
+bash install.sh --global
+
+# Optional: Physical Copy Mode (copies files instead of symlinking)
+bash install.sh --local --copy
+# or
+bash install.sh --global --copy
+```
+
+> [!NOTE]
+> Ensure `~/.local/bin` is present in your shell `$PATH` (e.g. `export PATH="$HOME/.local/bin:$PATH"` in `~/.bashrc` or `~/.zshrc`).
+
+### What `install.sh` Configures
+- **Plugin Registry**: Registers `agy-switch` as an active Antigravity booster plugin (`.agents/plugins/agy-switch` or `~/.gemini/config/plugins/agy-switch`).
+- **CLI Launcher**: Symlinks `~/.local/bin/agy-switch` directly to `scripts/agy_switch.py`.
+- **Vault Bootstrap**: Initialises the secure vault directory structure in `~/.antigravity-vault/` with `0700` file modes.
+
+---
+
+## Clean Uninstallation
+
+`install.sh` provides dedicated uninstallation flags to cleanly remove registered plugins and CLI symlinks without leaving orphaned files:
+
+```bash
+# Uninstall local workspace plugin and launcher
+bash install.sh --uninstall --local
+
+# Uninstall global user plugin and launcher
+bash install.sh --uninstall --global
+
+# Uninstall all (cleans up both local and global installations)
+bash install.sh --uninstall --all
+# or simply:
+bash install.sh --uninstall
+```
+
+> [!TIP]
+> **Credential Preservation**: Uninstallation intentionally leaves `~/.antigravity-vault/` untouched so your configured accounts and OAuth tokens are never lost accidentally. If you wish to completely purge all local tokens, delete the vault directory manually:
+> ```bash
+> rm -rf ~/.antigravity-vault
+> ```
 
 ---
 
@@ -80,6 +138,8 @@ This sets up:
 | `agy-switch login <name>` | `[--force] [--timeout <sec>]` | Interactive Google OAuth login in an isolated sandbox |
 | `agy-switch add <name>` | `--token-file <path>` | Register account from an existing token JSON file |
 | `agy-switch remove <name>` | `[--force]` | Remove an account from vault (`--force` if active) |
+| `agy-switch config` | `[auto-switch <on\|off>]` | View or configure automatic rotation settings |
+| `agy-switch hook` | `[install\|uninstall]` | Manage Antigravity PreInvocation lifecycle hooks |
 | `agy-switch migrate` | None | Manually trigger import from legacy `~/.agy-cli-manager` |
 
 ---
@@ -112,7 +172,17 @@ agy-switch switch credible --no-restart
 
 ### 3. Log In a New Account
 ```bash
+# Launches an isolated browser session to authenticate
 agy-switch login my-new-account
+```
+
+### 4. Enable Automatic Rotation & Lifecycle Hooks
+```bash
+# Register PreInvocation lifecycle hook
+agy-switch hook install
+
+# Turn on auto-switch rotation
+agy-switch config auto-switch on
 ```
 
 ---
@@ -131,6 +201,17 @@ Autonomous pair-programming agents can inspect multi-account capacity and execut
 Run the full unit test suite:
 
 ```bash
-python3 -m unittest discover -s booster/agy-switch/tests -q
+python3 -m unittest discover tests/
 ```
 
+Verify switcher installation:
+
+```bash
+bash install.sh --local
+```
+
+---
+
+## License
+
+Distributed under the [MIT License](LICENSE).

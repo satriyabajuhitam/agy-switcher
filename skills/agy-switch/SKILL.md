@@ -20,13 +20,11 @@ It also manages graceful `language_server` auto-restart via `SIGTERM` with safet
 | Action | Command | Description |
 | :--- | :--- | :--- |
 | **List Accounts** | `agy-switch list` | Lists all vault accounts and marks the currently active account |
-| **System Status** | `agy-switch status` | Displays active account, `language_server` PID, and server busy state |
+| **List with Quota** | `agy-switch list --quota` | Evaluates all vaulted accounts concurrently for real-time quota (Fast Telemetry) |
+| **System Status** | `agy-switch status` | Displays active account, zero-lag cache status, and server health |
 | **Switch Account** | `agy-switch switch <name>` | Atomically updates tokens and restarts `language_server` safely |
 | **Force Switch** | `agy-switch switch <name> --force` | Overrides active turn protection and forces immediate daemon restart |
-| **No-Restart Switch** | `agy-switch switch <name> --no-restart` | Swaps tokens on disk without killing running `language_server` |
-| **Inspect Quotas** | `agy-switch quota` | Shows real-time Gemini & Claude 5h/weekly limits sorted by capacity |
-| **Listicle Quota** | `agy-switch quota --format list` | Outputs numbered listicle formatted for chat / mobile display |
-| **JSON Quota** | `agy-switch quota --json` | Returns machine-readable quota metrics and recommendation |
+| **Auto Switch** | `agy-switch switch --auto` | Intelligently rotates the account using heuristics (skips swap if current is optimal) |
 | **Login Account** | `agy-switch login <name>` | Interactive Google OAuth login in an isolated sandbox |
 | **Add Account** | `agy-switch add <name> --token-file <path>` | Registers account from existing token JSON file |
 | **Remove Account** | `agy-switch remove <name>` | Removes standby account from vault |
@@ -49,31 +47,30 @@ Report the active account and available standby accounts clearly to the user.
 ### Procedure B: When User asks to check quota (e.g. "Cek kuota", "Berapa sisa kuota?")
 Run via `run_command`:
 ```bash
-~/.local/bin/agy-switch quota --format list
+~/.local/bin/agy-switch list --quota
 ```
 Report the output directly as plain conversational text.
 
 > [!IMPORTANT]
-> **NO MARKDOWN TABLES IN CHAT**: Never render quota reports as Markdown tables in conversational chat—tables wrap destructively on mobile screens. Always use `--format list` for clean numbered listicles.
+> **NO MARKDOWN TABLES IN CHAT**: Never render quota reports as Markdown tables in conversational chat—tables wrap destructively on mobile screens. Always use plain lists for clean numbered listicles.
 
 ### Procedure C: When User asks to switch accounts
 Run:
 ```bash
 ~/.local/bin/agy-switch switch <account_name>
 ```
+Or to let the engine auto-rotate based on intelligent thresholds:
+```bash
+~/.local/bin/agy-switch switch --auto
+```
 
 > [!CAUTION]
-> **Active Turn Safety Guard**: If Antigravity is actively processing an agent turn or background task, `agy-switch switch` will return exit code 2:
-> ```text
-> Warning: Antigravity is currently busy processing an agent turn or background task. Use --force to switch and restart anyway.
-> ```
+> **Active Turn Safety Guard**: If Antigravity is actively processing an agent turn or background task, `agy-switch switch <name>` will return exit code 2.
 > Never pass `--force` unless the user explicitly requests a forced switch or confirms the turn may be restarted.
 
 ### Procedure D: When User hits quota exhaustion or requests best account
-1. Run `~/.local/bin/agy-switch quota` (or `~/.local/bin/agy-switch quota --format list`).
-2. Identify the recommended standby account with the highest remaining quota.
-3. Inform the user and suggest switching.
-4. Execute `~/.local/bin/agy-switch switch <target_account>` once confirmed or requested.
+1. Run `~/.local/bin/agy-switch switch --auto`.
+2. Inform the user that the rotation engine has evaluated the quotas and selected the optimal account based on cache_optimized, drain_window, and imminent_reset heuristics.
 
 ---
 

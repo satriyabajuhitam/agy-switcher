@@ -10,3 +10,4 @@ __pycache__/
 
 # Vault local caches
 .vault_cache/
+.agents/plugins/
