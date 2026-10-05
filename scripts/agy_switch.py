@@ -1303,23 +1303,40 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         try:
             raw = sys.stdin.read()
             _payload = json.loads(raw) if raw.strip() else {}
+            model_name = _payload.get("modelName", "gemini-1.5-pro")
             
-            # Wire in QuotaClient
+            # Wire in QuotaClient and RotationEngine
             try:
                 from quota_client import QuotaClient
+                from rotation_engine import RotationEngine
+                
                 active_name = engine.get_active_name()
-                if active_name:
-                    token_path = engine.accounts_dir / active_name / "token.json"
+                accounts_data = engine.list_accounts().get("accounts", [])
+                
+                client = QuotaClient(timeout=2.0)
+                quotas = {}
+                
+                for acc in accounts_data:
+                    acc_name = acc.get("account")
+                    if not acc_name:
+                        continue
+                    token_path = engine.accounts_dir / acc_name / "token.json"
                     if token_path.is_file():
                         token_data = engine.validate_token_file(token_path)
                         access_token = token_data.get("token", {}).get("access_token")
                         refresh_token = token_data.get("token", {}).get("refresh_token")
                         if access_token:
-                            client = QuotaClient(timeout=2.0)
                             quota_res = client.fetch_quota(access_token, refresh_token=refresh_token)
-                            print(f"[agy-switch hook] Quota for {active_name}: {json.dumps(quota_res)}", file=sys.stderr)
+                            if quota_res:
+                                quotas[acc_name] = quota_res
+                                
+                rot_engine = RotationEngine(model_name=model_name, active_account_id=active_name)
+                target_account = rot_engine.evaluate(quotas)
+                
+                print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account}", file=sys.stderr)
+                
             except Exception as qc_exc:
-                print(f"[agy-switch hook] QuotaClient error: {qc_exc}", file=sys.stderr)
+                print(f"[agy-switch hook] QuotaClient/RotationEngine error: {qc_exc}", file=sys.stderr)
         except Exception as exc:
             print(f"[agy-switch hook] Error parsing stdin: {exc}", file=sys.stderr)
         sys.stdout.write(json.dumps({}) + "\n")
