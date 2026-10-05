@@ -1335,6 +1335,36 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 
                 print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account}", file=sys.stderr)
                 
+                # Check if the chosen account is exhausted
+                target_frac, _ = rot_engine._get_worst_case(quotas.get(target_account, {}))
+                
+                if target_frac is not None and target_frac <= 0.0:
+                    sys.stdout.write(json.dumps({
+                        "injectSteps": [
+                            {
+                                "type": "ephemeralMessage",
+                                "message": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
+                            }
+                        ]
+                    }) + "\n")
+                    sys.stdout.flush()
+                    return 0
+                    
+                if target_account and target_account != active_name:
+                    engine.switch_tokens(target_account, restart_server=False, force=True)
+                    
+                    pct = int(target_frac * 100) if target_frac is not None else "Unknown"
+                    sys.stdout.write(json.dumps({
+                        "injectSteps": [
+                            {
+                                "type": "ephemeralMessage",
+                                "message": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
+                            }
+                        ]
+                    }) + "\n")
+                    sys.stdout.flush()
+                    return 0
+                    
             except Exception as qc_exc:
                 print(f"[agy-switch hook] QuotaClient/RotationEngine error: {qc_exc}", file=sys.stderr)
         except Exception as exc:
