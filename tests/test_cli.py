@@ -89,7 +89,7 @@ class TestCLI(unittest.TestCase):
         mock_qc.fetch_quota.return_value = {"gemini": {"quota": 85}}
         
         mock_re = mock_re_class.return_value
-        mock_re.evaluate.return_value = "acc1" # Current active is optimal
+        mock_re.evaluate.return_value = None  # Current active is optimal (returns None)
         
         with patch('sys.stdout') as mock_stdout:
             exit_code = main(["switch", "--auto"], engine=self.engine)
