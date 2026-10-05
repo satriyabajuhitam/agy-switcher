@@ -83,7 +83,15 @@ class AgySwitchEngine:
         except OSError:
             pass
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.accounts_dir, 0o700)
+        except OSError:
+            pass
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.cache_dir, 0o700)
+        except OSError:
+            pass
 
     def validate_token_dict(self, data: Any) -> dict[str, Any]:
         """Validates that data complies with Google OAuth token JSON schema."""
@@ -700,353 +708,6 @@ class AgySwitchEngine:
         except Exception:
             pass
 
-    def probe_account_quota(
-        self,
-        name: str,
-        token_path: Path,
-        agy_binary: str,
-        timeout: int = 45,
-    ) -> dict[str, Any]:
-        """Probes real-time quota of a single account in an isolated temporary sandbox."""
-        result: dict[str, Any] = {
-            "account": name,
-            "gemini_5h": None,
-            "gemini_5h_reset": None,
-            "gemini_weekly": None,
-            "gemini_weekly_reset": None,
-            "claude_5h": None,
-            "claude_5h_reset": None,
-            "claude_weekly": None,
-            "claude_weekly_reset": None,
-            "raw_error": None,
-            "is_fallback": False,
-        }
-
-        with tempfile.TemporaryDirectory(prefix=f"agy-quota-{name}-") as tmpdir:
-            tmp_home = Path(tmpdir)
-            cli_dir = tmp_home / ".gemini" / "antigravity-cli"
-            cli_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(token_path, cli_dir / "antigravity-oauth-token")
-            shutil.copy2(token_path, tmp_home / ".gemini" / "jetski-standalone-oauth-token")
-            try:
-                (cli_dir / "antigravity-oauth-token").chmod(0o600)
-                (tmp_home / ".gemini" / "jetski-standalone-oauth-token").chmod(0o600)
-            except OSError:
-                pass
-
-            env = os.environ.copy()
-            env["HOME"] = str(tmp_home)
-            env["PATH"] = f"{Path.home()}/.local/bin:{env.get('PATH', '/bin:/usr/bin:/usr/local/bin')}"
-
-            try:
-                proc = subprocess.run(
-                    [agy_binary, "-p", "/usage"],
-                    cwd=str(tmp_home),
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                )
-                output = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
-
-                for match in QUOTA_REGEX.finditer(output):
-                    model_type = match.group(1).strip()
-                    limit_type = match.group(2).strip()
-                    pct = int(match.group(3))
-                    reset_time = (match.group(4) or "").strip()
-
-                    if model_type == "Gemini Models":
-                        if limit_type == "Five Hour Limit Remaining":
-                            result["gemini_5h"] = pct
-                            result["gemini_5h_reset"] = reset_time
-                        elif limit_type == "Weekly Limit Remaining":
-                            result["gemini_weekly"] = pct
-                            result["gemini_weekly_reset"] = reset_time
-                    elif model_type == "Claude and GPT models":
-                        if limit_type == "Five Hour Limit Remaining":
-                            result["claude_5h"] = pct
-                            result["claude_5h_reset"] = reset_time
-                        elif limit_type == "Weekly Limit Remaining":
-                            result["claude_weekly"] = pct
-                            result["claude_weekly_reset"] = reset_time
-
-                if proc.returncode != 0 and all(
-                    result[k] is None for k in ["gemini_5h", "gemini_weekly", "claude_5h", "claude_weekly"]
-                ):
-                    result["raw_error"] = f"Exit code {proc.returncode}: {output[:200]}"
-            except subprocess.TimeoutExpired:
-                result["raw_error"] = f"Timed out after {timeout}s"
-            except Exception as e:
-                result["raw_error"] = str(e)
-
-        return result
-
-    def get_quota_overview(
-        self,
-        agy_binary: str | None = None,
-        timeout: int = 45,
-    ) -> dict[str, Any]:
-        """Probes real-time quotas across all vault accounts and returns sorted rankings and recommendations."""
-        resolved_bin: str | None = None
-        binary_error: str | None = None
-        try:
-            resolved_bin = self.resolve_agy_binary(agy_binary)
-        except AgySwitchError as e:
-            binary_error = str(e)
-
-        active_account = self.get_active_name()
-        listed = self.list_accounts().get("accounts", [])
-        cache = self.load_quota_cache()
-
-        results: list[dict[str, Any]] = []
-
-        for item in listed:
-            name = item["name"]
-            token_path = self.accounts_dir / name / "token.json"
-            if not token_path.is_file():
-                continue
-
-            if resolved_bin:
-                probe_data = self.probe_account_quota(name, token_path, resolved_bin, timeout=timeout)
-            else:
-                probe_data = {
-                    "account": name,
-                    "gemini_5h": None,
-                    "gemini_5h_reset": None,
-                    "gemini_weekly": None,
-                    "gemini_weekly_reset": None,
-                    "claude_5h": None,
-                    "claude_5h_reset": None,
-                    "claude_weekly": None,
-                    "claude_weekly_reset": None,
-                    "raw_error": binary_error,
-                    "is_fallback": False,
-                }
-
-            # Update cache if probe succeeded
-            if probe_data["gemini_5h"] is not None and probe_data["gemini_weekly"] is not None:
-                cache[name] = {
-                    "gemini_5h": probe_data["gemini_5h"],
-                    "gemini_5h_reset": probe_data["gemini_5h_reset"],
-                    "gemini_weekly": probe_data["gemini_weekly"],
-                    "gemini_weekly_reset": probe_data["gemini_weekly_reset"],
-                    "claude_5h": probe_data["claude_5h"],
-                    "claude_5h_reset": probe_data["claude_5h_reset"],
-                    "claude_weekly": probe_data["claude_weekly"],
-                    "claude_weekly_reset": probe_data["claude_weekly_reset"],
-                }
-            elif name in cache:
-                cached = cache[name]
-                probe_data["gemini_5h"] = cached.get("gemini_5h")
-                probe_data["gemini_5h_reset"] = cached.get("gemini_5h_reset")
-                probe_data["gemini_weekly"] = cached.get("gemini_weekly")
-                probe_data["gemini_weekly_reset"] = cached.get("gemini_weekly_reset")
-                probe_data["claude_5h"] = cached.get("claude_5h")
-                probe_data["claude_5h_reset"] = cached.get("claude_5h_reset")
-                probe_data["claude_weekly"] = cached.get("claude_weekly")
-                probe_data["claude_weekly_reset"] = cached.get("claude_weekly_reset")
-                probe_data["is_fallback"] = True
-
-            probe_data["is_active"] = (name == active_account)
-            probe_data["status"] = "Active" if probe_data["is_active"] else "Standby"
-            probe_data["email"] = item.get("email") or "-"
-            results.append(probe_data)
-
-        self.save_quota_cache(cache)
-
-        # Sort accounts: highest Gemini weekly limit first, then highest Gemini 5-hour limit
-        results.sort(
-            key=lambda r: (
-                r["gemini_weekly"] if r["gemini_weekly"] is not None else -1,
-                r["gemini_5h"] if r["gemini_5h"] is not None else -1,
-            ),
-            reverse=True,
-        )
-
-        recommendation: str | None = None
-        if not results:
-            recommendation = "No accounts found in vault."
-        else:
-            top = results[0]
-            top_weekly = top.get("gemini_weekly")
-            if top_weekly is None or top_weekly == 0:
-                recommendation = "All accounts have exhausted or unavailable quotas."
-            elif not top["is_active"]:
-                recommendation = f"Switch to '{top['account']}' ({top['email']}) with {top_weekly}% Gemini Weekly quota remaining."
-            else:
-                recommendation = f"Current active account '{top['account']}' has the highest remaining quota ({top_weekly}% Gemini Weekly)."
-
-        return {
-            "active": active_account,
-            "accounts": results,
-            "recommendation": recommendation,
-        }
-
-
-def format_countdown(dt: datetime, now: datetime | None = None) -> str:
-    """Formats time difference into human-readable countdown in Indonesian (e.g. ~3 jam 20 menit lagi)."""
-    if now is None:
-        now = datetime.now().astimezone()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-
-    diff = dt - now
-    sec = int(diff.total_seconds())
-    if sec <= 0:
-        return "baru reset"
-    if diff.days > 0:
-        hours = diff.seconds // 3600
-        return f"~{diff.days} hari {hours} jam lagi"
-    if diff.seconds >= 3600:
-        hours = diff.seconds // 3600
-        mins = (diff.seconds % 3600) // 60
-        return f"~{hours} jam {mins} menit lagi"
-    mins = diff.seconds // 60
-    return f"~{mins} menit lagi"
-
-
-def fmt_quota_detail(
-    pct: int | None,
-    reset_str: str | None,
-    is_weekly: bool = False,
-    now: datetime | None = None,
-) -> str:
-    """Formats quota percentage with warning emoji and localized countdown."""
-    if pct is None:
-        return "N/A"
-    icon = ""
-    if pct == 0:
-        icon = " 🔴"
-    elif pct <= 20:
-        icon = " ⚠️"
-    if not reset_str:
-        return f"**{pct}%**{icon}"
-
-    try:
-        dt = datetime.fromisoformat(reset_str.replace("Z", "+00:00")).astimezone()
-        if now is None:
-            now = datetime.now().astimezone()
-        cd = format_countdown(dt, now)
-        tz_name = dt.strftime("%Z") or "WIB"
-        time_str = dt.strftime(f"%H:%M {tz_name}") if not is_weekly else dt.strftime(f"%d %b %H:%M {tz_name}")
-        return f"**{pct}%**{icon} *(Reset: {time_str}, {cd})*"
-    except Exception:
-        return f"**{pct}%**{icon}"
-
-
-def format_quota_table(data: dict[str, Any]) -> str:
-    """Formats quota overview into a compact, human-readable terminal table."""
-    accounts = data.get("accounts", [])
-    if not accounts:
-        return "No accounts registered in vault (~/.antigravity-vault/accounts)."
-
-    active_account = data.get("active")
-    recommendation = data.get("recommendation")
-
-    max_acc_len = max(max((len(a["account"]) for a in accounts), default=7), 7)
-    max_email_len = max(max((len(str(a.get("email") or "")) for a in accounts), default=5), 18)
-
-    email_col_width = min(max_email_len, 32)
-    acc_col_width = min(max_acc_len, 16)
-
-    header = (
-        f"   {'ACCOUNT':<{acc_col_width}} "
-        f"{'EMAIL':<{email_col_width}} "
-        f"{'STATUS':<7} "
-        f"{'GEMINI 5H':<10} "
-        f"{'GEMINI WK':<10} "
-        f"{'CLAUDE 5H':<10} "
-        f"{'CLAUDE WK':<10}"
-    )
-    separator = "-" * len(header)
-    lines = [
-        "Antigravity Quota Overview (~/.antigravity-vault):",
-        separator,
-        header,
-        separator,
-    ]
-
-    has_fallback = False
-    for a in accounts:
-        marker = "* " if a.get("is_active") else "  "
-        acc_name = a["account"]
-        if len(acc_name) > acc_col_width:
-            acc_name = acc_name[: acc_col_width - 2] + ".."
-        email = str(a.get("email") or "-")
-        if len(email) > email_col_width:
-            email = email[: email_col_width - 3] + "..."
-
-        status = a.get("status") or ("Active" if a.get("is_active") else "Standby")
-
-        is_fb = a.get("is_fallback", False)
-        if is_fb:
-            has_fallback = True
-
-        def _fmt_pct(val: int | None) -> str:
-            if val is None:
-                return "N/A"
-            suffix = "*" if is_fb else ""
-            return f"{val}%{suffix}"
-
-        g5 = _fmt_pct(a.get("gemini_5h"))
-        gw = _fmt_pct(a.get("gemini_weekly"))
-        c5 = _fmt_pct(a.get("claude_5h"))
-        cw = _fmt_pct(a.get("claude_weekly"))
-
-        lines.append(
-            f"{marker} {acc_name:<{acc_col_width}} "
-            f"{email:<{email_col_width}} "
-            f"{status:<7} "
-            f"{g5:<10} "
-            f"{gw:<10} "
-            f"{c5:<10} "
-            f"{cw:<10}"
-        )
-
-    lines.append(separator)
-    if active_account:
-        lines.append(f"Active Account : {active_account}")
-    if recommendation:
-        lines.append(f"Recommendation : {recommendation}")
-    if has_fallback:
-        lines.append("* Note: Asterisk (*) indicates cached fallback metrics.")
-    return "\n".join(lines)
-
-
-def format_quota_listicle(data: dict[str, Any]) -> str:
-    """Formats quota overview into a clean numbered listicle for mobile/chat."""
-    accounts = data.get("accounts", [])
-    if not accounts:
-        return "Tidak ada akun terdaftar di vault Antigravity."
-
-    now = datetime.now().astimezone()
-    lines = ["Berikut status sisa kuota akun Antigravity saat ini:\n"]
-
-    for idx, r in enumerate(accounts, 1):
-        status_tag = "*(Aktif)*" if r.get("is_active") else "*(Standby)*"
-        if r.get("is_fallback"):
-            status_tag += " *(Cache)*"
-        lines.append(f"{idx}. **`{r['account']}`** — {status_tag}")
-        lines.append(f"   * **Email:** `{r.get('email') or '-'}`")
-        lines.append(f"   * **Status:** {'Active' if r.get('is_active') else 'Standby'}")
-        lines.append("   * **Gemini Models:**")
-        lines.append(f"     * **Limit Mingguan:** {fmt_quota_detail(r.get('gemini_weekly'), r.get('gemini_weekly_reset'), is_weekly=True, now=now)}")
-        lines.append(f"     * **Limit 5-Jam:** {fmt_quota_detail(r.get('gemini_5h'), r.get('gemini_5h_reset'), is_weekly=False, now=now)}")
-        lines.append("   * **Claude & GPT Models:**")
-        lines.append(f"     * **Limit Mingguan:** {fmt_quota_detail(r.get('claude_weekly'), r.get('claude_weekly_reset'), is_weekly=True, now=now)}")
-        lines.append(f"     * **Limit 5-Jam:** {fmt_quota_detail(r.get('claude_5h'), r.get('claude_5h_reset'), is_weekly=False, now=now)}")
-        lines.append("")
-
-    rec = data.get("recommendation")
-    if rec:
-        lines.append(f"💡 **Rekomendasi:** {rec}")
-
-    return "\n".join(lines)
-
-
 def format_accounts_table(result: dict[str, Any]) -> str:
     """Formats accounts list as a clean, human-readable terminal table."""
     accounts = result.get("accounts", [])
@@ -1114,17 +775,8 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     # Command: list
     list_parser = subparsers.add_parser("list", help="List registered accounts and show active account")
-    list_parser.add_argument("--quota", action="store_true", help="Include real-time quota overview")
     list_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     list_parser.add_argument("--format", choices=["table", "list"], default="table", help="Output format: table (default) or list (listicle)")
-    list_parser.add_argument("--timeout", type=int, default=45, help="Probe timeout in seconds per account (default: 45)")
-
-    # Command: quota
-    quota_parser = subparsers.add_parser("quota", help="Inspect real-time quota usage across all accounts")
-    quota_parser.add_argument("--agy-binary", help="Path to agy binary (default: auto-detected)")
-    quota_parser.add_argument("--timeout", type=int, default=45, help="Probe timeout in seconds per account (default: 45)")
-    quota_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
-    quota_parser.add_argument("--format", choices=["table", "list"], default="table", help="Output format: table (default) or list (listicle)")
 
     # Command: status
     subparsers.add_parser("status", help="Show system status, active account, and server health")
@@ -1181,18 +833,6 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}", file=sys.stderr)
         else:
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}")
-
-    if args.command == "quota" or (args.command == "list" and getattr(args, "quota", False)):
-        agy_bin = getattr(args, "agy_binary", None)
-        timeout = getattr(args, "timeout", 45)
-        overview = engine.get_quota_overview(agy_binary=agy_bin, timeout=timeout)
-        if getattr(args, "json", False):
-            print(json.dumps(overview, indent=2))
-        elif getattr(args, "format", "table") == "list":
-            print(format_quota_listicle(overview))
-        else:
-            print(format_quota_table(overview))
-        return 0
 
     if args.command == "list" or not args.command:
         data = engine.list_accounts()
@@ -1300,6 +940,10 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         return 0
 
     if args.command == "hook-pre-invocation":
+        if not engine.get_auto_switch():
+            sys.stdout.write(json.dumps({}) + "\n")
+            sys.stdout.flush()
+            return 0
         try:
             raw = sys.stdin.read()
             _payload = json.loads(raw) if raw.strip() else {}
@@ -1317,7 +961,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 quotas = {}
                 
                 for acc in accounts_data:
-                    acc_name = acc.get("account")
+                    acc_name = acc.get("name")
                     if not acc_name:
                         continue
                     token_path = engine.accounts_dir / acc_name / "token.json"
