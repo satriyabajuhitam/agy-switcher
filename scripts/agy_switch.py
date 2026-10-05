@@ -22,6 +22,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Import safety: prepend script directory to sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
@@ -68,12 +71,17 @@ class AgySwitchEngine:
         self.active_file = self.vault_dir / "active"
         self.cache_dir = self.vault_dir / "cache"
         self.cache_file = self.cache_dir / "last_known_quota.json"
+        self.config_file = self.vault_dir / "config.json"
 
         self.init_vault()
 
     def init_vault(self) -> None:
         """Ensures ~/.antigravity-vault/ and required subdirectories exist."""
         self.vault_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,6 +232,65 @@ class AgySwitchEngine:
         finally:
             if temp_file.exists():
                 temp_file.unlink(missing_ok=True)
+
+    def load_config(self) -> dict[str, Any]:
+        """Loads vault configuration from ~/.antigravity-vault/config.json."""
+        if self.config_file.is_file():
+            try:
+                return json.loads(self.config_file.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def save_config(self, config: dict[str, Any]) -> None:
+        """Saves vault configuration atomically with 0600 permissions."""
+        self._atomic_write_json(self.config_file, config)
+
+    def get_auto_switch(self) -> bool:
+        """Returns whether auto-switch is enabled in vault config."""
+        cfg = self.load_config()
+        return bool(cfg.get("auto_switch", False))
+
+    def set_auto_switch(self, enabled: bool) -> dict[str, Any]:
+        """Sets auto-switch state and saves to config.json."""
+        cfg = self.load_config()
+        cfg["auto_switch"] = bool(enabled)
+        self.save_config(cfg)
+        return cfg
+
+    def install_hook(self, hooks_file: Path | None = None) -> Path:
+        """Installs the PreInvocation lifecycle hook into hooks.json via deep JSON merge."""
+        target_hooks = Path(hooks_file or (self.gemini_dir / "config" / "hooks.json")).expanduser()
+        target_hooks.parent.mkdir(parents=True, exist_ok=True)
+
+        existing: dict[str, Any] = {}
+        if target_hooks.is_file():
+            try:
+                content = target_hooks.read_text(encoding="utf-8").strip()
+                if content:
+                    loaded = json.loads(content)
+                    if isinstance(loaded, dict):
+                        existing = loaded
+            except Exception:
+                existing = {}
+
+        script_abs_path = str(Path(__file__).resolve())
+        hook_cmd = f"python3 {script_abs_path} hook-pre-invocation"
+
+        hook_def = {
+            "enabled": True,
+            "PreInvocation": [
+                {
+                    "type": "command",
+                    "command": hook_cmd,
+                    "timeout": 5,
+                }
+            ],
+        }
+
+        existing["agy-switch-auto-rotate"] = hook_def
+        self._atomic_write_json(target_hooks, existing)
+        return target_hooks
 
     def get_active_name(self) -> str | None:
         """Returns the name of the currently active account, or None."""
@@ -1088,6 +1155,20 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     login_parser.add_argument("--timeout", type=int, default=600, help="Timeout in seconds (default: 600)")
     login_parser.add_argument("--force", action="store_true", help="Overwrite existing account without confirmation prompt")
 
+    # Command: config
+    config_parser = subparsers.add_parser("config", help="Manage vault configuration")
+    config_subparsers = config_parser.add_subparsers(dest="config_command")
+    auto_switch_parser = config_subparsers.add_parser("auto-switch", help="Configure auto-switch toggle (on/off)")
+    auto_switch_parser.add_argument("state", nargs="?", choices=["on", "off"], help="State (on/off)")
+
+    # Command: hook
+    hook_parser = subparsers.add_parser("hook", help="Manage Antigravity lifecycle hooks")
+    hook_subparsers = hook_parser.add_subparsers(dest="hook_command")
+    hook_subparsers.add_parser("install", help="Install PreInvocation lifecycle hook into hooks.json")
+
+    # Command: hook-pre-invocation
+    subparsers.add_parser("hook-pre-invocation", help="Antigravity PreInvocation lifecycle hook handler")
+
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     if engine is None:
@@ -1096,7 +1177,10 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     # Perform auto-migration if needed on startup
     migrated = engine.auto_migrate_if_needed()
     if migrated and args.command != "migrate":
-        print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}")
+        if args.command == "hook-pre-invocation":
+            print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}", file=sys.stderr)
+        else:
+            print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}")
 
     if args.command == "quota" or (args.command == "list" and getattr(args, "quota", False)):
         agy_bin = getattr(args, "agy_binary", None)
@@ -1188,6 +1272,41 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             print(f"[agy-switch] Successfully migrated {len(migrated)} account(s): {', '.join(migrated)}")
         else:
             print("[agy-switch] No new accounts to migrate from legacy ~/.agy-cli-manager.")
+        return 0
+
+    if args.command == "config":
+        if getattr(args, "config_command", None) == "auto-switch":
+            state = getattr(args, "state", None)
+            if state == "on":
+                engine.set_auto_switch(True)
+                print("[agy-switch] auto-switch enabled.")
+            elif state == "off":
+                engine.set_auto_switch(False)
+                print("[agy-switch] auto-switch disabled.")
+            else:
+                current = engine.get_auto_switch()
+                print(f"[agy-switch] auto-switch is currently {'on' if current else 'off'}.")
+            return 0
+        cfg = engine.load_config()
+        print(json.dumps(cfg, indent=2))
+        return 0
+
+    if args.command == "hook":
+        if getattr(args, "hook_command", None) == "install":
+            hooks_path = engine.install_hook()
+            print(f"[agy-switch] PreInvocation hook registered successfully in {hooks_path}.")
+            return 0
+        hook_parser.print_help()
+        return 0
+
+    if args.command == "hook-pre-invocation":
+        try:
+            raw = sys.stdin.read()
+            _payload = json.loads(raw) if raw.strip() else {}
+        except Exception as exc:
+            print(f"[agy-switch hook] Error parsing stdin: {exc}", file=sys.stderr)
+        sys.stdout.write(json.dumps({}) + "\n")
+        sys.stdout.flush()
         return 0
 
     return 0

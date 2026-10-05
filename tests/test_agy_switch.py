@@ -4,6 +4,7 @@
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,8 +54,10 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
         self.vault_dir = self.base_path / ".antigravity-vault"
         self.gemini_dir = self.base_path / ".gemini"
         self.legacy_root = self.base_path / ".agy-cli-manager"
+        self._orig_popen = subprocess.Popen
 
     def tearDown(self):
+        subprocess.Popen = self._orig_popen
         self.temp_dir.cleanup()
 
     def test_vault_directories_created(self):
@@ -409,12 +412,14 @@ class TestInteractiveLogin(unittest.TestCase):
         self.base_path = Path(self.temp_dir.name)
         self.vault_dir = self.base_path / ".antigravity-vault"
         self.gemini_dir = self.base_path / ".gemini"
+        self._orig_popen = subprocess.Popen
         self.engine = AgySwitchEngine(
             vault_dir=self.vault_dir,
             gemini_dir=self.gemini_dir,
         )
 
     def tearDown(self):
+        subprocess.Popen = self._orig_popen
         self.temp_dir.cleanup()
 
     def _mock_popen_with_token(self, token_payload: dict):
