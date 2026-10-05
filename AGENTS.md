@@ -13,6 +13,7 @@ This workspace hosts `agy-switch` (Antigravity Multi-Account Switcher & Vault Ma
 3. **Turn Safety & Process Supervisor**: Never restart or interrupt `language_server` during an active agent turn without checking process status.
 4. **Absolute Credential Protection**: Never expose, log, or commit OAuth tokens from `~/.antigravity-vault/`.
 5. **Persistent Memory**: Use `memory_search`, `memory_add`, and `memory_audit` MCP tools. Workspace identity files live in `.agents/identity/`.
+6. **Branching & Git Workflow**: All feature development and modifications must occur on the `dev` branch. Direct commits or pushes to `main` are strictly forbidden; `main` is reserved only for tested, stable releases via merge.
 
 ## Plugins & Skills
 
