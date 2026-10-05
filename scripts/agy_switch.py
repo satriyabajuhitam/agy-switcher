@@ -766,6 +766,87 @@ def format_status_report(status: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
+    if not engine.get_auto_switch():
+        sys.stdout.write(json.dumps({}) + "\n")
+        sys.stdout.flush()
+        return 0
+    try:
+        raw = sys.stdin.read()
+        _payload = json.loads(raw) if raw.strip() else {}
+        model_name = _payload.get("modelName", "gemini-1.5-pro")
+        
+        # Wire in QuotaClient and RotationEngine
+        try:
+            from quota_client import QuotaClient
+            from rotation_engine import RotationEngine
+            
+            active_name = engine.get_active_name()
+            accounts_data = engine.list_accounts().get("accounts", [])
+            
+            client = QuotaClient(timeout=2.0)
+            quotas = {}
+            
+            for acc in accounts_data:
+                acc_name = acc.get("name")
+                if not acc_name:
+                    continue
+                token_path = engine.accounts_dir / acc_name / "token.json"
+                if token_path.is_file():
+                    token_data = engine.validate_token_file(token_path)
+                    token_payload = token_data.get("token", {})
+                    access_token = token_payload.get("access_token")
+                    refresh_token = token_payload.get("refresh_token")
+                    if access_token:
+                        quota_res = client.fetch_quota(access_token, refresh_token=refresh_token)
+                        if quota_res:
+                            quotas[acc_name] = quota_res
+                            
+            rot_engine = RotationEngine(model_name=model_name, active_account_id=active_name)
+            target_account = rot_engine.evaluate(quotas)
+            
+            print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account}", file=sys.stderr)
+            
+            # Check if the chosen account is exhausted
+            is_exhausted = rot_engine.is_exhausted(quotas.get(target_account, {}))
+            
+            if is_exhausted:
+                sys.stdout.write(json.dumps({
+                    "injectSteps": [
+                        {
+                            "type": "ephemeralMessage",
+                            "message": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
+                        }
+                    ]
+                }) + "\n")
+                sys.stdout.flush()
+                return 0
+                
+            if target_account and target_account != active_name:
+                engine.switch_tokens(target_account, restart_server=False, force=True)
+                
+                status = rot_engine.get_quota_status(quotas.get(target_account, {}))
+                pct = int(status.fraction * 100) if status is not None else "Unknown"
+                sys.stdout.write(json.dumps({
+                    "injectSteps": [
+                        {
+                            "type": "ephemeralMessage",
+                            "message": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
+                        }
+                    ]
+                }) + "\n")
+                sys.stdout.flush()
+                return 0
+                
+        except Exception as qc_exc:
+            print(f"[agy-switch hook] QuotaClient/RotationEngine error: {qc_exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[agy-switch hook] Error parsing stdin: {exc}", file=sys.stderr)
+    sys.stdout.write(json.dumps({}) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agy-switch",
@@ -940,82 +1021,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         return 0
 
     if args.command == "hook-pre-invocation":
-        if not engine.get_auto_switch():
-            sys.stdout.write(json.dumps({}) + "\n")
-            sys.stdout.flush()
-            return 0
-        try:
-            raw = sys.stdin.read()
-            _payload = json.loads(raw) if raw.strip() else {}
-            model_name = _payload.get("modelName", "gemini-1.5-pro")
-            
-            # Wire in QuotaClient and RotationEngine
-            try:
-                from quota_client import QuotaClient
-                from rotation_engine import RotationEngine
-                
-                active_name = engine.get_active_name()
-                accounts_data = engine.list_accounts().get("accounts", [])
-                
-                client = QuotaClient(timeout=2.0)
-                quotas = {}
-                
-                for acc in accounts_data:
-                    acc_name = acc.get("name")
-                    if not acc_name:
-                        continue
-                    token_path = engine.accounts_dir / acc_name / "token.json"
-                    if token_path.is_file():
-                        token_data = engine.validate_token_file(token_path)
-                        access_token = token_data.get("token", {}).get("access_token")
-                        refresh_token = token_data.get("token", {}).get("refresh_token")
-                        if access_token:
-                            quota_res = client.fetch_quota(access_token, refresh_token=refresh_token)
-                            if quota_res:
-                                quotas[acc_name] = quota_res
-                                
-                rot_engine = RotationEngine(model_name=model_name, active_account_id=active_name)
-                target_account = rot_engine.evaluate(quotas)
-                
-                print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account}", file=sys.stderr)
-                
-                # Check if the chosen account is exhausted
-                target_frac, _ = rot_engine._get_worst_case(quotas.get(target_account, {}))
-                
-                if target_frac is not None and target_frac <= 0.0:
-                    sys.stdout.write(json.dumps({
-                        "injectSteps": [
-                            {
-                                "type": "ephemeralMessage",
-                                "message": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
-                            }
-                        ]
-                    }) + "\n")
-                    sys.stdout.flush()
-                    return 0
-                    
-                if target_account and target_account != active_name:
-                    engine.switch_tokens(target_account, restart_server=False, force=True)
-                    
-                    pct = int(target_frac * 100) if target_frac is not None else "Unknown"
-                    sys.stdout.write(json.dumps({
-                        "injectSteps": [
-                            {
-                                "type": "ephemeralMessage",
-                                "message": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
-                            }
-                        ]
-                    }) + "\n")
-                    sys.stdout.flush()
-                    return 0
-                    
-            except Exception as qc_exc:
-                print(f"[agy-switch hook] QuotaClient/RotationEngine error: {qc_exc}", file=sys.stderr)
-        except Exception as exc:
-            print(f"[agy-switch hook] Error parsing stdin: {exc}", file=sys.stderr)
-        sys.stdout.write(json.dumps({}) + "\n")
-        sys.stdout.flush()
-        return 0
+        return handle_pre_invocation_hook(engine)
 
     return 0
 

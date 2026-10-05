@@ -1,4 +1,11 @@
 import datetime
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class QuotaStatus:
+    fraction: float
+    reset_time: datetime.datetime
 
 class RotationEngine:
     def __init__(self, model_name: str, active_account_id: str):
@@ -12,16 +19,16 @@ class RotationEngine:
         else:
             self.target_group_prefix = "Gemini"
             
-    def _parse_time(self, t_str):
+    def _parse_time(self, t_str: str) -> datetime.datetime:
         if not t_str:
             return datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
         if t_str.endswith("Z"):
             t_str = t_str[:-1] + "+00:00"
         return datetime.datetime.fromisoformat(t_str)
         
-    def _get_worst_case(self, quota_data):
+    def get_quota_status(self, quota_data: dict) -> Optional[QuotaStatus]:
         if not quota_data or "groups" not in quota_data:
-            return None, None
+            return None
             
         target_group = None
         for group in quota_data.get("groups", []):
@@ -30,7 +37,7 @@ class RotationEngine:
                 break
                 
         if not target_group or "buckets" not in target_group:
-            return None, None
+            return None
             
         lowest_fraction = 1.0
         earliest_reset = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
@@ -44,9 +51,16 @@ class RotationEngine:
             elif frac == lowest_fraction and reset_time < earliest_reset:
                 earliest_reset = reset_time
                 
-        return lowest_fraction, earliest_reset
+        return QuotaStatus(fraction=lowest_fraction, reset_time=earliest_reset)
 
-    def evaluate(self, accounts: dict, current_time: datetime.datetime = None):
+    def is_exhausted(self, quota_data: dict) -> bool:
+        """Returns True if the relevant quota is completely exhausted (0% remaining)."""
+        status = self.get_quota_status(quota_data)
+        if status is None:
+            return False
+        return status.fraction <= 0.0
+
+    def evaluate(self, accounts: dict, current_time: datetime.datetime = None) -> str:
         """
         accounts: dict mapping account_id -> quota JSON
         """
@@ -55,40 +69,40 @@ class RotationEngine:
             
         evaluated = {}
         for acc_id, quota_data in accounts.items():
-            frac, reset_time = self._get_worst_case(quota_data)
-            if frac is not None:
-                evaluated[acc_id] = (frac, reset_time)
+            status = self.get_quota_status(quota_data)
+            if status is not None:
+                evaluated[acc_id] = status
                 
         if not evaluated:
             return self.active_account_id
             
-        active_frac, active_reset = evaluated.get(self.active_account_id, (None, None))
+        active_status = evaluated.get(self.active_account_id)
         
         # 1. cache_optimized heuristic
-        if active_frac is not None and active_frac > 0.15:
+        if active_status is not None and active_status.fraction > 0.15:
             return self.active_account_id
             
         # 2. drain_window heuristic
-        if active_frac is not None and active_frac > 0.05:
-            reset_delta = (active_reset - current_time).total_seconds() / 60.0
+        if active_status is not None and active_status.fraction > 0.05:
+            reset_delta = (active_status.reset_time - current_time).total_seconds() / 60.0
             if reset_delta <= 30:
                 return self.active_account_id
                 
         # 3. imminent_reset priority
         best_acc = None
-        best_imminent_frac = -1
-        best_normal_frac = -1
+        best_imminent_frac = -1.0
+        best_normal_frac = -1.0
         
-        for acc_id, (frac, reset_time) in evaluated.items():
-            reset_delta = (reset_time - current_time).total_seconds() / 60.0
+        for acc_id, status in evaluated.items():
+            reset_delta = (status.reset_time - current_time).total_seconds() / 60.0
             
-            if reset_delta <= 45 and frac > 0.10:
-                if frac > best_imminent_frac:
-                    best_imminent_frac = frac
+            if reset_delta <= 45 and status.fraction > 0.10:
+                if status.fraction > best_imminent_frac:
+                    best_imminent_frac = status.fraction
                     best_acc = acc_id
             else:
-                if best_imminent_frac == -1 and frac > best_normal_frac:
-                    best_normal_frac = frac
+                if best_imminent_frac == -1.0 and status.fraction > best_normal_frac:
+                    best_normal_frac = status.fraction
                     best_acc = acc_id
                     
         return best_acc if best_acc else self.active_account_id
