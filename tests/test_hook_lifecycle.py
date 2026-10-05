@@ -172,7 +172,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
 
         # Mock QuotaClient.fetch_quota to return empty dict (simulating network failure)
-        with patch("quota_client.QuotaClient.fetch_quota", return_value={}):
+        with patch("agy_switch.QuotaClient.fetch_quota", return_value={}):
             with patch("sys.stdin", io.StringIO(input_payload)):
                 out_capture = io.StringIO()
                 with patch("sys.stdout", out_capture):
@@ -211,7 +211,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             ]
         }
 
-        with patch("quota_client.QuotaClient.fetch_quota", return_value=zero_quota):
+        with patch("agy_switch.QuotaClient.fetch_quota", return_value=zero_quota):
             with patch("sys.stdin", io.StringIO(input_payload)):
                 out_capture = io.StringIO()
                 with patch("sys.stdout", out_capture):
@@ -242,7 +242,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
 
         with patch.object(self.engine, "get_account_tokens", wraps=self.engine.get_account_tokens) as spy_tokens:
-            with patch("quota_client.QuotaClient.fetch_quota", return_value={}):
+            with patch("agy_switch.QuotaClient.fetch_quota", return_value={}):
                 with patch("sys.stdin", io.StringIO(input_payload)):
                     out_capture = io.StringIO()
                     with patch("sys.stdout", out_capture):
@@ -253,7 +253,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
     def test_hook_pre_invocation_uses_semantic_quota_methods(self):
         """Hook must use semantic methods on RotationEngine/QuotaStatus rather than raw fraction access."""
         from agy_switch import handle_pre_invocation_hook
-        from rotation_engine import RotationEngine
+        from agy_switch import RotationEngine
         import io
 
         self.engine.set_auto_switch(True)
@@ -276,7 +276,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             ]
         }
 
-        with patch("quota_client.QuotaClient.fetch_quota", return_value=dummy_quota):
+        with patch("agy_switch.QuotaClient.fetch_quota", return_value=dummy_quota):
             with patch.object(RotationEngine, "has_available_quota", return_value=True) as spy_has_quota:
                 with patch("sys.stdin", io.StringIO(input_payload)):
                     out_capture = io.StringIO()
