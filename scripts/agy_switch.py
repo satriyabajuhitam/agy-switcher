@@ -1303,6 +1303,23 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         try:
             raw = sys.stdin.read()
             _payload = json.loads(raw) if raw.strip() else {}
+            
+            # Wire in QuotaClient
+            try:
+                from quota_client import QuotaClient
+                active_name = engine.get_active_name()
+                if active_name:
+                    token_path = engine.accounts_dir / active_name / "token.json"
+                    if token_path.is_file():
+                        token_data = engine.validate_token_file(token_path)
+                        access_token = token_data.get("token", {}).get("access_token")
+                        refresh_token = token_data.get("token", {}).get("refresh_token")
+                        if access_token:
+                            client = QuotaClient(timeout=2.0)
+                            quota_res = client.fetch_quota(access_token, refresh_token=refresh_token)
+                            print(f"[agy-switch hook] Quota for {active_name}: {json.dumps(quota_res)}", file=sys.stderr)
+            except Exception as qc_exc:
+                print(f"[agy-switch hook] QuotaClient error: {qc_exc}", file=sys.stderr)
         except Exception as exc:
             print(f"[agy-switch hook] Error parsing stdin: {exc}", file=sys.stderr)
         sys.stdout.write(json.dumps({}) + "\n")
