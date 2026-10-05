@@ -853,28 +853,45 @@ class QuotaClient:
         except Exception:
             pass
 
-def format_accounts_table(result: dict[str, Any]) -> str:
+def format_accounts_table(result: dict[str, Any], show_quota: bool = False) -> str:
     """Formats accounts list as a clean, human-readable terminal table."""
     accounts = result.get("accounts", [])
     if not accounts:
         return "No accounts registered in vault (~/.antigravity-vault/accounts)."
 
+    header = f"{'':2} {'ACCOUNT':<20} {'EMAIL':<30} {'STATUS':<15}"
+    if show_quota:
+        header += " QUOTA"
+        
     lines = [
         "Antigravity Accounts (~/.antigravity-vault):",
-        "-------------------------------------------------------------",
-        f"{'':2} {'ACCOUNT':<20} {'EMAIL':<30} {'STATUS'}",
-        "-------------------------------------------------------------",
+        "-" * len(header),
+        header,
+        "-" * len(header),
     ]
 
     for acc in accounts:
         marker = "* " if acc["is_active"] else "  "
         status = "Active" if acc["is_active"] else "Standby"
         if not acc["valid"]:
-            status += " (Invalid Token)"
+            status += " (Invalid)"
         email_str = acc["email"] or "-"
-        lines.append(f"{marker}{acc['name']:<20} {email_str:<30} {status}")
+        line = f"{marker}{acc['name']:<20} {email_str:<30} {status:<15}"
+        
+        if show_quota:
+            q_data = acc.get("quota", {})
+            if "error" in q_data:
+                line += " Error"
+            elif "gemini" in q_data:
+                line += f" {q_data['gemini'].get('quota', 0)}%"
+            elif "claude" in q_data:
+                line += f" {q_data['claude'].get('quota', 0)}% (C)"
+            else:
+                line += " 0%"
+                
+        lines.append(line)
 
-    lines.append("-------------------------------------------------------------")
+    lines.append("-" * len(header))
     active_acc = result.get("active")
     if active_acc:
         lines.append(f"Active Account: {active_acc}")
@@ -894,6 +911,12 @@ def format_status_report(status: dict[str, Any]) -> str:
     email = status.get("email") or "unknown"
     if active:
         lines.append(f"Active Account    : {active} ({email})")
+        if "cached_quota" in status:
+            q_data = status["cached_quota"]
+            if "gemini" in q_data:
+                lines.append(f"Cached Quota      : {q_data['gemini'].get('quota', 0)}% (Gemini)")
+            elif "claude" in q_data:
+                lines.append(f"Cached Quota      : {q_data['claude'].get('quota', 0)}% (Claude)")
     else:
         lines.append("Active Account    : None (No account active)")
 
@@ -1138,15 +1161,17 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     list_parser = subparsers.add_parser("list", help="List registered accounts and show active account")
     list_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     list_parser.add_argument("--format", choices=["table", "list"], default="table", help="Output format: table (default) or list (listicle)")
+    list_parser.add_argument("--quota", action="store_true", help="Fetch and display quota concurrently")
 
     # Command: status
     subparsers.add_parser("status", help="Show system status, active account, and server health")
 
     # Command: switch
     switch_parser = subparsers.add_parser("switch", help="Switch active account across Antigravity 2.0 and CLI")
-    switch_parser.add_argument("account", help="Name of the account to switch to")
+    switch_parser.add_argument("account", nargs="?", help="Name of the account to switch to")
     switch_parser.add_argument("--no-restart", action="store_true", help="Do not restart language_server process")
     switch_parser.add_argument("--force", action="store_true", help="Force switch even if active turns are detected")
+    switch_parser.add_argument("--auto", action="store_true", help="Auto-switch to optimal account")
 
     # Command: add
     add_parser = subparsers.add_parser("add", help="Register a new account from token JSON file")
@@ -1182,6 +1207,9 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     # Command: hook-pre-invocation
     subparsers.add_parser("hook-pre-invocation", help="Antigravity PreInvocation lifecycle hook handler")
 
+    # Command: internal-probe
+    subparsers.add_parser("internal-probe", help=argparse.SUPPRESS)
+
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     if engine is None:
@@ -1197,18 +1225,119 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     if args.command == "list" or not args.command:
         data = engine.list_accounts()
+        if getattr(args, "quota", False):
+            import concurrent.futures
+            client = QuotaClient(timeout=2.0)
+            
+            def fetch_account_quota(acc):
+                acc_name = acc["name"]
+                tokens = engine.get_account_tokens(acc_name)
+                if not tokens or not tokens.get("access_token"):
+                    return acc_name, {"error": "No token"}
+                try:
+                    quota_res = client.fetch_quota(tokens["access_token"], refresh_token=tokens.get("refresh_token"))
+                    return acc_name, quota_res if quota_res else {"error": "Fetch failed"}
+                except Exception as e:
+                    return acc_name, {"error": str(e)}
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(fetch_account_quota, acc) for acc in data.get("accounts", [])]
+                quotas = dict(f.result() for f in concurrent.futures.as_completed(futures))
+                
+            for acc in data.get("accounts", []):
+                acc["quota"] = quotas.get(acc["name"], {})
+                
         if getattr(args, "json", False):
             print(json.dumps(data, indent=2))
         else:
-            print(format_accounts_table(data))
+            print(format_accounts_table(data, show_quota=getattr(args, "quota", False)))
         return 0
 
     if args.command == "status":
         status_info = engine.get_status()
+        
+        client = QuotaClient(timeout=2.0)
+        cache_data = client.load_cache()
+        
+        now = datetime.now(timezone.utc).timestamp()
+        cache_age = now - cache_data.get("timestamp", 0)
+        
+        if cache_age > 60:
+            script_abs_path = str(Path(__file__).resolve())
+            import subprocess
+            subprocess.Popen([sys.executable, script_abs_path, "internal-probe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+        if "accounts" in cache_data and status_info.get("active"):
+            active_name = status_info["active"]
+            q_data = cache_data["accounts"].get(active_name, {})
+            status_info["cached_quota"] = q_data
+            
         print(format_status_report(status_info))
         return 0
 
+    if args.command == "internal-probe":
+        import concurrent.futures
+        accounts_data = engine.list_accounts().get("accounts", [])
+        client = QuotaClient(timeout=2.0)
+        quotas = {}
+        
+        def fetch_account_quota(acc):
+            acc_name = acc["name"]
+            tokens = engine.get_account_tokens(acc_name)
+            if tokens and tokens.get("access_token"):
+                return acc_name, client.fetch_quota(tokens["access_token"], refresh_token=tokens.get("refresh_token"))
+            return acc_name, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(fetch_account_quota, acc) for acc in accounts_data]
+            for f in concurrent.futures.as_completed(futures):
+                acc_name, q = f.result()
+                if q:
+                    quotas[acc_name] = q
+                    
+        client.save_cache({
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+            "accounts": quotas
+        })
+        return 0
+
     if args.command == "switch":
+        if getattr(args, "auto", False):
+            active_name = engine.get_active_name()
+            accounts_data = engine.list_accounts().get("accounts", [])
+            
+            client = QuotaClient(timeout=2.0)
+            quotas = {}
+            for acc in accounts_data:
+                acc_name = acc.get("name")
+                tokens = engine.get_account_tokens(acc_name)
+                if tokens and tokens.get("access_token"):
+                    q = client.fetch_quota(tokens["access_token"], refresh_token=tokens.get("refresh_token"))
+                    if q:
+                        quotas[acc_name] = q
+            
+            client.save_cache({
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+                "accounts": quotas
+            })
+            
+            rot_engine = RotationEngine(model_name="gemini", active_account_id=active_name)
+            target_account = rot_engine.evaluate(quotas)
+            
+            if target_account and target_account == active_name:
+                print(f"[agy-switch] Active account '{active_name}' is optimal. No switch needed.")
+                return 0
+            
+            if not target_account:
+                print(f"[agy-switch] No valid quota info available to auto-switch.")
+                return 1
+                
+            args.account = target_account
+            
+        elif getattr(args, "account", None) is None:
+            print("Error: account name must be provided if --auto is not used.", file=sys.stderr)
+            return 1
+
         try:
             res = engine.switch_tokens(
                 args.account,
