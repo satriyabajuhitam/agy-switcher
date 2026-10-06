@@ -8,9 +8,9 @@ from pathlib import Path
 import sys
 
 try:
-    from agy_switch import AgySwitchEngine, RotationEngine
+    from agy_switch import AgySwitchEngine, RotationEngine, QuotaClient
 except ImportError:
-    from scripts.agy_switch import AgySwitchEngine, RotationEngine
+    from scripts.agy_switch import AgySwitchEngine, RotationEngine, QuotaClient
 
 class LogWatcher:
     def __init__(self, engine: AgySwitchEngine, log_dirs: list[str] = None, cooldown_minutes: int = 60):
@@ -32,10 +32,41 @@ class LogWatcher:
     def is_exhausted_message(self, line: str) -> bool:
         return bool(self.exhaustion_regex.search(line))
 
+    def infer_target_model(self, line: str = "", active_account: str | None = None, cache: dict | None = None) -> str:
+        line_lower = line.lower() if line else ""
+        if "claude" in line_lower or "anthropic" in line_lower:
+            return "claude"
+        if "gemini" in line_lower:
+            return "gemini"
+
+        # Check active account quota state if available
+        if active_account and cache:
+            accounts_cache = cache.get("accounts", cache) if isinstance(cache.get("accounts"), dict) else cache
+            acc_quota = accounts_cache.get(active_account)
+            if isinstance(acc_quota, dict):
+                rot = RotationEngine()
+                c_status = rot.get_quota_status(acc_quota, model_key="claude")
+                g_status = rot.get_quota_status(acc_quota, model_key="gemini")
+
+                c_frac = c_status.fraction if c_status is not None else None
+                g_frac = g_status.fraction if g_status is not None else None
+
+                if c_frac is not None and c_frac <= 0.0 and (g_frac is None or g_frac > 0.0):
+                    return "claude"
+                if g_frac is not None and g_frac <= 0.0 and (c_frac is None or c_frac > 0.0):
+                    return "gemini"
+                if c_frac is not None and g_frac is not None:
+                    if c_frac < g_frac and c_frac <= 0.15:
+                        return "claude"
+                    if g_frac < c_frac and g_frac <= 0.15:
+                        return "gemini"
+
+        return "gemini"
+
     def process_line(self, line: str):
         if self.is_exhausted_message(line):
             print(f"[watch] Detected quota exhaustion: {line.strip()}", file=sys.stderr)
-            self.trigger_switch()
+            self.trigger_switch(line=line)
 
     def get_cooldowns(self) -> dict:
         if not self.cooldown_file.is_file():
@@ -55,7 +86,7 @@ class LogWatcher:
         self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cooldown_file.write_text(json.dumps(cooldowns, indent=2), encoding="utf-8")
 
-    def trigger_switch(self):
+    def trigger_switch(self, line: str = ""):
         active_name = self.engine.get_active_name()
         if not active_name:
             print("[watch] No active account found. Cannot switch.", file=sys.stderr)
@@ -82,18 +113,18 @@ class LogWatcher:
             return
 
         # Read cache to get quotas
-        cache = {}
-        if self.engine.cache_file.is_file():
-            try:
-                cache = json.loads(self.engine.cache_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+        client = QuotaClient(self.engine)
+        cache_data = client.load_cache()
+        accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
         
         for acc in valid_accounts:
-            acc["quota"] = cache.get(acc["name"], {})
+            acc["quota"] = accounts_cache.get(acc["name"], {})
         
-        rot_engine = RotationEngine(model_name="gemini", active_account_id=active_name)
-        target_account = rot_engine.evaluate(valid_accounts, current_active=active_name, target_model="gemini")
+        # Dynamically infer model family
+        resolved_model = self.infer_target_model(line=line, active_account=active_name, cache=accounts_cache)
+
+        rot_engine = RotationEngine(model_name=resolved_model, active_account_id=active_name)
+        target_account = rot_engine.evaluate(valid_accounts, current_active=active_name, target_model=resolved_model)
         
         if not target_account or target_account == active_name:
             # Fallback to the first available if rotation engine is strict
@@ -113,8 +144,7 @@ class LogWatcher:
         for log_dir in self.log_dirs:
             if not os.path.isdir(log_dir):
                 continue
-            for ext in ("*.log", "*.txt"):
-                log_files.extend(glob.glob(os.path.join(log_dir, ext)))
+            log_files.extend(glob.glob(os.path.join(log_dir, "*.log")))
         return log_files
 
     def watch_loop(self):

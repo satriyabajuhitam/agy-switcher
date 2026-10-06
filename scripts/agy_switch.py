@@ -762,18 +762,26 @@ class AgySwitchEngine:
 class QuotaClient:
     def __init__(
         self,
-        client_id: str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+        engine_or_client_id: Any = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
         client_secret: str = "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",
         timeout: float = 2.0,
         cache_dir: Path | None = None,
+        engine: Any | None = None,
     ) -> None:
-        self.client_id = client_id
+        target_engine = engine if engine is not None else (engine_or_client_id if hasattr(engine_or_client_id, "cache_dir") else None)
+        if target_engine is not None:
+            self.engine = target_engine
+            self.cache_dir = cache_dir or getattr(target_engine, "cache_dir", None) or (Path.home() / ".antigravity-vault" / "cache")
+            self.client_id = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+        else:
+            self.engine = None
+            self.client_id = engine_or_client_id
+            self.cache_dir = cache_dir or (Path.home() / ".antigravity-vault" / "cache")
         self.client_secret = client_secret
         self.timeout = timeout
         self.token_endpoint = "https://oauth2.googleapis.com/token"
         self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-        self.cache_dir = cache_dir or (Path.home() / ".antigravity-vault" / "cache")
-        self.cache_file = self.cache_dir / "last_known_quota.json"
+        self.cache_file = getattr(target_engine, "cache_file", None) or (self.cache_dir / "last_known_quota.json")
 
     def refresh_access_token(self, refresh_token: str) -> str | None:
         """Refreshes the OAuth access token."""
