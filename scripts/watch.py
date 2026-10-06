@@ -44,7 +44,7 @@ class LogWatcher:
             accounts_cache = cache.get("accounts", cache) if isinstance(cache.get("accounts"), dict) else cache
             acc_quota = accounts_cache.get(active_account)
             if isinstance(acc_quota, dict):
-                rot = RotationEngine()
+                rot = RotationEngine(model_name="gemini", active_account_id=active_account)
                 c_status = rot.get_quota_status(acc_quota, model_key="claude")
                 g_status = rot.get_quota_status(acc_quota, model_key="gemini")
 
@@ -63,10 +63,11 @@ class LogWatcher:
 
         return "gemini"
 
-    def process_line(self, line: str):
+    def process_line(self, line: str) -> bool:
         if self.is_exhausted_message(line):
             print(f"[watch] Detected quota exhaustion: {line.strip()}", file=sys.stderr)
-            self.trigger_switch(line=line)
+            return self.trigger_switch(line=line)
+        return False
 
     def get_cooldowns(self) -> dict:
         if not self.cooldown_file.is_file():
@@ -86,11 +87,11 @@ class LogWatcher:
         self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cooldown_file.write_text(json.dumps(cooldowns, indent=2), encoding="utf-8")
 
-    def trigger_switch(self, line: str = ""):
+    def trigger_switch(self, line: str = "") -> bool:
         active_name = self.engine.get_active_name()
         if not active_name:
             print("[watch] No active account found. Cannot switch.", file=sys.stderr)
-            return
+            return False
 
         self.set_cooldown(active_name)
         cooldowns = self.get_cooldowns()
@@ -110,7 +111,7 @@ class LogWatcher:
 
         if not valid_accounts:
             print("[watch] All other valid accounts are in cooldown. Cannot switch.", file=sys.stderr)
-            return
+            return False
 
         # Read cache to get quotas
         client = QuotaClient(self.engine)
@@ -136,8 +137,10 @@ class LogWatcher:
             print(f"[watch] Successfully switched to '{target_account}'.", file=sys.stderr)
             # small sleep to avoid rapid re-triggering for the same error
             time.sleep(2)
+            return True
         except Exception as e:
             print(f"[watch] Error switching accounts: {e}", file=sys.stderr)
+            return False
 
     def scan_new_files(self) -> list[str]:
         log_files = []
@@ -176,7 +179,10 @@ class LogWatcher:
                             self.file_cursors[file_path] = f.tell()
                             
                             for line in lines:
-                                self.process_line(line)
+                                if self.process_line(line):
+                                    # If a failover switch was triggered, break out of this batch
+                                    # to prevent cascading failovers from duplicate burst error lines.
+                                    break
                                 
                 time.sleep(0.5)
             except KeyboardInterrupt:

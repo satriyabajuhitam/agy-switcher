@@ -215,6 +215,43 @@ class TestLogWatcher(unittest.TestCase):
             self.engine_mock.switch_tokens.assert_called_once_with('acc3', restart_server=False, force=True)
 
 
+    def test_process_line_returns_boolean(self):
+        # Non-exhausted returns False
+        self.assertFalse(self.watcher.process_line("Normal log line"))
+
+        # Exhausted with switch returns True
+        with patch.object(self.watcher, "trigger_switch", return_value=True):
+            self.assertTrue(self.watcher.process_line("RESOURCE_EXHAUSTED (code 429)"))
+
+        # Exhausted with failed switch returns False
+        with patch.object(self.watcher, "trigger_switch", return_value=False):
+            self.assertFalse(self.watcher.process_line("RESOURCE_EXHAUSTED (code 429)"))
+
+    def test_watch_batch_burst_lines_breaks_on_switch(self):
+        """Verify that when a batch of lines contains multiple 429 errors, only the first triggers a switch."""
+        switch_count = 0
+        def fake_trigger_switch(line=""):
+            nonlocal switch_count
+            switch_count += 1
+            return True
+
+        self.watcher.trigger_switch = fake_trigger_switch
+
+        batch_lines = [
+            "RESOURCE_EXHAUSTED (code 429) line 1\n",
+            "RESOURCE_EXHAUSTED (code 429) line 2\n",
+            "RESOURCE_EXHAUSTED (code 429) line 3\n",
+        ]
+
+        # Simulate batch processing in watch_loop
+        for line in batch_lines:
+            if self.watcher.process_line(line):
+                break
+
+        # Only one switch should have occurred
+        self.assertEqual(switch_count, 1)
+
+
 if __name__ == '__main__':
     unittest.main()
 
