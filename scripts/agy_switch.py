@@ -1418,6 +1418,9 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     # Command: hook-pre-invocation
     subparsers.add_parser("hook-pre-invocation", help="Antigravity PreInvocation lifecycle hook handler")
 
+    # Command: watch
+    subparsers.add_parser("watch", help="Run background daemon to tail logs and auto-switch on quota exhaustion")
+
     # Command: internal-probe
     subparsers.add_parser("internal-probe", help=argparse.SUPPRESS)
 
@@ -1606,6 +1609,15 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             return 0
         hook_parser.print_help()
         return 0
+
+    if args.command == "watch":
+        try:
+            import watch
+            watcher = watch.LogWatcher(engine)
+            watcher.watch_loop()
+            return 0
+        except KeyboardInterrupt:
+            return 0
 
     if args.command == "hook-pre-invocation":
         return handle_pre_invocation_hook(engine)
