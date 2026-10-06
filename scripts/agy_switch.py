@@ -1071,6 +1071,12 @@ class QuotaStatus:
         """Returns remaining quota as an integer percentage (0-100)."""
         return int(self.fraction * 100)
 
+@dataclass
+class EvaluationCandidate:
+    account_id: str
+    status: QuotaStatus
+    reset_delta: float
+
 class RotationEngine:
     def __init__(self, model_name: str | None = "gemini", active_account_id: str | None = None):
         self.model_name = model_name or "gemini"
@@ -1250,27 +1256,43 @@ class RotationEngine:
             if 0 <= reset_delta <= 30:
                 return None
 
-        # 3. imminent_reset priority: accounts with reset_delta <= 45m and fraction > 0.10
-        best_acc = None
-        best_imminent_frac = -1.0
-        best_normal_frac = -1.0
-
+        # 3. Candidate evaluation
+        # Active account is explicitly excluded from being selected as the fallback.
+        # Candidates must strictly have positive quota (fraction > 0.0).
+        candidates: list[EvaluationCandidate] = []
         for acc_id, status in evaluated.items():
-            reset_delta = reset_deltas[acc_id]
+            if acc_id == current_active:
+                continue
+            if status.fraction <= 0.0 or not status.has_available_quota():
+                continue
+            candidates.append(
+                EvaluationCandidate(
+                    account_id=acc_id,
+                    status=status,
+                    reset_delta=reset_deltas.get(acc_id, float("inf")),
+                )
+            )
 
-            if 0 <= reset_delta <= 45 and status.fraction > 0.10:
-                if status.fraction > best_imminent_frac:
-                    best_imminent_frac = status.fraction
-                    best_acc = acc_id
-            else:
-                if best_imminent_frac == -1.0 and status.fraction > best_normal_frac:
-                    best_normal_frac = status.fraction
-                    best_acc = acc_id
-
-        if best_acc is None or best_acc == current_active:
+        if not candidates:
             return None
 
-        return best_acc
+        # Imminent reset priority: accounts nearing reset (reset_delta <= 45m)
+        # with healthy quota (fraction >= 0.15).
+        # Imminent accounts with very low quota (< 15%) do not qualify for imminent priority
+        # so they do not starve accounts with higher / 100% quota.
+        imminent_candidates = [
+            c for c in candidates
+            if 0 <= c.reset_delta <= 45 and c.status.fraction >= 0.15
+        ]
+
+        if imminent_candidates:
+            # Sort by highest fraction first, tie-break by earliest reset delta
+            imminent_candidates.sort(key=lambda c: (-c.status.fraction, c.reset_delta))
+            return imminent_candidates[0].account_id
+
+        # Prioritize candidate with highest absolute quota, tie-break by earliest reset delta
+        candidates.sort(key=lambda c: (-c.status.fraction, c.reset_delta))
+        return candidates[0].account_id
 
 
 def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:

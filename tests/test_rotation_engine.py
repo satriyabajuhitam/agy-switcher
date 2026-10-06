@@ -81,6 +81,29 @@ class TestRotationEngine(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_imminent_reset_priority(self):
+        """Standby account nearing reset with healthy quota (>= 15%) is prioritized."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        accounts = [
+            {"name": "acc1", "quota": self._make_quota(gemini_frac=0.05, gemini_reset=60)},
+            {"name": "acc2", "quota": self._make_quota(gemini_frac=0.50, gemini_reset=120)},
+            {"name": "acc3", "quota": self._make_quota(gemini_frac=0.20, gemini_reset=40)},
+        ]
+        result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "acc3")
+
+    def test_accounts_100_percent_override_11_percent_imminent(self):
+        """Accounts with 100% quota correctly override 11% imminent-reset accounts."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        accounts = [
+            {"name": "acc1", "quota": self._make_quota(gemini_frac=0.05, gemini_reset=60)},
+            {"name": "acc2", "quota": self._make_quota(gemini_frac=1.00, gemini_reset=120)},
+            {"name": "acc3", "quota": self._make_quota(gemini_frac=0.11, gemini_reset=40)},
+        ]
+        result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "acc2")
+
+    def test_imminent_reset_too_low(self):
+        """Imminent accounts with < 15% quota do not get priority over higher quota accounts."""
         engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
         accounts = [
             {"name": "acc1", "quota": self._make_quota(gemini_frac=0.05, gemini_reset=60)},
@@ -88,17 +111,54 @@ class TestRotationEngine(unittest.TestCase):
             {"name": "acc3", "quota": self._make_quota(gemini_frac=0.11, gemini_reset=40)},
         ]
         result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
-        self.assertEqual(result, "acc3")
+        self.assertEqual(result, "acc2")
 
-    def test_imminent_reset_too_low(self):
+    def test_candidates_with_zero_quota_ignored(self):
+        """Candidates with 0% quota must be ignored and never selected as fallback."""
         engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
         accounts = [
             {"name": "acc1", "quota": self._make_quota(gemini_frac=0.05, gemini_reset=60)},
-            {"name": "acc2", "quota": self._make_quota(gemini_frac=0.50, gemini_reset=120)},
-            {"name": "acc3", "quota": self._make_quota(gemini_frac=0.09, gemini_reset=40)},
+            {"name": "acc2", "quota": self._make_quota(gemini_frac=0.00, gemini_reset=120)},
+            {"name": "acc3", "quota": self._make_quota(gemini_frac=0.00, gemini_reset=30)},
+        ]
+        result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
+        self.assertIsNone(result)
+
+        accounts.append({"name": "acc4", "quota": self._make_quota(gemini_frac=0.30, gemini_reset=120)})
+        result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "acc4")
+
+    def test_active_account_excluded_from_fallback(self):
+        """Active account is explicitly excluded from being selected as the fallback."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        accounts = [
+            {"name": "acc1", "quota": self._make_quota(gemini_frac=0.12, gemini_reset=60)},
+            {"name": "acc2", "quota": self._make_quota(gemini_frac=0.10, gemini_reset=120)},
         ]
         result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
         self.assertEqual(result, "acc2")
+
+    def test_all_standby_below_15_picks_highest_absolute_quota(self):
+        """When all standby accounts have < 15% quota, pick the highest absolute quota."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        accounts = [
+            {"name": "acc1", "quota": self._make_quota(gemini_frac=0.02, gemini_reset=60)},
+            {"name": "acc2", "quota": self._make_quota(gemini_frac=0.08, gemini_reset=120)},
+            {"name": "acc3", "quota": self._make_quota(gemini_frac=0.12, gemini_reset=40)},
+        ]
+        result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "acc3")
+
+    def test_tie_break_by_earliest_reset_delta(self):
+        """When two candidate accounts have equal highest quota, tie-break by earliest reset time."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        accounts = [
+            {"name": "acc1", "quota": self._make_quota(gemini_frac=0.05, gemini_reset=60)},
+            {"name": "acc2", "quota": self._make_quota(gemini_frac=1.00, gemini_reset=120)},
+            {"name": "acc3", "quota": self._make_quota(gemini_frac=1.00, gemini_reset=50)},
+        ]
+        result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "acc3")
 
     def test_target_claude_model(self):
         engine = RotationEngine(model_name="claude-3-5-sonnet", active_account_id="acc1")
