@@ -1072,11 +1072,12 @@ class QuotaStatus:
         return int(self.fraction * 100)
 
 class RotationEngine:
-    def __init__(self, model_name: str = "gemini", active_account_id: str | None = None):
-        self.model_name = model_name
+    def __init__(self, model_name: str | None = "gemini", active_account_id: str | None = None):
+        self.model_name = model_name or "gemini"
         self.active_account_id = active_account_id
         
-        if "claude" in self.model_name.lower():
+        model_lower = (self.model_name or "gemini").lower()
+        if "claude" in model_lower:
             self.target_group_prefix = "Claude"
             self.target_model_key = "claude"
         else:
@@ -1216,7 +1217,7 @@ class RotationEngine:
                     continue
                 if current_active is None and acc.get("is_active"):
                     current_active = acc_name
-                if "quota" in acc and isinstance(acc["quota"], dict) and (model_key in acc["quota"] or "groups" in acc["quota"] or "quota" in acc["quota"]):
+                if "quota" in acc and isinstance(acc["quota"], dict):
                     q_data = acc["quota"]
                 else:
                     q_data = acc
@@ -1298,19 +1299,16 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
             print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
             
             # Check if all network quotas failed or all accounts are exhausted
-            eval_account = target_account or active_name
             all_exhausted = (
                 not quotas
                 or not any(rot_engine.has_available_quota(q) for q in quotas.values())
-                or rot_engine.is_exhausted(quotas.get(eval_account, {}))
             )
             
             if all_exhausted:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "type": "ephemeralMessage",
-                            "message": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
+                            "ephemeralMessage": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
                         }
                     ]
                 }) + "\n")
@@ -1325,8 +1323,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "type": "ephemeralMessage",
-                            "message": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
+                            "ephemeralMessage": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
                         }
                     ]
                 }) + "\n")

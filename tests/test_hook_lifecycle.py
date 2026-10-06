@@ -183,8 +183,10 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertIn("injectSteps", output, "Hook should output injectSteps warning when quotas are empty")
         self.assertEqual(len(output["injectSteps"]), 1)
         step = output["injectSteps"][0]
-        self.assertEqual(step.get("type"), "ephemeralMessage")
-        self.assertIn("exhausted their gemini-1.5-pro quota", step.get("message", ""))
+        self.assertIn("ephemeralMessage", step)
+        self.assertNotIn("type", step)
+        self.assertNotIn("message", step)
+        self.assertIn("exhausted their gemini-1.5-pro quota", step["ephemeralMessage"])
 
     def test_hook_pre_invocation_all_quotas_zero_warns_exhausted(self):
         """When auto-switch is on and all accounts have 0 quota, output exhausted warning ephemeralMessage."""
@@ -221,8 +223,10 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         output = json.loads(out_capture.getvalue())
         self.assertIn("injectSteps", output)
         step = output["injectSteps"][0]
-        self.assertEqual(step.get("type"), "ephemeralMessage")
-        self.assertIn("exhausted their gemini-1.5-pro quota", step.get("message", ""))
+        self.assertIn("ephemeralMessage", step)
+        self.assertNotIn("type", step)
+        self.assertNotIn("message", step)
+        self.assertIn("exhausted their gemini-1.5-pro quota", step["ephemeralMessage"])
 
     def test_hook_pre_invocation_uses_get_account_tokens(self):
         """Hook must call engine.get_account_tokens instead of directly parsing token dicts."""
@@ -284,6 +288,162 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                         handle_pre_invocation_hook(self.engine)
 
         self.assertTrue(spy_has_quota.called, "Hook must invoke rot_engine.has_available_quota()")
+
+    def test_hook_pre_invocation_auto_rotate_ephemeral_schema(self):
+        """When auto-rotation succeeds, hook output must use {"ephemeralMessage": "..."} without type/message keys."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        # Register acc1 (active, low quota) and acc2 (standby, high quota)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+
+        mock_quotas = {
+            "tok_acc1": {"gemini": {"quota": 5, "reset_time": 1700000000}},
+            "tok_acc2": {"gemini": {"quota": 90, "reset_time": 1700000000}},
+        }
+
+        with patch("agy_switch.QuotaClient.fetch_quota", side_effect=lambda tok, refresh_token=None: mock_quotas.get(tok, {})):
+            with patch("sys.stdin", io.StringIO(input_payload)):
+                out_capture = io.StringIO()
+                with patch("sys.stdout", out_capture):
+                    ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        self.assertEqual(len(output["injectSteps"]), 1)
+        step = output["injectSteps"][0]
+        self.assertIn("ephemeralMessage", step)
+        self.assertNotIn("type", step)
+        self.assertNotIn("message", step)
+        self.assertIn("Auto-rotated to **acc2**", step["ephemeralMessage"])
+        self.assertIn("90% remaining", step["ephemeralMessage"])
+
+    def test_hook_pre_invocation_all_exhausted_only_when_all_accounts_zero(self):
+        """all_exhausted should not trigger just because active account is at 0% when standby has quota."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        # acc1 has 0% quota, acc2 has 85% quota
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+
+        mock_quotas = {
+            "tok_acc1": {"gemini": {"quota": 0, "reset_time": 1700000000}},
+            "tok_acc2": {"gemini": {"quota": 85, "reset_time": 1700000000}},
+        }
+
+        with patch("agy_switch.QuotaClient.fetch_quota", side_effect=lambda tok, refresh_token=None: mock_quotas.get(tok, {})):
+            with patch("sys.stdin", io.StringIO(input_payload)):
+                out_capture = io.StringIO()
+                with patch("sys.stdout", out_capture):
+                    ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        step = output["injectSteps"][0]
+        self.assertIn("ephemeralMessage", step)
+        self.assertNotIn("type", step)
+        self.assertNotIn("message", step)
+        self.assertIn("Auto-rotated to **acc2**", step["ephemeralMessage"])
+        self.assertNotIn("All Antigravity accounts have exhausted", step["ephemeralMessage"])
+
+    def test_hook_pre_invocation_model_name_auto_with_zero_claude(self):
+        """modelName: 'auto' gracefully defaults to evaluating Gemini and does not crash when Claude is 0%."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "tok1", "refresh_token": "ref1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.sig",
+        }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "auto"})
+
+        mock_quota = {
+            "gemini": {"quota": 80, "reset_time": 1700000000},
+            "claude": {"quota": 0, "reset_time": 1700000000},
+        }
+
+        with patch("agy_switch.QuotaClient.fetch_quota", return_value=mock_quota):
+            with patch("sys.stdin", io.StringIO(input_payload)):
+                out_capture = io.StringIO()
+                with patch("sys.stdout", out_capture):
+                    ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        # acc1 has 80% Gemini quota (>15%), so it should retain acc1 and return empty {}
+        self.assertEqual(output, {})
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+
+    def test_hook_pre_invocation_model_name_auto_rotates_when_gemini_low(self):
+        """modelName: 'auto' auto-rotates when Gemini is low, even when Claude quota is 0% across accounts."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        input_payload = json.dumps({"modelName": "auto"})
+
+        mock_quotas = {
+            "tok_acc1": {"gemini": {"quota": 5, "reset_time": 1700000000}, "claude": {"quota": 0, "reset_time": 1700000000}},
+            "tok_acc2": {"gemini": {"quota": 90, "reset_time": 1700000000}, "claude": {"quota": 0, "reset_time": 1700000000}},
+        }
+
+        with patch("agy_switch.QuotaClient.fetch_quota", side_effect=lambda tok, refresh_token=None: mock_quotas.get(tok, {})):
+            with patch("sys.stdin", io.StringIO(input_payload)):
+                out_capture = io.StringIO()
+                with patch("sys.stdout", out_capture):
+                    ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        step = output["injectSteps"][0]
+        self.assertIn("ephemeralMessage", step)
+        self.assertNotIn("type", step)
+        self.assertNotIn("message", step)
+        self.assertIn("Auto-rotated to **acc2**", step["ephemeralMessage"])
 
 
 if __name__ == "__main__":
