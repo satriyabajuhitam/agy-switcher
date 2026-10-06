@@ -137,6 +137,17 @@ class TestQuotaClient(unittest.TestCase):
         loaded = self.client.load_cache()
         self.assertEqual(loaded, test_data)
 
+    def test_init_with_engine(self):
+        engine_mock = MagicMock()
+        engine_mock.cache_dir = self.cache_dir
+        engine_mock.cache_file = self.cache_dir / "last_known_quota.json"
+        
+        client = QuotaClient(engine_mock)
+        self.assertEqual(client.cache_dir, self.cache_dir)
+        self.assertEqual(client.cache_file, engine_mock.cache_file)
+        self.assertEqual(client.client_id, "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
+
 
 if __name__ == "__main__":
     unittest.main()
+

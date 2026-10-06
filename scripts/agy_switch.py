@@ -762,18 +762,26 @@ class AgySwitchEngine:
 class QuotaClient:
     def __init__(
         self,
-        client_id: str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+        engine_or_client_id: Any = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
         client_secret: str = "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",
         timeout: float = 2.0,
         cache_dir: Path | None = None,
+        engine: Any | None = None,
     ) -> None:
-        self.client_id = client_id
+        target_engine = engine if engine is not None else (engine_or_client_id if hasattr(engine_or_client_id, "cache_dir") else None)
+        if target_engine is not None:
+            self.engine = target_engine
+            self.cache_dir = cache_dir or getattr(target_engine, "cache_dir", None) or (Path.home() / ".antigravity-vault" / "cache")
+            self.client_id = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+        else:
+            self.engine = None
+            self.client_id = engine_or_client_id
+            self.cache_dir = cache_dir or (Path.home() / ".antigravity-vault" / "cache")
         self.client_secret = client_secret
         self.timeout = timeout
         self.token_endpoint = "https://oauth2.googleapis.com/token"
         self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-        self.cache_dir = cache_dir or (Path.home() / ".antigravity-vault" / "cache")
-        self.cache_file = self.cache_dir / "last_known_quota.json"
+        self.cache_file = getattr(target_engine, "cache_file", None) or (self.cache_dir / "last_known_quota.json")
 
     def refresh_access_token(self, refresh_token: str) -> str | None:
         """Refreshes the OAuth access token."""
@@ -1071,12 +1079,19 @@ class QuotaStatus:
         """Returns remaining quota as an integer percentage (0-100)."""
         return int(self.fraction * 100)
 
+@dataclass
+class EvaluationCandidate:
+    account_id: str
+    status: QuotaStatus
+    reset_delta: float
+
 class RotationEngine:
-    def __init__(self, model_name: str = "gemini", active_account_id: str | None = None):
-        self.model_name = model_name
+    def __init__(self, model_name: str | None = "gemini", active_account_id: str | None = None):
+        self.model_name = model_name or "gemini"
         self.active_account_id = active_account_id
         
-        if "claude" in self.model_name.lower():
+        model_lower = (self.model_name or "gemini").lower()
+        if "claude" in model_lower:
             self.target_group_prefix = "Claude"
             self.target_model_key = "claude"
         else:
@@ -1216,7 +1231,7 @@ class RotationEngine:
                     continue
                 if current_active is None and acc.get("is_active"):
                     current_active = acc_name
-                if "quota" in acc and isinstance(acc["quota"], dict) and (model_key in acc["quota"] or "groups" in acc["quota"] or "quota" in acc["quota"]):
+                if "quota" in acc and isinstance(acc["quota"], dict):
                     q_data = acc["quota"]
                 else:
                     q_data = acc
@@ -1249,27 +1264,43 @@ class RotationEngine:
             if 0 <= reset_delta <= 30:
                 return None
 
-        # 3. imminent_reset priority: accounts with reset_delta <= 45m and fraction > 0.10
-        best_acc = None
-        best_imminent_frac = -1.0
-        best_normal_frac = -1.0
-
+        # 3. Candidate evaluation
+        # Active account is explicitly excluded from being selected as the fallback.
+        # Candidates must strictly have positive quota (fraction > 0.0).
+        candidates: list[EvaluationCandidate] = []
         for acc_id, status in evaluated.items():
-            reset_delta = reset_deltas[acc_id]
+            if acc_id == current_active:
+                continue
+            if status.fraction <= 0.0 or not status.has_available_quota():
+                continue
+            candidates.append(
+                EvaluationCandidate(
+                    account_id=acc_id,
+                    status=status,
+                    reset_delta=reset_deltas.get(acc_id, float("inf")),
+                )
+            )
 
-            if 0 <= reset_delta <= 45 and status.fraction > 0.10:
-                if status.fraction > best_imminent_frac:
-                    best_imminent_frac = status.fraction
-                    best_acc = acc_id
-            else:
-                if best_imminent_frac == -1.0 and status.fraction > best_normal_frac:
-                    best_normal_frac = status.fraction
-                    best_acc = acc_id
-
-        if best_acc is None or best_acc == current_active:
+        if not candidates:
             return None
 
-        return best_acc
+        # Imminent reset priority: accounts nearing reset (reset_delta <= 45m)
+        # with healthy quota (fraction >= 0.15).
+        # Imminent accounts with very low quota (< 15%) do not qualify for imminent priority
+        # so they do not starve accounts with higher / 100% quota.
+        imminent_candidates = [
+            c for c in candidates
+            if 0 <= c.reset_delta <= 45 and c.status.fraction >= 0.15
+        ]
+
+        if imminent_candidates:
+            # Sort by highest fraction first, tie-break by earliest reset delta
+            imminent_candidates.sort(key=lambda c: (-c.status.fraction, c.reset_delta))
+            return imminent_candidates[0].account_id
+
+        # Prioritize candidate with highest absolute quota, tie-break by earliest reset delta
+        candidates.sort(key=lambda c: (-c.status.fraction, c.reset_delta))
+        return candidates[0].account_id
 
 
 def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
@@ -1298,19 +1329,16 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
             print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
             
             # Check if all network quotas failed or all accounts are exhausted
-            eval_account = target_account or active_name
             all_exhausted = (
                 not quotas
                 or not any(rot_engine.has_available_quota(q) for q in quotas.values())
-                or rot_engine.is_exhausted(quotas.get(eval_account, {}))
             )
             
             if all_exhausted:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "type": "ephemeralMessage",
-                            "message": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
+                            "ephemeralMessage": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
                         }
                     ]
                 }) + "\n")
@@ -1325,8 +1353,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "type": "ephemeralMessage",
-                            "message": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
+                            "ephemeralMessage": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
                         }
                     ]
                 }) + "\n")
@@ -1398,6 +1425,9 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     # Command: hook-pre-invocation
     subparsers.add_parser("hook-pre-invocation", help="Antigravity PreInvocation lifecycle hook handler")
+
+    # Command: watch
+    subparsers.add_parser("watch", help="Run background daemon to tail logs and auto-switch on quota exhaustion")
 
     # Command: internal-probe
     subparsers.add_parser("internal-probe", help=argparse.SUPPRESS)
@@ -1587,6 +1617,15 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             return 0
         hook_parser.print_help()
         return 0
+
+    if args.command == "watch":
+        try:
+            import watch
+            watcher = watch.LogWatcher(engine)
+            watcher.watch_loop()
+            return 0
+        except KeyboardInterrupt:
+            return 0
 
     if args.command == "hook-pre-invocation":
         return handle_pre_invocation_hook(engine)

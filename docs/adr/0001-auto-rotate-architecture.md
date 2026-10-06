@@ -4,7 +4,7 @@ Date: 2026-10-05
 
 ## Status
 
-Accepted
+Accepted (Amended: 2026-10-06)
 
 ## Context
 
@@ -34,7 +34,7 @@ Kita telah merancang arsitektur Auto-Rotate yang memanfaatkan empat pilar utama:
    `RotationEngine` tidak hanya melihat sisa kuota, tetapi menggunakan pendekatan prediktif:
    - **Cache-Optimized Default**: Selama akun saat ini memiliki kuota > 15%, rotasi akan ditahan untuk menjaga *prompt cache hit rate* agar latensi tetap rendah.
    - **Drain Window**: Jika reset kuota tinggal $\le 30$ menit dan saldo $> 5\%$, akun dipertahankan agar kuota yang hampir hangus terpakai maksimal.
-   - **Imminent Reset**: Akun di pool yang akan reset dalam $\le 45$ menit dan saldo $> 10\%$ akan diprioritaskan untuk dipakai.
+   - **Imminent Reset**: Akun di pool yang akan reset dalam $\le 45$ menit dan saldo $> 10\%$ *(diamandemen menjadi $\ge 15\%$, lihat bagian Amendments)* akan diprioritaskan untuk dipakai.
 
 Konfigurasi global untuk fitur ini (Enable/Disable) disimpan di `~/.antigravity-vault/config.json` dan dikontrol lewat sub-command `agy-switch config auto-switch [on|off]`.
 
@@ -49,3 +49,19 @@ Konfigurasi global untuk fitur ini (Enable/Disable) disimpan di `~/.antigravity-
 **Negatif/Risiko:**
 - Kita harus secara manual menangani token OAuth parsing dan HTTP requests menggunakan standard library tanpa `requests`, yang meningkatkan sedikit kompleksitas parser.
 - Google sewaktu-waktu bisa mengubah format payload dari internal CloudCode API.
+
+## Amendments
+
+### 2026-10-06: Penyesuaian Ambang Batas Imminent Reset (10% $\rightarrow$ $\ge 15\%$)
+
+- **Latar Belakang & Masalah (Starvation Bug)**:
+  Pada pengujian implementasi `RotationEngine`, ditemukan kelemahan (*starvation bug*) saat akun standby berada dalam kondisi mendekati waktu reset ($\le 45$ menit) namun hanya memiliki sisa kuota rendah (misal: $11\%$). Karena ambang batas awal ditetapkan pada $> 10\%$, akun berkuota rendah tersebut secara keliru mendapatkan prioritas rotasi (*imminent priority*), mendahului akun-akun standby lain yang memiliki kuota penuh atau jauh lebih tinggi ($100\%$). Akibatnya, agen segera mengalami error `RESOURCE_EXHAUSTED` (429) sesaat setelah pergantian akun.
+
+- **Keputusan Amandemen**:
+  - Ambang batas kuota minimum untuk prioritas *Imminent Reset* ditingkatkan dari $> 10\%$ menjadi $\ge 15\%$.
+  - Akun di pool yang mendekati reset ($\le 45$ menit) wajib mempertahankan sisa kuota $\ge 15\%$ untuk memenuhi syarat prioritas imminent.
+  - Akun yang mendekati reset tetapi memiliki kuota $< 15\%$ tidak lagi mendapatkan prioritas imminent; `RotationEngine` akan memprioritaskan akun dengan kuota absolut tertinggi (misal: akun standby dengan kuota $100\%$). Hal ini menyelesaikan starvation bug dan memastikan failover yang stabil.
+
+- **Konsekuensi Amandemen**:
+  - **Positif**: Mencegah akun berkuota kritis ($11\%-14\%$) membajak rotasi dari akun standby $100\%$. Menjamin transisi akun selalu menuju akun yang memiliki kapasitas memadai untuk melanjutkan sesi kerja agen.
+  - **Negatif/Risiko**: Sisa kuota kecil ($< 15\%$) pada akun yang hampir reset berpotensi hangus jika tidak termanfaatkan, namun pengorbanan ini jauh lebih kecil dampaknya dibandingkan risiko kegagalan turn agen (*turn failure*) akibat kekurangan kuota.
