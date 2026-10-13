@@ -40,7 +40,35 @@ if [ "$IS_BOOTSTRAP" -eq 1 ]; then
             safe_cleanup_target
             exit 1
         }
+        git -C "$TARGET_DIR" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
         trap - INT TERM
+    elif [ ! -e "$TARGET_DIR/.git" ]; then
+        echo "Error: Destination directory '$TARGET_DIR' already exists and is not an agy-switch repository." >&2
+        exit 1
+    elif [ ! -f "$TARGET_DIR/scripts/agy_switch.py" ] || [ ! -f "$TARGET_DIR/plugin.json" ]; then
+        echo "Error: Existing git repository at '$TARGET_DIR' is not an agy-switch repository." >&2
+        exit 1
+    else
+        if [ -n "$(git -C "$TARGET_DIR" status --porcelain 2>/dev/null)" ]; then
+            echo "Error: Working directory at $TARGET_DIR has uncommitted changes." >&2
+            echo "Please commit, stash, or reset your local modifications before running bootstrap." >&2
+            exit 1
+        fi
+
+        [ -n "${AGY_SWITCH_REPO_URL:-}" ] && git -C "$TARGET_DIR" remote set-url origin "$REPO_URL" 2>/dev/null || true
+        git -C "$TARGET_DIR" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+        git -C "$TARGET_DIR" fetch origin || {
+            echo "Error: Failed to fetch branch '$BRANCH' from origin." >&2
+            exit 1
+        }
+        git -C "$TARGET_DIR" checkout "$BRANCH" || {
+            echo "Error: Failed to checkout branch '$BRANCH'." >&2
+            exit 1
+        }
+        git -C "$TARGET_DIR" merge --ff-only "origin/$BRANCH" || {
+            echo "Error: Cannot fast-forward branch '$BRANCH'. Local branch has diverged." >&2
+            exit 1
+        }
     fi
 
     has_target=0
