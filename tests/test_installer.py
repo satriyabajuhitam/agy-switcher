@@ -16,7 +16,8 @@ def get_current_branch():
         text=True,
         check=True,
     )
-    return res.stdout.strip()
+    branch = res.stdout.strip()
+    return "dev" if branch == "HEAD" else branch
 
 
 class TestInstallerScript(unittest.TestCase):
@@ -722,12 +723,12 @@ exec "{real_git}" "$@"
 
         # Ensure REPO_ROOT has not been touched
         res_branches = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "branch", "--list", worktree_branch],
+            ["git", "-C", str(REPO_ROOT), "branch", "-a", "--list", f"*{worktree_branch}*"],
             capture_output=True,
             text=True,
             check=True,
         )
-        self.assertEqual(res_branches.stdout.strip(), "", "REPO_ROOT must not contain worktree branch")
+        self.assertEqual(res_branches.stdout.strip(), "", "REPO_ROOT must not contain worktree branch in local or remote tracking refs")
 
         wt_list = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "worktree", "list", "--porcelain"],
@@ -991,6 +992,37 @@ exec "{real_git}" "$@"
                 0o600,
                 "Vault token file must retain 0600 permissions",
             )
+
+    def test_uninstall_all_preserves_vault_tokens_and_strict_permissions(self):
+        vault_dir = Path(self.temp_home.name) / ".antigravity-vault"
+        accounts_dir = vault_dir / "accounts" / "preserve_uninstall"
+        accounts_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(vault_dir, 0o700)
+        os.chmod(vault_dir / "accounts", 0o700)
+        os.chmod(accounts_dir, 0o700)
+
+        token_file = accounts_dir / "token.json"
+        token_payload = '{"access_token": "secret_uninst", "refresh_token": "refr_uninst"}'
+        token_file.write_text(token_payload)
+        os.chmod(token_file, 0o600)
+
+        # Install first
+        self.run_installer("--global")
+        self.assertTrue(self.global_plugin.exists())
+        self.assertTrue(self.bin_link.exists())
+
+        # Run uninstall --all
+        res = self.run_installer("--uninstall", "--all")
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertFalse(self.global_plugin.exists())
+        self.assertFalse(self.bin_link.exists())
+
+        # Assert vault directory and tokens remain intact with strict permissions
+        self.assertTrue(vault_dir.is_dir())
+        self.assertEqual(oct(vault_dir.stat().st_mode & 0o777), oct(0o700))
+        self.assertTrue(token_file.is_file())
+        self.assertEqual(token_file.read_text(), token_payload)
+        self.assertEqual(oct(token_file.stat().st_mode & 0o777), oct(0o600))
 
 
 if __name__ == "__main__":

@@ -129,6 +129,9 @@ bash install.sh --local
 # Installs plugin to ~/.gemini/config/plugins/agy-switch and links CLI to ~/.local/bin/agy-switch
 bash install.sh --global
 
+# Option C: Dual Installation (Installs both local workspace and global user plugins)
+bash install.sh --all
+
 # Optional: Physical Copy Mode (copies files instead of symlinking)
 bash install.sh --local --copy
 # or

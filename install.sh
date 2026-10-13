@@ -63,7 +63,6 @@ if [ "$IS_BOOTSTRAP" -eq 1 ]; then
     fi
 
     TARGET_DIR="${AGY_SWITCH_HOME:-$HOME/agy-switcher}"
-    TARGET_DIR="${TARGET_DIR%/}"
     while [ "$TARGET_DIR" != "/" ] && [ "${TARGET_DIR%/}" != "$TARGET_DIR" ]; do
         TARGET_DIR="${TARGET_DIR%/}"
     done
@@ -71,7 +70,7 @@ if [ "$IS_BOOTSTRAP" -eq 1 ]; then
     BRANCH="${AGY_SWITCH_BRANCH:-dev}"
 
     safe_cleanup_target() {
-        local target="${TARGET_DIR%/}"
+        local target="${TARGET_DIR}"
         while [ "$target" != "/" ] && [ "${target%/}" != "$target" ]; do
             target="${target%/}"
         done
@@ -106,7 +105,7 @@ if [ "$IS_BOOTSTRAP" -eq 1 ]; then
         fi
     }
 
-    if [ ! -e "$TARGET_DIR" ] || ( [ -d "$TARGET_DIR" ] && [ -z "$(ls -A "$TARGET_DIR" 2>/dev/null)" ] ); then
+    if [ ! -e "$TARGET_DIR" ] || [ -d "$TARGET_DIR" ] && [ -z "$(ls -A "$TARGET_DIR" 2>/dev/null)" ]; then
         trap 'echo "Error: Installation interrupted or failed. Cleaning up incomplete clone..." >&2; safe_cleanup_target; exit 1' INT TERM
 
         git clone --single-branch -b "$BRANCH" "$REPO_URL" "$TARGET_DIR" || {
@@ -229,7 +228,7 @@ if [ -z "$TARGET" ]; then
         # Default uninstall without explicit target cleans up both to prevent orphaned files
         TARGET="all"
     else
-        echo "Error: Must specify --local or --global (or use interactive menu)."
+        echo "Error: Must specify --local, --global, or --all (or use interactive menu)."
         exit 1
     fi
 fi
