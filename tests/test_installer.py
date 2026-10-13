@@ -49,6 +49,61 @@ class TestInstallerScript(unittest.TestCase):
             stdin=subprocess.DEVNULL,
         )
 
+    def run_piped_bootstrap(
+        self,
+        args=None,
+        extra_env=None,
+        script_input=None,
+        cwd=None,
+        bash_options=None,
+    ):
+        env = self.env.copy()
+        default_env = {
+            "AGY_SWITCH_REPO_URL": f"file://{REPO_ROOT}",
+            "AGY_SWITCH_BRANCH": get_current_branch(),
+        }
+        for k, v in default_env.items():
+            if k not in env:
+                env[k] = v
+
+        if extra_env:
+            for k, v in extra_env.items():
+                if v is None:
+                    env.pop(k, None)
+                else:
+                    env[k] = str(v)
+
+        cmd = ["bash"]
+        if bash_options:
+            if isinstance(bash_options, (list, tuple)):
+                cmd.extend(bash_options)
+            else:
+                cmd.append(bash_options)
+
+        if args is not None:
+            cmd.extend(["-s", "--"])
+            if isinstance(args, (list, tuple)):
+                cmd.extend(args)
+            else:
+                cmd.append(args)
+
+        input_data = (
+            script_input
+            if script_input is not None
+            else INSTALL_SH.read_text()
+        )
+        if isinstance(input_data, bytes):
+            input_data = input_data.decode("utf-8")
+
+        return subprocess.run(
+            cmd,
+            cwd=cwd or self.temp_workspace.name,
+            env=env,
+            capture_output=True,
+            text=True,
+            input=input_data,
+        )
+
     def test_script_syntax_and_set_e(self):
         content = INSTALL_SH.read_text()
         self.assertIn("set -e", content, "install.sh must declare 'set -e'")
@@ -146,19 +201,7 @@ class TestInstallerScript(unittest.TestCase):
         self.assertFalse(self.bin_link.exists())
 
     def test_piped_bootstrap_installs_globally_by_default(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        cmd = f"cat '{INSTALL_SH}' | bash"
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap()
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         self.assertIn("agy-switch Remote Bootstrap Installer", res.stdout)
 
@@ -179,19 +222,7 @@ class TestInstallerScript(unittest.TestCase):
 
     def test_piped_bootstrap_respects_agy_switch_home_override(self):
         custom_home = Path(self.temp_workspace.name) / "custom-switcher"
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-        env["AGY_SWITCH_HOME"] = str(custom_home)
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(extra_env={"AGY_SWITCH_HOME": str(custom_home)})
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         self.assertTrue(custom_home.is_dir(), "Repository should be cloned to custom AGY_SWITCH_HOME")
         self.assertTrue((custom_home / "scripts" / "agy_switch.py").is_file())
@@ -220,8 +251,6 @@ class TestInstallerScript(unittest.TestCase):
         self.assertTrue(self.global_plugin.is_symlink())
 
     def test_bootstrap_missing_git_halts_with_code_1_and_descriptive_error(self):
-        env = self.env.copy()
-        # Provide a restricted PATH containing essential shell utilities but without git
         temp_bin = Path(self.temp_workspace.name) / "bin_no_git"
         temp_bin.mkdir(parents=True, exist_ok=True)
         for tool in ["bash", "sh", "rm", "cat", "ls", "dirname", "mkdir"]:
@@ -229,37 +258,14 @@ class TestInstallerScript(unittest.TestCase):
             if tool_path and Path(tool_path).exists():
                 (temp_bin / tool).symlink_to(tool_path)
 
-        env["PATH"] = str(temp_bin)
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(extra_env={"PATH": str(temp_bin)})
         self.assertEqual(res.returncode, 1)
         output = res.stdout + res.stderr
         self.assertIn("Error: git is required for remote installation.", output)
         self.assertFalse((Path(self.temp_home.name) / "agy-switcher").exists())
 
     def test_piped_bootstrap_forwards_local_flag(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        cmd = f"cat '{INSTALL_SH}' | bash -s -- --local"
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(args=["--local"])
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         self.assertTrue(self.local_plugin.is_symlink())
         self.assertFalse(self.global_plugin.exists())
@@ -288,36 +294,18 @@ class TestInstallerScript(unittest.TestCase):
         self.assertTrue(self.global_plugin.exists())
 
     def test_bootstrap_clone_failure_cleans_up_target_dir(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = "file:///nonexistent/repo.git"
-        env["AGY_SWITCH_BRANCH"] = "dev"
-
         target_dir = Path(self.temp_home.name) / "agy-switcher"
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
+        res = self.run_piped_bootstrap(
+            extra_env={
+                "AGY_SWITCH_REPO_URL": "file:///nonexistent/repo.git",
+                "AGY_SWITCH_BRANCH": "dev",
+            }
         )
         self.assertNotEqual(res.returncode, 0)
         self.assertFalse(target_dir.exists(), "Failed clone must clean up target directory")
 
     def test_piped_bootstrap_defaults_to_dev_branch_when_branch_env_unset(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env.pop("AGY_SWITCH_BRANCH", None)
-
-        cmd = f"cat '{INSTALL_SH}' | bash"
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(extra_env={"AGY_SWITCH_BRANCH": None})
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         default_target_repo = Path(self.temp_home.name) / "agy-switcher"
         branch_res = subprocess.run(
@@ -332,136 +320,53 @@ class TestInstallerScript(unittest.TestCase):
         default_target_repo = Path(self.temp_home.name) / "agy-switcher"
         default_target_repo.mkdir(parents=True, exist_ok=True)
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        cmd = f"cat '{INSTALL_SH}' | bash"
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap()
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         self.assertTrue((default_target_repo / ".git").is_dir())
         self.assertTrue(self.global_plugin.exists())
 
     def test_piped_bootstrap_with_custom_home_containing_spaces(self):
         custom_home = Path(self.temp_workspace.name) / "custom path with spaces"
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-        env["AGY_SWITCH_HOME"] = str(custom_home)
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(extra_env={"AGY_SWITCH_HOME": str(custom_home)})
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         self.assertTrue(custom_home.is_dir())
         self.assertEqual(self.global_plugin.resolve(), custom_home.resolve())
 
     def test_piped_bootstrap_forwards_short_flags_and_copy_mode(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
         # Test short -l flag
-        cmd_l = f"cat '{INSTALL_SH}' | bash -s -- -l"
-        res_l = subprocess.run(
-            cmd_l,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res_l = self.run_piped_bootstrap(args=["-l"])
         self.assertEqual(res_l.returncode, 0, f"Stdout: {res_l.stdout}\nStderr: {res_l.stderr}")
         self.assertTrue(self.local_plugin.is_symlink())
 
+        # Clean up local plugin before testing copy mode
+        self.local_plugin.unlink(missing_ok=True)
+
         # Test --copy mode without explicit target flag defaults to --global --copy
-        cmd_copy = f"cat '{INSTALL_SH}' | bash -s -- --copy"
-        res_copy = subprocess.run(
-            cmd_copy,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res_copy = self.run_piped_bootstrap(args=["--copy"])
         self.assertEqual(res_copy.returncode, 0, f"Stdout: {res_copy.stdout}\nStderr: {res_copy.stderr}")
         self.assertTrue(self.global_plugin.is_dir())
         self.assertFalse(self.global_plugin.is_symlink())
 
     def test_piped_bootstrap_preserves_installer_exit_code_on_invalid_arguments(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        cmd = f"cat '{INSTALL_SH}' | bash -s -- --invalid-flag"
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(args=["--invalid-flag"])
         self.assertEqual(res.returncode, 1)
         self.assertIn("Unknown parameter passed: --invalid-flag", res.stdout + res.stderr)
 
     def test_piped_bootstrap_safe_under_bash_nounset(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        cmd = f"cat '{INSTALL_SH}' | bash -u"
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(bash_options=["-u"])
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         self.assertNotIn("unbound variable", res.stderr)
         self.assertTrue(self.global_plugin.exists())
 
     def test_piped_bootstrap_forwards_uninstall_flag(self):
         # First install
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res_install = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res_install = self.run_piped_bootstrap()
         self.assertEqual(res_install.returncode, 0)
         self.assertTrue(self.global_plugin.exists())
         self.assertTrue(self.bin_link.exists())
 
         # Forward --uninstall via piped bootstrap
-        res_uninstall = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash -s -- --uninstall",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res_uninstall = self.run_piped_bootstrap(args=["--uninstall"])
         self.assertEqual(res_uninstall.returncode, 0, f"Stdout: {res_uninstall.stdout}\nStderr: {res_uninstall.stderr}")
         self.assertFalse(self.global_plugin.exists())
         self.assertFalse(self.bin_link.exists())
@@ -470,47 +375,17 @@ class TestInstallerScript(unittest.TestCase):
         target_file = Path(self.temp_home.name) / "agy-switcher"
         target_file.write_text("pre-existing important file")
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        # Should fail or not overwrite, but crucially the file MUST NOT be deleted
+        res = self.run_piped_bootstrap()
         self.assertTrue(target_file.is_file(), "Regular file at target path must not be deleted")
         self.assertEqual(target_file.read_text(), "pre-existing important file")
 
     def test_piped_bootstrap_rerun_clean_repo_idempotent_and_syncs(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res1 = self.run_piped_bootstrap()
         self.assertEqual(res1.returncode, 0, f"Stdout: {res1.stdout}\nStderr: {res1.stderr}")
         default_target_repo = Path(self.temp_home.name) / "agy-switcher"
         self.assertTrue(default_target_repo.is_dir())
 
-        res2 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res2 = self.run_piped_bootstrap()
         self.assertEqual(res2.returncode, 0, f"Stdout: {res2.stdout}\nStderr: {res2.stderr}")
         self.assertTrue(self.global_plugin.exists())
         self.assertTrue(self.bin_link.exists())
@@ -525,17 +400,11 @@ class TestInstallerScript(unittest.TestCase):
             capture_output=True,
         )
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{upstream}"
-        env["AGY_SWITCH_BRANCH"] = branch
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
+        res1 = self.run_piped_bootstrap(
+            extra_env={
+                "AGY_SWITCH_REPO_URL": f"file://{upstream}",
+                "AGY_SWITCH_BRANCH": branch,
+            }
         )
         self.assertEqual(res1.returncode, 0)
         target_repo = Path(self.temp_home.name) / "agy-switcher"
@@ -548,31 +417,18 @@ class TestInstallerScript(unittest.TestCase):
             check=True,
         )
 
-        res2 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
+        res2 = self.run_piped_bootstrap(
+            extra_env={
+                "AGY_SWITCH_REPO_URL": f"file://{upstream}",
+                "AGY_SWITCH_BRANCH": branch,
+            }
         )
         self.assertEqual(res2.returncode, 0, f"Stdout: {res2.stdout}\nStderr: {res2.stderr}")
         self.assertTrue((target_repo / "version_marker.txt").exists(), "Target repo must be fast-forwarded with upstream changes")
         self.assertEqual((target_repo / "version_marker.txt").read_text(), "v2.0.0")
 
     def test_piped_bootstrap_dirty_repo_rejected_and_preserves_changes(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res1 = self.run_piped_bootstrap()
         self.assertEqual(res1.returncode, 0)
         target_repo = Path(self.temp_home.name) / "agy-switcher"
 
@@ -581,14 +437,7 @@ class TestInstallerScript(unittest.TestCase):
         uncommitted_content = original_readme + "\nUncommitted local changes"
         readme.write_text(uncommitted_content)
 
-        res2 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res2 = self.run_piped_bootstrap()
         self.assertEqual(res2.returncode, 1, f"Expected returncode 1, got {res2.returncode}")
         output = res2.stdout + res2.stderr
         self.assertIn(f"Error: Working directory at {target_repo} has uncommitted changes.", output)
@@ -600,18 +449,7 @@ class TestInstallerScript(unittest.TestCase):
         foreign_file = target_dir / "my_important_document.txt"
         foreign_file.write_text("important foreign content")
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap()
         self.assertEqual(res.returncode, 1, f"Expected returncode 1, got {res.returncode}")
         output = res.stdout + res.stderr
         self.assertIn(
@@ -633,18 +471,7 @@ class TestInstallerScript(unittest.TestCase):
             check=True,
         )
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap()
         self.assertEqual(res.returncode, 1, f"Expected returncode 1, got {res.returncode}")
         output = res.stdout + res.stderr
         self.assertIn(
@@ -664,18 +491,11 @@ class TestInstallerScript(unittest.TestCase):
             capture_output=True,
         )
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{upstream}"
-        env["AGY_SWITCH_BRANCH"] = branch
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        extra_env = {
+            "AGY_SWITCH_REPO_URL": f"file://{upstream}",
+            "AGY_SWITCH_BRANCH": branch,
+        }
+        res1 = self.run_piped_bootstrap(extra_env=extra_env)
         self.assertEqual(res1.returncode, 0)
         target_repo = Path(self.temp_home.name) / "agy-switcher"
 
@@ -693,14 +513,7 @@ class TestInstallerScript(unittest.TestCase):
             check=True,
         )
 
-        res2 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res2 = self.run_piped_bootstrap(extra_env=extra_env)
         self.assertEqual(res2.returncode, 1, f"Expected returncode 1, got {res2.returncode}")
         output = res2.stdout + res2.stderr
         self.assertIn(f"Error: Cannot fast-forward branch '{branch}'. Local branch has diverged.", output)
@@ -716,36 +529,24 @@ class TestInstallerScript(unittest.TestCase):
         )
         probe_git.chmod(0o755)
 
-        env = self.env.copy()
-        env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap(extra_env={"PATH": f"{bin_dir}:{self.env['PATH']}"})
         self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
         self.assertTrue(probe_file.exists(), "Probe file must be written during clone")
         self.assertEqual(probe_file.read_text().strip(), "PROMPT_VALUE=0")
 
-    def test_piped_bootstrap_interrupted_by_sigterm_cleans_up_incomplete_target(self):
-        bin_dir = Path(self.temp_workspace.name) / "bin_probe_sigterm"
+    def _test_signal_cleanup(self, sig_name, sig_flag):
+        bin_dir = Path(self.temp_workspace.name) / f"bin_probe_{sig_name.lower()}"
         bin_dir.mkdir(parents=True, exist_ok=True)
         probe_git = bin_dir / "git"
         real_git = shutil.which("git")
-        target_dir = Path(self.temp_home.name) / "agy-switcher"
+        target_dir = Path(self.temp_home.name) / f"agy-switcher-{sig_name.lower()}"
 
         probe_script = f'''#!/bin/bash
 if [ "$1" = "clone" ]; then
     target="${{@: -1}}"
     mkdir -p "$target"
     touch "$target/incomplete_marker.txt"
-    kill -TERM "$PPID"
+    kill -{sig_flag} "$PPID"
     sleep 1
     exit 1
 fi
@@ -754,60 +555,27 @@ exec "{real_git}" "$@"
         probe_git.write_text(probe_script)
         probe_git.chmod(0o755)
 
-        env = self.env.copy()
-        env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
+        res = self.run_piped_bootstrap(
+            extra_env={
+                "PATH": f"{bin_dir}:{self.env['PATH']}",
+                "AGY_SWITCH_HOME": str(target_dir),
+            }
         )
         self.assertEqual(res.returncode, 1)
-        self.assertIn("Error: Installation interrupted or failed. Cleaning up incomplete clone...", res.stderr)
-        self.assertFalse(target_dir.exists(), "Target directory must be cleaned up on SIGTERM interruption")
+        self.assertIn(
+            "Error: Installation interrupted or failed. Cleaning up incomplete clone...",
+            res.stderr,
+        )
+        self.assertFalse(
+            target_dir.exists(),
+            f"Target directory must be cleaned up on {sig_name} interruption",
+        )
+
+    def test_piped_bootstrap_interrupted_by_sigterm_cleans_up_incomplete_target(self):
+        self._test_signal_cleanup("SIGTERM", "TERM")
 
     def test_piped_bootstrap_interrupted_by_sigint_cleans_up_incomplete_target(self):
-        bin_dir = Path(self.temp_workspace.name) / "bin_probe_sigint"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        probe_git = bin_dir / "git"
-        real_git = shutil.which("git")
-        target_dir = Path(self.temp_home.name) / "agy-switcher"
-
-        probe_script = f'''#!/bin/bash
-if [ "$1" = "clone" ]; then
-    target="${{@: -1}}"
-    mkdir -p "$target"
-    touch "$target/incomplete_marker.txt"
-    kill -INT "$PPID"
-    sleep 1
-    exit 1
-fi
-exec "{real_git}" "$@"
-'''
-        probe_git.write_text(probe_script)
-        probe_git.chmod(0o755)
-
-        env = self.env.copy()
-        env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(res.returncode, 1)
-        self.assertIn("Error: Installation interrupted or failed. Cleaning up incomplete clone...", res.stderr)
-        self.assertFalse(target_dir.exists(), "Target directory must be cleaned up on SIGINT interruption")
+        self._test_signal_cleanup("SIGINT", "INT")
 
     def test_piped_bootstrap_switch_branch_on_existing_clean_repo(self):
         upstream = Path(self.temp_workspace.name) / "upstream_repo"
@@ -828,30 +596,16 @@ exec "{real_git}" "$@"
         )
         subprocess.run(["git", "-C", str(upstream), "checkout", current_branch], check=True, capture_output=True)
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{upstream}"
-        env["AGY_SWITCH_BRANCH"] = current_branch
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        extra_env = {
+            "AGY_SWITCH_REPO_URL": f"file://{upstream}",
+            "AGY_SWITCH_BRANCH": current_branch,
+        }
+        res1 = self.run_piped_bootstrap(extra_env=extra_env)
         self.assertEqual(res1.returncode, 0, f"Stderr: {res1.stderr}")
         target_repo = Path(self.temp_home.name) / "agy-switcher"
 
-        env["AGY_SWITCH_BRANCH"] = "feature-alt"
-        res2 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        extra_env["AGY_SWITCH_BRANCH"] = "feature-alt"
+        res2 = self.run_piped_bootstrap(extra_env=extra_env)
         self.assertEqual(res2.returncode, 0, f"Stderr: {res2.stderr}")
         branch_res = subprocess.run(
             ["git", "-C", str(target_repo), "rev-parse", "--abbrev-ref", "HEAD"],
@@ -862,15 +616,8 @@ exec "{real_git}" "$@"
         self.assertEqual(branch_res.stdout.strip(), "feature-alt")
         self.assertTrue((target_repo / "alt_marker.txt").exists())
 
-        env["AGY_SWITCH_BRANCH"] = current_branch
-        res3 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        extra_env["AGY_SWITCH_BRANCH"] = current_branch
+        res3 = self.run_piped_bootstrap(extra_env=extra_env)
         self.assertEqual(res3.returncode, 0, f"Stderr: {res3.stderr}")
         branch_res2 = subprocess.run(
             ["git", "-C", str(target_repo), "rev-parse", "--abbrev-ref", "HEAD"],
@@ -893,18 +640,7 @@ exec "{real_git}" "$@"
             check=True,
         )
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap()
         self.assertEqual(res.returncode, 1)
         self.assertIn(
             f"Error: Existing git repository at '{target_dir}' is not an agy-switch repository.",
@@ -922,18 +658,7 @@ exec "{real_git}" "$@"
             check=True,
         )
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap()
         self.assertEqual(res.returncode, 1)
         self.assertIn(
             f"Error: Existing git repository at '{target_dir}' is not an agy-switch repository.",
@@ -941,32 +666,14 @@ exec "{real_git}" "$@"
         )
 
     def test_piped_bootstrap_dirty_repo_with_untracked_files_fails(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res1 = self.run_piped_bootstrap()
         self.assertEqual(res1.returncode, 0)
         target_repo = Path(self.temp_home.name) / "agy-switcher"
 
         untracked_file = target_repo / "untracked_work.txt"
         untracked_file.write_text("work in progress")
 
-        res2 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res2 = self.run_piped_bootstrap()
         self.assertEqual(res2.returncode, 1)
         output = res2.stdout + res2.stderr
         self.assertIn(f"Error: Working directory at {target_repo} has uncommitted changes.", output)
@@ -974,34 +681,62 @@ exec "{real_git}" "$@"
         self.assertEqual(untracked_file.read_text(), "work in progress")
 
     def test_piped_bootstrap_valid_git_worktree_supported(self):
-        target_dir = Path(self.temp_home.name) / "agy-switcher"
-        worktree_branch = "worktree-test-branch"
+        upstream_fixture = Path(self.temp_workspace.name) / "upstream_fixture"
+        current_branch = get_current_branch()
         subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "worktree", "add", "-b", worktree_branch, str(target_dir)],
+            ["git", "clone", "--single-branch", "-b", current_branch, f"file://{REPO_ROOT}", str(upstream_fixture)],
             check=True,
             capture_output=True,
         )
-        try:
-            self.assertTrue((target_dir / ".git").is_file(), ".git must be a worktree file, not a directory")
+        worktree_branch = "worktree-test-branch"
+        subprocess.run(
+            ["git", "-C", str(upstream_fixture), "branch", worktree_branch],
+            check=True,
+            capture_output=True,
+        )
 
-            env = self.env.copy()
-            env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-            env["AGY_SWITCH_BRANCH"] = worktree_branch
+        fixture_repo = Path(self.temp_workspace.name) / "fixture_repo"
+        subprocess.run(
+            ["git", "clone", f"file://{upstream_fixture}", str(fixture_repo)],
+            check=True,
+            capture_output=True,
+        )
 
-            res = subprocess.run(
-                f"cat '{INSTALL_SH}' | bash",
-                shell=True,
-                cwd=self.temp_workspace.name,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
-            self.assertTrue(self.global_plugin.exists())
-            self.assertTrue(self.bin_link.exists())
-        finally:
-            subprocess.run(["git", "-C", str(REPO_ROOT), "worktree", "remove", "--force", str(target_dir)], capture_output=True)
-            subprocess.run(["git", "-C", str(REPO_ROOT), "branch", "-D", worktree_branch], capture_output=True)
+        target_dir = Path(self.temp_home.name) / "agy-switcher"
+        subprocess.run(
+            ["git", "-C", str(fixture_repo), "worktree", "add", "-b", worktree_branch, str(target_dir), f"origin/{worktree_branch}"],
+            check=True,
+            capture_output=True,
+        )
+        self.assertTrue((target_dir / ".git").is_file(), ".git must be a worktree file, not a directory")
+
+        res = self.run_piped_bootstrap(
+            extra_env={
+                "AGY_SWITCH_REPO_URL": f"file://{upstream_fixture}",
+                "AGY_SWITCH_BRANCH": worktree_branch,
+            }
+        )
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertTrue(self.global_plugin.exists())
+        self.assertTrue(self.bin_link.exists())
+
+        # Ensure REPO_ROOT has not been touched
+        res_branches = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "branch", "--list", worktree_branch],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(res_branches.stdout.strip(), "", "REPO_ROOT must not contain worktree branch")
+
+        wt_list = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertNotIn(worktree_branch, wt_list.stdout)
+        self.assertNotIn(str(target_dir), wt_list.stdout)
 
     def test_installer_help_flag_displays_usage_and_exits_zero(self):
         for flag in ["-h", "--help"]:
@@ -1018,21 +753,9 @@ exec "{real_git}" "$@"
                 self.assertEqual(res.stderr.strip(), "")
 
     def test_piped_bootstrap_help_flag_exits_early_without_cloning(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
         for flag in ["-h", "--help"]:
             with self.subTest(flag=flag):
-                cmd = f"cat '{INSTALL_SH}' | bash -s -- {flag}"
-                res = subprocess.run(
-                    cmd,
-                    shell=True,
-                    cwd=self.temp_workspace.name,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                )
+                res = self.run_piped_bootstrap(args=[flag])
                 self.assertEqual(res.returncode, 0, f"Piped {flag} failed with code {res.returncode}")
                 output = res.stdout
                 self.assertIn("Usage:", output)
@@ -1052,19 +775,7 @@ exec "{real_git}" "$@"
         for slash_suffix in ["/", "///"]:
             with self.subTest(slash_suffix=slash_suffix):
                 custom_home = f"{self.temp_workspace.name}/custom-trimmed{slash_suffix}"
-                env = self.env.copy()
-                env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-                env["AGY_SWITCH_BRANCH"] = get_current_branch()
-                env["AGY_SWITCH_HOME"] = custom_home
-
-                res = subprocess.run(
-                    f"cat '{INSTALL_SH}' | bash",
-                    shell=True,
-                    cwd=self.temp_workspace.name,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                )
+                res = self.run_piped_bootstrap(extra_env={"AGY_SWITCH_HOME": custom_home})
                 self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
                 expected_dir = Path(self.temp_workspace.name) / "custom-trimmed"
                 self.assertTrue(expected_dir.is_dir())
@@ -1077,19 +788,12 @@ exec "{real_git}" "$@"
                 sentinel_file = Path(self.temp_home.name) / "sentinel_user_data.txt"
                 sentinel_file.write_text("critical user file")
 
-                env = self.env.copy()
-                env["AGY_SWITCH_REPO_URL"] = "file:///nonexistent/repo.git"
-                env["AGY_SWITCH_BRANCH"] = "dev"
-                # Trailing slash in AGY_SWITCH_HOME pointing directly to HOME
-                env["AGY_SWITCH_HOME"] = f"{self.temp_home.name}{slash_suffix}"
-
-                res = subprocess.run(
-                    f"cat '{INSTALL_SH}' | bash",
-                    shell=True,
-                    cwd=self.temp_workspace.name,
-                    env=env,
-                    capture_output=True,
-                    text=True,
+                res = self.run_piped_bootstrap(
+                    extra_env={
+                        "AGY_SWITCH_REPO_URL": "file:///nonexistent/repo.git",
+                        "AGY_SWITCH_BRANCH": "dev",
+                        "AGY_SWITCH_HOME": f"{self.temp_home.name}{slash_suffix}",
+                    }
                 )
                 self.assertNotEqual(res.returncode, 0)
                 # HOME and sentinel file must remain intact!
@@ -1130,18 +834,12 @@ exec "{real_git}" "$@"
         subprocess.run(["git", "-C", str(upstream), "add", "."], check=True)
         subprocess.run(["git", "-C", str(upstream), "commit", "-m", "init"], check=True, capture_output=True)
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{upstream.resolve()}"
-        env["AGY_SWITCH_BRANCH"] = "dev"
-
-        cmd = f"cat '{INSTALL_SH}' | bash -s -- --all"
-        res = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
+        res = self.run_piped_bootstrap(
+            args=["--all"],
+            extra_env={
+                "AGY_SWITCH_REPO_URL": f"file://{upstream.resolve()}",
+                "AGY_SWITCH_BRANCH": "dev",
+            },
         )
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         self.assertTrue(self.local_plugin.is_symlink(), "--all via bootstrap should install local plugin")
@@ -1149,18 +847,7 @@ exec "{real_git}" "$@"
         self.assertTrue(self.bin_link.is_symlink(), "--all via bootstrap should create launcher link")
 
     def test_piped_bootstrap_preserves_single_branch_fetch_refspec(self):
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res = self.run_piped_bootstrap()
         self.assertEqual(res.returncode, 0)
         target_repo = Path(self.temp_home.name) / "agy-switcher"
 
@@ -1175,18 +862,7 @@ exec "{real_git}" "$@"
 
     def test_piped_bootstrap_does_not_mutate_remote_origin_url_on_existing_repo(self):
         # First install
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
-        env["AGY_SWITCH_BRANCH"] = get_current_branch()
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        res1 = self.run_piped_bootstrap()
         self.assertEqual(res1.returncode, 0)
         target_repo = Path(self.temp_home.name) / "agy-switcher"
 
@@ -1199,14 +875,8 @@ exec "{real_git}" "$@"
         ).stdout.strip()
 
         # Second bootstrap run with a different AGY_SWITCH_REPO_URL specified
-        env["AGY_SWITCH_REPO_URL"] = "https://example.com/unsolicited/url.git"
-        res2 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
+        res2 = self.run_piped_bootstrap(
+            extra_env={"AGY_SWITCH_REPO_URL": "https://example.com/unsolicited/url.git"}
         )
         # It should succeed without rewriting existing remote.origin.url
         self.assertEqual(res2.returncode, 0)
@@ -1240,17 +910,11 @@ exec "{real_git}" "$@"
         # Create another branch in upstream
         subprocess.run(["git", "-C", str(upstream), "branch", "feature-secret"], check=True)
 
-        env = self.env.copy()
-        env["AGY_SWITCH_REPO_URL"] = f"file://{upstream.resolve()}"
-        env["AGY_SWITCH_BRANCH"] = "dev"
-
-        res1 = subprocess.run(
-            f"cat '{INSTALL_SH}' | bash",
-            shell=True,
-            cwd=self.temp_workspace.name,
-            env=env,
-            capture_output=True,
-            text=True,
+        res1 = self.run_piped_bootstrap(
+            extra_env={
+                "AGY_SWITCH_REPO_URL": f"file://{upstream.resolve()}",
+                "AGY_SWITCH_BRANCH": "dev",
+            }
         )
         self.assertEqual(res1.returncode, 0, f"Stderr: {res1.stderr}")
         target_repo = Path(self.temp_home.name) / "agy-switcher"
@@ -1263,6 +927,70 @@ exec "{real_git}" "$@"
             check=True,
         ).stdout
         self.assertNotIn("feature-secret", remotes_out, "Strict branch fetch must not pull other remote branches")
+
+    def test_piped_bootstrap_preserves_vault_tokens_and_strict_permissions(self):
+        vault_dir = Path(self.temp_home.name) / ".antigravity-vault"
+        acc1_dir = vault_dir / "accounts" / "primary_acc"
+        acc2_dir = vault_dir / "accounts" / "standby_acc"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        acc2_dir.mkdir(parents=True, exist_ok=True)
+        vault_dir.chmod(0o700)
+        acc1_dir.chmod(0o700)
+        acc2_dir.chmod(0o700)
+
+        token1_file = acc1_dir / "token.json"
+        token2_file = acc2_dir / "token.json"
+        content1 = '{"access_token": "primary_token_secret", "refresh_token": "primary_refresh"}'
+        content2 = '{"access_token": "standby_token_secret", "refresh_token": "standby_refresh"}'
+        token1_file.write_text(content1)
+        token2_file.write_text(content2)
+        token1_file.chmod(0o600)
+        token2_file.chmod(0o600)
+
+        self.assertEqual(vault_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(acc1_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(acc2_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(token1_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(token2_file.stat().st_mode & 0o777, 0o600)
+
+        # First run (initial clone)
+        res1 = self.run_piped_bootstrap()
+        self.assertEqual(res1.returncode, 0, f"Stdout: {res1.stdout}\nStderr: {res1.stderr}")
+        self.assertTrue(self.global_plugin.exists())
+
+        # Second run (idempotent pull)
+        res2 = self.run_piped_bootstrap()
+        self.assertEqual(res2.returncode, 0, f"Stdout: {res2.stdout}\nStderr: {res2.stderr}")
+
+        # Verify vault directory mode remains strictly 0700
+        self.assertEqual(
+            vault_dir.stat().st_mode & 0o777,
+            0o700,
+            "Vault directory ~/.antigravity-vault must retain 0700 permissions",
+        )
+        self.assertEqual(
+            acc1_dir.stat().st_mode & 0o777,
+            0o700,
+            "Account directory 1 must retain 0700 permissions",
+        )
+        self.assertEqual(
+            acc2_dir.stat().st_mode & 0o777,
+            0o700,
+            "Account directory 2 must retain 0700 permissions",
+        )
+        # Verify token files exist, content unmutated, and mode strictly 0600
+        for token_file, expected_content in [(token1_file, content1), (token2_file, content2)]:
+            self.assertTrue(token_file.is_file(), "Vault token file must exist untouched")
+            self.assertEqual(
+                token_file.read_text(),
+                expected_content,
+                "Vault token contents must not be mutated or overwritten",
+            )
+            self.assertEqual(
+                token_file.stat().st_mode & 0o777,
+                0o600,
+                "Vault token file must retain 0600 permissions",
+            )
 
 
 if __name__ == "__main__":
