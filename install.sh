@@ -4,6 +4,65 @@
 
 set -e
 
+# ---------------------------------------------------------
+# Execution Mode Detection (Local Mode vs Bootstrap Mode)
+# ---------------------------------------------------------
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/scripts/agy_switch.py" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/plugin.json" ]; then
+    IS_BOOTSTRAP=0
+else
+    IS_BOOTSTRAP=1
+fi
+
+if [ "$IS_BOOTSTRAP" -eq 1 ]; then
+    echo "==> agy-switch Remote Bootstrap Installer"
+    export GIT_TERMINAL_PROMPT=0
+
+    if ! command -v git >/dev/null 2>&1; then
+        echo "Error: git is required for remote installation." >&2
+        exit 1
+    fi
+
+    TARGET_DIR="${AGY_SWITCH_HOME:-$HOME/agy-switcher}"
+    REPO_URL="${AGY_SWITCH_REPO_URL:-https://github.com/satriyabajuhitam/agy-switcher.git}"
+    BRANCH="${AGY_SWITCH_BRANCH:-dev}"
+
+    safe_cleanup_target() {
+        if [ -n "$TARGET_DIR" ] && [ "$TARGET_DIR" != "/" ] && [ "$TARGET_DIR" != "$HOME" ] && [ -d "$TARGET_DIR" ]; then
+            rm -rf "$TARGET_DIR"
+        fi
+    }
+
+    if [ ! -e "$TARGET_DIR" ] || ( [ -d "$TARGET_DIR" ] && [ -z "$(ls -A "$TARGET_DIR" 2>/dev/null)" ] ); then
+        trap 'echo "Error: Installation interrupted or failed. Cleaning up incomplete clone..." >&2; safe_cleanup_target; exit 1' INT TERM
+
+        git clone --single-branch -b "$BRANCH" "$REPO_URL" "$TARGET_DIR" || {
+            echo "Error: Failed to clone repository from $REPO_URL" >&2
+            safe_cleanup_target
+            exit 1
+        }
+        trap - INT TERM
+    fi
+
+    has_target=0
+    has_action=0
+    for arg in "$@"; do
+        case "$arg" in
+            -l|--local|-g|--global|-a|--all)
+                has_target=1
+                ;;
+            -u|--uninstall|-h|--help)
+                has_action=1
+                ;;
+        esac
+    done
+
+    if [ "$has_target" -eq 1 ] || [ "$has_action" -eq 1 ]; then
+        exec bash "$TARGET_DIR/install.sh" "$@"
+    else
+        exec bash "$TARGET_DIR/install.sh" --global "$@"
+    fi
+fi
+
 # Default settings
 INSTALL_MODE="symlink"
 TARGET=""
@@ -47,7 +106,8 @@ interactive_menu() {
     echo "4) Uninstall Global Installation"
     echo "5) Uninstall All (Local & Global)"
     echo "6) Exit"
-    read -p "Select an option [1-6]: " choice
+    printf "Select an option [1-6]: "
+    read -r choice || exit 0
     case "$choice" in
         1) TARGET="local";;
         2) TARGET="global";;

@@ -7,3 +7,5 @@ Kamus/Glossary domain arsitektur untuk `agy-switch`. Semua penamaan kode, fungsi
 - **RotationEngine**: Modul pembuat keputusan (heuristik) yang menentukan akun mana yang paling optimal untuk diputar, menggunakan algoritma `cache_optimized`, `drain_window`, atau `auto_highest`. *Avoid:* AutoSwitcher, brain.
 - **Fast Telemetry**: Mekanisme akuisisi metrik (seperti kuota sisa) secara paralel/caching tanpa harus bergantung pada subprocess (seperti `agy -p /usage`).
 - **Atomic Swap**: Pemindahan/overwrite kredensial dari vault ke target CLI/Desktop (misal `os.replace`) yang menjamin state tidak akan pernah corrupt.
+- **Unified Bootstrap**: Kemampuan `install.sh` mendeteksi eksekusi tanpa clone lokal (seperti via pipe `curl | bash`), otomatis meng-clone ke direktori home (`~/agy-switcher`), dan mengeksekusi instalasi global. *Avoid:* auto-installer, curl script, remote runner.
+- **Home Repository Layout**: Pola peletakan folder repositori standar di root direktori user (`~/agy-switcher`) untuk kemudahan navigasi manual dan pembaruan via `git pull`. *Avoid:* custom path, deep workspace root.
