@@ -1003,6 +1003,51 @@ exec "{real_git}" "$@"
             subprocess.run(["git", "-C", str(REPO_ROOT), "worktree", "remove", "--force", str(target_dir)], capture_output=True)
             subprocess.run(["git", "-C", str(REPO_ROOT), "branch", "-D", worktree_branch], capture_output=True)
 
+    def test_installer_help_flag_displays_usage_and_exits_zero(self):
+        for flag in ["-h", "--help"]:
+            with self.subTest(flag=flag):
+                res = self.run_installer(flag)
+                self.assertEqual(res.returncode, 0, f"Flag {flag} failed with code {res.returncode}")
+                output = res.stdout
+                self.assertIn("Usage:", output)
+                self.assertIn("Options:", output)
+                self.assertIn("--help", output)
+                self.assertIn("AGY_SWITCH_HOME", output)
+                self.assertIn("AGY_SWITCH_BRANCH", output)
+                self.assertIn("AGY_SWITCH_REPO_URL", output)
+                self.assertEqual(res.stderr.strip(), "")
+
+    def test_piped_bootstrap_help_flag_exits_early_without_cloning(self):
+        env = self.env.copy()
+        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
+        env["AGY_SWITCH_BRANCH"] = get_current_branch()
+
+        for flag in ["-h", "--help"]:
+            with self.subTest(flag=flag):
+                cmd = f"cat '{INSTALL_SH}' | bash -s -- {flag}"
+                res = subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=self.temp_workspace.name,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(res.returncode, 0, f"Piped {flag} failed with code {res.returncode}")
+                output = res.stdout
+                self.assertIn("Usage:", output)
+                self.assertIn("Options:", output)
+                self.assertIn("AGY_SWITCH_HOME", output)
+                self.assertIn("AGY_SWITCH_BRANCH", output)
+                self.assertIn("AGY_SWITCH_REPO_URL", output)
+                self.assertEqual(res.stderr.strip(), "")
+                self.assertFalse(
+                    (Path(self.temp_home.name) / "agy-switcher").exists(),
+                    "Help flag must short-circuit without cloning repository",
+                )
+                self.assertFalse(self.global_plugin.exists(), "Help flag must not install global plugin")
+                self.assertFalse(self.bin_link.exists(), "Help flag must not create launcher link")
+
 
 if __name__ == "__main__":
     unittest.main()

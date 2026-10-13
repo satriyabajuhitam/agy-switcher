@@ -64,7 +64,48 @@ It completely supersedes legacy token managers with an isolated local vault, ato
 
 `agy-switch` uses a unified installer script (`install.sh`) that installs the Antigravity Booster Plugin and registers the standalone terminal CLI wrapper (`~/.local/bin/agy-switch`) simultaneously in a single step.
 
-### Quick Start
+### Quick Start (Remote Bootstrap One-Liner)
+
+For fresh VPS instances, Linux hosts, and terminal environments, install directly using the remote bootstrap one-liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | bash
+```
+
+**What the bootstrap one-liner does automatically:**
+- **Clones into `~/agy-switcher`**: Clones the repository into `$HOME/agy-switcher` tracking the active `dev` branch.
+- **Installs Global Plugin**: Registers the booster plugin globally in `~/.gemini/config/plugins/agy-switch` so all workspaces and AI agent sessions have immediate access.
+- **Configures CLI Launcher**: Symlinks `~/.local/bin/agy-switch` directly to `scripts/agy_switch.py`.
+- **Vault Protection**: Leaves existing credentials in `~/.antigravity-vault/` untouched; strict `0700` directory and `0600` file permissions are enforced by `agy-switch` at runtime.
+- **Idempotent Updates**: Re-running the command safely synchronizes updates (`git pull --ff-only`) while protecting uncommitted working tree changes and preserving existing vault credentials.
+
+#### Passing Installer Flags via Pipe
+To pass flags (such as `--help` or `--copy`) directly through the remote pipeline, pass `-s --` to Bash:
+
+```bash
+# View usage help without cloning
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | bash -s -- --help
+```
+
+#### Optional Environment Variable Overrides
+You can customize the destination directory, git branch, or repository URL by setting environment variables before piping to `bash`:
+
+```bash
+# Example: Custom directory and branch
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | AGY_SWITCH_HOME="$HOME/tools/agy-switcher" AGY_SWITCH_BRANCH="dev" bash
+```
+
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `AGY_SWITCH_HOME` | `$HOME/agy-switcher` | Destination directory for the cloned repository |
+| `AGY_SWITCH_BRANCH` | `dev` | Git branch to clone and synchronize |
+| `AGY_SWITCH_REPO_URL` | `https://github.com/satriyabajuhitam/agy-switcher.git` | Upstream Git repository URL |
+
+---
+
+### Manual Clone Installation (Alternative)
+
+If you prefer to clone manually or are already inside a cloned repository:
 
 ```bash
 # Clone the repository (active dev branch)
@@ -76,6 +117,8 @@ bash install.sh
 ```
 
 ### Scripted Installation Options
+
+When running directly from a cloned repository:
 
 ```bash
 # Option A: Local Workspace Installation (Default for workspace-isolated agents)

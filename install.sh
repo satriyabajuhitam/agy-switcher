@@ -4,6 +4,46 @@
 
 set -e
 
+usage() {
+    cat <<EOF
+Usage:
+  bash install.sh [OPTIONS]
+
+Options:
+  -l, --local           Install or uninstall for current workspace (.agents/plugins/agy-switch)
+  -g, --global          Install or uninstall for user home (~/.gemini/config/plugins/agy-switch)
+  -a, --all             Uninstall both local and global installations (with --uninstall)
+  -c, --copy            Copy files physically instead of symlinking (default is symlink)
+  -s, --symlink         Explicitly force symlink installation (default behavior)
+  -u, --uninstall       Remove installed plugin and clean up launcher
+  -h, --help            Show this usage information
+
+Environment Variables (Remote Bootstrap):
+  AGY_SWITCH_HOME       Destination directory (default: \$HOME/agy-switcher)
+  AGY_SWITCH_BRANCH     Git branch to clone (default: dev)
+  AGY_SWITCH_REPO_URL   Upstream repository URL (default: https://github.com/satriyabajuhitam/agy-switcher.git)
+
+Interactive Mode:
+  When run with no options and stdin is an interactive TTY, display:
+  1) Install Locally (Workspace: .agents/plugins/agy-switch)
+  2) Install Globally (User Home: ~/.gemini/config/plugins/agy-switch)
+  3) Uninstall Local Installation
+  4) Uninstall Global Installation
+  5) Uninstall All (Local & Global)
+  6) Exit
+EOF
+}
+
+# Early check for help options
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+    esac
+done
+
 # ---------------------------------------------------------
 # Execution Mode Detection (Local Mode vs Bootstrap Mode)
 # ---------------------------------------------------------
@@ -78,7 +118,7 @@ if [ "$IS_BOOTSTRAP" -eq 1 ]; then
             -l|--local|-g|--global|-a|--all)
                 has_target=1
                 ;;
-            -u|--uninstall|-h|--help)
+            -u|--uninstall)
                 has_action=1
                 ;;
         esac
@@ -100,31 +140,6 @@ INTERACTIVE=0
 # Determine script directory robustly
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOOSTER_ROOT="$SCRIPT_DIR"
-
-usage() {
-    cat <<EOF
-Usage:
-  bash install.sh [OPTIONS]
-
-Options:
-  -l, --local           Install or uninstall for current workspace (.agents/plugins/agy-switch)
-  -g, --global          Install or uninstall for user home (~/.gemini/config/plugins/agy-switch)
-  -a, --all             Uninstall both local and global installations (with --uninstall)
-  -c, --copy            Copy files physically instead of symlinking (default is symlink)
-  -s, --symlink         Explicitly force symlink installation (default behavior)
-  -u, --uninstall       Remove installed plugin and clean up launcher
-  -h, --help            Show this usage information
-
-Interactive Mode:
-  When run with no options and stdin is an interactive TTY, display:
-  1) Install Locally (Workspace: .agents/plugins/agy-switch)
-  2) Install Globally (User Home: ~/.gemini/config/plugins/agy-switch)
-  3) Uninstall Local Installation
-  4) Uninstall Global Installation
-  5) Uninstall All (Local & Global)
-  6) Exit
-EOF
-}
 
 interactive_menu() {
     echo "agy-switch Installer Menu"
