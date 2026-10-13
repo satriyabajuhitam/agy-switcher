@@ -141,7 +141,7 @@ bash install.sh --global --copy
 ### What `install.sh` Configures
 - **Plugin Registry**: Registers `agy-switch` as an active Antigravity booster plugin (`.agents/plugins/agy-switch` or `~/.gemini/config/plugins/agy-switch`).
 - **CLI Launcher**: Symlinks `~/.local/bin/agy-switch` directly to `scripts/agy_switch.py`.
-- **Vault Bootstrap**: Initialises the secure vault directory structure in `~/.antigravity-vault/` with `0700` file modes.
+- **Vault Management**: Secure vault directories (`~/.antigravity-vault/`) and `0700`/`0600` permissions are managed lazily at runtime by `scripts/agy_switch.py`, keeping installation zero-touch for existing vaults.
 
 ---
 

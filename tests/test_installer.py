@@ -1048,6 +1048,222 @@ exec "{real_git}" "$@"
                 self.assertFalse(self.global_plugin.exists(), "Help flag must not install global plugin")
                 self.assertFalse(self.bin_link.exists(), "Help flag must not create launcher link")
 
+    def test_piped_bootstrap_with_trailing_slash_in_home_trims_and_installs_cleanly(self):
+        for slash_suffix in ["/", "///"]:
+            with self.subTest(slash_suffix=slash_suffix):
+                custom_home = f"{self.temp_workspace.name}/custom-trimmed{slash_suffix}"
+                env = self.env.copy()
+                env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
+                env["AGY_SWITCH_BRANCH"] = get_current_branch()
+                env["AGY_SWITCH_HOME"] = custom_home
+
+                res = subprocess.run(
+                    f"cat '{INSTALL_SH}' | bash",
+                    shell=True,
+                    cwd=self.temp_workspace.name,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
+                expected_dir = Path(self.temp_workspace.name) / "custom-trimmed"
+                self.assertTrue(expected_dir.is_dir())
+                self.assertTrue((expected_dir / "scripts" / "agy_switch.py").is_file())
+                self.assertEqual(self.global_plugin.resolve(), expected_dir.resolve())
+
+    def test_safe_cleanup_target_refuses_deletion_of_home_on_clone_failure(self):
+        for slash_suffix in ["/", "///"]:
+            with self.subTest(slash_suffix=slash_suffix):
+                sentinel_file = Path(self.temp_home.name) / "sentinel_user_data.txt"
+                sentinel_file.write_text("critical user file")
+
+                env = self.env.copy()
+                env["AGY_SWITCH_REPO_URL"] = "file:///nonexistent/repo.git"
+                env["AGY_SWITCH_BRANCH"] = "dev"
+                # Trailing slash in AGY_SWITCH_HOME pointing directly to HOME
+                env["AGY_SWITCH_HOME"] = f"{self.temp_home.name}{slash_suffix}"
+
+                res = subprocess.run(
+                    f"cat '{INSTALL_SH}' | bash",
+                    shell=True,
+                    cwd=self.temp_workspace.name,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(res.returncode, 0)
+                # HOME and sentinel file must remain intact!
+                self.assertTrue(Path(self.temp_home.name).is_dir(), "HOME directory must never be deleted")
+                self.assertTrue(sentinel_file.is_file(), "User files in HOME must never be deleted")
+                self.assertEqual(sentinel_file.read_text(), "critical user file")
+
+    def test_installer_all_flag_without_uninstall_installs_both_local_and_global(self):
+        for flag in ["-a", "--all"]:
+            with self.subTest(flag=flag):
+                # Clean up before each subtest
+                if self.local_plugin.is_symlink() or self.local_plugin.is_dir():
+                    self.local_plugin.unlink(missing_ok=True)
+                if self.global_plugin.is_symlink() or self.global_plugin.is_dir():
+                    self.global_plugin.unlink(missing_ok=True)
+                if self.bin_link.is_symlink() or self.bin_link.is_file():
+                    self.bin_link.unlink(missing_ok=True)
+
+                res = self.run_installer(flag)
+                self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+                self.assertTrue(self.local_plugin.is_symlink(), f"Flag {flag} should install local plugin")
+                self.assertTrue(self.global_plugin.is_symlink(), f"Flag {flag} should install global plugin")
+                self.assertTrue(self.bin_link.is_symlink(), f"Flag {flag} should create launcher binary link")
+
+    def test_piped_bootstrap_forwards_all_flag_and_installs_both(self):
+        upstream = Path(self.temp_workspace.name) / "upstream_repo_all"
+        upstream.mkdir()
+        subprocess.run(["git", "init", str(upstream)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(upstream), "config", "user.name", "test"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "config", "user.email", "test@test.com"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "checkout", "-b", "dev"], check=True, capture_output=True)
+        (upstream / "scripts").mkdir()
+        (upstream / "scripts" / "agy_switch.py").write_text("#!/usr/bin/env python3\n")
+        (upstream / "scripts" / "agy_switch.py").chmod(0o755)
+        (upstream / "plugin.json").write_text('{"name": "agy-switch"}')
+        (upstream / "install.sh").write_text(INSTALL_SH.read_text())
+        (upstream / "install.sh").chmod(0o755)
+        subprocess.run(["git", "-C", str(upstream), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(upstream), "commit", "-m", "init"], check=True, capture_output=True)
+
+        env = self.env.copy()
+        env["AGY_SWITCH_REPO_URL"] = f"file://{upstream.resolve()}"
+        env["AGY_SWITCH_BRANCH"] = "dev"
+
+        cmd = f"cat '{INSTALL_SH}' | bash -s -- --all"
+        res = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=self.temp_workspace.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
+        self.assertTrue(self.local_plugin.is_symlink(), "--all via bootstrap should install local plugin")
+        self.assertTrue(self.global_plugin.is_symlink(), "--all via bootstrap should install global plugin")
+        self.assertTrue(self.bin_link.is_symlink(), "--all via bootstrap should create launcher link")
+
+    def test_piped_bootstrap_preserves_single_branch_fetch_refspec(self):
+        env = self.env.copy()
+        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
+        env["AGY_SWITCH_BRANCH"] = get_current_branch()
+
+        res = subprocess.run(
+            f"cat '{INSTALL_SH}' | bash",
+            shell=True,
+            cwd=self.temp_workspace.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0)
+        target_repo = Path(self.temp_home.name) / "agy-switcher"
+
+        fetch_cfg = subprocess.run(
+            ["git", "-C", str(target_repo), "config", "remote.origin.fetch"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # Should NOT be wild-card +refs/heads/*:refs/remotes/origin/*
+        self.assertNotIn("*", fetch_cfg.stdout.strip(), "Must not expand fetch refspec to all branches")
+
+    def test_piped_bootstrap_does_not_mutate_remote_origin_url_on_existing_repo(self):
+        # First install
+        env = self.env.copy()
+        env["AGY_SWITCH_REPO_URL"] = f"file://{REPO_ROOT}"
+        env["AGY_SWITCH_BRANCH"] = get_current_branch()
+
+        res1 = subprocess.run(
+            f"cat '{INSTALL_SH}' | bash",
+            shell=True,
+            cwd=self.temp_workspace.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res1.returncode, 0)
+        target_repo = Path(self.temp_home.name) / "agy-switcher"
+
+        # Check existing remote origin url
+        orig_url = subprocess.run(
+            ["git", "-C", str(target_repo), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        # Second bootstrap run with a different AGY_SWITCH_REPO_URL specified
+        env["AGY_SWITCH_REPO_URL"] = "https://example.com/unsolicited/url.git"
+        res2 = subprocess.run(
+            f"cat '{INSTALL_SH}' | bash",
+            shell=True,
+            cwd=self.temp_workspace.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # It should succeed without rewriting existing remote.origin.url
+        self.assertEqual(res2.returncode, 0)
+        current_url = subprocess.run(
+            ["git", "-C", str(target_repo), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(current_url, orig_url, "Existing remote.origin.url must not be mutated")
+
+    def test_piped_bootstrap_sync_fetches_strictly_target_branch(self):
+        # Create an upstream repo with dev and feature-secret branch
+        upstream = Path(self.temp_workspace.name) / "upstream_repo"
+        upstream.mkdir()
+        subprocess.run(["git", "init", str(upstream)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(upstream), "config", "user.name", "test"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "config", "user.email", "test@test.com"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "checkout", "-b", "dev"], check=True, capture_output=True)
+        
+        # Populate with dummy booster files
+        (upstream / "scripts").mkdir()
+        (upstream / "scripts" / "agy_switch.py").write_text("#!/usr/bin/env python3\n")
+        (upstream / "scripts" / "agy_switch.py").chmod(0o755)
+        (upstream / "plugin.json").write_text('{"name": "agy-switch"}')
+        (upstream / "install.sh").write_text(INSTALL_SH.read_text())
+        (upstream / "install.sh").chmod(0o755)
+        subprocess.run(["git", "-C", str(upstream), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(upstream), "commit", "-m", "init"], check=True, capture_output=True)
+
+        # Create another branch in upstream
+        subprocess.run(["git", "-C", str(upstream), "branch", "feature-secret"], check=True)
+
+        env = self.env.copy()
+        env["AGY_SWITCH_REPO_URL"] = f"file://{upstream.resolve()}"
+        env["AGY_SWITCH_BRANCH"] = "dev"
+
+        res1 = subprocess.run(
+            f"cat '{INSTALL_SH}' | bash",
+            shell=True,
+            cwd=self.temp_workspace.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res1.returncode, 0, f"Stderr: {res1.stderr}")
+        target_repo = Path(self.temp_home.name) / "agy-switcher"
+
+        # Check remote branches present in local clone
+        remotes_out = subprocess.run(
+            ["git", "-C", str(target_repo), "branch", "-r"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertNotIn("feature-secret", remotes_out, "Strict branch fetch must not pull other remote branches")
+
 
 if __name__ == "__main__":
     unittest.main()
