@@ -34,7 +34,17 @@ class TestQuotaClient(unittest.TestCase):
                 }
             ]
         }
-        self.expected_parsed_resp = {"gemini": {"quota": 80, "reset_time": 1791201600}}
+        self.expected_parsed_resp = {
+            "gemini": {
+                "quota": 80,
+                "reset_time": 1791201600,
+                "cached": False,
+                "buckets": {
+                    "5h": {"quota": 80, "reset_time": 1791201600},
+                    "weekly": {"quota": 90, "reset_time": 1791633600},
+                },
+            }
+        }
 
     def tearDown(self):
         self.test_dir.cleanup()
@@ -72,7 +82,19 @@ class TestQuotaClient(unittest.TestCase):
         mock_urlopen.return_value = mock_resp
 
         res = self.client.fetch_quota(self.access_token)
-        self.assertEqual(res, {"gemini": {"quota": 75, "reset_time": 1791201600}})
+        self.assertEqual(
+            res,
+            {
+                "gemini": {
+                    "quota": 75,
+                    "reset_time": 1791201600,
+                    "cached": False,
+                    "buckets": {
+                        "5h": {"quota": 75, "reset_time": 1791201600},
+                    },
+                }
+            },
+        )
 
     @patch("urllib.request.urlopen")
     def test_fetch_quota_network_error_fails_gracefully(self, mock_urlopen):
@@ -146,6 +168,158 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(client.cache_dir, self.cache_dir)
         self.assertEqual(client.cache_file, engine_mock.cache_file)
         self.assertEqual(client.client_id, "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
+
+    def test_parse_quota_response_invalid_inputs(self):
+        for invalid_input in [None, {}, "invalid", 123, [], {"groups": []}, {"groups": None}, {"groups": "string"}]:
+            res = self.client.parse_quota_response(invalid_input)
+            self.assertEqual(res, {})
+
+    def test_parse_quota_response_bucket_normalization(self):
+        variations = [
+            ("five_hour", "5h"),
+            ("five_hours", "5h"),
+            ("5h", "5h"),
+            ("rolling_5h", "5h"),
+            ("weekly", "weekly"),
+            ("week", "weekly"),
+            ("7d", "weekly"),
+            ("custom-limit!", "customlimit"),
+        ]
+        for raw_id, expected_id in variations:
+            payload = {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {"bucketId": raw_id, "remainingFraction": 0.8, "resetTime": "2026-10-05T12:00:00Z"}
+                        ]
+                    }
+                ]
+            }
+            res = self.client.parse_quota_response(payload)
+            self.assertIn("gemini", res)
+            self.assertIn("buckets", res["gemini"])
+            self.assertIn(expected_id, res["gemini"]["buckets"])
+            self.assertEqual(res["gemini"]["buckets"][expected_id]["quota"], 80)
+            self.assertEqual(res["gemini"]["buckets"][expected_id]["reset_time"], 1791201600)
+
+    def test_parse_quota_response_rounding_and_clamping(self):
+        test_cases = [
+            (0.796, 80),
+            (0.804, 80),
+            (0.0, 0),
+            (1.0, 100),
+            (None, 0),
+            (1.5, 100),
+            (-0.2, 0),
+            ("not_a_number", 0),
+        ]
+        for frac, expected_quota in test_cases:
+            payload = {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {"bucketId": "5h", "remainingFraction": frac, "resetTime": "2026-10-05T12:00:00Z"}
+                        ]
+                    }
+                ]
+            }
+            res = self.client.parse_quota_response(payload)
+            self.assertEqual(res["gemini"]["quota"], expected_quota)
+            self.assertEqual(res["gemini"]["buckets"]["5h"]["quota"], expected_quota)
+
+    def test_parse_quota_response_deterministic_tie_breaking(self):
+        # When 5h and weekly share identical percentages (100%), earliest reset timestamp wins
+        payload = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "weekly", "remainingFraction": 1.0, "resetTime": "2026-10-10T12:00:00Z"},
+                        {"bucketId": "5h", "remainingFraction": 1.0, "resetTime": "2026-10-05T12:00:00Z"},
+                    ]
+                }
+            ]
+        }
+        res = self.client.parse_quota_response(payload)
+        self.assertEqual(res["gemini"]["quota"], 100)
+        # 5h window (1791201600) is earlier than weekly (1791633600), so 5h must be selected as worst-case reset_time
+        self.assertEqual(res["gemini"]["reset_time"], 1791201600)
+        self.assertFalse(res["gemini"]["cached"])
+        self.assertEqual(res["gemini"]["buckets"]["5h"]["quota"], 100)
+        self.assertEqual(res["gemini"]["buckets"]["weekly"]["quota"], 100)
+
+    def test_parse_quota_response_worst_case_selection(self):
+        # Case 1: 5h is lower (10% vs 90%)
+        payload1 = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": 0.1, "resetTime": "2026-10-05T12:00:00Z"},
+                        {"bucketId": "weekly", "remainingFraction": 0.9, "resetTime": "2026-10-10T12:00:00Z"},
+                    ]
+                }
+            ]
+        }
+        res1 = self.client.parse_quota_response(payload1)
+        self.assertEqual(res1["gemini"]["quota"], 10)
+        self.assertEqual(res1["gemini"]["reset_time"], 1791201600)
+
+        # Case 2: Weekly is lower (5% vs 100%)
+        payload2 = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": 1.0, "resetTime": "2026-10-05T12:00:00Z"},
+                        {"bucketId": "weekly", "remainingFraction": 0.05, "resetTime": "2026-10-10T12:00:00Z"},
+                    ]
+                }
+            ]
+        }
+        res2 = self.client.parse_quota_response(payload2)
+        self.assertEqual(res2["gemini"]["quota"], 5)
+        self.assertEqual(res2["gemini"]["reset_time"], 1791633600)
+
+    def test_parse_quota_response_claude_preservation(self):
+        payload = {
+            "groups": [
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": 0.6, "resetTime": "2026-10-05T12:00:00Z"},
+                        {"bucketId": "weekly", "remainingFraction": 0.8, "resetTime": "2026-10-10T12:00:00Z"},
+                    ]
+                }
+            ]
+        }
+        res = self.client.parse_quota_response(payload)
+        self.assertIn("claude", res)
+        self.assertEqual(res["claude"]["quota"], 60)
+        self.assertEqual(res["claude"]["reset_time"], 1791201600)
+        self.assertFalse(res["claude"]["cached"])
+        self.assertIn("5h", res["claude"]["buckets"])
+        self.assertIn("weekly", res["claude"]["buckets"])
+
+    def test_parse_quota_response_malformed_reset_time(self):
+        payload = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": 0.5, "resetTime": "invalid-timestamp-string"},
+                        {"bucketId": "weekly", "remainingFraction": 0.7}
+                    ]
+                }
+            ]
+        }
+        res = self.client.parse_quota_response(payload)
+        self.assertEqual(res["gemini"]["quota"], 50)
+        self.assertEqual(res["gemini"]["reset_time"], 0)
+        self.assertEqual(res["gemini"]["buckets"]["5h"]["reset_time"], 0)
+        self.assertEqual(res["gemini"]["buckets"]["weekly"]["reset_time"], 0)
 
 
 if __name__ == "__main__":

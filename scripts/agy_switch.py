@@ -803,37 +803,106 @@ class QuotaClient:
             return None
 
     def parse_quota_response(self, raw_resp: dict[str, Any]) -> dict[str, Any]:
-        """Parses CloudCode response into the standardized cache schema."""
-        result = {}
-        for group in raw_resp.get("groups", []):
+        """Parses CloudCode response into the standardized Hybrid Quota Schema."""
+        if not isinstance(raw_resp, dict):
+            return {}
+        groups = raw_resp.get("groups")
+        if not isinstance(groups, list) or not groups:
+            return {}
+
+        result: dict[str, Any] = {}
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
             group_name = group.get("displayName") or group.get("group", "")
-            if "Gemini" in group_name:
+            if not isinstance(group_name, str):
+                continue
+
+            group_name_lower = group_name.lower()
+            if "gemini" in group_name_lower:
                 key = "gemini"
-            elif "Claude" in group_name:
+            elif "claude" in group_name_lower:
                 key = "claude"
             else:
                 continue
 
-            buckets = group.get("buckets", [])
-            if not buckets:
+            buckets_raw = group.get("buckets", [])
+            if not isinstance(buckets_raw, list) or not buckets_raw:
                 continue
-            
-            worst_bucket = min(buckets, key=lambda b: b.get("remainingFraction", 1.0))
-            quota_pct = int(worst_bucket.get("remainingFraction", 1.0) * 100)
-            reset_time_str = worst_bucket.get("resetTime")
-            reset_time = 0
-            if reset_time_str:
-                try:
-                    rt = reset_time_str.replace("Z", "+00:00")
-                    # Using datetime.fromisoformat with "+00:00" allows python 3.10 parsing
-                    reset_time = int(datetime.fromisoformat(rt).timestamp())
-                except Exception:
-                    pass
-            
+
+            buckets: dict[str, dict[str, Any]] = {}
+            parsed_buckets_list: list[tuple[float, int, int, dict[str, Any]]] = []
+
+            for b in buckets_raw:
+                if not isinstance(b, dict):
+                    continue
+                raw_bucket_id = str(b.get("bucketId") or "").strip().lower()
+                if any(x in raw_bucket_id for x in ("five_hour", "five_hours", "5h", "rolling_5h", "5_hour", "5-hour")):
+                    norm_id = "5h"
+                elif any(x in raw_bucket_id for x in ("weekly", "week", "7d")):
+                    norm_id = "weekly"
+                else:
+                    norm_id = re.sub(r"[^a-z0-9_]", "", raw_bucket_id)
+
+                if not norm_id:
+                    continue
+
+                frac = b.get("remainingFraction")
+                if frac is None:
+                    frac_val = 0.0
+                else:
+                    try:
+                        frac_val = float(frac)
+                    except (ValueError, TypeError):
+                        frac_val = 0.0
+                frac_val = max(0.0, min(1.0, frac_val))
+
+                quota_pct = int(round(frac_val * 100))
+
+                reset_time_str = b.get("resetTime")
+                reset_time = 0
+                if isinstance(reset_time_str, (int, float)):
+                    reset_time = max(0, int(reset_time_str))
+                elif isinstance(reset_time_str, str) and reset_time_str:
+                    if reset_time_str.isdigit():
+                        reset_time = max(0, int(reset_time_str))
+                    else:
+                        try:
+                            rt = reset_time_str.replace("Z", "+00:00")
+                            dt = datetime.fromisoformat(rt)
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            reset_time = max(0, int(dt.timestamp()))
+                        except Exception:
+                            reset_time = 0
+
+                bucket_info = {
+                    "quota": quota_pct,
+                    "reset_time": reset_time,
+                }
+                buckets[norm_id] = bucket_info
+                parsed_buckets_list.append((quota_pct, frac_val, reset_time, bucket_info))
+
+            if not parsed_buckets_list:
+                continue
+
+            # Deterministic 2-tier comparison for top-level worst-case values:
+            # Primary: lowest quota_pct (remaining percentage) ascending
+            # Secondary: earliest reset_time ascending (break ties by earliest reset timestamp)
+            def _worst_key(item: tuple[int, float, int, dict[str, Any]]) -> tuple[int, float]:
+                pct, _f_val, r_time, _ = item
+                r_key = float(r_time) if r_time > 0 else float("inf")
+                return (pct, r_key)
+
+            worst_pct, worst_frac, worst_reset, _ = min(parsed_buckets_list, key=_worst_key)
+
             result[key] = {
-                "quota": quota_pct,
-                "reset_time": reset_time,
+                "quota": worst_pct,
+                "reset_time": worst_reset,
+                "cached": False,
+                "buckets": buckets,
             }
+
         return result
 
     def fetch_quota(
