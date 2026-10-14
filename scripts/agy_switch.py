@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
@@ -280,8 +280,13 @@ class AgySwitchEngine:
         cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
         self._atomic_write_file(cli_token_path, token_payload, mode=0o600)
 
-    def update_account_access_token(self, name: str, access_token: str) -> bool:
+    def update_account_access_token(self, name: str, access_token: str, expiry: str | None = None) -> bool:
         """Updates the access token in vault and syncs to active targets if current."""
+        if not name or not isinstance(name, str) or not name.strip():
+            return False
+        name = name.strip()
+        if not access_token or not isinstance(access_token, str) or not access_token.strip():
+            return False
         token_path = self.accounts_dir / name / "token.json"
         if not token_path.is_file():
             return False
@@ -290,7 +295,10 @@ class AgySwitchEngine:
             data = json.loads(raw)
             if "token" not in data or not isinstance(data["token"], dict):
                 return False
-            data["token"]["access_token"] = access_token
+            data["token"]["access_token"] = access_token.strip()
+            if expiry is not None:
+                if isinstance(expiry, str) and expiry.strip():
+                    data["token"]["expiry"] = expiry.strip()
             self._atomic_write_json(token_path, data)
 
             if name == self.get_active_name():
@@ -754,12 +762,14 @@ class QuotaClient:
         self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
         self.cache_file = getattr(target_engine, "cache_file", None) or (self.cache_dir / "last_known_quota.json")
 
-    def refresh_access_token(self, refresh_token: str) -> str | None:
+    def refresh_access_token(self, refresh_token: str) -> dict[str, Any] | None:
         """Refreshes the OAuth access token."""
+        if not refresh_token or not isinstance(refresh_token, str) or not refresh_token.strip():
+            return None
         data = urllib.parse.urlencode({
             "client_id": self.client_id,
             "client_secret": self.client_secret,
-            "refresh_token": refresh_token,
+            "refresh_token": refresh_token.strip(),
             "grant_type": "refresh_token",
         }).encode("utf-8")
 
@@ -768,8 +778,25 @@ class QuotaClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8")
                 token_data = json.loads(body)
-                return token_data.get("access_token")
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+                if not isinstance(token_data, dict) or "error" in token_data:
+                    return None
+                raw_token = token_data.get("access_token")
+                if not isinstance(raw_token, str) or not raw_token.strip():
+                    return None
+                raw_exp = token_data.get("expires_in", 3600)
+                if isinstance(raw_exp, bool):
+                    expires_in = 3600
+                else:
+                    try:
+                        val = float(raw_exp)
+                        expires_in = int(val) if math.isfinite(val) and val > 0 else 3600
+                    except (ValueError, TypeError, OverflowError):
+                        expires_in = 3600
+                return {
+                    "access_token": raw_token.strip(),
+                    "expires_in": expires_in,
+                }
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
             print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
             return None
 
@@ -883,6 +910,16 @@ class QuotaClient:
         on_refresh: Any | None = None,
     ) -> dict[str, Any]:
         """Fetches quota from the internal CloudCode API."""
+        if isinstance(access_token, dict):
+            access_token = str(access_token.get("access_token", "")).strip()
+        elif isinstance(access_token, str):
+            access_token = access_token.strip()
+        else:
+            access_token = str(access_token or "").strip()
+
+        if not access_token:
+            return {}
+
         req = urllib.request.Request(
             self.quota_endpoint,
             data=b'{"project": ""}',
@@ -900,17 +937,19 @@ class QuotaClient:
                 return self.parse_quota_response(raw_data)
         except urllib.error.HTTPError as e:
             if e.code == 401 and refresh_token:
-                new_access_token = self.refresh_access_token(refresh_token)
-                if new_access_token:
-                    if on_refresh:
-                        try:
-                            on_refresh(new_access_token)
-                        except Exception:
-                            pass
-                    return self.fetch_quota(new_access_token, refresh_token=None)
+                new_token_data = self.refresh_access_token(refresh_token)
+                if new_token_data:
+                    new_tok_str = new_token_data.get("access_token") if isinstance(new_token_data, dict) else str(new_token_data)
+                    if new_tok_str and isinstance(new_tok_str, str) and new_tok_str.strip():
+                        if on_refresh:
+                            try:
+                                on_refresh(new_token_data)
+                            except Exception:
+                                pass
+                        return self.fetch_quota(new_tok_str.strip(), refresh_token=None)
             print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
             return {}
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
             print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
             return {}
 
@@ -1016,8 +1055,24 @@ def fetch_account_quota(
     if not tokens or not tokens.get("access_token"):
         return acc_name, {"error": "No token"}
 
-    def _on_token_refreshed(new_tok: str) -> None:
-        engine.update_account_access_token(acc_name, new_tok)
+    def _on_token_refreshed(new_token_data: dict[str, Any] | str) -> None:
+        if isinstance(new_token_data, dict):
+            access_tok = str(new_token_data.get("access_token", "")).strip()
+            if not access_tok:
+                return
+            raw_exp = new_token_data.get("expires_in", 3600)
+            if isinstance(raw_exp, bool):
+                exp_sec = 3600
+            else:
+                try:
+                    val = float(raw_exp)
+                    exp_sec = int(val) if math.isfinite(val) and val > 0 else 3600
+                except (ValueError, TypeError, OverflowError):
+                    exp_sec = 3600
+            expiry_iso = (datetime.now(timezone.utc) + timedelta(seconds=exp_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            engine.update_account_access_token(acc_name, access_tok, expiry=expiry_iso)
+        else:
+            engine.update_account_access_token(acc_name, str(new_token_data))
 
     try:
         try:
@@ -1026,11 +1081,14 @@ def fetch_account_quota(
                 refresh_token=tokens.get("refresh_token"),
                 on_refresh=_on_token_refreshed,
             )
-        except TypeError:
-            quota_res = client.fetch_quota(
-                tokens["access_token"],
-                refresh_token=tokens.get("refresh_token"),
-            )
+        except TypeError as te:
+            if "on_refresh" in str(te):
+                quota_res = client.fetch_quota(
+                    tokens["access_token"],
+                    refresh_token=tokens.get("refresh_token"),
+                )
+            else:
+                raise
         return acc_name, quota_res if quota_res else {"error": "Fetch failed"}
     except Exception as e:
         return acc_name, {"error": str(e)}

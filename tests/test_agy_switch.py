@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 import sys
 
@@ -27,6 +27,8 @@ from agy_switch import (
     format_accounts_listicle,
     format_accounts_table,
     _parse_timestamp_defensive,
+    fetch_account_quota,
+    QuotaClient,
     main,
 )
 
@@ -1223,6 +1225,199 @@ class TestFormatAccountsTable(unittest.TestCase):
         res = format_accounts_table(data, show_quota=False)
         self.assertIn("* ok", res)
         self.assertIn("-", res)  # whitespace email falls back to '-'
+
+
+class TestTokenExpiryAndUnpacking(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.gemini_dir = self.base_path / ".gemini"
+        self.engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+
+        # Setup active account
+        self.acc_active_dir = self.vault_dir / "accounts" / "active_acc"
+        self.acc_active_dir.mkdir(parents=True, exist_ok=True)
+        self.active_token_file = self.acc_active_dir / "token.json"
+        self.active_token_payload = create_sample_token("active@example.com")
+        self.active_token_payload["token"]["access_token"] = "ya29.initial_active_tok"
+        self.active_token_payload["token"]["expiry"] = "2026-10-14T00:00:00Z"
+        self.active_token_file.write_text(json.dumps(self.active_token_payload, indent=2), encoding="utf-8")
+        os.chmod(self.active_token_file, 0o600)
+        self.engine.set_active_name("active_acc")
+
+        # Setup standby account
+        self.acc_standby_dir = self.vault_dir / "accounts" / "standby_acc"
+        self.acc_standby_dir.mkdir(parents=True, exist_ok=True)
+        self.standby_token_file = self.acc_standby_dir / "token.json"
+        self.standby_token_payload = create_sample_token("standby@example.com")
+        self.standby_token_payload["token"]["access_token"] = "ya29.initial_standby_tok"
+        self.standby_token_payload["token"]["expiry"] = "2026-10-14T00:00:00Z"
+        self.standby_token_file.write_text(json.dumps(self.standby_token_payload, indent=2), encoding="utf-8")
+        os.chmod(self.standby_token_file, 0o600)
+
+        # Sync active targets initially
+        self.engine.switch_tokens("active_acc", restart_server=False, force=True)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_update_account_access_token_with_expiry(self):
+        """update_account_access_token updates access_token and expiry with 0600 mode."""
+        new_expiry = "2026-10-14T12:34:56Z"
+        res = self.engine.update_account_access_token("active_acc", "ya29.new_tok", expiry=new_expiry)
+        self.assertTrue(res)
+
+        data = json.loads(self.active_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["token"]["access_token"], "ya29.new_tok")
+        self.assertEqual(data["token"]["expiry"], new_expiry)
+
+        # File permissions check
+        mode = stat.S_IMODE(self.active_token_file.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_update_account_access_token_preserves_expiry_when_none(self):
+        """Calling update_account_access_token without expiry preserves existing expiry."""
+        orig_expiry = self.active_token_payload["token"]["expiry"]
+        res = self.engine.update_account_access_token("active_acc", "ya29.newer_tok")
+        self.assertTrue(res)
+
+        data = json.loads(self.active_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["token"]["access_token"], "ya29.newer_tok")
+        self.assertEqual(data["token"]["expiry"], orig_expiry)
+
+    def test_update_account_access_token_syncs_to_desktop_and_cli_if_active(self):
+        """Updating active account syncs updated access_token and expiry to Desktop & CLI token files."""
+        new_expiry = "2026-10-14T15:00:00Z"
+        res = self.engine.update_account_access_token("active_acc", "ya29.synced_tok", expiry=new_expiry)
+        self.assertTrue(res)
+
+        jetski_path = self.gemini_dir / "jetski-standalone-oauth-token"
+        cli_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+
+        self.assertTrue(jetski_path.is_file())
+        self.assertTrue(cli_path.is_file())
+        self.assertEqual(stat.S_IMODE(jetski_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(cli_path.stat().st_mode), 0o600)
+
+        jetski_data = json.loads(jetski_path.read_text(encoding="utf-8"))
+        cli_data = json.loads(cli_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(jetski_data["token"]["access_token"], "ya29.synced_tok")
+        self.assertEqual(jetski_data["token"]["expiry"], new_expiry)
+        self.assertEqual(cli_data["token"]["access_token"], "ya29.synced_tok")
+        self.assertEqual(cli_data["token"]["expiry"], new_expiry)
+
+    def test_update_account_access_token_does_not_sync_if_standby(self):
+        """Updating standby account does not overwrite active Desktop & CLI files."""
+        res = self.engine.update_account_access_token("standby_acc", "ya29.standby_updated", expiry="2026-10-14T18:00:00Z")
+        self.assertTrue(res)
+
+        jetski_path = self.gemini_dir / "jetski-standalone-oauth-token"
+        cli_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+
+        jetski_data = json.loads(jetski_path.read_text(encoding="utf-8"))
+        cli_data = json.loads(cli_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(jetski_data["token"]["access_token"], "ya29.initial_active_tok")
+        self.assertEqual(cli_data["token"]["access_token"], "ya29.initial_active_tok")
+
+    def test_update_account_access_token_invalid_or_whitespace_name(self):
+        """update_account_access_token handles invalid names and strips whitespace."""
+        self.assertFalse(self.engine.update_account_access_token("", "ya29.valid_tok"))
+        self.assertFalse(self.engine.update_account_access_token("   ", "ya29.valid_tok"))
+        self.assertFalse(self.engine.update_account_access_token(None, "ya29.valid_tok"))  # type: ignore
+
+        # Stripped active name correctly updates and syncs
+        res = self.engine.update_account_access_token("  active_acc  ", "ya29.stripped_name_tok", expiry="2026-10-14T20:00:00Z")
+        self.assertTrue(res)
+        jetski_path = self.gemini_dir / "jetski-standalone-oauth-token"
+        jetski_data = json.loads(jetski_path.read_text(encoding="utf-8"))
+        self.assertEqual(jetski_data["token"]["access_token"], "ya29.stripped_name_tok")
+
+    def test_fetch_account_quota_on_refresh_calculates_utc_iso_expiry(self):
+        """fetch_account_quota computes UTC ISO 8601 ending in Z from expires_in and saves it, syncing targets."""
+        mock_client = MagicMock(spec=QuotaClient)
+
+        def fake_fetch_quota(access_tok, refresh_token=None, on_refresh=None):
+            if on_refresh:
+                on_refresh({"access_token": "ya29.auto_refreshed", "expires_in": 7200})
+            return {"gemini": {"quota": 90, "reset_time": 12345, "cached": False, "buckets": {}}}
+
+        mock_client.fetch_quota.side_effect = fake_fetch_quota
+
+        with patch("agy_switch.datetime") as mock_dt:
+            from datetime import datetime as real_datetime, timezone as real_tz
+            fixed_now = real_datetime(2026, 10, 14, 10, 0, 0, tzinfo=real_tz.utc)
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat = real_datetime.fromisoformat
+
+            name, q = fetch_account_quota(self.engine, "active_acc", client=mock_client)
+            self.assertEqual(name, "active_acc")
+            self.assertIn("gemini", q)
+
+        # 7200 seconds = 2 hours -> 2026-10-14T12:00:00Z
+        data = json.loads(self.active_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["token"]["access_token"], "ya29.auto_refreshed")
+        self.assertEqual(data["token"]["expiry"], "2026-10-14T12:00:00Z")
+
+        # Verify dual targets were also synced upon active account refresh with mode 0600
+        jetski_path = self.gemini_dir / "jetski-standalone-oauth-token"
+        cli_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        self.assertEqual(stat.S_IMODE(jetski_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(cli_path.stat().st_mode), 0o600)
+        jetski_data = json.loads(jetski_path.read_text(encoding="utf-8"))
+        cli_data = json.loads(cli_path.read_text(encoding="utf-8"))
+        self.assertEqual(jetski_data["token"]["access_token"], "ya29.auto_refreshed")
+        self.assertEqual(jetski_data["token"]["expiry"], "2026-10-14T12:00:00Z")
+        self.assertEqual(cli_data["token"]["access_token"], "ya29.auto_refreshed")
+        self.assertEqual(cli_data["token"]["expiry"], "2026-10-14T12:00:00Z")
+
+    def test_fetch_account_quota_refresh_revoked_fails_gracefully(self):
+        """fetch_account_quota returns Fetch failed error dict when token refresh fails/revoked."""
+        mock_client = MagicMock(spec=QuotaClient)
+        # Client returns empty dict on revoked refresh
+        mock_client.fetch_quota.return_value = {}
+
+        name, q = fetch_account_quota(self.engine, "active_acc", client=mock_client)
+        self.assertEqual(name, "active_acc")
+        self.assertEqual(q, {"error": "Fetch failed"})
+
+    def test_update_account_access_token_empty_token_rejected(self):
+        """update_account_access_token rejects empty or whitespace access tokens."""
+        self.assertFalse(self.engine.update_account_access_token("active_acc", ""))
+        self.assertFalse(self.engine.update_account_access_token("active_acc", "   "))
+        self.assertFalse(self.engine.update_account_access_token("active_acc", None))  # type: ignore
+
+    def test_fetch_account_quota_boundary_and_float_expires_in(self):
+        """fetch_account_quota handles float strings, non-finite values, and booleans safely."""
+        test_cases = [
+            ("1800.0", "2026-10-14T10:30:00Z"),
+            ("inf", "2026-10-14T11:00:00Z"),  # defaults to 3600
+            (True, "2026-10-14T11:00:00Z"),   # defaults to 3600
+            (-10, "2026-10-14T11:00:00Z"),    # defaults to 3600
+        ]
+        for exp_val, expected_expiry in test_cases:
+            mock_client = MagicMock(spec=QuotaClient)
+
+            def fake_fetch_quota(access_tok, refresh_token=None, on_refresh=None):
+                if on_refresh:
+                    on_refresh({"access_token": "ya29.test_tok", "expires_in": exp_val})
+                return {"gemini": {"quota": 90, "reset_time": 12345, "cached": False, "buckets": {}}}
+
+            mock_client.fetch_quota.side_effect = fake_fetch_quota
+
+            with patch("agy_switch.datetime") as mock_dt:
+                from datetime import datetime as real_datetime, timezone as real_tz
+                fixed_now = real_datetime(2026, 10, 14, 10, 0, 0, tzinfo=real_tz.utc)
+                mock_dt.now.return_value = fixed_now
+                mock_dt.fromisoformat = real_datetime.fromisoformat
+
+                fetch_account_quota(self.engine, "active_acc", client=mock_client)
+
+            data = json.loads(self.active_token_file.read_text(encoding="utf-8"))
+            self.assertEqual(data["token"]["access_token"], "ya29.test_tok")
+            self.assertEqual(data["token"]["expiry"], expected_expiry, f"Failed for expires_in={exp_val}")
 
 
 if __name__ == "__main__":

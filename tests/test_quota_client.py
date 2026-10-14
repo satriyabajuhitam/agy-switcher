@@ -365,6 +365,201 @@ class TestQuotaClient(unittest.TestCase):
         self.assertIn("acc_valid", loaded["accounts"])
         self.assertNotIn("acc_error", loaded["accounts"])
 
+    @patch("urllib.request.urlopen")
+    def test_refresh_access_token_success(self, mock_urlopen):
+        """refresh_access_token returns dict with access_token and expires_in."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "access_token": "ya29.refreshed_token",
+            "expires_in": 7200,
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.client.refresh_access_token(self.refresh_token)
+        self.assertEqual(res, {
+            "access_token": "ya29.refreshed_token",
+            "expires_in": 7200,
+        })
+
+    @patch("urllib.request.urlopen")
+    def test_refresh_access_token_default_expires_in(self, mock_urlopen):
+        """refresh_access_token defaults expires_in to 3600 when omitted in response."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "access_token": "ya29.refreshed_token",
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.client.refresh_access_token(self.refresh_token)
+        self.assertEqual(res, {
+            "access_token": "ya29.refreshed_token",
+            "expires_in": 3600,
+        })
+
+    @patch("urllib.request.urlopen")
+    def test_refresh_access_token_string_and_invalid_expires_in(self, mock_urlopen):
+        """refresh_access_token parses string expires_in and defaults invalid/negative values to 3600."""
+        # String integer
+        mock_resp1 = MagicMock()
+        mock_resp1.read.return_value = json.dumps({
+            "access_token": "ya29.tok1",
+            "expires_in": "1800",
+        }).encode("utf-8")
+        mock_resp1.__enter__.return_value = mock_resp1
+        mock_urlopen.return_value = mock_resp1
+
+        res1 = self.client.refresh_access_token(self.refresh_token)
+        self.assertEqual(res1, {"access_token": "ya29.tok1", "expires_in": 1800})
+
+        # Negative number -> defaults to 3600
+        mock_resp2 = MagicMock()
+        mock_resp2.read.return_value = json.dumps({
+            "access_token": "ya29.tok2",
+            "expires_in": -100,
+        }).encode("utf-8")
+        mock_resp2.__enter__.return_value = mock_resp2
+        mock_urlopen.return_value = mock_resp2
+
+        res2 = self.client.refresh_access_token(self.refresh_token)
+        self.assertEqual(res2, {"access_token": "ya29.tok2", "expires_in": 3600})
+
+        # Non-numeric string -> defaults to 3600
+        mock_resp3 = MagicMock()
+        mock_resp3.read.return_value = json.dumps({
+            "access_token": "ya29.tok3",
+            "expires_in": "not-a-number",
+        }).encode("utf-8")
+        mock_resp3.__enter__.return_value = mock_resp3
+        mock_urlopen.return_value = mock_resp3
+
+        res3 = self.client.refresh_access_token(self.refresh_token)
+        self.assertEqual(res3, {"access_token": "ya29.tok3", "expires_in": 3600})
+
+    @patch("urllib.request.urlopen")
+    def test_refresh_access_token_error_or_missing_token(self, mock_urlopen):
+        """refresh_access_token returns None on error response or missing/empty token."""
+        for error_payload in [
+            {"error": "invalid_grant", "error_description": "Token revoked"},
+            {"access_token": ""},
+            {"access_token": "   "},
+            {"access_token": None},
+            {"access_token": 12345},
+            {},
+        ]:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(error_payload).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            res = self.client.refresh_access_token(self.refresh_token)
+            self.assertIsNone(res, f"Expected None for payload {error_payload}")
+
+    @patch("urllib.request.urlopen")
+    def test_refresh_access_token_revoked_http_error(self, mock_urlopen):
+        """refresh_access_token returns None on HTTP 400 Bad Request."""
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            self.client.token_endpoint, 400, "Bad Request", {}, None
+        )
+        res = self.client.refresh_access_token(self.refresh_token)
+        self.assertIsNone(res)
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_refresh_unpacks_dict_and_passes_string_token(self, mock_urlopen):
+        """fetch_quota unpacks the string token from refresh dict before recursive call and forwards dict to callback."""
+        mock_401 = urllib.error.HTTPError(self.client.quota_endpoint, 401, "Unauthorized", {}, None)
+
+        mock_refresh_resp = MagicMock()
+        mock_refresh_resp.read.return_value = json.dumps({
+            "access_token": "ya29.unpacked_token",
+            "expires_in": 3600,
+        }).encode("utf-8")
+        mock_refresh_resp.__enter__.return_value = mock_refresh_resp
+
+        mock_quota_success = MagicMock()
+        mock_quota_success.read.return_value = json.dumps(self.mock_quota_resp).encode("utf-8")
+        mock_quota_success.__enter__.return_value = mock_quota_success
+
+        mock_urlopen.side_effect = [mock_401, mock_refresh_resp, mock_quota_success]
+
+        callback_received = []
+
+        def on_refresh_callback(tok_data):
+            callback_received.append(tok_data)
+
+        res = self.client.fetch_quota(
+            self.access_token,
+            refresh_token=self.refresh_token,
+            on_refresh=on_refresh_callback,
+        )
+        self.assertEqual(res, self.expected_parsed_resp)
+        self.assertEqual(mock_urlopen.call_count, 3)
+
+        # Verify callback received full dictionary
+        self.assertEqual(len(callback_received), 1)
+        self.assertEqual(callback_received[0], {
+            "access_token": "ya29.unpacked_token",
+            "expires_in": 3600,
+        })
+
+        # Verify second quota request received string token, not dict
+        second_quota_call_req = mock_urlopen.call_args_list[2][0][0]
+        self.assertEqual(
+            second_quota_call_req.headers.get("Authorization"),
+            "Bearer ya29.unpacked_token",
+        )
+
+    def test_refresh_access_token_empty_or_none_refresh_token(self):
+        """refresh_access_token returns None immediately for empty or non-string refresh token without network call."""
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            self.assertIsNone(self.client.refresh_access_token(""))
+            self.assertIsNone(self.client.refresh_access_token("   "))
+            self.assertIsNone(self.client.refresh_access_token(None))  # type: ignore
+            self.assertIsNone(self.client.refresh_access_token(12345))  # type: ignore
+            mock_urlopen.assert_not_called()
+
+    @patch("urllib.request.urlopen")
+    def test_refresh_access_token_non_finite_and_bool_expires_in(self, mock_urlopen):
+        """refresh_access_token handles inf, -inf, nan, and bool without crashing, defaulting to 3600."""
+        for tricky_exp in ["inf", "-inf", float("inf"), float("-inf"), float("nan"), True, False]:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "access_token": "ya29.tricky",
+                "expires_in": tricky_exp,
+            }).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            res = self.client.refresh_access_token(self.refresh_token)
+            self.assertIsNotNone(res)
+            self.assertEqual(res["expires_in"], 3600, f"Failed for expires_in={tricky_exp}")
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_dict_access_token_at_entry(self, mock_urlopen):
+        """fetch_quota unpacks access_token if passed as a dictionary at function entry."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(self.mock_quota_resp).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.client.fetch_quota({"access_token": "ya29.entry_dict_token"})
+        self.assertEqual(res, self.expected_parsed_resp)
+
+        req_arg = mock_urlopen.call_args[0][0]
+        self.assertEqual(req_arg.headers.get("Authorization"), "Bearer ya29.entry_dict_token")
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_unicode_decode_error_fails_gracefully(self, mock_urlopen):
+        """fetch_quota returns empty dict on UnicodeDecodeError without crashing."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"\xff\xfe\x00\x00"  # Invalid utf-8
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.client.fetch_quota(self.access_token)
+        self.assertEqual(res, {})
+
 
 if __name__ == "__main__":
     unittest.main()
