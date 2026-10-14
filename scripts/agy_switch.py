@@ -1192,7 +1192,12 @@ def fetch_account_quota(
         raw_err = getattr(client, "last_error", None)
         err_msg = raw_err if isinstance(raw_err, str) and raw_err else "Fetch failed"
         raw_type = getattr(client, "last_error_type", None)
-        err_type = raw_type if isinstance(raw_type, str) and raw_type else ("auth" if any(k in err_msg.lower() for k in ("token", "unauthorized", "invalid_grant", "revoked", "401", "403")) else "network")
+        if raw_type == "http" and any(code in err_msg for code in ("500", "502", "503", "504")):
+            err_type = "network"
+        elif isinstance(raw_type, str) and raw_type:
+            err_type = raw_type
+        else:
+            err_type = "auth" if any(k in err_msg.lower() for k in ("unauthorized", "invalid_grant", "revoked", "no token", "token refresh rejected", "401", "403")) else "network"
         return acc_name, {"error": err_msg, "error_type": err_type}
     except Exception as e:
         err_str = str(e)
@@ -1873,12 +1878,22 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
     if error_val is None:
         return False
     if isinstance(error_val, dict):
-        if error_val.get("error_type") == "auth":
+        raw_type = error_val.get("error_type")
+        if raw_type == "auth":
             return True
+        if isinstance(raw_type, str) and raw_type.strip() and raw_type.strip() != "auth":
+            return False
         err_str = str(error_val.get("error", "")).lower()
     elif isinstance(error_val, Exception):
-        if isinstance(error_val, urllib.error.HTTPError) and error_val.code in (401, 403):
-            return True
+        if isinstance(error_val, urllib.error.HTTPError):
+            if error_val.code in (401, 403):
+                return True
+            if error_val.code in (500, 502, 503, 504):
+                return False
+        if isinstance(error_val, (TimeoutError, ConnectionError)):
+            return False
+        if isinstance(error_val, urllib.error.URLError) and not isinstance(error_val, urllib.error.HTTPError):
+            return False
         err_str = str(error_val).lower()
     elif isinstance(error_val, str):
         err_str = error_val.lower()
@@ -1904,11 +1919,22 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
     """Classifies whether an error represents a transient network transport failure."""
     if error_val is None:
         return False
+    if isinstance(error_val, urllib.error.HTTPError):
+        # Only classify 5xx server errors as transient network/transport errors
+        return error_val.code in (500, 502, 503, 504)
     if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError)):
         return True
     if isinstance(error_val, dict):
         if error_val.get("error_type") == "network":
             return True
+        if error_val.get("error_type") == "auth":
+            return False
+        if error_val.get("error_type") == "http":
+            code = error_val.get("code") or error_val.get("status_code")
+            if isinstance(code, int):
+                return code in (500, 502, 503, 504)
+            err_str = str(error_val.get("error", "")).lower()
+            return any(k in err_str for k in ("500", "502", "503", "504"))
         err_str = str(error_val.get("error", "")).lower()
     elif isinstance(error_val, Exception):
         err_str = str(error_val).lower()
@@ -1917,17 +1943,32 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
     else:
         err_str = str(error_val).lower()
 
-    net_keywords = ["timeout", "timed out", "urlerror", "network", "unreachable", "connection", "reset by peer", "failed to connect", "socket", "dns", "authoritative"]
+    net_keywords = [
+        "timeout", "timed out", "urlerror", "network", "unreachable",
+        "connection", "reset by peer", "failed to connect", "socket",
+        "dns", "authoritative", "500", "502", "503", "504",
+    ]
+    auth_indicators = (
+        "401", "403", "unauthorized", "invalid_grant", "revoked",
+        "no token", "token refresh rejected",
+    )
     if any(k in err_str for k in net_keywords):
-        return True
+        if not any(a in err_str for a in auth_indicators):
+            return True
 
     if client is not None:
         c_type = getattr(client, "last_error_type", None)
         if isinstance(c_type, str) and c_type == "network":
             return True
+        if isinstance(c_type, str) and c_type == "http":
+            c_err = getattr(client, "last_error", None)
+            if isinstance(c_err, str) and any(code in c_err for code in ("500", "502", "503", "504")):
+                return True
         c_err = getattr(client, "last_error", None)
-        if isinstance(c_err, str) and any(k in c_err.lower() for k in net_keywords):
-            return True
+        if isinstance(c_err, str):
+            c_err_lower = c_err.lower()
+            if any(k in c_err_lower for k in net_keywords) and not any(a in c_err_lower for a in auth_indicators):
+                return True
 
     return False
 
@@ -1998,10 +2039,11 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
 
                 if probe_error is not None:
                     # Active Probe Error Classification
-                    if _is_auth_error(probe_error, client=client):
+                    err_obj = active_quota if isinstance(active_quota, dict) else probe_error
+                    if _is_auth_error(err_obj, client=client):
                         # Auth/token corruption: do not fall back to cache; signal Tier 3 failover
                         print(f"[agy-switch hook] Active account '{active_name}' auth corruption: {probe_error}. Triggering Tier 3 failover.", file=sys.stderr)
-                    elif _is_network_error(probe_error, client=client):
+                    elif _is_network_error(err_obj, client=client) or _is_network_error(probe_error, client=client):
                         # Transient transport failure: attempt fallback to cached quota
                         if isinstance(active_cache, dict):
                             cached_status = rot_engine.get_quota_status(active_cache, model_key=model_key)
@@ -2046,14 +2088,14 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
 
             combined_quotas = {k: v for k, v in accounts_cache.items() if k in registered_names}
             now = time.time()
-            evict_keys: set[str] = set()
+            evict_keys: set[str] = set(accounts_cache.keys()) - registered_names
             for acc_name, q_data in raw_quotas.items():
                 if isinstance(q_data, dict) and "error" not in q_data and q_data:
                     entry = dict(q_data)
                     entry["cached_at"] = now
                     combined_quotas[acc_name] = entry
                 elif isinstance(q_data, dict) and q_data.get("error"):
-                    if _is_auth_error(q_data, client=client):
+                    if _is_auth_error(q_data):
                         combined_quotas.pop(acc_name, None)
                         evict_keys.add(acc_name)
 

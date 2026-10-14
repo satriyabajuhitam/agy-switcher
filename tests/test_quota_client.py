@@ -841,6 +841,56 @@ class TestQuotaClient(unittest.TestCase):
         self.assertTrue(_is_auth_error(auth_msg))
         self.assertFalse(_is_network_error(auth_msg))
 
+    def test_is_network_error_disambiguates_httperror_from_urlerror(self):
+        """HTTPError 401/403 are NOT network errors; HTTP 5xx are network errors."""
+        err_401 = urllib.error.HTTPError("https://example.com", 401, "Unauthorized", {}, None)
+        err_403 = urllib.error.HTTPError("https://example.com", 403, "Forbidden", {}, None)
+        err_500 = urllib.error.HTTPError("https://example.com", 500, "Internal Server Error", {}, None)
+        err_502 = urllib.error.HTTPError("https://example.com", 502, "Bad Gateway", {}, None)
+        err_503 = urllib.error.HTTPError("https://example.com", 503, "Service Unavailable", {}, None)
+        err_504 = urllib.error.HTTPError("https://example.com", 504, "Gateway Timeout", {}, None)
+
+        self.assertFalse(_is_network_error(err_401))
+        self.assertFalse(_is_network_error(err_403))
+        self.assertTrue(_is_network_error(err_500))
+        self.assertTrue(_is_network_error(err_502))
+        self.assertTrue(_is_network_error(err_503))
+        self.assertTrue(_is_network_error(err_504))
+
+        # Pure URLError remains network error
+        url_err = urllib.error.URLError("Connection refused")
+        self.assertTrue(_is_network_error(url_err))
+
+    def test_is_auth_error_explicit_non_auth_error_type_ignores_client_state(self):
+        """If q_data has error_type != 'auth', _is_auth_error returns False regardless of client state."""
+        auth_client = MagicMock()
+        auth_client.last_error_type = "auth"
+        auth_client.last_error = "HTTP Error 401: Unauthorized"
+
+        self.assertFalse(_is_auth_error({"error": "Timed out", "error_type": "network"}, client=auth_client))
+        self.assertFalse(_is_auth_error({"error": "Server error", "error_type": "http"}, client=auth_client))
+        self.assertFalse(_is_auth_error({"error": "General failure", "error_type": "general"}, client=auth_client))
+
+    def test_fetch_account_quota_hardening_token_endpoint_and_5xx(self):
+        """fetch_account_quota classifies token endpoint timeout and HTTP 5xx as network errors."""
+        mock_engine = MagicMock()
+        mock_engine.get_account_tokens.return_value = {"access_token": "tok_123"}
+
+        mock_client = MagicMock()
+        mock_client.fetch_quota.return_value = {}
+
+        # Bare token in endpoint timeout must not be misclassified as auth
+        mock_client.last_error = "Failed to reach token endpoint: timeout"
+        mock_client.last_error_type = None
+        _, res_timeout = fetch_account_quota(mock_engine, "acc1", client=mock_client)
+        self.assertEqual(res_timeout.get("error_type"), "network")
+
+        # HTTP 5xx server error must be classified as network
+        mock_client.last_error = "HTTP Error 503: Service Unavailable"
+        mock_client.last_error_type = "http"
+        _, res_503 = fetch_account_quota(mock_engine, "acc1", client=mock_client)
+        self.assertEqual(res_503.get("error_type"), "network")
+
     def test_quota_client_thread_local_error_isolation(self):
         """QuotaClient last_error and last_error_type maintain isolated thread-local state."""
         import threading
