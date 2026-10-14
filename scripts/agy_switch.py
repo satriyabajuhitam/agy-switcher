@@ -2008,6 +2008,9 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                     entry = dict(q_data)
                     entry["cached_at"] = now
                     combined_quotas[acc_name] = entry
+                elif isinstance(q_data, dict) and q_data.get("error"):
+                    if _is_auth_error(q_data.get("error"), client=client):
+                        combined_quotas.pop(acc_name, None)
 
             # If active_quota from Tier 2 was successful, ensure it is in combined_quotas
             if isinstance(active_quota, dict) and not active_quota.get("error") and active_quota:
@@ -2027,11 +2030,15 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
 
             # Exhaustion Evaluation Invariant:
             total_registered = len(accounts_data)
-            evaluated_count = len([acc for acc in accounts_data if acc.get("name") in combined_quotas])
+            evaluated_count = len([acc for acc in accounts_data if acc.get("name") and acc.get("name") in combined_quotas])
             all_exhausted = (
                 total_registered > 0
                 and evaluated_count == total_registered
-                and not any(rot_engine.has_available_quota(combined_quotas[acc["name"]]) for acc in accounts_data)
+                and not any(
+                    rot_engine.has_available_quota(combined_quotas[acc["name"]])
+                    for acc in accounts_data
+                    if acc.get("name") and acc.get("name") in combined_quotas
+                )
             )
 
             if all_exhausted:
