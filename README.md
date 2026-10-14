@@ -64,7 +64,48 @@ It completely supersedes legacy token managers with an isolated local vault, ato
 
 `agy-switch` uses a unified installer script (`install.sh`) that installs the Antigravity Booster Plugin and registers the standalone terminal CLI wrapper (`~/.local/bin/agy-switch`) simultaneously in a single step.
 
-### Quick Start
+### Quick Start (Remote Bootstrap One-Liner)
+
+For fresh VPS instances, Linux hosts, and terminal environments, install directly using the remote bootstrap one-liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | bash
+```
+
+**What the bootstrap one-liner does automatically:**
+- **Clones into `~/agy-switcher`**: Clones the repository into `$HOME/agy-switcher` tracking the active `dev` branch.
+- **Installs Global Plugin**: Registers the booster plugin globally in `~/.gemini/config/plugins/agy-switch` so all workspaces and AI agent sessions have immediate access.
+- **Configures CLI Launcher**: Symlinks `~/.local/bin/agy-switch` directly to `scripts/agy_switch.py`.
+- **Vault Protection**: Leaves existing credentials in `~/.antigravity-vault/` untouched; strict `0700` directory and `0600` file permissions are enforced by `agy-switch` at runtime.
+- **Idempotent Updates**: Re-running the command safely synchronizes updates (`git pull --ff-only`) while protecting uncommitted working tree changes and preserving existing vault credentials.
+
+#### Passing Installer Flags via Pipe
+To pass flags (such as `--help` or `--copy`) directly through the remote pipeline, pass `-s --` to Bash:
+
+```bash
+# View usage help without cloning
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | bash -s -- --help
+```
+
+#### Optional Environment Variable Overrides
+You can customize the destination directory, git branch, or repository URL by setting environment variables before piping to `bash`:
+
+```bash
+# Example: Custom directory and branch
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | AGY_SWITCH_HOME="$HOME/tools/agy-switcher" AGY_SWITCH_BRANCH="dev" bash
+```
+
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `AGY_SWITCH_HOME` | `$HOME/agy-switcher` | Destination directory for the cloned repository |
+| `AGY_SWITCH_BRANCH` | `dev` | Git branch to clone and synchronize |
+| `AGY_SWITCH_REPO_URL` | `https://github.com/satriyabajuhitam/agy-switcher.git` | Upstream Git repository URL |
+
+---
+
+### Manual Clone Installation (Alternative)
+
+If you prefer to clone manually or are already inside a cloned repository:
 
 ```bash
 # Clone the repository (active dev branch)
@@ -77,6 +118,8 @@ bash install.sh
 
 ### Scripted Installation Options
 
+When running directly from a cloned repository:
+
 ```bash
 # Option A: Local Workspace Installation (Default for workspace-isolated agents)
 # Installs plugin to .agents/plugins/agy-switch and links CLI to ~/.local/bin/agy-switch
@@ -85,6 +128,9 @@ bash install.sh --local
 # Option B: Global Installation (Available to all workspaces and user sessions)
 # Installs plugin to ~/.gemini/config/plugins/agy-switch and links CLI to ~/.local/bin/agy-switch
 bash install.sh --global
+
+# Option C: Dual Installation (Installs both local workspace and global user plugins)
+bash install.sh --all
 
 # Optional: Physical Copy Mode (copies files instead of symlinking)
 bash install.sh --local --copy
@@ -98,7 +144,7 @@ bash install.sh --global --copy
 ### What `install.sh` Configures
 - **Plugin Registry**: Registers `agy-switch` as an active Antigravity booster plugin (`.agents/plugins/agy-switch` or `~/.gemini/config/plugins/agy-switch`).
 - **CLI Launcher**: Symlinks `~/.local/bin/agy-switch` directly to `scripts/agy_switch.py`.
-- **Vault Bootstrap**: Initialises the secure vault directory structure in `~/.antigravity-vault/` with `0700` file modes.
+- **Vault Management**: Secure vault directories (`~/.antigravity-vault/`) and `0700`/`0600` permissions are managed lazily at runtime by `scripts/agy_switch.py`, keeping installation zero-touch for existing vaults.
 
 ---
 

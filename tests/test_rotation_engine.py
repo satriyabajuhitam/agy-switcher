@@ -289,6 +289,20 @@ class TestRotationEngine(unittest.TestCase):
         self.assertIn("gemini", all_quotas["acc2"])
         self.assertIn("error", all_quotas["no_token"])
 
+    def test_quota_status_integer_percentage_one(self):
+        """Integer percentage 1 (1%) is parsed as fraction 0.01, not 1.0 (100%)."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
+        quota_data = {"gemini": {"quota": 1, "reset_time": 1700000000}}
+        status = engine.get_quota_status(quota_data, model_key="gemini")
+        self.assertAlmostEqual(status.fraction, 0.01)
+        self.assertFalse(status.is_exhausted())
+
+        # Test integer 0 (0%)
+        quota_data_zero = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+        status_zero = engine.get_quota_status(quota_data_zero, model_key="gemini")
+        self.assertEqual(status_zero.fraction, 0.0)
+        self.assertTrue(status_zero.is_exhausted())
+
 
 if __name__ == "__main__":
     unittest.main()

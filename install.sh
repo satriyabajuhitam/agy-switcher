@@ -4,16 +4,6 @@
 
 set -e
 
-# Default settings
-INSTALL_MODE="symlink"
-TARGET=""
-UNINSTALL=0
-INTERACTIVE=0
-
-# Determine script directory robustly
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOOSTER_ROOT="$SCRIPT_DIR"
-
 usage() {
     cat <<EOF
 Usage:
@@ -22,11 +12,16 @@ Usage:
 Options:
   -l, --local           Install or uninstall for current workspace (.agents/plugins/agy-switch)
   -g, --global          Install or uninstall for user home (~/.gemini/config/plugins/agy-switch)
-  -a, --all             Uninstall both local and global installations (with --uninstall)
+  -a, --all             Install or uninstall both local and global installations
   -c, --copy            Copy files physically instead of symlinking (default is symlink)
   -s, --symlink         Explicitly force symlink installation (default behavior)
   -u, --uninstall       Remove installed plugin and clean up launcher
   -h, --help            Show this usage information
+
+Environment Variables (Remote Bootstrap):
+  AGY_SWITCH_HOME       Destination directory (default: \$HOME/agy-switcher)
+  AGY_SWITCH_BRANCH     Git branch to clone (default: dev)
+  AGY_SWITCH_REPO_URL   Upstream repository URL (default: https://github.com/satriyabajuhitam/agy-switcher.git)
 
 Interactive Mode:
   When run with no options and stdin is an interactive TTY, display:
@@ -39,6 +34,150 @@ Interactive Mode:
 EOF
 }
 
+# Early check for help options
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------
+# Execution Mode Detection (Local Mode vs Bootstrap Mode)
+# ---------------------------------------------------------
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/scripts/agy_switch.py" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/plugin.json" ]; then
+    IS_BOOTSTRAP=0
+else
+    IS_BOOTSTRAP=1
+fi
+
+if [ "$IS_BOOTSTRAP" -eq 1 ]; then
+    echo "==> agy-switch Remote Bootstrap Installer"
+    export GIT_TERMINAL_PROMPT=0
+
+    if ! command -v git >/dev/null 2>&1; then
+        echo "Error: git is required for remote installation." >&2
+        exit 1
+    fi
+
+    TARGET_DIR="${AGY_SWITCH_HOME:-$HOME/agy-switcher}"
+    while [ "$TARGET_DIR" != "/" ] && [ "${TARGET_DIR%/}" != "$TARGET_DIR" ]; do
+        TARGET_DIR="${TARGET_DIR%/}"
+    done
+    REPO_URL="${AGY_SWITCH_REPO_URL:-https://github.com/satriyabajuhitam/agy-switcher.git}"
+    BRANCH="${AGY_SWITCH_BRANCH:-dev}"
+
+    safe_cleanup_target() {
+        local target="${TARGET_DIR}"
+        while [ "$target" != "/" ] && [ "${target%/}" != "$target" ]; do
+            target="${target%/}"
+        done
+        [ -z "$target" ] && return 0
+        [ "$target" = "/" ] && return 0
+        [ "$target" = "$HOME" ] && return 0
+
+        local canonical_target=""
+        if command -v realpath >/dev/null 2>&1; then
+            canonical_target="$(realpath -m "$target" 2>/dev/null || true)"
+        elif command -v readlink >/dev/null 2>&1; then
+            canonical_target="$(readlink -m "$target" 2>/dev/null || true)"
+        fi
+        [ -z "$canonical_target" ] && return 0
+        [ "$canonical_target" = "/" ] && return 0
+
+        local canonical_home=""
+        if command -v realpath >/dev/null 2>&1; then
+            canonical_home="$(realpath -m "$HOME" 2>/dev/null || true)"
+        elif command -v readlink >/dev/null 2>&1; then
+            canonical_home="$(readlink -m "$HOME" 2>/dev/null || true)"
+        else
+            canonical_home="${HOME%/}"
+        fi
+
+        if [ -n "$canonical_home" ] && [ "$canonical_target" = "$canonical_home" ]; then
+            return 0
+        fi
+
+        if [ -d "$target" ]; then
+            rm -rf "$target"
+        fi
+    }
+
+    if [ ! -e "$TARGET_DIR" ] || [ -d "$TARGET_DIR" ] && [ -z "$(ls -A "$TARGET_DIR" 2>/dev/null)" ]; then
+        trap 'echo "Error: Installation interrupted or failed. Cleaning up incomplete clone..." >&2; safe_cleanup_target; exit 1' INT TERM
+
+        git clone --single-branch -b "$BRANCH" "$REPO_URL" "$TARGET_DIR" || {
+            echo "Error: Failed to clone repository from $REPO_URL" >&2
+            safe_cleanup_target
+            exit 1
+        }
+        trap - INT TERM
+    elif [ ! -e "$TARGET_DIR/.git" ]; then
+        echo "Error: Destination directory '$TARGET_DIR' already exists and is not an agy-switch repository." >&2
+        exit 1
+    elif [ ! -f "$TARGET_DIR/scripts/agy_switch.py" ] || [ ! -f "$TARGET_DIR/plugin.json" ]; then
+        echo "Error: Existing git repository at '$TARGET_DIR' is not an agy-switch repository." >&2
+        exit 1
+    else
+        if [ -n "$(git -C "$TARGET_DIR" status --porcelain 2>/dev/null)" ]; then
+            echo "Error: Working directory at $TARGET_DIR has uncommitted changes." >&2
+            echo "Please commit, stash, or reset your local modifications before running bootstrap." >&2
+            exit 1
+        fi
+
+        git -C "$TARGET_DIR" fetch origin "$BRANCH" || {
+            echo "Error: Failed to fetch branch '$BRANCH' from origin." >&2
+            exit 1
+        }
+        if git -C "$TARGET_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+            git -C "$TARGET_DIR" checkout "$BRANCH" || {
+                echo "Error: Failed to checkout branch '$BRANCH'." >&2
+                exit 1
+            }
+            git -C "$TARGET_DIR" merge --ff-only FETCH_HEAD || {
+                echo "Error: Cannot fast-forward branch '$BRANCH'. Local branch has diverged." >&2
+                exit 1
+            }
+        else
+            git -C "$TARGET_DIR" checkout -b "$BRANCH" FETCH_HEAD || {
+                echo "Error: Failed to checkout branch '$BRANCH'." >&2
+                exit 1
+            }
+        fi
+    fi
+
+    has_target=0
+    has_action=0
+    for arg in "$@"; do
+        case "$arg" in
+            -l|--local|-g|--global|-a|--all)
+                has_target=1
+                ;;
+            -u|--uninstall)
+                has_action=1
+                ;;
+        esac
+    done
+
+    if [ "$has_target" -eq 1 ] || [ "$has_action" -eq 1 ]; then
+        exec bash "$TARGET_DIR/install.sh" "$@"
+    else
+        exec bash "$TARGET_DIR/install.sh" --global "$@"
+    fi
+fi
+
+# Default settings
+INSTALL_MODE="symlink"
+TARGET=""
+UNINSTALL=0
+INTERACTIVE=0
+
+# Determine script directory robustly
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BOOSTER_ROOT="$SCRIPT_DIR"
+
 interactive_menu() {
     echo "agy-switch Installer Menu"
     echo "1) Install Locally (Workspace: .agents/plugins/agy-switch)"
@@ -47,7 +186,8 @@ interactive_menu() {
     echo "4) Uninstall Global Installation"
     echo "5) Uninstall All (Local & Global)"
     echo "6) Exit"
-    read -p "Select an option [1-6]: " choice
+    printf "Select an option [1-6]: "
+    read -r choice || exit 0
     case "$choice" in
         1) TARGET="local";;
         2) TARGET="global";;
@@ -88,7 +228,7 @@ if [ -z "$TARGET" ]; then
         # Default uninstall without explicit target cleans up both to prevent orphaned files
         TARGET="all"
     else
-        echo "Error: Must specify --local or --global (or use interactive menu)."
+        echo "Error: Must specify --local, --global, or --all (or use interactive menu)."
         exit 1
     fi
 fi
@@ -225,6 +365,9 @@ else
     if [ "$TARGET" = "local" ]; then
         install_target "$(get_local_dest)"
     elif [ "$TARGET" = "global" ]; then
+        install_target "$(get_global_dest)"
+    elif [ "$TARGET" = "all" ]; then
+        install_target "$(get_local_dest)"
         install_target "$(get_global_dest)"
     fi
 fi

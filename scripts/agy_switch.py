@@ -10,6 +10,7 @@ import argparse
 import base64
 from datetime import datetime, timezone
 import json
+import math
 import os
 import re
 import shutil
@@ -250,18 +251,34 @@ class AgySwitchEngine:
         self.set_active_name(account_name)
         return account_name
 
+    def _atomic_write_file(self, target_path: Path, content: str, mode: int = 0o600) -> None:
+        """Writes content to a target path atomically with specified permissions."""
+        target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp_fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=f"{target_path.name}.tmp-")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(tmp_file, mode)
+            os.replace(tmp_file, target_path)
+            tmp_file = None
+        finally:
+            if tmp_file and os.path.exists(tmp_file):
+                try:
+                    os.unlink(tmp_file)
+                except OSError:
+                    pass
+
     def _atomic_write_json(self, target_path: Path, payload: dict[str, Any]) -> None:
         """Writes JSON to a target path atomically with 0600 permissions."""
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = target_path.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            content = json.dumps(payload, indent=2) + "\n"
-            temp_file.write_text(content, encoding="utf-8")
-            os.chmod(temp_file, 0o600)
-            os.replace(temp_file, target_path)
-        finally:
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
+        self._atomic_write_file(target_path, json.dumps(payload, indent=2) + "\n", mode=0o600)
+
+    def _sync_tokens_to_targets(self, token_payload: str) -> None:
+        """Atomically emits token payload to both Desktop and CLI target files."""
+        jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
+        self._atomic_write_file(jetski_token_path, token_payload, mode=0o600)
+
+        cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        self._atomic_write_file(cli_token_path, token_payload, mode=0o600)
 
     def update_account_access_token(self, name: str, access_token: str) -> bool:
         """Updates the access token in vault and syncs to active targets if current."""
@@ -278,25 +295,7 @@ class AgySwitchEngine:
 
             if name == self.get_active_name():
                 token_payload = json.dumps(data, indent=2) + "\n"
-                jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
-                temp_jetski = jetski_token_path.with_suffix(f".tmp.{os.getpid()}")
-                try:
-                    temp_jetski.write_text(token_payload, encoding="utf-8")
-                    os.chmod(temp_jetski, 0o600)
-                    os.replace(temp_jetski, jetski_token_path)
-                finally:
-                    if temp_jetski.exists():
-                        temp_jetski.unlink(missing_ok=True)
-
-                cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
-                temp_cli = cli_token_path.with_suffix(f".tmp.{os.getpid()}")
-                try:
-                    temp_cli.write_text(token_payload, encoding="utf-8")
-                    os.chmod(temp_cli, 0o600)
-                    os.replace(temp_cli, cli_token_path)
-                finally:
-                    if temp_cli.exists():
-                        temp_cli.unlink(missing_ok=True)
+                self._sync_tokens_to_targets(token_payload)
             return True
         except Exception:
             return False
@@ -372,14 +371,7 @@ class AgySwitchEngine:
 
     def set_active_name(self, name: str) -> None:
         """Sets the active account name in the vault."""
-        temp_file = self.active_file.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            temp_file.write_text(f"{name.strip()}\n", encoding="utf-8")
-            os.chmod(temp_file, 0o600)
-            os.replace(temp_file, self.active_file)
-        finally:
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
+        self._atomic_write_file(self.active_file, f"{name.strip()}\n", mode=0o600)
 
     def list_accounts(self) -> dict[str, Any]:
         """Lists all accounts registered in the vault and marks the active account."""
@@ -435,29 +427,8 @@ class AgySwitchEngine:
         token_data = self.validate_token_file(token_file)
         token_payload = json.dumps(token_data, indent=2) + "\n"
 
-        # 1. Update Antigravity 2.0 (WSL / Desktop) token
-        jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
-        jetski_token_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_jetski = jetski_token_path.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            temp_jetski.write_text(token_payload, encoding="utf-8")
-            os.chmod(temp_jetski, 0o600)
-            os.replace(temp_jetski, jetski_token_path)
-        finally:
-            if temp_jetski.exists():
-                temp_jetski.unlink(missing_ok=True)
-
-        # 2. Update Antigravity CLI token
-        cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
-        cli_token_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_cli = cli_token_path.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            temp_cli.write_text(token_payload, encoding="utf-8")
-            os.chmod(temp_cli, 0o600)
-            os.replace(temp_cli, cli_token_path)
-        finally:
-            if temp_cli.exists():
-                temp_cli.unlink(missing_ok=True)
+        # 1 & 2. Update Antigravity 2.0 (WSL / Desktop) and CLI tokens atomically
+        self._sync_tokens_to_targets(token_payload)
 
         # 3. Update vault active marker
         self.set_active_name(name)
@@ -803,37 +774,106 @@ class QuotaClient:
             return None
 
     def parse_quota_response(self, raw_resp: dict[str, Any]) -> dict[str, Any]:
-        """Parses CloudCode response into the standardized cache schema."""
-        result = {}
-        for group in raw_resp.get("groups", []):
+        """Parses CloudCode response into the standardized Hybrid Quota Schema."""
+        if not isinstance(raw_resp, dict):
+            return {}
+        groups = raw_resp.get("groups")
+        if not isinstance(groups, list) or not groups:
+            return {}
+
+        result: dict[str, Any] = {}
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
             group_name = group.get("displayName") or group.get("group", "")
-            if "Gemini" in group_name:
+            if not isinstance(group_name, str):
+                continue
+
+            group_name_lower = group_name.lower()
+            if "gemini" in group_name_lower:
                 key = "gemini"
-            elif "Claude" in group_name:
+            elif "claude" in group_name_lower:
                 key = "claude"
             else:
                 continue
 
-            buckets = group.get("buckets", [])
-            if not buckets:
+            buckets_raw = group.get("buckets", [])
+            if not isinstance(buckets_raw, list) or not buckets_raw:
                 continue
-            
-            worst_bucket = min(buckets, key=lambda b: b.get("remainingFraction", 1.0))
-            quota_pct = int(worst_bucket.get("remainingFraction", 1.0) * 100)
-            reset_time_str = worst_bucket.get("resetTime")
-            reset_time = 0
-            if reset_time_str:
-                try:
-                    rt = reset_time_str.replace("Z", "+00:00")
-                    # Using datetime.fromisoformat with "+00:00" allows python 3.10 parsing
-                    reset_time = int(datetime.fromisoformat(rt).timestamp())
-                except Exception:
-                    pass
-            
+
+            buckets: dict[str, dict[str, Any]] = {}
+            parsed_buckets_list: list[tuple[int, float, int, dict[str, Any]]] = []
+
+            for b in buckets_raw:
+                if not isinstance(b, dict):
+                    continue
+                raw_bucket_id = str(b.get("bucketId") or "").strip().lower()
+                if any(x in raw_bucket_id for x in ("five_hour", "five_hours", "5h", "rolling_5h", "5_hour", "5-hour")):
+                    norm_id = "5h"
+                elif any(x in raw_bucket_id for x in ("weekly", "week", "7d")):
+                    norm_id = "weekly"
+                else:
+                    norm_id = re.sub(r"[^a-z0-9_]", "", raw_bucket_id)
+
+                if not norm_id:
+                    continue
+
+                frac = b.get("remainingFraction")
+                if frac is None:
+                    frac_val = 0.0
+                else:
+                    try:
+                        frac_val = float(frac)
+                    except (ValueError, TypeError):
+                        frac_val = 0.0
+                frac_val = max(0.0, min(1.0, frac_val))
+
+                quota_pct = int(round(frac_val * 100))
+
+                reset_time_str = b.get("resetTime")
+                reset_time = 0
+                if isinstance(reset_time_str, (int, float)):
+                    reset_time = max(0, int(reset_time_str))
+                elif isinstance(reset_time_str, str) and reset_time_str:
+                    if reset_time_str.isdigit():
+                        reset_time = max(0, int(reset_time_str))
+                    else:
+                        try:
+                            rt = reset_time_str.replace("Z", "+00:00")
+                            dt = datetime.fromisoformat(rt)
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            reset_time = max(0, int(dt.timestamp()))
+                        except Exception:
+                            reset_time = 0
+
+                bucket_info = {
+                    "quota": quota_pct,
+                    "reset_time": reset_time,
+                }
+                buckets[norm_id] = bucket_info
+                parsed_buckets_list.append((quota_pct, frac_val, reset_time, bucket_info))
+
+            if not parsed_buckets_list:
+                continue
+
+            # Deterministic 2-tier comparison for top-level worst-case values:
+            # Primary: lowest remainingFraction ascending (raw unrounded float)
+            # Secondary: earliest reset_time ascending (break ties by earliest reset timestamp)
+            def _worst_key(item: tuple[int, float, int, dict[str, Any]]) -> tuple[float, float]:
+                pct, _f_val, r_time, _ = item
+                r_key = float(r_time) if r_time > 0 else float("inf")
+                return (_f_val, r_key)
+
+            worst_pct, worst_frac, worst_reset, _ = min(parsed_buckets_list, key=_worst_key)
+
             result[key] = {
-                "quota": quota_pct,
-                "reset_time": reset_time,
+                "quota": worst_pct,
+                "reset_time": worst_reset,
+                "cached": False,
+                "buckets": buckets,
             }
+
         return result
 
     def fetch_quota(
@@ -889,22 +929,67 @@ class QuotaClient:
                 return {}
         return {}
 
-    def save_cache(self, data: dict[str, Any]) -> None:
-        """Atomically saves quota cache to vault cache directory."""
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+    def save_cache(self, data: dict[str, Any], merge: bool = True) -> None:
+        """Atomically saves quota cache to vault cache directory.
+
+        When merge=True and data contains an 'accounts' dict, existing cached
+        accounts not present in the new data are preserved (Cache Merge Invariant).
+        """
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self.cache_dir, 0o700)
         except OSError:
             pass
-        
+
+        data_to_write = data
+        if isinstance(data, dict) and isinstance(data.get("accounts"), dict):
+            # Exclude accounts containing "error" or nested gemini error payloads
+            def _is_valid_entry(acc_val: Any) -> bool:
+                if not isinstance(acc_val, dict) or acc_val.get("error"):
+                    return False
+                g = acc_val.get("gemini")
+                if isinstance(g, dict) and g.get("error"):
+                    return False
+                return True
+
+            incoming_valid = {
+                k: v for k, v in data["accounts"].items()
+                if _is_valid_entry(v)
+            }
+            if merge:
+                current = self.load_cache()
+                merged_accounts: dict[str, Any] = {}
+                if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
+                    # Preserve existing cached accounts that do not have errors
+                    merged_accounts = {
+                        k: v for k, v in current["accounts"].items()
+                        if _is_valid_entry(v)
+                    }
+                merged_accounts.update(incoming_valid)
+                merged_data = dict(current) if isinstance(current, dict) else {}
+                merged_data.update(data)
+                merged_data["accounts"] = merged_accounts
+                data_to_write = merged_data
+            else:
+                data_to_write = dict(data)
+                data_to_write["accounts"] = incoming_valid
+
+        tmp_file = None
         try:
             tmp_fd, tmp_file = tempfile.mkstemp(dir=self.cache_dir, prefix="quota-cache-", suffix=".tmp")
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data_to_write, f, indent=2)
             os.chmod(tmp_file, 0o600)
             os.replace(tmp_file, self.cache_file)
+            tmp_file = None
         except Exception:
             pass
+        finally:
+            if tmp_file and os.path.exists(tmp_file):
+                try:
+                    os.unlink(tmp_file)
+                except OSError:
+                    pass
 
 
 def fetch_account_quota(
@@ -925,7 +1010,7 @@ def fetch_account_quota(
         return "", {"error": "Invalid account name"}
 
     if client is None:
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
 
     tokens = engine.get_account_tokens(acc_name)
     if not tokens or not tokens.get("access_token"):
@@ -961,7 +1046,7 @@ def fetch_all_accounts_quota(
     import concurrent.futures
 
     if client is None:
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
 
     if not accounts:
         return {}
@@ -974,16 +1059,335 @@ def fetch_all_accounts_quota(
         return dict(f.result() for f in concurrent.futures.as_completed(futures))
 
 
-def format_accounts_table(result: dict[str, Any], show_quota: bool = False) -> str:
-    """Formats accounts list as a clean, human-readable terminal table."""
-    accounts = result.get("accounts", [])
+def _parse_timestamp_defensive(val: Any) -> float:
+    """Safely extracts a positive float UNIX epoch timestamp in UTC or returns float('inf')."""
+    if val is None or isinstance(val, bool):
+        return float("inf")
+    if isinstance(val, (int, float)):
+        return float(val) if math.isfinite(val) and val > 0 else float("inf")
+    if isinstance(val, str):
+        cleaned = val.strip()
+        try:
+            num = float(cleaned)
+            if math.isfinite(num) and num > 0:
+                return num
+            return float("inf")
+        except ValueError:
+            pass
+        try:
+            iso_str = cleaned.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
+            return ts if math.isfinite(ts) and ts > 0 else float("inf")
+        except Exception:
+            pass
+    return float("inf")
+
+
+def _parse_quota_defensive(val: Any) -> int | float:
+    """Safely extracts a non-negative quota percentage or returns -1."""
+    if val is None or isinstance(val, bool):
+        return -1
+    if isinstance(val, (int, float)):
+        return val if math.isfinite(val) and val >= 0 else -1
+    if isinstance(val, str):
+        try:
+            num = float(val.strip().rstrip("%"))
+            if math.isfinite(num) and num >= 0:
+                return num
+        except ValueError:
+            pass
+    return -1
+
+
+def format_countdown(reset_timestamp: int | float | str | None, current_timestamp: float | None = None) -> str:
+    """Converts a UNIX epoch reset timestamp into a relative human-readable countdown string.
+
+    Rules:
+    - If reset_timestamp is None, non-numeric/unparseable, or <= 0: returns "-"
+    - If delta <= 0: returns "expired"
+    - If delta < 3600: returns f"{max(1, delta // 60)}m" (e.g. "45m", "1m")
+    - If 3600 <= delta < 86400: returns f"{h}h {m}m" if m > 0 else f"{h}h" (e.g. "2h 15m", "2h")
+    - If delta >= 86400: returns f"{d}d {h}h" if h > 0 else f"{d}d" (e.g. "4d 2h", "3d")
+    """
+    ts = _parse_timestamp_defensive(reset_timestamp)
+    if math.isinf(ts) or ts <= 0:
+        return "-"
+
+    curr = current_timestamp if current_timestamp is not None else time.time()
+    if isinstance(curr, bool) or not isinstance(curr, (int, float)) or not math.isfinite(curr):
+        curr = time.time()
+
+    delta = int(ts - curr)
+
+    if delta <= 0:
+        return "expired"
+
+    if delta < 3600:
+        minutes = max(1, delta // 60)
+        return f"{minutes}m"
+
+    if delta < 86400:
+        h = delta // 3600
+        m = (delta % 3600) // 60
+        return f"{h}h {m}m" if m > 0 else f"{h}h"
+
+    d = delta // 86400
+    h = (delta % 86400) // 3600
+    return f"{d}d {h}h" if h > 0 else f"{d}d"
+
+
+def sort_accounts_by_quota(accounts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Sorts accounts deterministically using a 3-tier tie-breaking key:
+
+    1. Primary: -quota_val (highest available Gemini quota percentage first).
+    2. Secondary: reset_time (earliest reset timestamp first; accounts with reset time <= 0 or None map to float("inf")).
+    3. Tertiary: account name (alphabetical ascending for stable sorting).
+
+    Defensively handles missing, non-dict, or error quota payloads without crashing.
+    """
     if not accounts:
+        return []
+
+    def _sort_key(acc: dict[str, Any]) -> tuple[int | float, float, str]:
+        if not isinstance(acc, dict):
+            return (1, float("inf"), "")
+
+        q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
+        q_data = q_root.get("gemini") if isinstance(q_root.get("gemini"), dict) else {}
+
+        quota_val: int | float = -1
+        reset_time: float = float("inf")
+
+        if isinstance(q_data, dict):
+            quota_val = _parse_quota_defensive(q_data.get("quota"))
+            reset_time = _parse_timestamp_defensive(q_data.get("reset_time"))
+
+        name = str(acc.get("name") or "")
+        return (-quota_val, reset_time, name)
+
+    return sorted(accounts, key=_sort_key)
+
+
+def run_quota_pipeline(
+    engine: AgySwitchEngine,
+    data: dict[str, Any] | None,
+    client: QuotaClient | None = None,
+) -> dict[str, Any]:
+    """Executes the standard quota telemetry pipeline:
+
+    1. Fetches quotas concurrently for all accounts via fetch_all_accounts_quota.
+    2. Enforces Cache Merge Invariant: merges newly fetched valid account data into last_known_quota.json.
+    3. For accounts failing network fetch, loads last known cached telemetry if present and marks cached=True.
+       Accounts without cache are marked as Error / Unreachable.
+    4. Sorts accounts deterministically using sort_accounts_by_quota.
+    """
+    if not isinstance(data, dict):
+        return {"active": None, "accounts": []}
+
+    if client is None:
+        client = QuotaClient(timeout=2.0, engine=engine)
+
+    raw_accounts = data.get("accounts", [])
+    if not isinstance(raw_accounts, list) or not raw_accounts:
+        return data
+
+    # Defensive copy of accounts to avoid in-place mutation of caller data
+    accounts = [dict(acc) for acc in raw_accounts if isinstance(acc, dict)]
+
+    # 1. Concurrently fetch quotas
+    raw_quotas = fetch_all_accounts_quota(engine, accounts, client=client)
+
+    # 2. Extract valid quotas and merge into cache
+    valid_quotas: dict[str, Any] = {}
+    for name, q in raw_quotas.items():
+        if isinstance(q, dict) and not q.get("error") and q.get("gemini"):
+            valid_quotas[name] = q
+
+    if valid_quotas:
+        client.save_cache({
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+            "accounts": valid_quotas,
+        }, merge=True)
+
+    # Reload merged cache to get all historical + new entries
+    cache_data = client.load_cache()
+    cached_accounts = (
+        cache_data.get("accounts", {})
+        if isinstance(cache_data, dict) and isinstance(cache_data.get("accounts"), dict)
+        else {}
+    )
+
+    # 3. Apply quota / cache fallback per account
+    for acc in accounts:
+        acc_name = acc.get("name", "")
+        live_q = raw_quotas.get(acc_name)
+
+        if isinstance(live_q, dict) and not live_q.get("error") and live_q.get("gemini"):
+            # Live telemetry succeeded: sanitize to strictly {"gemini": gemini_copy}
+            gemini_copy = dict(live_q["gemini"])
+            gemini_copy["cached"] = False
+            acc["quota"] = {"gemini": gemini_copy}
+        else:
+            # Live fetch failed or error returned: check cache
+            cached_acc = cached_accounts.get(acc_name)
+            has_valid_gemini_cache = (
+                isinstance(cached_acc, dict)
+                and isinstance(cached_acc.get("gemini"), dict)
+                and not cached_acc["gemini"].get("error")
+                and "quota" in cached_acc["gemini"]
+            )
+            has_legacy_cache = (
+                isinstance(cached_acc, dict)
+                and "quota" in cached_acc
+                and not cached_acc.get("error")
+            )
+
+            if has_valid_gemini_cache:
+                gemini_copy = dict(cached_acc["gemini"])
+                gemini_copy["cached"] = True
+                acc["quota"] = {"gemini": gemini_copy}
+            elif has_legacy_cache:
+                gemini_copy = {
+                    "quota": cached_acc.get("quota", 0),
+                    "reset_time": cached_acc.get("reset_time", 0),
+                    "cached": True,
+                    "buckets": {},
+                }
+                acc["quota"] = {"gemini": gemini_copy}
+            else:
+                # No cache available: mark as Unreachable
+                acc["quota"] = {
+                    "gemini": None,
+                    "error": "Unreachable",
+                }
+
+    # 4. Sort accounts deterministically
+    result = dict(data)
+    result["accounts"] = sort_accounts_by_quota(accounts)
+    return result
+
+
+def _format_bucket_countdown(reset_ts: Any, current_timestamp: float | None = None) -> str:
+    """Helper to format countdown badge for bucket summaries without broken strings."""
+    cd = format_countdown(reset_ts, current_timestamp=current_timestamp)
+    if cd == "-":
+        return ""
+    if cd == "expired":
+        return " (expired)"
+    return f" (in {cd})"
+
+
+def _format_gemini_quota_summary(acc: dict[str, Any], current_timestamp: float | None = None) -> str:
+    """Extracts and formats Gemini quota summary for display across table and listicle views."""
+    if not isinstance(acc, dict):
+        return "Error / Unreachable"
+
+    q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
+    gemini_data = q_root.get("gemini") if isinstance(q_root.get("gemini"), dict) else None
+
+    if q_root.get("error") or gemini_data is None or (isinstance(gemini_data, dict) and gemini_data.get("error")):
+        return "Error / Unreachable"
+
+    if not isinstance(gemini_data, dict):
+        return "Error / Unreachable"
+
+    raw_cached = gemini_data.get("cached")
+    is_cached = (
+        raw_cached.strip().lower() in ("true", "1")
+        if isinstance(raw_cached, str)
+        else bool(raw_cached)
+    )
+
+    raw_quota = gemini_data.get("quota")
+    parsed_q = _parse_quota_defensive(raw_quota)
+    quota = int(round(parsed_q)) if parsed_q >= 0 else 0
+
+    if is_cached:
+        return f"{quota}% (Cached)"
+
+    buckets = gemini_data.get("buckets") if isinstance(gemini_data.get("buckets"), dict) else {}
+    b_5h = buckets.get("5h") if isinstance(buckets.get("5h"), dict) else {}
+    b_wk = buckets.get("weekly") if isinstance(buckets.get("weekly"), dict) else (buckets.get("wk") if isinstance(buckets.get("wk"), dict) else {})
+
+    def _render_bucket(tag: str, b_data: dict[str, Any]) -> str:
+        raw_b = b_data.get("quota")
+        parsed_b = _parse_quota_defensive(raw_b)
+        q_b = int(round(parsed_b)) if parsed_b >= 0 else quota
+        ts_b = b_data.get("reset_time")
+        cd_b = _format_bucket_countdown(ts_b, current_timestamp=current_timestamp)
+        return f"{tag}: {q_b}%{cd_b}"
+
+    parts: list[str] = []
+    if b_5h:
+        parts.append(_render_bucket("5h", b_5h))
+    if b_wk:
+        parts.append(_render_bucket("wk", b_wk))
+
+    if parts:
+        return f"{quota}% [{' | '.join(parts)}]"
+    return f"{quota}%"
+
+
+def format_accounts_listicle(
+    result: dict[str, Any] | None,
+    show_quota: bool = True,
+    current_timestamp: float | None = None,
+) -> str:
+    """Formats accounts list as a compact, single-line bulleted listicle for LLMs and narrow terminals."""
+    if not isinstance(result, dict):
+        return "No accounts registered in vault (~/.antigravity-vault/accounts)."
+
+    accounts = result.get("accounts", [])
+    if not isinstance(accounts, list) or not accounts:
+        return "No accounts registered in vault (~/.antigravity-vault/accounts)."
+
+    lines: list[str] = []
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        marker = "• [*]" if acc.get("is_active") else "• [ ]"
+        email_str = str(acc.get("email") or "").strip() or "-"
+        name = str(acc.get("name") or "").strip()
+        prefix = f"{marker} {name} ({email_str})"
+
+        if show_quota:
+            quota_summary = _format_gemini_quota_summary(acc, current_timestamp=current_timestamp)
+            lines.append(f"{prefix} — Gemini: {quota_summary}")
+        else:
+            status = "Active" if acc.get("is_active") else "Standby"
+            if not acc.get("valid", True):
+                status += " (Invalid)"
+            lines.append(f"{prefix} [{status}]")
+
+    active_acc = result.get("active")
+    if active_acc:
+        lines.append(f"Active Account: {active_acc}")
+    else:
+        lines.append("No account currently active. Run: agy-switch switch <account>")
+
+    return "\n".join(lines)
+
+
+def format_accounts_table(
+    result: dict[str, Any] | None,
+    show_quota: bool = False,
+    current_timestamp: float | None = None,
+) -> str:
+    """Formats accounts list as a clean, human-readable terminal table focusing exclusively on Gemini."""
+    if not isinstance(result, dict):
+        return "No accounts registered in vault (~/.antigravity-vault/accounts)."
+
+    accounts = result.get("accounts", [])
+    if not isinstance(accounts, list) or not accounts:
         return "No accounts registered in vault (~/.antigravity-vault/accounts)."
 
     header = f"{'':2} {'ACCOUNT':<20} {'EMAIL':<30} {'STATUS':<15}"
     if show_quota:
-        header += " QUOTA"
-        
+        header += " GEMINI QUOTA"
+
     lines = [
         "Antigravity Accounts (~/.antigravity-vault):",
         "-" * len(header),
@@ -992,24 +1396,19 @@ def format_accounts_table(result: dict[str, Any], show_quota: bool = False) -> s
     ]
 
     for acc in accounts:
-        marker = "* " if acc["is_active"] else "  "
-        status = "Active" if acc["is_active"] else "Standby"
-        if not acc["valid"]:
+        if not isinstance(acc, dict):
+            continue
+        marker = "* " if acc.get("is_active") else "  "
+        status = "Active" if acc.get("is_active") else "Standby"
+        if not acc.get("valid", True):
             status += " (Invalid)"
-        email_str = acc["email"] or "-"
-        line = f"{marker}{acc['name']:<20} {email_str:<30} {status:<15}"
-        
+        email_str = str(acc.get("email") or "").strip() or "-"
+        line = f"{marker}{str(acc.get('name') or ''):<20} {email_str:<30} {status:<15}"
+
         if show_quota:
-            q_data = acc.get("quota", {})
-            if "error" in q_data:
-                line += " Error"
-            elif "gemini" in q_data:
-                line += f" {q_data['gemini'].get('quota', 0)}%"
-            elif "claude" in q_data:
-                line += f" {q_data['claude'].get('quota', 0)}% (C)"
-            else:
-                line += " 0%"
-                
+            quota_summary = _format_gemini_quota_summary(acc, current_timestamp=current_timestamp)
+            line += f" {quota_summary}"
+
         lines.append(line)
 
     lines.append("-" * len(header))
@@ -1032,11 +1431,11 @@ def format_status_report(status: dict[str, Any]) -> str:
     email = status.get("email") or "unknown"
     if active:
         lines.append(f"Active Account    : {active} ({email})")
-        if "cached_quota" in status:
+        if "cached_quota" in status and isinstance(status["cached_quota"], dict):
             q_data = status["cached_quota"]
-            if "gemini" in q_data:
+            if isinstance(q_data.get("gemini"), dict):
                 lines.append(f"Cached Quota      : {q_data['gemini'].get('quota', 0)}% (Gemini)")
-            elif "claude" in q_data:
+            elif isinstance(q_data.get("claude"), dict):
                 lines.append(f"Cached Quota      : {q_data['claude'].get('quota', 0)}% (Claude)")
     else:
         lines.append("Active Account    : None (No account active)")
@@ -1141,7 +1540,9 @@ class RotationEngine:
             q_val = target_info.get("quota")
             r_val = target_info.get("reset_time")
             if q_val is not None:
-                if isinstance(q_val, (int, float)):
+                if isinstance(q_val, int):
+                    fraction = max(0.0, min(1.0, float(q_val) / 100.0))
+                elif isinstance(q_val, float):
                     if q_val > 1.0:
                         fraction = float(q_val) / 100.0
                     elif q_val >= 0.0:
@@ -1382,6 +1783,11 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     list_parser.add_argument("--format", choices=["table", "list"], default="table", help="Output format: table (default) or list (listicle)")
     list_parser.add_argument("--quota", action="store_true", help="Fetch and display quota concurrently")
 
+    # Command: quota
+    quota_parser = subparsers.add_parser("quota", help="Fetch and display current quota rankings across all accounts")
+    quota_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    quota_parser.add_argument("--format", choices=["table", "list"], default="table", help="Output format: table (default) or list (listicle)")
+
     # Command: status
     subparsers.add_parser("status", help="Show system status, active account, and server health")
 
@@ -1439,30 +1845,30 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     # Perform auto-migration if needed on startup
     migrated = engine.auto_migrate_if_needed()
-    if migrated and args.command != "migrate":
-        if args.command == "hook-pre-invocation":
+    if migrated and len(migrated) > 0 and args.command != "migrate":
+        if args.command == "hook-pre-invocation" or getattr(args, "json", False):
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}", file=sys.stderr)
         else:
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}")
 
-    if args.command == "list" or not args.command:
+    if args.command in ("quota", "list") or not args.command:
         data = engine.list_accounts()
-        if getattr(args, "quota", False):
-            client = QuotaClient(timeout=2.0)
-            quotas = fetch_all_accounts_quota(engine, data.get("accounts", []), client=client)
-            for acc in data.get("accounts", []):
-                acc["quota"] = quotas.get(acc["name"], {})
-                
+        show_quota = True if args.command == "quota" else getattr(args, "quota", False)
+        if show_quota:
+            data = run_quota_pipeline(engine, data)
+
         if getattr(args, "json", False):
             print(json.dumps(data, indent=2))
+        elif getattr(args, "format", "table") == "list":
+            print(format_accounts_listicle(data, show_quota=show_quota))
         else:
-            print(format_accounts_table(data, show_quota=getattr(args, "quota", False)))
+            print(format_accounts_table(data, show_quota=show_quota))
         return 0
 
     if args.command == "status":
         status_info = engine.get_status()
         
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
         cache_data = client.load_cache()
         
         now = datetime.now(timezone.utc).timestamp()
@@ -1470,7 +1876,6 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         
         if cache_age > 60:
             script_abs_path = str(Path(__file__).resolve())
-            import subprocess
             subprocess.Popen([sys.executable, script_abs_path, "internal-probe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
         if "accounts" in cache_data and status_info.get("active"):
@@ -1483,7 +1888,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     if args.command == "internal-probe":
         accounts_data = engine.list_accounts().get("accounts", [])
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
         raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
         valid_quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
                     
@@ -1498,7 +1903,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             active_name = engine.get_active_name()
             accounts_data = engine.list_accounts().get("accounts", [])
             
-            client = QuotaClient(timeout=2.0)
+            client = QuotaClient(timeout=2.0, engine=engine)
             raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
             valid_quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
             
