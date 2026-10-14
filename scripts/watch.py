@@ -4,6 +4,8 @@ import re
 import glob
 import json
 import math
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -591,20 +593,37 @@ class LogWatcher:
         self,
         engine: AgySwitchEngine,
         cooldown_manager: CooldownManager | None = None,
-        log_dirs: list[str] = None,
+        damping_seconds: float | list[str] = 15.0,
+        log_dirs: list[str] | None = None,
         cooldown_minutes: int = 60,
+        presence_detector: PresenceDetector | None = None,
     ):
         self.engine = engine
-        self.log_dirs = log_dirs or [
-            str(self.engine.gemini_dir / "antigravity-cli" / "log")
-            if hasattr(self.engine, "gemini_dir") and isinstance(self.engine.gemini_dir, (str, Path))
-            else str(Path.home() / ".gemini" / "antigravity-cli" / "log"),
-            str(self.engine.gemini_dir / "antigravity" / "log")
-            if hasattr(self.engine, "gemini_dir") and isinstance(self.engine.gemini_dir, (str, Path))
-            else str(Path.home() / ".gemini" / "antigravity" / "log"),
-        ]
+        if isinstance(damping_seconds, list):
+            log_dirs = damping_seconds
+            damping_seconds = 15.0
+        self.damping_seconds = float(damping_seconds)
+        self.last_switch_time: float = 0.0
+        self.file_cursors: dict[str, int] = {}
+        self.active_session_id: str | None = None
+        self.active_transcript_path: Path | None = None
+
+        if presence_detector is not None:
+            self.presence_detector = presence_detector
+        else:
+            gemini_dir = getattr(self.engine, "gemini_dir", None)
+            self.presence_detector = PresenceDetector(gemini_dir=gemini_dir)
+
+        if log_dirs is not None:
+            self.log_dirs = log_dirs
+        else:
+            gemini_dir = getattr(self.presence_detector, "gemini_dir", Path.home() / ".gemini")
+            self.log_dirs = [
+                str(self.presence_detector.cli_log_dir),
+                str(Path(gemini_dir) / "antigravity" / "log"),
+            ]
         self.cooldown_minutes = cooldown_minutes
-        
+
         if cooldown_manager is not None:
             self.cooldown_manager = cooldown_manager
         else:
@@ -619,16 +638,20 @@ class LogWatcher:
                 cache_dir=cache_dir,
                 default_cooldown_seconds=cooldown_minutes * 60,
             )
-        self.cooldown_file = getattr(self.cooldown_manager, "cooldown_file", getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json")
-        
+        self.cooldown_file = getattr(
+            self.cooldown_manager,
+            "cooldown_file",
+            getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json"
+        )
+
         self.exhaustion_regex = re.compile(
-            r"RESOURCE_EXHAUSTED \(\s*code\s*429\s*\)|Individual quota reached|weekly quota reached",
+            r"RESOURCE_EXHAUSTED|\bcode\s*429\b|429\s+Too\s+Many\s+Requests|Individual quota reached|weekly quota reached",
             re.IGNORECASE
         )
-        
-        self.file_cursors = {}
 
     def is_exhausted_message(self, line: str) -> bool:
+        if not line or not isinstance(line, str):
+            return False
         return bool(self.exhaustion_regex.search(line))
 
     def infer_target_model(self, line: str = "", active_account: str | None = None, cache: dict | None = None) -> str:
@@ -662,10 +685,106 @@ class LogWatcher:
 
         return "gemini"
 
-    def process_line(self, line: str) -> bool:
-        if self.is_exhausted_message(line):
-            print(f"[watch] Detected quota exhaustion: {line.strip()}", file=sys.stderr)
-            return self.trigger_switch(line=line)
+    def process_line(self, line: str, is_jsonl: bool = False) -> bool:
+        if not line or not isinstance(line, str):
+            return False
+
+        # Anti-thrashing damping window (15s): suppress rotation if within damping window
+        now = time.time()
+        if self.last_switch_time > 0:
+            elapsed = now - self.last_switch_time
+            if 0 <= elapsed < self.damping_seconds:
+                return False
+            elif elapsed < 0:
+                self.last_switch_time = 0.0
+
+        if not is_jsonl:
+            if self.is_exhausted_message(line):
+                print(f"[watch] Detected quota exhaustion: {line.strip()}", file=sys.stderr)
+                return self.trigger_switch(line=line)
+            return False
+
+        # Structured JSON-First Event Filtering
+        line_clean = line.strip()
+        if not line_clean.startswith("{"):
+            return False
+
+        try:
+            data = json.loads(line_clean)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+
+        if not isinstance(data, dict):
+            return False
+
+        status = data.get("status")
+        msg_type = data.get("type")
+
+        # IMMUNITY RULE: NEVER trigger rotation on DONE status or USER_INPUT type
+        if status == "DONE" or msg_type == "USER_INPUT":
+            return False
+
+        # ONLY evaluate if status == "ERROR", type == "ERROR_MESSAGE", or non-empty error field
+        is_error = (
+            status == "ERROR"
+            or msg_type == "ERROR_MESSAGE"
+            or bool(data.get("error"))
+        )
+        if not is_error:
+            return False
+
+        # Extract text from content, message, and/or error payload
+        error_parts: list[str] = []
+
+        error_val = data.get("error")
+        if error_val:
+            if isinstance(error_val, str):
+                error_parts.append(error_val)
+            else:
+                try:
+                    error_parts.append(json.dumps(error_val))
+                except Exception:
+                    error_parts.append(str(error_val))
+
+        content_val = data.get("content")
+        if content_val and (status == "ERROR" or msg_type == "ERROR_MESSAGE"):
+            if isinstance(content_val, str):
+                error_parts.append(content_val)
+            elif isinstance(content_val, list):
+                for item in content_val:
+                    if isinstance(item, str):
+                        error_parts.append(item)
+                    elif isinstance(item, dict):
+                        if "text" in item:
+                            error_parts.append(str(item["text"]))
+                        else:
+                            try:
+                                error_parts.append(json.dumps(item))
+                            except Exception:
+                                error_parts.append(str(item))
+                    else:
+                        error_parts.append(str(item))
+            elif isinstance(content_val, dict):
+                try:
+                    error_parts.append(json.dumps(content_val))
+                except Exception:
+                    error_parts.append(str(content_val))
+
+        message_val = data.get("message")
+        if message_val and (status == "ERROR" or msg_type == "ERROR_MESSAGE"):
+            if isinstance(message_val, str):
+                error_parts.append(message_val)
+            else:
+                try:
+                    error_parts.append(json.dumps(message_val))
+                except Exception:
+                    error_parts.append(str(message_val))
+
+        combined_text = " ".join(error_parts)
+        if self.is_exhausted_message(combined_text):
+            print(f"[watch] Detected structured JSON quota exhaustion: {combined_text.strip()[:160]}", file=sys.stderr)
+            return self.trigger_switch(line=combined_text)
+
         return False
 
     def get_cooldowns(self) -> dict:
@@ -674,7 +793,49 @@ class LogWatcher:
     def set_cooldown(self, account_name: str, reset_time: float | None = None, reason: str = "RESOURCE_EXHAUSTED"):
         return self.cooldown_manager.set_cooldown(account_name, reset_time=reset_time, reason=reason)
 
+    def _notify_desktop(self, target_account: str, reason: str = "") -> None:
+        """Fires an asynchronous, non-blocking desktop notification via notify-send if installed."""
+        notify_bin = shutil.which("notify-send")
+        if notify_bin:
+            title = "agy-switch"
+            msg = f"Auto-rotated to '{target_account}' ({reason})"
+            try:
+                subprocess.Popen(
+                    [notify_bin, title, msg],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+
+        # Log event to watch.log
+        vault_dir = getattr(self.engine, "vault_dir", None)
+        if not isinstance(vault_dir, (str, Path)):
+            vault_dir = Path.home() / ".antigravity-vault"
+        log_file = Path(vault_dir) / "watch.log"
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with open(log_file, "a", encoding="utf-8") as f:
+                ts = datetime.now(timezone.utc).isoformat()
+                f.write(f"[{ts}] Switched to '{target_account}' ({reason})\n")
+        except Exception:
+            pass
+
     def trigger_switch(self, line: str = "", model_hint: str | None = None) -> bool:
+        # Check damping window
+        now = time.time()
+        if self.last_switch_time > 0:
+            elapsed = now - self.last_switch_time
+            if 0 <= elapsed < self.damping_seconds:
+                print(
+                    f"[watch] Damping window active ({elapsed:.1f}s < {self.damping_seconds}s). "
+                    f"Suppressing rotation.",
+                    file=sys.stderr,
+                )
+                return False
+            elif elapsed < 0:
+                self.last_switch_time = 0.0
+
         active_name = self.engine.get_active_name()
         if not active_name:
             print("[watch] No active account found. Cannot switch.", file=sys.stderr)
@@ -728,71 +889,136 @@ class LogWatcher:
 
         rot_engine = RotationEngine(model_name=resolved_model, active_account_id=active_name)
         target_account = rot_engine.evaluate(valid_accounts, current_active=active_name, target_model=resolved_model)
-        
+
         if not target_account or target_account == active_name:
             # Fallback to the first available if rotation engine is strict
             target_account = valid_accounts[0]["name"]
-            
+
         print(f"[watch] Switching from '{active_name}' to '{target_account}' mid-turn...", file=sys.stderr)
         try:
             self.engine.switch_tokens(target_account, restart_server=False, force=True)
+            self.last_switch_time = time.time()
             print(f"[watch] Successfully switched to '{target_account}'.", file=sys.stderr)
+
+            # Fire non-blocking desktop notification
+            self._notify_desktop(target_account=target_account, reason=reason)
+
             # small sleep to avoid rapid re-triggering for the same error
-            time.sleep(2)
+            time.sleep(0.1)
             return True
         except Exception as e:
             print(f"[watch] Error switching accounts: {e}", file=sys.stderr)
             return False
 
-    def scan_new_files(self) -> list[str]:
-        log_files = []
-        for log_dir in self.log_dirs:
-            if not os.path.isdir(log_dir):
-                continue
-            log_files.extend(glob.glob(os.path.join(log_dir, "*.log")))
-        return log_files
+    def scan_active_targets(self) -> list[str]:
+        """
+        Returns list of file paths to tail:
+        1. Current active Desktop transcript (if active session discovered).
+        2. CLI logs from ~/.gemini/antigravity-cli/log/*.log.
+        Handles dynamic active session switching and cursor reset/cleanup.
+        """
+        current_session_id = self.presence_detector.get_active_session_id()
+        if current_session_id != self.active_session_id:
+            # Active session changed: clean up previous transcript cursor
+            if self.active_transcript_path:
+                prev_path_str = str(self.active_transcript_path)
+                if prev_path_str in self.file_cursors:
+                    del self.file_cursors[prev_path_str]
+            self.active_session_id = current_session_id
+            self.active_transcript_path = self.presence_detector.get_active_transcript_path()
 
-    def watch_loop(self):
+        # Clean up any stale jsonl transcript cursors not matching active transcript
+        active_transcript_str = str(self.active_transcript_path) if self.active_transcript_path else None
+        for path_key in list(self.file_cursors.keys()):
+            if path_key.endswith(".jsonl") and path_key != active_transcript_str:
+                del self.file_cursors[path_key]
+
+        targets = list(self.presence_detector.get_watch_targets(as_str=True))
+
+        # Check custom log_dirs if provided
+        if getattr(self, "log_dirs", None):
+            for log_dir in self.log_dirs:
+                if not os.path.isdir(log_dir):
+                    continue
+                if hasattr(self.presence_detector, "cli_log_dir") and os.path.abspath(log_dir) == os.path.abspath(str(self.presence_detector.cli_log_dir)):
+                    continue
+                for f in glob.glob(os.path.join(log_dir, "*.log")):
+                    if f not in targets:
+                        targets.append(f)
+
+        return targets
+
+    def scan_new_files(self) -> list[str]:
+        return self.scan_active_targets()
+
+    def poll_once(self) -> int:
+        """
+        Polls active targets once for new lines and processes them.
+        Returns the number of account switches triggered during this polling cycle.
+        """
+        current_targets = self.scan_active_targets()
+        switches_triggered = 0
+
+        # Initialize cursors for newly discovered files (start at end of file)
+        for target in current_targets:
+            if target not in self.file_cursors:
+                try:
+                    self.file_cursors[target] = os.path.getsize(target)
+                except OSError:
+                    self.file_cursors[target] = 0
+
+        # Process lines for all active tracked files
+        for target in list(self.file_cursors.keys()):
+            if not os.path.isfile(target):
+                del self.file_cursors[target]
+                continue
+
+            try:
+                current_size = os.path.getsize(target)
+            except OSError:
+                continue
+
+            cursor = self.file_cursors[target]
+            if current_size < cursor:
+                # File was rotated/truncated: reset cursor to beginning
+                cursor = 0
+
+            if current_size > cursor:
+                try:
+                    with open(target, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(cursor)
+                        lines = f.readlines()
+                        self.file_cursors[target] = f.tell()
+
+                        is_jsonl = target.endswith(".jsonl") or target.endswith("transcript.jsonl")
+                        for line in lines:
+                            if self.process_line(line, is_jsonl=is_jsonl):
+                                switches_triggered += 1
+                                # Failover triggered: break from remaining lines in this file
+                                # to prevent cascading triggers from duplicate burst lines
+                                break
+                except OSError:
+                    continue
+
+        return switches_triggered
+
+    def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None):
         print("[watch] Daemon started, tailing logs for quota exhaustion...", file=sys.stderr)
+        iterations = 0
         while True:
             try:
-                current_files = self.scan_new_files()
-                for file_path in current_files:
-                    if file_path not in self.file_cursors:
-                        # Start tailing from the end of new files
-                        self.file_cursors[file_path] = os.path.getsize(file_path)
-
-                for file_path in list(self.file_cursors.keys()):
-                    if not os.path.isfile(file_path):
-                        del self.file_cursors[file_path]
-                        continue
-
-                    current_size = os.path.getsize(file_path)
-                    cursor = self.file_cursors[file_path]
-
-                    if current_size < cursor:
-                        # File was rotated/truncated
-                        cursor = 0
-
-                    if current_size > cursor:
-                        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                            f.seek(cursor)
-                            lines = f.readlines()
-                            self.file_cursors[file_path] = f.tell()
-                            
-                            for line in lines:
-                                if self.process_line(line):
-                                    # If a failover switch was triggered, break out of this batch
-                                    # to prevent cascading failovers from duplicate burst error lines.
-                                    break
-                                
-                time.sleep(0.5)
+                self.poll_once()
+                iterations += 1
+                if max_iterations is not None and iterations >= max_iterations:
+                    break
+                time.sleep(poll_interval)
             except KeyboardInterrupt:
                 print("\n[watch] Stopping daemon.", file=sys.stderr)
                 break
             except Exception as e:
                 print(f"[watch] Unhandled exception in loop: {e}", file=sys.stderr)
                 time.sleep(5)
+
 
 if __name__ == "__main__":
     engine = AgySwitchEngine()

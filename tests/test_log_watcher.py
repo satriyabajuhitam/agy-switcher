@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -737,6 +738,337 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
         with patch("time.time", return_value=now):
             res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
             self.assertFalse(res)
+
+
+class TestLogWatcherProcessing(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.tmp_dir.name)
+        self.cache_dir = self.base_dir / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir = self.base_dir / "vault"
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.get_active_name.return_value = "acc1"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},
+            ],
+        }
+
+        self.cooldown_mgr = CooldownManager(self.cache_dir)
+        self.watcher = LogWatcher(
+            engine=self.engine_mock,
+            cooldown_manager=self.cooldown_mgr,
+            damping_seconds=15.0,
+            log_dirs=[str(self.base_dir)],
+        )
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_error_status_resource_exhausted_triggers_switch(self, mock_switch):
+        """Line with status == 'ERROR' and RESOURCE_EXHAUSTED in content triggers rotation."""
+        line = json.dumps({
+            "status": "ERROR",
+            "type": "MODEL",
+            "content": "Error: RESOURCE_EXHAUSTED (code 429): Quota limit reached",
+        })
+        res = self.watcher.process_line(line, is_jsonl=True)
+        self.assertTrue(res)
+        mock_switch.assert_called_once()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_error_status_code_429_triggers_switch(self, mock_switch):
+        """Line with status == 'ERROR' and code 429 in content triggers rotation."""
+        line = json.dumps({
+            "status": "ERROR",
+            "content": "HTTP error: code 429 Too Many Requests",
+        })
+        res = self.watcher.process_line(line, is_jsonl=True)
+        self.assertTrue(res)
+        mock_switch.assert_called_once()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_error_field_payload_triggers_switch(self, mock_switch):
+        """Line with error payload field containing exhaustion error triggers rotation."""
+        line = json.dumps({
+            "status": "FAILED",
+            "error": {"code": 429, "message": "RESOURCE_EXHAUSTED"},
+        })
+        res = self.watcher.process_line(line, is_jsonl=True)
+        self.assertTrue(res)
+        mock_switch.assert_called_once()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_error_message_type_triggers_switch(self, mock_switch):
+        """Line with type == 'ERROR_MESSAGE' triggers rotation on exhaustion keywords."""
+        line = json.dumps({
+            "type": "ERROR_MESSAGE",
+            "content": "Individual quota reached for active model",
+        })
+        res = self.watcher.process_line(line, is_jsonl=True)
+        self.assertTrue(res)
+        mock_switch.assert_called_once()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_weekly_quota_triggers_switch(self, mock_switch):
+        """Line with status == 'ERROR' and 'weekly quota reached' triggers rotation."""
+        line = json.dumps({
+            "status": "ERROR",
+            "content": "weekly quota reached, resets on Monday",
+        })
+        res = self.watcher.process_line(line, is_jsonl=True)
+        self.assertTrue(res)
+        mock_switch.assert_called_once()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_immunity_done_status_with_exhaustion_text(self, mock_switch):
+        """Line with status == 'DONE' DOES NOT trigger rotation even if content contains RESOURCE_EXHAUSTED."""
+        line = json.dumps({
+            "status": "DONE",
+            "type": "PLANNER_RESPONSE",
+            "content": "The user asked how to handle RESOURCE_EXHAUSTED and code 429 errors.",
+        })
+        res = self.watcher.process_line(line, is_jsonl=True)
+        self.assertFalse(res)
+        mock_switch.assert_not_called()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_immunity_user_input_type_with_exhaustion_text(self, mock_switch):
+        """Line with type == 'USER_INPUT' DOES NOT trigger rotation even if content mentions quota exhaustion."""
+        line = json.dumps({
+            "type": "USER_INPUT",
+            "status": "ERROR",  # Even if status is somehow ERROR, USER_INPUT is immune
+            "content": "Why did my previous request say RESOURCE_EXHAUSTED?",
+        })
+        res = self.watcher.process_line(line, is_jsonl=True)
+        self.assertFalse(res)
+        mock_switch.assert_not_called()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_jsonl_immunity_model_thinking_and_code_view(self, mock_switch):
+        """Line representing model thinking or code file inspection DOES NOT trigger rotation."""
+        # Non-error planner response (status IN_PROGRESS or missing)
+        code_line = json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "def handle_error():\n    if err == 'RESOURCE_EXHAUSTED':\n        return True",
+        })
+        self.assertFalse(self.watcher.process_line(code_line, is_jsonl=True))
+        mock_switch.assert_not_called()
+
+        # Model thinking field mentioning exhaustion without error status
+        thinking_line = json.dumps({
+            "type": "MODEL",
+            "thinking": "Thinking about RESOURCE_EXHAUSTED (code 429)...",
+            "content": "Here is the solution to your query.",
+        })
+        self.assertFalse(self.watcher.process_line(thinking_line, is_jsonl=True))
+        mock_switch.assert_not_called()
+
+    def test_jsonl_malformed_and_non_json_lines_ignored(self):
+        """Malformed JSON or non-JSON lines in JSONL mode return False safely."""
+        self.assertFalse(self.watcher.process_line("{malformed json line", is_jsonl=True))
+        self.assertFalse(self.watcher.process_line("not json at all", is_jsonl=True))
+        self.assertFalse(self.watcher.process_line("", is_jsonl=True))
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_raw_cli_log_detects_exhaustion(self, mock_switch):
+        """Raw CLI text line with exhaustion pattern triggers rotation."""
+        line = "2026-10-14 10:00:00 [ERROR] RESOURCE_EXHAUSTED (code 429) received"
+        res = self.watcher.process_line(line, is_jsonl=False)
+        self.assertTrue(res)
+        mock_switch.assert_called_once_with(line=line)
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_raw_cli_log_ignores_normal_lines(self, mock_switch):
+        """Raw CLI text line without exhaustion pattern does not trigger rotation."""
+        line = "2026-10-14 10:00:00 [INFO] Successfully completed request"
+        res = self.watcher.process_line(line, is_jsonl=False)
+        self.assertFalse(res)
+        mock_switch.assert_not_called()
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_damping_window_suppresses_subsequent_rotations(self, mock_sleep):
+        """Exhaustion events within 15 seconds of a prior switch are suppressed."""
+        now = 1000.0
+        line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
+
+        # Mock RotationEngine to return acc2
+        with patch("scripts.watch.RotationEngine") as mock_rot_cls:
+            mock_rot = MagicMock()
+            mock_rot.evaluate.return_value = "acc2"
+            mock_rot_cls.return_value = mock_rot
+
+            # First event at t = 1000.0 -> Successful switch
+            with patch("time.time", return_value=now):
+                res1 = self.watcher.process_line(line, is_jsonl=True)
+                self.assertTrue(res1)
+                self.assertEqual(self.watcher.last_switch_time, 1000.0)
+                self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+            # Second event at t = 1005.0 (5s elapsed < 15s damping window) -> Suppressed
+            with patch("time.time", return_value=now + 5.0):
+                res2 = self.watcher.process_line(line, is_jsonl=True)
+                self.assertFalse(res2)
+                # switch_tokens NOT called again
+                self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+            # Third event at t = 1014.9 (14.9s elapsed < 15s damping window) -> Suppressed
+            with patch("time.time", return_value=now + 14.9):
+                res3 = self.watcher.process_line(line, is_jsonl=True)
+                self.assertFalse(res3)
+                self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+            # Fourth event at t = 1015.1 (15.1s elapsed >= 15s damping window) -> Allowed
+            # Reset acc1 as active or valid for next test
+            self.cooldown_mgr.clear_cooldown("acc1")
+            with patch("time.time", return_value=now + 15.1):
+                res4 = self.watcher.process_line(line, is_jsonl=True)
+                self.assertTrue(res4)
+                self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
+                self.assertEqual(self.watcher.last_switch_time, 1015.1)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_damping_window_resets_on_backward_clock_jump(self, mock_sleep):
+        """When system clock jumps backward (e.g. NTP sync), damping resets safely instead of hanging."""
+        line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
+        self.watcher.last_switch_time = 2000.0
+
+        with patch("scripts.watch.RotationEngine") as mock_rot_cls:
+            mock_rot = MagicMock()
+            mock_rot.evaluate.return_value = "acc2"
+            mock_rot_cls.return_value = mock_rot
+
+            # Clock moved back to 1000.0 (elapsed is -1000 < 0)
+            with patch("time.time", return_value=1000.0):
+                res = self.watcher.process_line(line, is_jsonl=True)
+                self.assertTrue(res)
+                self.assertEqual(self.watcher.last_switch_time, 1000.0)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    @patch("scripts.watch.RotationEngine")
+    def test_trigger_switch_calls_engine_switch_tokens_turn_safe(self, mock_rot_cls, mock_sleep):
+        """trigger_switch calls engine.switch_tokens with restart_server=False and force=True."""
+        mock_rot = MagicMock()
+        mock_rot.evaluate.return_value = "acc2"
+        mock_rot_cls.return_value = mock_rot
+
+        res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+        self.assertTrue(res)
+        self.engine_mock.switch_tokens.assert_called_once_with("acc2", restart_server=False, force=True)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    @patch("scripts.watch.RotationEngine")
+    @patch("scripts.watch.shutil.which", return_value="/usr/bin/notify-send")
+    @patch("scripts.watch.subprocess.Popen")
+    def test_trigger_switch_spawns_nonblocking_desktop_notification_when_available(
+        self, mock_popen, mock_which, mock_rot_cls, mock_sleep
+    ):
+        """If notify-send is installed, trigger_switch spawns it asynchronously with DEVNULL."""
+        mock_rot = MagicMock()
+        mock_rot.evaluate.return_value = "acc2"
+        mock_rot_cls.return_value = mock_rot
+
+        self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+
+        mock_which.assert_called_with("notify-send")
+        mock_popen.assert_called_once()
+        popen_args, popen_kwargs = mock_popen.call_args
+        cmd_args = popen_args[0]
+        self.assertEqual(cmd_args[0], "/usr/bin/notify-send")
+        self.assertIn("agy-switch", cmd_args[1])
+        self.assertIn("acc2", cmd_args[2])
+        self.assertEqual(popen_kwargs.get("stdout"), subprocess.DEVNULL)
+        self.assertEqual(popen_kwargs.get("stderr"), subprocess.DEVNULL)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    @patch("scripts.watch.RotationEngine")
+    @patch("scripts.watch.shutil.which", return_value=None)
+    @patch("scripts.watch.subprocess.Popen")
+    def test_trigger_switch_skips_desktop_notification_when_missing(
+        self, mock_popen, mock_which, mock_rot_cls, mock_sleep
+    ):
+        """If notify-send is NOT installed, no subprocess is spawned."""
+        mock_rot = MagicMock()
+        mock_rot.evaluate.return_value = "acc2"
+        mock_rot_cls.return_value = mock_rot
+
+        self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+        mock_which.assert_called_with("notify-send")
+        mock_popen.assert_not_called()
+
+    def test_dynamic_active_session_switching_and_cursor_cleanup(self):
+        """When active session ID changes, watcher switches transcript target and prunes old cursor."""
+        mock_detector = MagicMock()
+        self.watcher.presence_detector = mock_detector
+
+        # Sesi 1
+        transcript_s1 = self.base_dir / "s1" / "transcript.jsonl"
+        mock_detector.get_active_session_id.return_value = "session-1"
+        mock_detector.get_active_transcript_path.return_value = transcript_s1
+        mock_detector.get_watch_targets.return_value = [str(transcript_s1)]
+
+        targets1 = self.watcher.scan_active_targets()
+        self.assertIn(str(transcript_s1), targets1)
+        self.assertEqual(self.watcher.active_session_id, "session-1")
+
+        # Simulate cursor set for session 1
+        self.watcher.file_cursors[str(transcript_s1)] = 1234
+
+        # Sesi berubah ke Sesi 2
+        transcript_s2 = self.base_dir / "s2" / "transcript.jsonl"
+        mock_detector.get_active_session_id.return_value = "session-2"
+        mock_detector.get_active_transcript_path.return_value = transcript_s2
+        mock_detector.get_watch_targets.return_value = [str(transcript_s2)]
+
+        targets2 = self.watcher.scan_active_targets()
+        self.assertIn(str(transcript_s2), targets2)
+        self.assertEqual(self.watcher.active_session_id, "session-2")
+        # Old cursor must be pruned!
+        self.assertNotIn(str(transcript_s1), self.watcher.file_cursors)
+
+    def test_poll_once_reads_lines_and_handles_truncation(self):
+        """poll_once correctly tails file, advances cursor, and resets cursor on truncation."""
+        test_file = self.base_dir / "test_session.transcript.jsonl"
+        test_file.write_text('{"type": "START"}\n', encoding="utf-8")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "test-session"
+        mock_detector.get_active_transcript_path.return_value = test_file
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        self.watcher.presence_detector = mock_detector
+
+        # Initial poll sets cursor to end of file
+        self.watcher.poll_once()
+        initial_cursor = self.watcher.file_cursors[str(test_file)]
+        self.assertEqual(initial_cursor, test_file.stat().st_size)
+
+        # Append an error line
+        error_line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"}) + "\n"
+        with open(test_file, "a", encoding="utf-8") as f:
+            f.write(error_line)
+
+        # Mock trigger_switch
+        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            switches = self.watcher.poll_once()
+            self.assertEqual(switches, 1)
+            mock_switch.assert_called_once()
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], test_file.stat().st_size)
+
+        # Truncate file (simulate log rotation / rewrite)
+        test_file.write_text('{"type": "RESET"}\n', encoding="utf-8")
+        self.assertTrue(test_file.stat().st_size < self.watcher.file_cursors[str(test_file)])
+
+        self.watcher.poll_once()
+        # Cursor should adapt to the new truncated file size
+        self.assertEqual(self.watcher.file_cursors[str(test_file)], test_file.stat().st_size)
 
 
 if __name__ == "__main__":
