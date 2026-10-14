@@ -19,7 +19,8 @@ It completely supersedes legacy token managers with an isolated local vault, ato
 - **Absolute Privacy & Zero Telemetry**:
   - **No Telemetry or Tracking**: `agy-switch` never phones home or collects analytics.
   - **Direct Google Authentication Only**: Zero cloud token intermediaries or proxies. OAuth credentials communicate directly with official Google endpoints solely when refreshing tokens or probing quota limits.
-- **Atomic Credential Swaps**: Credential propagation uses POSIX atomic filesystem replacement (`os.replace`), preventing partial writes, race conditions, or token corruption between Antigravity 2.0 Desktop and the Antigravity CLI.
+- **Atomic Credential & Cache Swaps**: Credential propagation and telemetry caching use POSIX atomic filesystem replacement (`os.replace`) within the target directory (`cache_file.parent`), preventing partial writes, race conditions, token corruption, or `EXDEV` cross-device link errors between Antigravity 2.0 Desktop and the Antigravity CLI.
+- **OAuth ISO Expiry Preservation**: Token refreshes automatically parse `expires_in` from Google OAuth responses and atomically persist updated UTC ISO 8601 (`...Z`) expiry timestamps to vault `token.json`, Antigravity Desktop, and CLI token targets.
 - **Process Turn Safety Guard**: The process supervisor monitors running `language_server` instances and active agent turns before triggering server restarts, ensuring in-flight agent tasks are never prematurely killed or corrupted.
 
 ---
@@ -47,16 +48,23 @@ It completely supersedes legacy token managers with an isolated local vault, ato
    - Validates JWT tokens, extracts email identity, guards against collisions (`[y/N]`), and saves new accounts in `Standby` status.
 
 5. **Real-Time Quota Overview & Decision Ranking (`quota`)**:
-   - Inspects real-time quotas (Gemini & Claude/GPT 5-Hour and Weekly limits) across all vault accounts via fast direct telemetry (`QuotaClient`).
+   - Inspects real-time quotas (Gemini & Claude/GPT 5-Hour and Weekly limits) across all vault accounts via fast direct telemetry (`QuotaClient`) conforming to the Hybrid Quota Schema (ADR 0005).
    - Deterministic sorting: Highest Gemini Weekly Limit followed by highest Gemini 5-Hour Limit.
    - Computes reset times and countdowns (e.g. `~3 jam 20 menit lagi`).
    - Actionable recommendation banner highlighting the highest-capacity standby account.
-   - Persistent cache fallback (`~/.antigravity-vault/cache/last_known_quota.json`) when network probes temporarily timeout.
+   - Account-level cache freshness (`cached_at`) and deep model-level merging (updating Gemini telemetry preserves existing Claude cache).
 
-6. **Automatic Rotation Engine & PreInvocation Hook (`hook`)**:
-   - Evaluates remaining model quota before each agent turn via Antigravity lifecycle hooks (`PreInvocation`).
-   - Supports intelligent rotation strategies (`cache_optimized`, `drain_window`, `auto_highest`).
-   - Seamlessly auto-switches to the healthiest account when capacity drops below threshold.
+6. **Tiered Cache-First Polling Engine (`PreInvocation` Hook)**:
+   - Evaluates remaining model quota before each agent turn via Antigravity lifecycle hooks with adaptive tiered execution:
+     - **Tier 1 (Healthy Pass — 0ms Latency)**: If active account cached quota $\ge 25\%$ and cache age is $\le 300$s (5 min), bypasses immediately without any HTTP network calls or disk I/O, reducing turn overhead to 0ms for 85–90% of turns.
+     - **Tier 2 (Single-Account Probe — ~300ms)**: If cache is expired ($> 300$s) or quota is intermediate ($15\% \le \text{quota} < 25\%$), probes only the active account. If quota $\ge 15\%$, retains the active account and persists telemetry with zero standby probing. Defers disk writes if quota is critical ($< 15\%$) to eliminate double disk I/O.
+     - **Tier 3 (Full Standby Probe & Auto-Rotation — $< 15\%$)**: Concurrently probes standby accounts only when active capacity drops below 15% or on authentication failure, rotating seamlessly via `RotationEngine`.
+
+7. **Network Transport Resilience & Zero False Alarms**:
+   - Decouples transport errors (timeouts, DNS, socket dropouts, HTTP 5xx) from quota depletion.
+   - Graceful fallback to valid cached telemetry; if no cache exists, proceeds silently on the active account without injecting false warnings.
+   - Stale 0% cache guard invalidates expired cached zero quotas during outages, preventing false alarms.
+   - Terminal auth accounting ensures accounts with revoked tokens are evicted cleanly while preserving accurate exhaustion warnings when remaining functional accounts hit 0%.
 
 ---
 
@@ -230,6 +238,16 @@ agy-switch hook install
 # Turn on auto-switch rotation
 agy-switch config auto-switch on
 ```
+
+### 5. PreInvocation Hook Latency & Execution Tiers
+
+The `PreInvocation` lifecycle hook evaluates account quota before each agent prompt interaction using adaptive tiered polling:
+
+| Tier | Trigger Condition | Latency Overhead | Disk I/O | Turn Action |
+| :--- | :--- | :---: | :---: | :--- |
+| **Tier 1: Healthy Pass** | Active quota $\ge 25\%$ & cache age $\le 300$s | **0ms** | None | Immediate bypass with `{}` (zero network or disk I/O) |
+| **Tier 2: Single Probe** | Active quota $15\% - 24\%$ or cache $> 300$s | **~300ms** | 1 atomic write | Probes active account only; retains turn if $\ge 15\%$ |
+| **Tier 3: Standby Rotation** | Active quota $< 15\%$ or Auth Corruption | **~600ms** | 1 atomic write | Concurrently probes standby accounts; auto-rotates tokens |
 
 ---
 
