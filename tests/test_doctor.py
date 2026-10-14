@@ -528,6 +528,117 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         self.engine.fix_diagnostics(report)
         self.assertFalse((self.vault_dir / "watch.pid").exists())
 
+    def test_layer2_token_integrity_ignores_dotfiles_and_temp_dirs(self):
+        """Hidden directories starting with '.' (like .tmp-rename-*) are ignored in _check_token_integrity."""
+        self._setup_pristine_environment()
+        tmp_dir = self.vault_dir / "accounts" / ".tmp-rename-12345"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(tmp_dir, 0o700)
+
+        report = self.engine.run_diagnostics()
+        token_item = next(it for it in report.items if it.category == "token_integrity")
+        self.assertEqual(token_item.status, "PASS")
+        self.assertNotIn(".tmp-rename", token_item.message)
+
+    def test_layer4_hook_command_with_shlex_quotes_and_spaces(self):
+        """Hook commands with quoted paths containing spaces are safely parsed via shlex."""
+        self._setup_pristine_environment()
+        custom_dir = self.base_path / "custom path with spaces"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        custom_script = custom_dir / "my_hook.py"
+        custom_script.write_text("#!/usr/bin/env python3\nprint('hook')\n", encoding="utf-8")
+        os.chmod(custom_script, 0o755)
+
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        hooks_data = {
+            "agy-switch-auto-rotate": {
+                "enabled": True,
+                "PreInvocation": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{custom_script}" hook-pre-invocation',
+                        "timeout": 5,
+                    }
+                ],
+            }
+        }
+        hooks_file.write_text(json.dumps(hooks_data), encoding="utf-8")
+
+        report = self.engine.run_diagnostics()
+        hook_item = next(it for it in report.items if it.category == "hooks")
+        self.assertEqual(hook_item.status, "PASS")
+
+    def test_layer4_hook_executable_wrapper_without_py_extension(self):
+        """Executable wrapper without .py extension is recognized and validated."""
+        self._setup_pristine_environment()
+        bin_dir = self.base_path / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        wrapper = bin_dir / "hook-wrapper"
+        wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(wrapper, 0o755)
+
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        hooks_data = {
+            "agy-switch-auto-rotate": {
+                "enabled": True,
+                "PreInvocation": [
+                    {
+                        "type": "command",
+                        "command": f'"{wrapper}" hook-pre-invocation',
+                        "timeout": 5,
+                    }
+                ],
+            }
+        }
+        hooks_file.write_text(json.dumps(hooks_data), encoding="utf-8")
+
+        report = self.engine.run_diagnostics()
+        hook_item = next(it for it in report.items if it.category == "hooks")
+        self.assertEqual(hook_item.status, "PASS")
+
+        # Negative test 1: wrapper exists but is not executable (0644)
+        os.chmod(wrapper, 0o644)
+        rep_unexec = self.engine.run_diagnostics()
+        item_unexec = next(it for it in rep_unexec.items if it.category == "hooks")
+        self.assertEqual(item_unexec.status, "WARN")
+        self.assertIn("not executable", item_unexec.message)
+
+        # Negative test 2: wrapper does not exist
+        wrapper.unlink()
+        rep_missing = self.engine.run_diagnostics()
+        item_missing = next(it for it in rep_missing.items if it.category == "hooks")
+        self.assertEqual(item_missing.status, "WARN")
+        self.assertIn("does not exist", item_missing.message)
+
+    def test_layer1_chmod_failure_records_error_and_does_not_mark_fixed(self):
+        """If os.chmod raises OSError during fix_diagnostics, item.fixed remains False."""
+        self._setup_pristine_environment()
+        os.chmod(self.vault_dir, 0o777)
+
+        report = self.engine.run_diagnostics()
+        perm_item = next(it for it in report.items if it.category == "permissions")
+        self.assertEqual(perm_item.status, "FAIL")
+        self.assertTrue(perm_item.can_fix)
+
+        def mock_chmod(path, mode):
+            raise OSError("Simulated permission denied error")
+
+        from unittest.mock import patch
+        with patch("os.chmod", side_effect=mock_chmod):
+            fixes = self.engine.fix_diagnostics(report)
+
+        self.assertFalse(perm_item.fixed)
+        self.assertNotEqual(perm_item.status, "PASS")
+        self.assertIn("Failed", str(perm_item.fix_action))
+        self.assertEqual(len(fixes), 0)
+
+    def test_is_valid_expiry_boolean_typeguard(self):
+        """Explicitly verifies that boolean values are rejected as valid expiry."""
+        self.assertFalse(self.engine._is_valid_expiry(True))
+        self.assertFalse(self.engine._is_valid_expiry(False))
+        self.assertTrue(self.engine._is_valid_expiry(1700000000))
+        self.assertTrue(self.engine._is_valid_expiry("2026-10-14T00:00:00Z"))
+
     # ---------------------------------------------------------
     # Overall Status & Auto-Healing Integration
     # ---------------------------------------------------------
@@ -961,6 +1072,41 @@ class TestDoctorCLIIntegration(unittest.TestCase):
         self.assertIsInstance(data, dict)
         err = stderr.getvalue()
         self.assertIn("Auto-migrated", err)
+
+    def test_process_health_ignores_unrelated_watch_command(self):
+        """Unrelated processes with 'watch' and 'run' in cmdline (like 'npm run watch') do not report active watcher."""
+        self._setup_pristine_environment()
+        watch_pid_dir = self.proc_dir / "202"
+        # Overwrite cmdline with third-party command
+        (watch_pid_dir / "cmdline").write_bytes(b"node\x00/usr/bin/npm\x00run\x00watch\x00")
+        (watch_pid_dir / "stat").write_text("202 (npm) S 1 202 202 0 0 0 0 0 0 0 0 0")
+
+        report = self.engine.run_diagnostics()
+        proc_item = next(it for it in report.items if it.category == "process")
+        self.assertEqual(proc_item.status, "WARN")
+        self.assertTrue(proc_item.can_fix)
+        self.assertIn("recycled PID", proc_item.message)
+        self.assertNotIn("watcher active", proc_item.message)
+
+    def test_is_server_busy_ignores_zombie_processes(self):
+        """Defunct zombie child processes (state == 'Z') are ignored in is_server_busy."""
+        self._setup_pristine_environment()
+        # Add zombie child process of language_server (PID 101)
+        zombie_pid_dir = self.proc_dir / "303"
+        zombie_pid_dir.mkdir(parents=True, exist_ok=True)
+        # stat format: pid (comm) state ppid ...
+        (zombie_pid_dir / "stat").write_text("303 (defunct_worker) Z 101 303 0 0 0 0 0 0 0 0 0")
+
+        # language_server has only zombie child -> busy must be False
+        self.assertFalse(self.engine.is_server_busy(101))
+
+        # Add active child process
+        active_pid_dir = self.proc_dir / "304"
+        active_pid_dir.mkdir(parents=True, exist_ok=True)
+        (active_pid_dir / "stat").write_text("304 (active_worker) S 101 304 0 0 0 0 0 0 0 0 0")
+
+        # Now busy must be True
+        self.assertTrue(self.engine.is_server_busy(101))
 
 
 if __name__ == "__main__":

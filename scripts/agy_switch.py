@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -679,7 +680,7 @@ class AgySwitchEngine:
             raise AgySwitchError("Account alias cannot be empty.")
 
         if clean_old == clean_new:
-            raise AgySwitchError("[agy-switch] Source and target account alias must be different.")
+            raise AgySwitchError("Source and target account alias must be different.")
 
         clean_old = self.validate_account_alias(clean_old)
         clean_new = self.validate_account_alias(clean_new)
@@ -1009,6 +1010,8 @@ class AgySwitchEngine:
                             if rparen != -1:
                                 rest = content[rparen + 1:].strip().split()
                                 if len(rest) >= 2 and rest[1] == str(pid):
+                                    if rest[0] == "Z":
+                                        continue
                                     return True
                         except (OSError, IndexError):
                             continue
@@ -1074,7 +1077,7 @@ class AgySwitchEngine:
 
     def _is_valid_expiry(self, raw_expiry: Any) -> bool:
         """Validates that expiry is a recognizable positive timestamp or ISO string."""
-        if raw_expiry is None:
+        if raw_expiry is None or isinstance(raw_expiry, bool):
             return False
         if isinstance(raw_expiry, (int, float)):
             return math.isfinite(raw_expiry) and raw_expiry > 0
@@ -1095,7 +1098,7 @@ class AgySwitchEngine:
 
     def _is_token_expired(self, raw_expiry: Any) -> bool:
         """Determines if a token expiry representation is already in the past."""
-        if raw_expiry is None:
+        if raw_expiry is None or isinstance(raw_expiry, bool):
             return False
         if isinstance(raw_expiry, (int, float)):
             return raw_expiry <= time.time()
@@ -1202,7 +1205,7 @@ class AgySwitchEngine:
                 can_fix=False,
             )
 
-        accounts = sorted([p for p in self.accounts_dir.iterdir() if p.is_dir()])
+        accounts = sorted([p for p in self.accounts_dir.iterdir() if p.is_dir() and not p.name.startswith(".")])
         if not accounts:
             return DiagnosticItem(
                 category="token_integrity",
@@ -1502,18 +1505,71 @@ class AgySwitchEngine:
                 can_fix=True,
             )
 
-        for part in cmd_str.split():
+        try:
+            parts = shlex.split(cmd_str)
+        except ValueError:
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook command syntax is invalid (unbalanced quotes).",
+                can_fix=True,
+            )
+
+        if not parts:
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook command is missing or empty.",
+                can_fix=True,
+            )
+
+        target_path: Path | None = None
+        for part in parts:
             if part.endswith(".py"):
-                script_path = Path(part)
-                if not script_path.is_file():
-                    return DiagnosticItem(
-                        category="hooks",
-                        name="Antigravity PreInvocation Hook",
-                        status="WARN",
-                        message=f"PreInvocation hook target script does not exist: {script_path}.",
-                        can_fix=True,
-                    )
+                target_path = Path(part)
                 break
+
+        if target_path is None:
+            first = parts[0]
+            if first in ("python", "python3", "bash", "sh") and len(parts) > 1 and not parts[1].startswith("-"):
+                target_path = Path(parts[1])
+            else:
+                target_path = Path(first)
+
+        if not target_path.is_file():
+            if "/" not in str(target_path):
+                resolved = shutil.which(str(target_path))
+                if resolved:
+                    target_path = Path(resolved)
+
+        if not target_path.is_file():
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message=f"PreInvocation hook target script does not exist: {target_path}.",
+                can_fix=True,
+            )
+
+        if not os.access(target_path, os.R_OK):
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message=f"PreInvocation hook target script is not readable: {target_path}.",
+                can_fix=True,
+            )
+
+        if not str(target_path).endswith(".py") and not os.access(target_path, os.X_OK):
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message=f"PreInvocation hook executable wrapper is not executable: {target_path}.",
+                can_fix=True,
+            )
 
         return DiagnosticItem(
             category="hooks",
@@ -1562,11 +1618,17 @@ class AgySwitchEngine:
                         try:
                             raw = cmdline_file.read_bytes().replace(b"\x00", b" ").lower()
                             is_watch = False
-                            if b"watch.py" in raw:
-                                is_watch = True
-                            elif (b"agy_switch" in raw or b"agy-switch" in raw) and (b"watch" in raw or b"run" in raw):
-                                is_watch = True
-                            elif b"watch" in raw and (b"run" in raw or b"daemon" in raw):
+                            has_script = (
+                                b"watch.py" in raw
+                                or b"agy_switch" in raw
+                                or b"agy-switch" in raw
+                            )
+                            has_action = (
+                                b"watch" in raw
+                                or b"run" in raw
+                                or b"daemon" in raw
+                            )
+                            if has_script and has_action:
                                 is_watch = True
 
                             if is_watch:
@@ -1643,63 +1705,51 @@ class AgySwitchEngine:
             if item.category == "permissions":
                 try:
                     self.init_vault()
+                    chmod_errors: list[str] = []
+
+                    def _safe_chmod(target: Path, mode: int) -> None:
+                        try:
+                            os.chmod(target, mode)
+                        except OSError as e:
+                            chmod_errors.append(f"{target.name}: {e}")
+
                     if self.vault_dir.is_dir():
-                        try:
-                            os.chmod(self.vault_dir, 0o700)
-                        except OSError:
-                            pass
+                        _safe_chmod(self.vault_dir, 0o700)
                     if self.accounts_dir.is_dir():
-                        try:
-                            os.chmod(self.accounts_dir, 0o700)
-                        except OSError:
-                            pass
+                        _safe_chmod(self.accounts_dir, 0o700)
                         for acc_dir in self.accounts_dir.iterdir():
                             if acc_dir.is_dir():
-                                try:
-                                    os.chmod(acc_dir, 0o700)
-                                except OSError:
-                                    pass
+                                _safe_chmod(acc_dir, 0o700)
                                 for f in acc_dir.iterdir():
                                     if f.is_file():
-                                        try:
-                                            os.chmod(f, 0o600)
-                                        except OSError:
-                                            pass
+                                        _safe_chmod(f, 0o600)
                     if self.active_file.is_file():
-                        try:
-                            os.chmod(self.active_file, 0o600)
-                        except OSError:
-                            pass
+                        _safe_chmod(self.active_file, 0o600)
                     if self.cache_dir.is_dir():
-                        try:
-                            os.chmod(self.cache_dir, 0o700)
-                        except OSError:
-                            pass
+                        _safe_chmod(self.cache_dir, 0o700)
                         for cf in self.cache_dir.iterdir():
                             if cf.is_file():
-                                try:
-                                    os.chmod(cf, 0o600)
-                                except OSError:
-                                    pass
+                                _safe_chmod(cf, 0o600)
                     if self.config_file.is_file():
-                        try:
-                            os.chmod(self.config_file, 0o600)
-                        except OSError:
-                            pass
+                        _safe_chmod(self.config_file, 0o600)
                     watch_pid = self.vault_dir / "watch.pid"
                     if watch_pid.is_file() or watch_pid.is_symlink():
-                        try:
-                            os.chmod(watch_pid, 0o600)
-                        except OSError:
-                            pass
+                        _safe_chmod(watch_pid, 0o600)
 
-                    action_str = "Restored POSIX permissions (0700 for directories, 0600 for files)"
-                    item.fixed = True
-                    item.status = "PASS"
-                    item.fix_action = action_str
-                    fixes.append(action_str)
-                except OSError:
-                    pass
+                    if chmod_errors:
+                        item.fixed = False
+                        item.status = "FAIL"
+                        item.fix_action = f"Failed to restore permissions: {'; '.join(chmod_errors)}"
+                    else:
+                        action_str = "Restored POSIX permissions (0700 for directories, 0600 for files)"
+                        item.fixed = True
+                        item.status = "PASS"
+                        item.fix_action = action_str
+                        fixes.append(action_str)
+                except OSError as e:
+                    item.fixed = False
+                    item.status = "FAIL"
+                    item.fix_action = f"Failed to restore permissions: {e}"
 
             elif item.category == "dual_sync":
                 active = self.get_active_name()
@@ -2909,6 +2959,54 @@ class RotationEngine:
         """Calculates reset delta in minutes."""
         return QuotaStatus(fraction=0.0, reset_time=reset_time).get_reset_delta_minutes(current_time)
 
+    def _is_cooldown_penalized_for_model(
+        self,
+        model_key: str,
+        fraction: float,
+        rec: Any,
+        q_data: dict,
+    ) -> bool:
+        """Determines if an account in cooldown is penalized for the target model_key.
+
+        An account in cooldown is exempt from penalty for model_key ONLY if:
+        1. It has healthy quota (> 15%) for the target model.
+        2. The cooldown was triggered by exhaustion of the alternate model family.
+        3. The cooldown does not explicitly penalize the target model family.
+        """
+        if fraction <= 0.15:
+            return True
+
+        norm_key = "claude" if "claude" in model_key.lower() else "gemini"
+        if norm_key == "claude":
+            target_tokens = ("claude", "anthropic")
+            alt_model_key = "gemini"
+            alt_tokens = ("gemini",)
+        else:
+            target_tokens = ("gemini",)
+            alt_model_key = "claude"
+            alt_tokens = ("claude", "anthropic")
+
+        is_alt_exhausted = False
+        is_explicitly_target = False
+
+        if isinstance(rec, dict):
+            r_str = str(rec.get("reason", "")).lower()
+            m_str = str(rec.get("model", "")).lower()
+            if any(tok in r_str or tok in m_str for tok in target_tokens):
+                is_explicitly_target = True
+            if any(tok in r_str or tok in m_str for tok in alt_tokens):
+                is_alt_exhausted = True
+
+        if not is_explicitly_target and not is_alt_exhausted:
+            alt_status = self.get_quota_status(q_data, model_key=alt_model_key)
+            if alt_status is not None and alt_status.fraction <= 0.0:
+                is_alt_exhausted = True
+
+        if is_alt_exhausted and not is_explicitly_target:
+            return False
+
+        return True
+
     def evaluate(
         self,
         accounts: list[dict] | dict,
@@ -2969,6 +3067,12 @@ class RotationEngine:
 
         active_status = evaluated.get(current_active) if current_active else None
         is_active_in_cooldown = bool(cooldowns and current_active and current_active in cooldowns)
+        if is_active_in_cooldown and active_status is not None:
+            rec = cooldowns[current_active]
+            q_data = raw_quota_map.get(current_active, {})
+            is_active_in_cooldown = self._is_cooldown_penalized_for_model(
+                model_key, active_status.fraction, rec, q_data
+            )
 
         if not is_active_in_cooldown:
             # 1. cache_optimized heuristic: retain current active if fraction > 0.15 (> 15%)
@@ -2994,46 +3098,8 @@ class RotationEngine:
             # Model-aware cooldown evaluation
             if cooldowns and acc_id in cooldowns:
                 rec = cooldowns[acc_id]
-                is_penalized = True
                 q_data = raw_quota_map.get(acc_id, {})
-
-                if model_key == "gemini" and status.fraction > 0.15:
-                    is_claude_exhausted = False
-                    is_explicitly_gemini = False
-                    if isinstance(rec, dict):
-                        r_str = str(rec.get("reason", "")).lower()
-                        m_str = str(rec.get("model", "")).lower()
-                        if "gemini" in r_str or "gemini" in m_str:
-                            is_explicitly_gemini = True
-                        if "claude" in r_str or "anthropic" in r_str or "claude" in m_str:
-                            is_claude_exhausted = True
-                    if not is_explicitly_gemini and not is_claude_exhausted:
-                        c_status = self.get_quota_status(q_data, model_key="claude")
-                        if c_status is not None and c_status.fraction <= 0.0:
-                            is_claude_exhausted = True
-
-                    if is_claude_exhausted and not is_explicitly_gemini:
-                        is_penalized = False
-
-                elif model_key == "claude" and status.fraction > 0.15:
-                    is_gemini_exhausted = False
-                    is_explicitly_claude = False
-                    if isinstance(rec, dict):
-                        r_str = str(rec.get("reason", "")).lower()
-                        m_str = str(rec.get("model", "")).lower()
-                        if "claude" in r_str or "anthropic" in r_str or "claude" in m_str:
-                            is_explicitly_claude = True
-                        if "gemini" in r_str or "gemini" in m_str:
-                            is_gemini_exhausted = True
-                    if not is_explicitly_claude and not is_gemini_exhausted:
-                        g_status = self.get_quota_status(q_data, model_key="gemini")
-                        if g_status is not None and g_status.fraction <= 0.0:
-                            is_gemini_exhausted = True
-
-                    if is_gemini_exhausted and not is_explicitly_claude:
-                        is_penalized = False
-
-                if is_penalized:
+                if self._is_cooldown_penalized_for_model(model_key, status.fraction, rec, q_data):
                     continue
 
             candidates.append(
@@ -3667,7 +3733,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             try:
                 target_model = normalize_model_name(cli_model)
             except AgySwitchError:
-                print(f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.")
+                print(f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.", file=sys.stderr)
                 return 1
         else:
             target_model = engine.get_default_model()
@@ -3681,7 +3747,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             valid_quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
             
             if not valid_quotas:
-                print(f"[agy-switch] No valid quota info available to auto-switch.")
+                print(f"[agy-switch] No valid quota info available to auto-switch.", file=sys.stderr)
                 return 1
 
             client.save_cache({
@@ -3703,7 +3769,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                     accounts_with_telemetry.append((acc, status))
 
             if not accounts_with_telemetry:
-                print(f"[agy-switch] No accounts found with available quota telemetry for model '{target_model}'.")
+                print(f"[agy-switch] No accounts found with available quota telemetry for model '{target_model}'.", file=sys.stderr)
                 return 1
 
             # Strict quota isolation: check if all accounts have verified 0% quota
@@ -3715,7 +3781,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                     return False
 
             if all(_is_zero(status) for _, status in accounts_with_telemetry):
-                print(f"[agy-switch] All accounts exhausted for model '{target_model}'. Cannot auto-switch.")
+                print(f"[agy-switch] All accounts exhausted for model '{target_model}'. Cannot auto-switch.", file=sys.stderr)
                 return 1
 
             cooldowns = engine.get_cooldowns()
@@ -3740,11 +3806,19 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 except (TypeError, ValueError):
                     active_fraction = 1.0
 
-                if active_status is not None and active_fraction > 0.0:
+                is_active_in_cooldown = bool(cooldowns and active_name in cooldowns)
+                if is_active_in_cooldown and active_status is not None:
+                    rec = cooldowns[active_name]
+                    q_data = valid_quotas.get(active_name, {})
+                    is_active_in_cooldown = rot_engine._is_cooldown_penalized_for_model(
+                        target_model, active_fraction, rec, q_data
+                    )
+
+                if active_status is not None and active_fraction > 0.0 and not is_active_in_cooldown:
                     print(f"[agy-switch] Active account '{active_name}' is optimal. No switch needed.")
                     return 0
 
-                print(f"[agy-switch] All accounts exhausted for model '{target_model}'. Cannot auto-switch.")
+                print(f"[agy-switch] All accounts exhausted for model '{target_model}'. Cannot auto-switch.", file=sys.stderr)
                 return 1
                 
             args.account = target_account
@@ -3866,7 +3940,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 print(f"[agy-switch] default-model set to '{normalized}'.")
                 return 0
             except AgySwitchError:
-                print(f"[agy-switch] Unsupported model '{model_arg}'. Allowed models: 'gemini', 'claude'.")
+                print(f"[agy-switch] Unsupported model '{model_arg}'. Allowed models: 'gemini', 'claude'.", file=sys.stderr)
                 return 1
         cfg = engine.load_config()
         print(json.dumps(cfg, indent=2))

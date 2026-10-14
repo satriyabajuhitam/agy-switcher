@@ -132,7 +132,7 @@ class TestModelSteeringCLI(unittest.TestCase):
     def test_cli_config_default_model_unsupported(self):
         """agy-switch config default-model invalid exits code 1 with error message."""
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stderr", buf):
             code = main(["config", "default-model", "openai-gpt"], engine=self.engine)
         self.assertEqual(code, 1)
         self.assertIn("[agy-switch] Unsupported model 'openai-gpt'. Allowed models: 'gemini', 'claude'.", buf.getvalue())
@@ -140,7 +140,7 @@ class TestModelSteeringCLI(unittest.TestCase):
     def test_cli_switch_auto_unsupported_model(self):
         """agy-switch switch --auto --model unsupported exits code 1 with error message."""
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stderr", buf):
             code = main(["switch", "--auto", "--model", "llama-3"], engine=self.engine)
         self.assertEqual(code, 1)
         self.assertIn("[agy-switch] Unsupported model 'llama-3'. Allowed models: 'gemini', 'claude'.", buf.getvalue())
@@ -208,7 +208,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         }
 
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stderr", buf):
             code = main(["switch", "--auto", "--model", "claude"], engine=self.engine)
         self.assertEqual(code, 1)
         self.assertIn("[agy-switch] All accounts exhausted for model 'claude'. Cannot auto-switch.", buf.getvalue())
@@ -230,7 +230,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         }
 
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stderr", buf):
             code = main(["switch", "--auto", "--model", "claude"], engine=self.engine)
         self.assertEqual(code, 1)
         self.assertIn("[agy-switch] No accounts found with available quota telemetry for model 'claude'.", buf.getvalue())
@@ -297,7 +297,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         (self.vault_dir / "cache" / "cooldown.json").write_text(json.dumps(cooldown_data), encoding="utf-8")
 
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stderr", buf):
             code = main(["switch", "--auto", "--model", "gemini"], engine=self.engine)
         self.assertEqual(code, 1)
         self.assertIn("All accounts exhausted for model 'gemini'", buf.getvalue())
@@ -329,7 +329,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         (self.vault_dir / "cache" / "cooldown.json").write_text(json.dumps(cooldown_data), encoding="utf-8")
 
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stderr", buf):
             code = main(["switch", "--auto", "--model", "gemini"], engine=self.engine)
         self.assertEqual(code, 1)
         self.engine.switch_tokens.assert_not_called()
@@ -360,7 +360,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         (self.vault_dir / "cache" / "cooldown.json").write_text(json.dumps(cooldown_data), encoding="utf-8")
 
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stderr", buf):
             code = main(["switch", "--auto", "--model", "gemini"], engine=self.engine)
         self.assertEqual(code, 1)
         self.assertIn("All accounts exhausted for model 'gemini'", buf.getvalue())
@@ -468,6 +468,59 @@ class TestModelSteeringCLI(unittest.TestCase):
         (self.vault_dir / "config.json").write_text("invalid json{{{", encoding="utf-8")
         self.assertEqual(self.engine.get_default_model(), "gemini")
 
+    @patch("agy_switch.fetch_all_accounts_quota")
+
+    def test_active_account_in_cooldown_no_standby_aborts_code_1(self, mock_fetch):
+        """Active account in cooldown with positive quota aborts with code 1 when no eligible standby exists."""
+        now = time.time()
+        mock_fetch.return_value = {
+            "acc1": {"gemini": {"quota": 50, "reset_time": now + 3600}},
+        }
+        self.engine.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "is_active": True, "valid": True},
+            ]
+        }
+        cooldown_data = {
+            "acc1": {
+                "cooldown_until": now + 1800,
+                "reason": "RESOURCE_EXHAUSTED",
+                "exhausted_at": now,
+            }
+        }
+        (self.vault_dir / "cache" / "cooldown.json").write_text(json.dumps(cooldown_data), encoding="utf-8")
+
+        buf = io.StringIO()
+        with patch("sys.stderr", buf):
+            code = main(["switch", "--auto", "--model", "gemini"], engine=self.engine)
+        self.assertEqual(code, 1)
+        self.assertNotIn("is optimal", buf.getvalue())
+        self.assertIn("All accounts exhausted for model 'gemini'. Cannot auto-switch.", buf.getvalue())
+        self.engine.switch_tokens.assert_not_called()
+
+    def test_is_cooldown_penalized_for_model_helper(self):
+        """Verifies _is_cooldown_penalized_for_model helper logic for Gemini and Claude."""
+        rot = RotationEngine()
+        # 1. fraction <= 0.15 is always penalized
+        self.assertTrue(rot._is_cooldown_penalized_for_model("gemini", 0.10, {}, {}))
+        self.assertTrue(rot._is_cooldown_penalized_for_model("claude", 0.10, {}, {}))
+
+        # 2. Gemini target: Claude cooldown reason -> exempt (False)
+        claude_rec = {"reason": "RESOURCE_EXHAUSTED for claude-3-5-sonnet"}
+        self.assertFalse(rot._is_cooldown_penalized_for_model("gemini", 0.80, claude_rec, {}))
+
+        # 3. Gemini target: Gemini cooldown reason -> penalized (True)
+        gemini_rec = {"reason": "RESOURCE_EXHAUSTED for gemini-3.8-pro"}
+        self.assertTrue(rot._is_cooldown_penalized_for_model("gemini", 0.80, gemini_rec, {}))
+
+        # 4. Claude target: Gemini cooldown reason -> exempt (False)
+        self.assertFalse(rot._is_cooldown_penalized_for_model("claude", 0.80, gemini_rec, {}))
+
+        # 5. Claude target: Claude cooldown reason -> penalized (True)
+        self.assertTrue(rot._is_cooldown_penalized_for_model("claude", 0.80, claude_rec, {}))
+
 
 if __name__ == "__main__":
     unittest.main()
+

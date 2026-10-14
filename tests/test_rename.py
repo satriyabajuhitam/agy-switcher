@@ -171,14 +171,14 @@ class TestAccountAliasMigration(unittest.TestCase):
         self._create_account("acc1")
         with self.assertRaises(AgySwitchError) as ctx:
             self.engine.rename_account("acc1", "acc1")
-        self.assertEqual(str(ctx.exception), "[agy-switch] Source and target account alias must be different.")
+        self.assertEqual(str(ctx.exception), "Source and target account alias must be different.")
 
     def test_rejection_identical_source_and_target_whitespace(self) -> None:
         """Rejects old_alias == new_alias even when padded with whitespace."""
         self._create_account("acc1")
         with self.assertRaises(AgySwitchError) as ctx:
             self.engine.rename_account("acc1", "  acc1  ")
-        self.assertEqual(str(ctx.exception), "[agy-switch] Source and target account alias must be different.")
+        self.assertEqual(str(ctx.exception), "Source and target account alias must be different.")
 
     def test_rejection_old_alias_not_found(self) -> None:
         """Rejects non-existent old_alias with AccountNotFoundError."""
