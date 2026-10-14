@@ -1,20 +1,61 @@
-import os
-import time
-import re
+import argparse
 import glob
 import json
 import math
-import shutil
-import subprocess
-from datetime import datetime, timezone
+import os
 from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from typing import Any
 
+# Ensure script and repo directories are in sys.path
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+_parent_dir = os.path.dirname(_script_dir)
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+
 try:
-    from agy_switch import AgySwitchEngine, RotationEngine, QuotaClient
+    from agy_switch import (
+        AgySwitchEngine,
+        RotationEngine,
+        QuotaClient,
+        AgySwitchError,
+    )
 except ImportError:
-    from scripts.agy_switch import AgySwitchEngine, RotationEngine, QuotaClient
+    try:
+        from scripts.agy_switch import (
+            AgySwitchEngine,
+            RotationEngine,
+            QuotaClient,
+            AgySwitchError,
+        )
+    except ImportError:
+        class AgySwitchError(Exception):
+            """Base exception fallback."""
+
+
+DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
+DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
+
+
+class DaemonError(AgySwitchError, RuntimeError):
+    """Base exception for watcher daemon lifecycle operations."""
+
+
+class DaemonAlreadyRunningError(DaemonError):
+    """Raised when daemon start() is attempted while an active daemon is already running."""
+
+    def __init__(self, pid: int, message: str | None = None) -> None:
+        self.pid = pid
+        msg = message or f"Watcher daemon is already running with PID {pid}."
+        super().__init__(msg)
 
 
 class PresenceDetector:
@@ -1020,7 +1061,482 @@ class LogWatcher:
                 time.sleep(5)
 
 
-if __name__ == "__main__":
+class DaemonManager:
+    """
+    Manages the detached background lifecycle of the watch daemon.
+    Enforces atomic PID file updates, mode 0600 permissions, process validation via /proc,
+    graceful SIGTERM termination with 5s SIGKILL escalation, and stale PID pruning.
+    """
+
+    SYSTEMD_TEMPLATE = """[Unit]
+Description=Antigravity Account Switcher Log Watcher Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agy-switch watch run
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:%h/.antigravity-vault/watch.log
+StandardError=append:%h/.antigravity-vault/watch.log
+
+[Install]
+WantedBy=default.target
+"""
+
+    def __init__(
+        self,
+        vault_dir: Path | str | None = None,
+        watch_script: Path | str | None = None,
+        proc_dir: Path | str | None = None,
+        python_bin: str | None = None,
+        gemini_dir: Path | str | None = None,
+    ) -> None:
+        self.vault_dir = Path(vault_dir).expanduser() if vault_dir else DEFAULT_VAULT_DIR
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.log_file = self.vault_dir / "watch.log"
+        self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
+        self.python_bin = python_bin or sys.executable
+        self.watch_script = Path(watch_script).resolve() if watch_script else Path(__file__).resolve()
+        self.gemini_dir = Path(gemini_dir).expanduser() if gemini_dir else DEFAULT_GEMINI_DIR
+
+    def _clean_pid_file(self) -> None:
+        """Safely unlinks PID file if it exists or is a symlink."""
+        try:
+            self.pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _write_pid_file(self, pid: int) -> None:
+        """Atomically writes PID to watch.pid with strictly enforced mode 0600."""
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
+
+        temp_path = self.vault_dir / f".watch.pid.tmp.{os.getpid()}.{time.time_ns()}"
+        payload = f"{pid}\n".encode("utf-8")
+        fd = None
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(temp_path, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+
+            with open(fd, "wb", closefd=True) as f:
+                fd = None
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temp_path, self.pid_file)
+            try:
+                os.chmod(self.pid_file, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _is_watch_cmdline(self, pid: int) -> bool:
+        """Validates /proc/<pid>/cmdline if accessible to prevent killing arbitrary processes."""
+        if not self.proc_dir.is_dir():
+            return True
+
+        cmdline_file = self.proc_dir / str(pid) / "cmdline"
+        if not cmdline_file.is_file():
+            return False
+
+        try:
+            raw = cmdline_file.read_bytes()
+        except OSError:
+            return False
+
+        if not raw:
+            return False
+
+        raw_args = [a for a in raw.split(b"\x00") if a]
+        if not raw_args:
+            return False
+
+        args = [a.decode("utf-8", errors="replace").strip() for a in raw_args]
+        argv0 = os.path.basename(args[0]).lower()
+
+        is_python = argv0.startswith("python") or argv0.startswith("pypy")
+        is_agyswitch = "agy-switch" in argv0 or "agy_switch" in argv0
+
+        if not (is_python or is_agyswitch):
+            return False
+
+        script_name = self.watch_script.name.lower() if self.watch_script else ""
+
+        if is_python:
+            target_script = None
+            skip_next = False
+            for arg in args[1:]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == "-m":
+                    target_script = "-m"
+                    break
+                if arg == "-c":
+                    return False
+                if arg.startswith("-"):
+                    if arg in ("-w", "-x"):
+                        skip_next = True
+                    continue
+                target_script = os.path.basename(arg).lower()
+                break
+
+            if not target_script:
+                return False
+
+            if target_script == "-m":
+                full_cmd = " ".join(args).lower()
+                return "watch" in full_cmd and "run" in full_cmd
+
+            matches_script = False
+            if bool(script_name) and target_script == script_name:
+                matches_script = True
+            elif target_script in ("watch.py", "agy_switch.py"):
+                matches_script = True
+            elif "agy-switch" in target_script or "agy_switch" in target_script:
+                matches_script = True
+
+            if not matches_script:
+                return False
+
+            full_cmd = " ".join(args).lower()
+            return "run" in full_cmd or "watch" in full_cmd or bool(script_name and script_name in full_cmd)
+
+        if is_agyswitch:
+            args_lower = [a.lower() for a in args]
+            return "watch" in args_lower or "run" in args_lower
+
+        return False
+
+    def is_process_alive(self, pid: int) -> bool:
+        """Checks if PID exists, belongs to current user, and represents an active watch process."""
+        if pid <= 1 or pid == os.getpid():
+            return False
+
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return False
+        except OSError:
+            return False
+
+        return self._is_watch_cmdline(pid)
+
+    def get_running_pid(self) -> int | None:
+        """
+        Reads and returns running daemon PID from watch.pid if active.
+        Automatically unlinks dead, stale, or corrupted PID files.
+        """
+        if self.pid_file.is_symlink():
+            self._clean_pid_file()
+            return None
+
+        if not self.pid_file.is_file():
+            return None
+
+        try:
+            content = self.pid_file.read_text(encoding="utf-8").strip()
+            if not content:
+                self._clean_pid_file()
+                return None
+            pid = int(content)
+            if pid <= 1:
+                self._clean_pid_file()
+                return None
+        except (OSError, ValueError):
+            self._clean_pid_file()
+            return None
+
+        if self.is_process_alive(pid):
+            return pid
+        else:
+            self._clean_pid_file()
+            return None
+
+    def start(self, cooldown: int | None = None) -> int:
+        """
+        Spawns detached background process with start_new_session=True.
+        Writes PID to watch.pid with mode 0600.
+        Raises DaemonAlreadyRunningError if daemon is already active.
+        """
+        existing_pid = self.get_running_pid()
+        if existing_pid is not None:
+            raise DaemonAlreadyRunningError(existing_pid)
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
+
+        if self.log_file.is_symlink():
+            try:
+                self.log_file.unlink()
+            except OSError:
+                pass
+
+        log_fd = os.open(
+            self.log_file,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.fchmod(log_fd, 0o600)
+        except OSError:
+            pass
+
+        cmd = [self.python_bin, str(self.watch_script), "run"]
+        if cooldown is not None:
+            cmd.extend(["--cooldown", str(cooldown)])
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=log_fd,
+                start_new_session=True,
+            )
+        finally:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
+
+        self._last_proc = proc
+        pid = proc.pid
+        try:
+            self._write_pid_file(pid)
+        except Exception:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            raise
+
+        return pid
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        """
+        Gracefully terminates the running daemon with SIGTERM.
+        Waits up to timeout seconds (default 5.0s). If still alive, escalates to SIGKILL.
+        Cleans up watch.pid. Returns True if a process was terminated, False otherwise.
+        """
+        if getattr(self, "_last_proc", None) is not None:
+            try:
+                self._last_proc.poll()
+            except Exception:
+                pass
+
+        pid = self.get_running_pid()
+        if pid is None:
+            return False
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            self._clean_pid_file()
+            return True
+        except OSError:
+            self._clean_pid_file()
+            return False
+
+        start_time = time.time()
+        poll_interval = 0.05
+        terminated = False
+        while time.time() - start_time < timeout:
+            if not self.is_process_alive(pid):
+                terminated = True
+                break
+            time.sleep(poll_interval)
+
+        if not terminated and self.is_process_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+            kill_start = time.time()
+            while time.time() - kill_start < 1.0:
+                if not self.is_process_alive(pid):
+                    break
+                time.sleep(poll_interval)
+
+        if getattr(self, "_last_proc", None) is not None and getattr(self._last_proc, "pid", None) == pid:
+            try:
+                self._last_proc.wait(timeout=0.2)
+            except Exception:
+                pass
+
+        if os.name == "posix":
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                pass
+
+        self._clean_pid_file()
+        return True
+
+    def status(self) -> dict[str, Any]:
+        """
+        Returns status dictionary:
+        {'running': bool, 'pid': int | None, 'log_file': str, 'targets': list[str]}.
+        Automatically cleans up stale PID files.
+        """
+        pid = self.get_running_pid()
+        if pid is not None:
+            targets: list[str] = []
+            try:
+                detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+                targets = list(detector.get_watch_targets(as_str=True))
+            except Exception:
+                targets = []
+
+            return {
+                "running": True,
+                "pid": pid,
+                "log_file": str(self.log_file),
+                "targets": targets,
+            }
+        else:
+            return {
+                "running": False,
+                "pid": None,
+                "log_file": str(self.log_file),
+                "targets": [],
+            }
+
+    def generate_systemd(self, target_path: Path | str | None = None) -> str:
+        """
+        Generates user systemd service definition and optionally writes it to target_path.
+        """
+        if target_path is not None:
+            target = Path(target_path).expanduser()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(self.SYSTEMD_TEMPLATE, encoding="utf-8")
+
+        return self.SYSTEMD_TEMPLATE
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="watch.py",
+        description="Antigravity Account Switcher Log Watcher & Daemon",
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["run", "start", "stop", "status"],
+        default="run",
+        help="Daemon action: run (default foreground), start (background daemon), stop, status",
+    )
+    parser.add_argument(
+        "--generate-systemd",
+        action="store_true",
+        help="Output user systemd service definition",
+    )
+    parser.add_argument(
+        "--install-systemd",
+        action="store_true",
+        help="Install systemd user service unit to ~/.config/systemd/user/agy-switch-watcher.service",
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=int,
+        default=60,
+        help="Default cooldown minutes for exhausted accounts (default: 60)",
+    )
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+
     engine = AgySwitchEngine()
-    watcher = LogWatcher(engine)
-    watcher.watch_loop()
+    dm = DaemonManager(vault_dir=engine.vault_dir)
+
+    if args.generate_systemd or args.install_systemd:
+        target = (
+            Path.home() / ".config" / "systemd" / "user" / "agy-switch-watcher.service"
+            if args.install_systemd
+            else None
+        )
+        unit = dm.generate_systemd(target_path=target)
+        sys.stdout.write(unit)
+        sys.stdout.flush()
+        return 0
+
+    if args.action == "start":
+        try:
+            pid = dm.start(cooldown=args.cooldown)
+            print(f"[watch] Daemon started in background (PID: {pid}).")
+            print(f"  - Log: {dm.log_file}")
+            print(f"  - PID: {dm.pid_file}")
+            return 0
+        except DaemonAlreadyRunningError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"Error starting daemon: {e}", file=sys.stderr)
+            return 1
+
+    elif args.action == "stop":
+        try:
+            stopped = dm.stop()
+            if stopped:
+                print("[watch] Daemon stopped successfully.")
+            else:
+                print("[watch] Daemon was not running.")
+            return 0
+        except Exception as e:
+            print(f"Error stopping daemon: {e}", file=sys.stderr)
+            return 1
+
+    elif args.action == "status":
+        st = dm.status()
+        if st["running"]:
+            print(f"[watch] Daemon is running (PID: {st['pid']}).")
+            print(f"  - Log: {st['log_file']}")
+            if st.get("targets"):
+                print("  - Monitored targets:")
+                for t in st["targets"]:
+                    print(f"    * {t}")
+        else:
+            print("[watch] Daemon is stopped.")
+            print(f"  - Log: {st['log_file']}")
+        return 0
+
+    elif args.action == "run":
+        try:
+            signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+        except Exception:
+            pass
+        watcher = LogWatcher(engine, cooldown_minutes=args.cooldown)
+        watcher.watch_loop()
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

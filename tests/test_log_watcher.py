@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -9,7 +10,14 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.watch import PresenceDetector, CooldownManager, LogWatcher
+from scripts.watch import (
+    PresenceDetector,
+    CooldownManager,
+    LogWatcher,
+    DaemonManager,
+    DaemonError,
+    DaemonAlreadyRunningError,
+)
 
 
 class TestPresenceDetector(unittest.TestCase):
@@ -1071,5 +1079,434 @@ class TestLogWatcherProcessing(unittest.TestCase):
         self.assertEqual(self.watcher.file_cursors[str(test_file)], test_file.stat().st_size)
 
 
+class TestDaemonLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.tmp_dir.name)
+        self.vault_dir = self.base_dir / "vault"
+        self.gemini_dir = self.base_dir / ".gemini"
+        self.proc_dir = self.base_dir / "proc"
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        self.mock_script = self.base_dir / "mock_watch.py"
+        self.mock_script.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n", encoding="utf-8")
+
+        self.dm = DaemonManager(
+            vault_dir=self.vault_dir,
+            watch_script=self.mock_script,
+            proc_dir=self.proc_dir,
+            gemini_dir=self.gemini_dir,
+        )
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def _create_mock_proc(self, pid: int, cmdline: bytes) -> Path:
+        p_dir = self.proc_dir / str(pid)
+        p_dir.mkdir(parents=True, exist_ok=True)
+        (p_dir / "cmdline").write_bytes(cmdline)
+        return p_dir
+
+    def test_daemon_start_creates_pid_file_with_0600_permissions(self):
+        """start() spawns background process with start_new_session=True and writes watch.pid with mode 0600."""
+        mock_proc = MagicMock(pid=12345)
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            pid = self.dm.start(cooldown=45)
+            self.assertEqual(pid, 12345)
+
+            self.assertTrue(self.dm.pid_file.is_file())
+            st_mode = self.dm.pid_file.stat().st_mode & 0o777
+            self.assertEqual(st_mode, 0o600)
+            self.assertEqual(self.dm.pid_file.read_text(encoding="utf-8").strip(), "12345")
+
+            self.assertTrue(self.dm.log_file.exists())
+            log_mode = self.dm.log_file.stat().st_mode & 0o777
+            self.assertEqual(log_mode, 0o600)
+
+            mock_popen.assert_called_once()
+            popen_args, popen_kwargs = mock_popen.call_args
+            self.assertTrue(popen_kwargs.get("start_new_session"))
+            self.assertIn("--cooldown", popen_args[0])
+            self.assertIn("45", popen_args[0])
+            self.assertIn("run", popen_args[0])
+
+    def test_daemon_start_rejects_if_already_running(self):
+        """start() rejects execution and reports active PID if daemon is already running."""
+        self._create_mock_proc(12345, b"python3\x00mock_watch.py\x00run\x00")
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+
+        with patch("os.kill", return_value=None):
+            with self.assertRaises(DaemonAlreadyRunningError) as ctx:
+                self.dm.start()
+            self.assertEqual(ctx.exception.pid, 12345)
+            self.assertIn("12345", str(ctx.exception))
+            self.assertIsInstance(ctx.exception, RuntimeError)
+
+    def test_daemon_start_prunes_stale_pid_and_starts(self):
+        """start() automatically prunes dead/stale PID file and successfully launches."""
+        self.dm.pid_file.write_text("99999\n", encoding="utf-8")
+        mock_proc = MagicMock(pid=54321)
+
+        with patch("os.kill", side_effect=ProcessLookupError):
+            with patch("subprocess.Popen", return_value=mock_proc):
+                pid = self.dm.start()
+                self.assertEqual(pid, 54321)
+                self.assertEqual(self.dm.pid_file.read_text(encoding="utf-8").strip(), "54321")
+
+    def test_daemon_stop_graceful_sigterm(self):
+        """stop() gracefully terminates the running daemon with SIGTERM and unlinks watch.pid."""
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        self._create_mock_proc(12345, b"python3\x00mock_watch.py\x00run\x00")
+
+        alive = [True]
+        signals_received = []
+
+        def mock_kill(pid, sig):
+            if sig == 0:
+                if not alive[0]:
+                    raise ProcessLookupError
+                return None
+            signals_received.append(sig)
+            if sig == signal.SIGTERM:
+                alive[0] = False
+                return None
+            raise ValueError(f"Unexpected signal {sig}")
+
+        with patch("os.kill", side_effect=mock_kill):
+            stopped = self.dm.stop(timeout=1.0)
+            self.assertTrue(stopped)
+            self.assertEqual(signals_received, [signal.SIGTERM])
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_stop_escalates_to_sigkill_on_timeout(self):
+        """stop() escalates to SIGKILL if process does not exit within timeout, and cleans up PID file."""
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        self._create_mock_proc(12345, b"python3\x00mock_watch.py\x00run\x00")
+
+        alive = [True]
+        signals_received = []
+
+        def mock_kill(pid, sig):
+            if sig == 0:
+                if not alive[0]:
+                    raise ProcessLookupError
+                return None
+            signals_received.append(sig)
+            if sig == signal.SIGKILL:
+                alive[0] = False
+                return None
+            return None
+
+        with patch("os.kill", side_effect=mock_kill):
+            stopped = self.dm.stop(timeout=0.05)
+            self.assertTrue(stopped)
+            self.assertEqual(signals_received, [signal.SIGTERM, signal.SIGKILL])
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_stop_default_timeout_is_5_seconds(self):
+        """stop() uses 5 seconds default timeout before escalating to SIGKILL."""
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        self._create_mock_proc(12345, b"python3\x00mock_watch.py\x00run\x00")
+
+        signals_received = []
+        simulated_time = [1000.0]
+
+        def mock_time():
+            return simulated_time[0]
+
+        def mock_sleep(duration):
+            simulated_time[0] += duration
+
+        def mock_kill(pid, sig):
+            if sig == 0:
+                if signal.SIGKILL in signals_received:
+                    raise ProcessLookupError
+                return None
+            signals_received.append(sig)
+            return None
+
+        with patch("time.time", side_effect=mock_time), patch("time.sleep", side_effect=mock_sleep), patch("os.kill", side_effect=mock_kill):
+            stopped = self.dm.stop()
+            self.assertTrue(stopped)
+            self.assertEqual(signals_received, [signal.SIGTERM, signal.SIGKILL])
+            self.assertGreaterEqual(simulated_time[0], 1005.0)
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_stop_when_not_running_returns_false(self):
+        """stop() returns False safely when no PID file exists."""
+        self.assertFalse(self.dm.stop())
+
+    def test_daemon_stop_prunes_stale_pid_file(self):
+        """stop() removes stale PID file and returns False when process is already dead."""
+        self.dm.pid_file.write_text("99999\n", encoding="utf-8")
+        with patch("os.kill", side_effect=ProcessLookupError):
+            self.assertFalse(self.dm.stop())
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_status_running(self):
+        """status() reports running with PID, log file, and targets when daemon is active."""
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        self._create_mock_proc(12345, b"python3\x00mock_watch.py\x00run\x00")
+
+        with patch("os.kill", return_value=None):
+            st = self.dm.status()
+            self.assertTrue(st["running"])
+            self.assertEqual(st["pid"], 12345)
+            self.assertEqual(st["log_file"], str(self.dm.log_file))
+            self.assertIsInstance(st["targets"], list)
+
+    def test_daemon_status_stopped(self):
+        """status() reports stopped when no daemon is active."""
+        st = self.dm.status()
+        self.assertFalse(st["running"])
+        self.assertIsNone(st["pid"])
+        self.assertEqual(st["targets"], [])
+
+    def test_daemon_status_prunes_stale_pid(self):
+        """status() automatically purges dead/stale PID file and reports stopped."""
+        self.dm.pid_file.write_text("99999\n", encoding="utf-8")
+        with patch("os.kill", side_effect=ProcessLookupError):
+            st = self.dm.status()
+            self.assertFalse(st["running"])
+            self.assertIsNone(st["pid"])
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_pid_validation_cmdline_mismatch_prunes(self):
+        """If PID exists in OS but cmdline doesn't match watch process, it is treated as stale and pruned."""
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        self._create_mock_proc(12345, b"/usr/sbin/nginx\x00-g\x00daemon off;\x00")
+
+        with patch("os.kill", return_value=None):
+            st = self.dm.status()
+            self.assertFalse(st["running"])
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_corrupt_pid_file_pruned(self):
+        """Non-integer content in watch.pid is cleaned up automatically."""
+        self.dm.pid_file.write_text("corrupted_pid\n", encoding="utf-8")
+        st = self.dm.status()
+        self.assertFalse(st["running"])
+        self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_empty_pid_file_pruned(self):
+        """Empty watch.pid is pruned automatically."""
+        self.dm.pid_file.write_text("  \n", encoding="utf-8")
+        st = self.dm.status()
+        self.assertFalse(st["running"])
+        self.assertFalse(self.dm.pid_file.exists())
+
+    def test_generate_systemd_content(self):
+        """generate_systemd() outputs a valid unit referencing %h/.local/bin/agy-switch watch run and vault paths."""
+        unit = self.dm.generate_systemd()
+        self.assertIn("[Unit]", unit)
+        self.assertIn("Description=Antigravity Account Switcher Log Watcher Daemon", unit)
+        self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", unit)
+        self.assertIn("StandardOutput=append:%h/.antigravity-vault/watch.log", unit)
+        self.assertIn("StandardError=append:%h/.antigravity-vault/watch.log", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("RestartSec=5s", unit)
+        self.assertIn("WantedBy=default.target", unit)
+
+    def test_generate_systemd_writes_to_file(self):
+        """generate_systemd(target_path=...) writes the unit file and creates parent directories."""
+        target = self.base_dir / "user_systemd" / "agy-switch-watcher.service"
+        unit = self.dm.generate_systemd(target_path=target)
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_text(encoding="utf-8"), unit)
+
+    def test_cli_watch_generate_systemd_prints_unit(self):
+        """agy-switch watch --generate-systemd prints the valid systemd unit definition and returns 0."""
+        from io import StringIO
+        from scripts import agy_switch
+
+        mock_engine = MagicMock()
+        mock_engine.vault_dir = self.vault_dir
+
+        out = StringIO()
+        with patch("sys.stdout", out):
+            code = agy_switch.main(["watch", "--generate-systemd"], engine=mock_engine)
+
+        self.assertEqual(code, 0)
+        output = out.getvalue()
+        self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", output)
+        self.assertIn("StandardOutput=append:%h/.antigravity-vault/watch.log", output)
+
+    def test_cli_watch_start_stop_status_dispatch(self):
+        """CLI agy-switch watch start/stop/status dispatches to DaemonManager."""
+        from io import StringIO
+        from scripts import agy_switch, watch
+
+        mock_engine = MagicMock()
+        mock_engine.vault_dir = self.vault_dir
+        mock_engine.proc_dir = self.proc_dir
+        mock_engine.gemini_dir = self.gemini_dir
+
+        mock_proc = MagicMock(pid=8888)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = agy_switch.main(["watch", "start", "--cooldown", "90"], engine=mock_engine)
+            self.assertEqual(code, 0)
+            self.assertIn("8888", out.getvalue())
+
+        # Check status
+        self._create_mock_proc(8888, b"python3\x00scripts/watch.py\x00run\x00")
+        with patch("os.kill", return_value=None):
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = agy_switch.main(["watch", "status"], engine=mock_engine)
+            self.assertEqual(code, 0)
+            self.assertIn("8888", out.getvalue())
+            self.assertIn("Daemon is running", out.getvalue())
+
+        # Check stop
+        with patch("os.kill", side_effect=lambda pid, sig: None if sig in (0, signal.SIGTERM) else None):
+            with patch.object(watch.DaemonManager, "is_process_alive", side_effect=[True, False]):
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    code = agy_switch.main(["watch", "stop"], engine=mock_engine)
+                self.assertEqual(code, 0)
+                self.assertIn("stopped successfully", out.getvalue())
+
+    def test_real_subprocess_start_and_stop_lifecycle(self):
+        """End-to-end integration test spawning a real python subprocess and stopping it with SIGTERM."""
+        real_script = self.base_dir / "real_watch.py"
+        real_script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time, sys, signal\n"
+            "signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))\n"
+            "while True:\n"
+            "    time.sleep(0.1)\n",
+            encoding="utf-8"
+        )
+        dm = DaemonManager(
+            vault_dir=self.vault_dir,
+            watch_script=real_script,
+            gemini_dir=self.gemini_dir,
+        )
+
+        # 1. Start real daemon
+        pid = dm.start()
+        self.assertIsInstance(pid, int)
+        self.assertTrue(dm.pid_file.is_file())
+
+        try:
+            # 2. Check status
+            st = dm.status()
+            self.assertTrue(st["running"])
+            self.assertEqual(st["pid"], pid)
+
+            # 3. Reject duplicate start
+            with self.assertRaises(DaemonAlreadyRunningError):
+                dm.start()
+        finally:
+            # 4. Stop real daemon
+            stopped = dm.stop(timeout=3.0)
+            self.assertTrue(stopped)
+            self.assertFalse(dm.pid_file.exists())
+            self.assertFalse(dm.status()["running"])
+
+    def test_daemon_cmdline_validation_rejects_innocent_processes(self):
+        """Processes whose cmdline merely references watch.py as an argument (vim, git, train.py) are rejected."""
+        # 1. Text editor editing watch.py
+        self._create_mock_proc(20001, b"/usr/bin/vim\x00scripts/watch.py\x00")
+        self.dm.pid_file.write_text("20001\n", encoding="utf-8")
+        with patch("os.kill", return_value=None):
+            self.assertFalse(self.dm.is_process_alive(20001))
+            st = self.dm.status()
+            self.assertFalse(st["running"])
+            self.assertFalse(self.dm.pid_file.exists())
+
+        # 2. Git diff on watch.py
+        self._create_mock_proc(20002, b"git\x00diff\x00scripts/watch.py\x00")
+        self.dm.pid_file.write_text("20002\n", encoding="utf-8")
+        with patch("os.kill", return_value=None):
+            self.assertFalse(self.dm.is_process_alive(20002))
+            self.assertIsNone(self.dm.get_running_pid())
+            self.assertFalse(self.dm.pid_file.exists())
+
+        # 3. Python script running an unrelated script with watch.py as an argument flag
+        self._create_mock_proc(20003, b"python3\x00train.py\x00--data\x00scripts/watch.py\x00")
+        self.dm.pid_file.write_text("20003\n", encoding="utf-8")
+        with patch("os.kill", return_value=None):
+            self.assertFalse(self.dm.is_process_alive(20003))
+            self.assertIsNone(self.dm.get_running_pid())
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_is_process_alive_permission_error_returns_false(self):
+        """PermissionError on os.kill(pid, 0) means the process belongs to another user and is not our daemon."""
+        self.dm.pid_file.write_text("10001\n", encoding="utf-8")
+        with patch("os.kill", side_effect=PermissionError("Operation not permitted")):
+            self.assertFalse(self.dm.is_process_alive(10001))
+            self.assertIsNone(self.dm.get_running_pid())
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_is_process_alive_pid_one_and_self_pid_rejected(self):
+        """PID 1 (init) and self process PID are never recognized as valid background watch daemons."""
+        self.assertFalse(self.dm.is_process_alive(1))
+        self.assertFalse(self.dm.is_process_alive(os.getpid()))
+
+        self.dm.pid_file.write_text("1\n", encoding="utf-8")
+        with patch("os.kill", return_value=None):
+            self.assertIsNone(self.dm.get_running_pid())
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_broken_symlink_pid_file_cleaned(self):
+        """Broken symlink for watch.pid is cleaned up safely without throwing exceptions."""
+        broken_target = self.base_dir / "nonexistent_target_pid"
+        self.dm.pid_file.symlink_to(broken_target)
+        self.assertTrue(self.dm.pid_file.is_symlink())
+
+        self.assertIsNone(self.dm.get_running_pid())
+        self.assertFalse(self.dm.pid_file.exists())
+        self.assertFalse(self.dm.pid_file.is_symlink())
+
+    def test_daemon_start_orphaned_process_cleaned_on_pid_write_failure(self):
+        """If writing watch.pid fails after Popen, the spawned background process is terminated to prevent leaks."""
+        mock_proc = MagicMock(pid=33333)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            with patch.object(self.dm, "_write_pid_file", side_effect=OSError("Disk full")):
+                with self.assertRaises(OSError):
+                    self.dm.start()
+                mock_proc.terminate.assert_called_once()
+
+    def test_daemon_negative_and_zero_pid_pruned(self):
+        """Negative and zero PIDs in watch.pid are recognized as invalid and pruned."""
+        for invalid_pid in ("-50\n", "0\n"):
+            self.dm.pid_file.write_text(invalid_pid, encoding="utf-8")
+            st = self.dm.status()
+            self.assertFalse(st["running"])
+            self.assertIsNone(st["pid"])
+            self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_stop_handles_permission_error_gracefully(self):
+        """stop() handles PermissionError from os.kill gracefully and unlinks the PID file."""
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        with patch.object(self.dm, "get_running_pid", return_value=12345):
+            with patch("os.kill", side_effect=PermissionError("Access denied")):
+                res = self.dm.stop()
+                self.assertTrue(res)
+                self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_start_log_file_symlink_cleaned(self):
+        """If watch.log is a pre-existing symlink, start() unlinks it to prevent writing through symlinks."""
+        symlink_target = self.base_dir / "some_target.log"
+        symlink_target.write_text("initial target content\n", encoding="utf-8")
+        self.dm.log_file.symlink_to(symlink_target)
+        self.assertTrue(self.dm.log_file.is_symlink())
+
+        mock_proc = MagicMock(pid=44444)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            pid = self.dm.start()
+            self.assertEqual(pid, 44444)
+            self.assertFalse(self.dm.log_file.is_symlink())
+            self.assertTrue(self.dm.log_file.is_file())
+            self.assertEqual(self.dm.log_file.stat().st_mode & 0o777, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()
+

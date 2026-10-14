@@ -2358,7 +2358,33 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     subparsers.add_parser("hook-pre-invocation", help="Antigravity PreInvocation lifecycle hook handler")
 
     # Command: watch
-    subparsers.add_parser("watch", help="Run background daemon to tail logs and auto-switch on quota exhaustion")
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Manage background daemon to tail logs and auto-switch on quota exhaustion",
+    )
+    watch_parser.add_argument(
+        "watch_action",
+        nargs="?",
+        choices=["run", "start", "stop", "status"],
+        default="run",
+        help="Action to perform: run (default foreground), start (background daemon), stop, status",
+    )
+    watch_parser.add_argument(
+        "--generate-systemd",
+        action="store_true",
+        help="Output systemd user service unit definition",
+    )
+    watch_parser.add_argument(
+        "--install-systemd",
+        action="store_true",
+        help="Install systemd user service unit to ~/.config/systemd/user/agy-switch-watcher.service",
+    )
+    watch_parser.add_argument(
+        "--cooldown",
+        type=int,
+        default=60,
+        help="Default cooldown minutes for exhausted accounts (default: 60)",
+    )
 
     # Command: internal-probe
     subparsers.add_parser("internal-probe", help=argparse.SUPPRESS)
@@ -2551,11 +2577,87 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     if args.command == "watch":
         try:
             import watch
-            watcher = watch.LogWatcher(engine)
-            watcher.watch_loop()
+        except ImportError:
+            from scripts import watch
+
+        dm = watch.DaemonManager(
+            vault_dir=engine.vault_dir,
+            proc_dir=getattr(engine, "proc_dir", None),
+            gemini_dir=getattr(engine, "gemini_dir", None),
+        )
+
+        if getattr(args, "generate_systemd", False) or getattr(args, "install_systemd", False):
+            target = (
+                Path.home() / ".config" / "systemd" / "user" / "agy-switch-watcher.service"
+                if getattr(args, "install_systemd", False)
+                else None
+            )
+            unit_content = dm.generate_systemd(target_path=target)
+            sys.stdout.write(unit_content)
+            sys.stdout.flush()
+            if target:
+                print(f"[agy-switch watch] Installed systemd unit to {target}", file=sys.stderr)
             return 0
-        except KeyboardInterrupt:
-            return 0
+
+        action = getattr(args, "watch_action", None) or "run"
+
+        if action == "start":
+            try:
+                cooldown = getattr(args, "cooldown", 60)
+                pid = dm.start(cooldown=cooldown)
+                print(f"[agy-switch watch] Daemon started in background (PID: {pid}).")
+                print(f"  - Log: {dm.log_file}")
+                print(f"  - PID: {dm.pid_file}")
+                return 0
+            except watch.DaemonAlreadyRunningError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 1
+            except Exception as e:
+                print(f"Error starting daemon: {e}", file=sys.stderr)
+                return 1
+
+        elif action == "stop":
+            try:
+                stopped = dm.stop()
+                if stopped:
+                    print("[agy-switch watch] Daemon stopped successfully.")
+                else:
+                    print("[agy-switch watch] No active daemon was running.")
+                return 0
+            except Exception as e:
+                print(f"Error stopping daemon: {e}", file=sys.stderr)
+                return 1
+
+        elif action == "status":
+            try:
+                st = dm.status()
+                if st["running"]:
+                    print(f"[agy-switch watch] Daemon is running (PID: {st['pid']}).")
+                    print(f"  - Log: {st['log_file']}")
+                    if st.get("targets"):
+                        print("  - Monitored targets:")
+                        for t in st["targets"]:
+                            print(f"    * {t}")
+                else:
+                    print("[agy-switch watch] Daemon is stopped.")
+                    print(f"  - Log: {st['log_file']}")
+                return 0
+            except Exception as e:
+                print(f"Error checking daemon status: {e}", file=sys.stderr)
+                return 1
+
+        elif action == "run":
+            cooldown_mins = getattr(args, "cooldown", 60)
+            try:
+                signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+            except Exception:
+                pass
+            try:
+                watcher = watch.LogWatcher(engine, cooldown_minutes=cooldown_mins)
+                watcher.watch_loop()
+                return 0
+            except KeyboardInterrupt:
+                return 0
 
     if args.command == "hook-pre-invocation":
         return handle_pre_invocation_hook(engine)
