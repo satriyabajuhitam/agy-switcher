@@ -1152,16 +1152,120 @@ def sort_accounts_by_quota(accounts: list[dict[str, Any]] | None) -> list[dict[s
     return sorted(accounts, key=_sort_key)
 
 
-def format_accounts_table(result: dict[str, Any], show_quota: bool = False) -> str:
-    """Formats accounts list as a clean, human-readable terminal table."""
+def _format_bucket_countdown(reset_ts: Any, current_timestamp: float | None = None) -> str:
+    """Helper to format countdown badge for bucket summaries without broken strings."""
+    cd = format_countdown(reset_ts, current_timestamp=current_timestamp)
+    if cd == "-":
+        return ""
+    if cd == "expired":
+        return " (expired)"
+    return f" (in {cd})"
+
+
+def _format_gemini_quota_summary(acc: dict[str, Any], current_timestamp: float | None = None) -> str:
+    """Extracts and formats Gemini quota summary for display across table and listicle views."""
+    if not isinstance(acc, dict):
+        return "Error / Unreachable"
+
+    q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
+    gemini_data = q_root.get("gemini") if isinstance(q_root.get("gemini"), dict) else None
+
+    if q_root.get("error") or gemini_data is None or (isinstance(gemini_data, dict) and gemini_data.get("error")):
+        return "Error / Unreachable"
+
+    if not isinstance(gemini_data, dict):
+        return "Error / Unreachable"
+
+    raw_cached = gemini_data.get("cached")
+    is_cached = (
+        raw_cached.strip().lower() in ("true", "1")
+        if isinstance(raw_cached, str)
+        else bool(raw_cached)
+    )
+
+    raw_quota = gemini_data.get("quota")
+    parsed_q = _parse_quota_defensive(raw_quota)
+    quota = int(round(parsed_q)) if parsed_q >= 0 else 0
+
+    if is_cached:
+        return f"{quota}% (Cached)"
+
+    buckets = gemini_data.get("buckets") if isinstance(gemini_data.get("buckets"), dict) else {}
+    b_5h = buckets.get("5h") if isinstance(buckets.get("5h"), dict) else {}
+    b_wk = buckets.get("weekly") if isinstance(buckets.get("weekly"), dict) else (buckets.get("wk") if isinstance(buckets.get("wk"), dict) else {})
+
+    raw_5h = b_5h.get("quota")
+    parsed_5h = _parse_quota_defensive(raw_5h)
+    q_5h = int(round(parsed_5h)) if parsed_5h >= 0 else quota
+    ts_5h = b_5h.get("reset_time", gemini_data.get("reset_time") if not buckets else None)
+    cd_5h = _format_bucket_countdown(ts_5h, current_timestamp=current_timestamp)
+
+    raw_wk = b_wk.get("quota")
+    parsed_wk = _parse_quota_defensive(raw_wk)
+    q_wk = int(round(parsed_wk)) if parsed_wk >= 0 else quota
+    ts_wk = b_wk.get("reset_time")
+    cd_wk = _format_bucket_countdown(ts_wk, current_timestamp=current_timestamp)
+
+    return f"{quota}% [5h: {q_5h}%{cd_5h} | wk: {q_wk}%{cd_wk}]"
+
+
+def format_accounts_listicle(
+    result: dict[str, Any] | None,
+    show_quota: bool = True,
+    current_timestamp: float | None = None,
+) -> str:
+    """Formats accounts list as a compact, single-line bulleted listicle for LLMs and narrow terminals."""
+    if not isinstance(result, dict):
+        return "No accounts registered in vault (~/.antigravity-vault/accounts)."
+
     accounts = result.get("accounts", [])
-    if not accounts:
+    if not isinstance(accounts, list) or not accounts:
+        return "No accounts registered in vault (~/.antigravity-vault/accounts)."
+
+    lines: list[str] = []
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        marker = "• [*]" if acc.get("is_active") else "• [ ]"
+        email_str = str(acc.get("email") or "").strip() or "-"
+        name = str(acc.get("name") or "").strip()
+        prefix = f"{marker} {name} ({email_str})"
+
+        if show_quota:
+            quota_summary = _format_gemini_quota_summary(acc, current_timestamp=current_timestamp)
+            lines.append(f"{prefix} — Gemini: {quota_summary}")
+        else:
+            status = "Active" if acc.get("is_active") else "Standby"
+            if not acc.get("valid", True):
+                status += " (Invalid)"
+            lines.append(f"{prefix} [{status}]")
+
+    active_acc = result.get("active")
+    if active_acc:
+        lines.append(f"Active Account: {active_acc}")
+    else:
+        lines.append("No account currently active. Run: agy-switch switch <account>")
+
+    return "\n".join(lines)
+
+
+def format_accounts_table(
+    result: dict[str, Any] | None,
+    show_quota: bool = False,
+    current_timestamp: float | None = None,
+) -> str:
+    """Formats accounts list as a clean, human-readable terminal table focusing exclusively on Gemini."""
+    if not isinstance(result, dict):
+        return "No accounts registered in vault (~/.antigravity-vault/accounts)."
+
+    accounts = result.get("accounts", [])
+    if not isinstance(accounts, list) or not accounts:
         return "No accounts registered in vault (~/.antigravity-vault/accounts)."
 
     header = f"{'':2} {'ACCOUNT':<20} {'EMAIL':<30} {'STATUS':<15}"
     if show_quota:
-        header += " QUOTA"
-        
+        header += " GEMINI QUOTA"
+
     lines = [
         "Antigravity Accounts (~/.antigravity-vault):",
         "-" * len(header),
@@ -1170,24 +1274,19 @@ def format_accounts_table(result: dict[str, Any], show_quota: bool = False) -> s
     ]
 
     for acc in accounts:
-        marker = "* " if acc["is_active"] else "  "
-        status = "Active" if acc["is_active"] else "Standby"
-        if not acc["valid"]:
+        if not isinstance(acc, dict):
+            continue
+        marker = "* " if acc.get("is_active") else "  "
+        status = "Active" if acc.get("is_active") else "Standby"
+        if not acc.get("valid", True):
             status += " (Invalid)"
-        email_str = acc["email"] or "-"
-        line = f"{marker}{acc['name']:<20} {email_str:<30} {status:<15}"
-        
+        email_str = str(acc.get("email") or "").strip() or "-"
+        line = f"{marker}{str(acc.get('name') or ''):<20} {email_str:<30} {status:<15}"
+
         if show_quota:
-            q_data = acc.get("quota", {})
-            if "error" in q_data:
-                line += " Error"
-            elif "gemini" in q_data:
-                line += f" {q_data['gemini'].get('quota', 0)}%"
-            elif "claude" in q_data:
-                line += f" {q_data['claude'].get('quota', 0)}% (C)"
-            else:
-                line += " 0%"
-                
+            quota_summary = _format_gemini_quota_summary(acc, current_timestamp=current_timestamp)
+            line += f" {quota_summary}"
+
         lines.append(line)
 
     lines.append("-" * len(header))

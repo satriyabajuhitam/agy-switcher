@@ -24,6 +24,8 @@ from agy_switch import (
     ActiveTurnRunningError,
     format_countdown,
     sort_accounts_by_quota,
+    format_accounts_listicle,
+    format_accounts_table,
     main,
 )
 
@@ -811,6 +813,359 @@ class TestSortAccountsByQuota(unittest.TestCase):
         self.assertIn("nan-reset", top_names)
         # normal-quota has reset_time 1000, while bool-reset and nan-reset have reset_time inf
         self.assertEqual(res[0]["name"], "normal-quota")
+
+
+
+class TestFormatAccountsListicle(unittest.TestCase):
+    """Unit tests for format_accounts_listicle formatter."""
+
+    def test_empty_accounts_returns_notice(self):
+        """Empty accounts list returns 'No accounts registered in vault (~/.antigravity-vault/accounts).'"""
+        self.assertEqual(
+            format_accounts_listicle({"active": None, "accounts": []}),
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+        self.assertEqual(
+            format_accounts_listicle({}),
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+
+    def test_listicle_without_quota(self):
+        """show_quota=False renders compact bullet items with [Active] / [Standby] tags."""
+        data = {
+            "active": "acc-active",
+            "accounts": [
+                {"name": "acc-active", "email": "active@example.com", "is_active": True, "valid": True},
+                {"name": "acc-standby", "email": "standby@example.com", "is_active": False, "valid": True},
+                {"name": "acc-invalid", "email": None, "is_active": False, "valid": False},
+            ],
+        }
+        res = format_accounts_listicle(data, show_quota=False)
+        lines = res.splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[0], "• [*] acc-active (active@example.com) [Active]")
+        self.assertEqual(lines[1], "• [ ] acc-standby (standby@example.com) [Standby]")
+        self.assertEqual(lines[2], "• [ ] acc-invalid (-) [Standby (Invalid)]")
+        self.assertEqual(lines[3], "Active Account: acc-active")
+
+    def test_listicle_with_live_quota(self):
+        """show_quota=True renders bullet items with worst-case percentage, bucket breakdown, and relative countdowns."""
+        curr = 1000.0
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc1",
+                    "email": "acc1@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 80,
+                            "reset_time": curr + 7200,  # 2h
+                            "cached": False,
+                            "buckets": {
+                                "5h": {"quota": 80, "reset_time": curr + 7200},  # in 2h
+                                "weekly": {"quota": 95, "reset_time": curr + 352800},  # in 4d 2h
+                            },
+                        }
+                    },
+                },
+                {
+                    "name": "acc2",
+                    "email": "acc2@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 50,
+                            "reset_time": curr + 2700,
+                            "cached": False,
+                            "buckets": {
+                                "5h": {"quota": 50, "reset_time": curr + 2700},  # in 45m
+                                "weekly": {"quota": 70, "reset_time": curr + 86400},  # in 1d
+                            },
+                        }
+                    },
+                },
+            ],
+        }
+        res = format_accounts_listicle(data, show_quota=True, current_timestamp=curr)
+        lines = res.splitlines()
+        self.assertEqual(lines[0], "• [*] acc1 (acc1@example.com) — Gemini: 80% [5h: 80% (in 2h) | wk: 95% (in 4d 2h)]")
+        self.assertEqual(lines[1], "• [ ] acc2 (acc2@example.com) — Gemini: 50% [5h: 50% (in 45m) | wk: 70% (in 1d)]")
+        self.assertEqual(lines[2], "Active Account: acc1")
+
+    def test_listicle_cached_quota(self):
+        """Cached quota displays '(Cached)' tag without raw bucket confusion."""
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc-cached",
+                    "email": "cached@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 40,
+                            "reset_time": 2000,
+                            "cached": True,
+                            "buckets": {
+                                "5h": {"quota": 40, "reset_time": 2000},
+                                "weekly": {"quota": 80, "reset_time": 5000},
+                            },
+                        }
+                    },
+                }
+            ],
+        }
+        res = format_accounts_listicle(data, show_quota=True)
+        lines = res.splitlines()
+        self.assertEqual(lines[0], "• [ ] acc-cached (cached@example.com) — Gemini: 40% (Cached)")
+        self.assertNotIn("5h:", lines[0])
+        self.assertNotIn("wk:", lines[0])
+
+    def test_listicle_error_and_unreachable_accounts(self):
+        """Unreachable, missing, or error accounts display 'Error / Unreachable'."""
+        data = {
+            "active": None,
+            "accounts": [
+                {"name": "err-acc", "email": "err@example.com", "is_active": False, "valid": True, "quota": {"error": "Timeout"}},
+                {"name": "none-gemini", "email": None, "is_active": False, "valid": True, "quota": {"gemini": None}},
+                {"name": "none-quota", "email": "nq@example.com", "is_active": False, "valid": True, "quota": None},
+                {"name": "gemini-err", "email": "ge@example.com", "is_active": False, "valid": True, "quota": {"gemini": {"error": "Failed"}}},
+            ],
+        }
+        res = format_accounts_listicle(data, show_quota=True)
+        lines = res.splitlines()
+        self.assertEqual(lines[0], "• [ ] err-acc (err@example.com) — Gemini: Error / Unreachable")
+        self.assertEqual(lines[1], "• [ ] none-gemini (-) — Gemini: Error / Unreachable")
+        self.assertEqual(lines[2], "• [ ] none-quota (nq@example.com) — Gemini: Error / Unreachable")
+        self.assertEqual(lines[3], "• [ ] gemini-err (ge@example.com) — Gemini: Error / Unreachable")
+        self.assertEqual(lines[4], "No account currently active. Run: agy-switch switch <account>")
+
+    def test_listicle_countdown_edge_cases(self):
+        """Expired countdowns render '(expired)' (never '(in expired)'), and missing/0 timestamps omit countdown (never '(in -)' or '(-) ')."""
+        curr = 1000.0
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc-expired",
+                    "email": "exp@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 0,
+                            "reset_time": curr - 10,
+                            "cached": False,
+                            "buckets": {
+                                "5h": {"quota": 0, "reset_time": curr - 10},
+                                "weekly": {"quota": 90, "reset_time": curr + 3600},
+                            },
+                        }
+                    },
+                },
+                {
+                    "name": "acc-no-ts",
+                    "email": "nots@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 100,
+                            "reset_time": 0,
+                            "cached": False,
+                            "buckets": {
+                                "5h": {"quota": 100, "reset_time": 0},
+                                "weekly": {"quota": 100, "reset_time": None},
+                            },
+                        }
+                    },
+                },
+            ],
+        }
+        res = format_accounts_listicle(data, show_quota=True, current_timestamp=curr)
+        lines = res.splitlines()
+        self.assertEqual(lines[0], "• [*] acc-expired (exp@example.com) — Gemini: 0% [5h: 0% (expired) | wk: 90% (in 1h)]")
+        self.assertNotIn("(in expired)", lines[0])
+        self.assertEqual(lines[1], "• [ ] acc-no-ts (nots@example.com) — Gemini: 100% [5h: 100% | wk: 100%]")
+        self.assertNotIn("(in -)", lines[1])
+        self.assertNotIn("(-)", lines[1][len("• [ ] acc-no-ts (nots@example.com) — Gemini: 100%"):])
+
+    def test_adversarial_inputs_listicle(self):
+        """None result, non-list accounts, and non-dict account entries do not crash format_accounts_listicle."""
+        self.assertEqual(
+            format_accounts_listicle(None),
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+        self.assertEqual(
+            format_accounts_listicle({"accounts": "invalid"}),  # type: ignore
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+        data = {
+            "active": "ok",
+            "accounts": [
+                None,  # type: ignore
+                "not-a-dict",  # type: ignore
+                {
+                    "name": "ok",
+                    "email": "  ",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": "85.4%",
+                            "cached": "true",
+                        }
+                    },
+                },
+            ],
+        }
+        res = format_accounts_listicle(data, show_quota=True)
+        self.assertIn("• [*] ok (-) — Gemini: 85% (Cached)", res)
+        self.assertIn("Active Account: ok", res)
+
+
+class TestFormatAccountsTable(unittest.TestCase):
+    """Unit tests for format_accounts_table formatter."""
+
+    def test_empty_accounts_returns_notice(self):
+        """Empty accounts list returns 'No accounts registered in vault (~/.antigravity-vault/accounts).'"""
+        self.assertEqual(
+            format_accounts_table({"active": None, "accounts": []}),
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+        self.assertEqual(
+            format_accounts_table({}),
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+
+    def test_table_without_quota(self):
+        """show_quota=False displays ACCOUNT, EMAIL, STATUS without GEMINI QUOTA."""
+        data = {
+            "active": "acc-active",
+            "accounts": [
+                {"name": "acc-active", "email": "active@example.com", "is_active": True, "valid": True},
+                {"name": "acc-standby", "email": "standby@example.com", "is_active": False, "valid": True},
+            ],
+        }
+        res = format_accounts_table(data, show_quota=False)
+        self.assertIn("ACCOUNT", res)
+        self.assertIn("EMAIL", res)
+        self.assertIn("STATUS", res)
+        self.assertNotIn("GEMINI QUOTA", res)
+        self.assertNotIn("CLAUDE", res)
+        self.assertIn("* acc-active", res)
+        self.assertIn("  acc-standby", res)
+        self.assertIn("Active Account: acc-active", res)
+
+    def test_table_with_gemini_quota(self):
+        """show_quota=True adds 'GEMINI QUOTA' column with live breakdown, cached tags, and error handling."""
+        curr = 1000.0
+        data = {
+            "active": "acc-live",
+            "accounts": [
+                {
+                    "name": "acc-live",
+                    "email": "live@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 80,
+                            "reset_time": curr + 7200,
+                            "cached": False,
+                            "buckets": {
+                                "5h": {"quota": 80, "reset_time": curr + 7200},
+                                "weekly": {"quota": 95, "reset_time": curr + 352800},
+                            },
+                        }
+                    },
+                },
+                {
+                    "name": "acc-cached",
+                    "email": "cached@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 40,
+                            "reset_time": curr + 100,
+                            "cached": True,
+                        }
+                    },
+                },
+                {
+                    "name": "acc-unreachable",
+                    "email": "unreach@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "error": "Failed to connect",
+                    },
+                },
+            ],
+        }
+        res = format_accounts_table(data, show_quota=True, current_timestamp=curr)
+        self.assertIn("GEMINI QUOTA", res)
+        self.assertNotIn("STATUS          QUOTA", res)  # Must be GEMINI QUOTA, not bare QUOTA
+        self.assertIn("80% [5h: 80% (in 2h) | wk: 95% (in 4d 2h)]", res)
+        self.assertIn("40% (Cached)", res)
+        self.assertIn("Error / Unreachable", res)
+        # Verify divider length matches header
+        lines = res.splitlines()
+        header_line = lines[2]
+        divider_top = lines[1]
+        divider_bottom = lines[3]
+        self.assertEqual(len(divider_top), len(header_line))
+        self.assertEqual(len(divider_bottom), len(header_line))
+
+    def test_table_claude_omitted(self):
+        """Claude telemetry is never rendered in table columns even if present in payload."""
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc1",
+                    "email": "acc1@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "claude": {"quota": 90, "reset_time": 1000},
+                        "gemini": {"quota": 70, "cached": True},
+                    },
+                }
+            ],
+        }
+        res = format_accounts_table(data, show_quota=True)
+        self.assertNotIn("(C)", res)
+        self.assertNotIn("Claude", res)
+        self.assertIn("70% (Cached)", res)
+
+    def test_adversarial_inputs_table(self):
+        """None result, non-list accounts, and non-dict account entries do not crash format_accounts_table."""
+        self.assertEqual(
+            format_accounts_table(None),
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+        self.assertEqual(
+            format_accounts_table({"accounts": "invalid"}),  # type: ignore
+            "No accounts registered in vault (~/.antigravity-vault/accounts).",
+        )
+        data = {
+            "active": "ok",
+            "accounts": [
+                None,  # type: ignore
+                "not-a-dict",  # type: ignore
+                {"name": "ok", "email": "  ", "is_active": True, "valid": True},
+            ],
+        }
+        res = format_accounts_table(data, show_quota=False)
+        self.assertIn("* ok", res)
+        self.assertIn("-", res)  # whitespace email falls back to '-'
 
 
 if __name__ == "__main__":
