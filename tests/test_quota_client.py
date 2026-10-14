@@ -1079,6 +1079,72 @@ class TestQuotaClient(unittest.TestCase):
         self.assertIn("gemini", results["acc_success"])
 
 
+    def test_numeric_error_codes_word_boundary_isolation(self):
+        """_is_auth_error and _is_network_error enforce word boundaries on 401/403 numeric codes."""
+        from agy_switch import _is_auth_error, _is_network_error
+
+        # Latency strings must NOT match 401/403 auth errors
+        self.assertFalse(_is_auth_error("Timed out after 401ms"))
+        self.assertTrue(_is_network_error("Timed out after 401ms"))
+
+        # Port numbers must NOT match 401/403 auth errors
+        self.assertFalse(_is_auth_error("Connection refused on port 4018"))
+        self.assertTrue(_is_network_error("Connection refused on port 4018"))
+
+        # Metric size strings must NOT match 401/403 auth errors
+        self.assertFalse(_is_auth_error("Payload 403KB exceeded"))
+
+        # Real auth errors must match
+        self.assertTrue(_is_auth_error("HTTP Error 401: Unauthorized"))
+        self.assertFalse(_is_network_error("HTTP Error 401: Unauthorized"))
+
+        self.assertTrue(_is_auth_error("HTTP Error 403: Forbidden"))
+        self.assertFalse(_is_network_error("HTTP Error 403: Forbidden"))
+
+        self.assertTrue(_is_auth_error("Failed with error code 401"))
+        self.assertTrue(_is_auth_error("Access denied (403)"))
+
+    def test_fetch_account_quota_word_boundary_error_classification(self):
+        """fetch_account_quota does not classify 401ms or port 4018 as auth error when raw_type is omitted."""
+        mock_engine = MagicMock()
+        mock_engine.get_account_tokens.return_value = {
+            "access_token": "valid_token",
+            "refresh_token": "valid_refresh",
+        }
+
+        mock_client = MagicMock(spec=QuotaClient)
+        mock_client.fetch_quota.return_value = {}
+        mock_client.last_error_type = None
+
+        # 401ms latency message
+        mock_client.last_error = "Timed out after 401ms"
+        _, res_401ms = fetch_account_quota(mock_engine, "acc1", client=mock_client)
+        self.assertEqual(res_401ms.get("error_type"), "network")
+
+        # Port 4018 message
+        mock_client.last_error = "Connection failed on port 4018"
+        _, res_4018 = fetch_account_quota(mock_engine, "acc1", client=mock_client)
+        self.assertEqual(res_4018.get("error_type"), "network")
+
+    def test_sanitize_expires_in_helper(self):
+        """_sanitize_expires_in extracts positive finite integer seconds with fallback to default."""
+        from agy_switch import _sanitize_expires_in
+
+        self.assertEqual(_sanitize_expires_in(3600), 3600)
+        self.assertEqual(_sanitize_expires_in("1800"), 1800)
+        self.assertEqual(_sanitize_expires_in(1800.9), 1800)
+        self.assertEqual(_sanitize_expires_in(True), 3600)
+        self.assertEqual(_sanitize_expires_in(False), 3600)
+        self.assertEqual(_sanitize_expires_in(-50), 3600)
+        self.assertEqual(_sanitize_expires_in(0), 3600)
+        self.assertEqual(_sanitize_expires_in(float("inf")), 3600)
+        self.assertEqual(_sanitize_expires_in(float("nan")), 3600)
+        self.assertEqual(_sanitize_expires_in("invalid"), 3600)
+        self.assertEqual(_sanitize_expires_in(None), 3600)
+        self.assertEqual(_sanitize_expires_in("bad", default=7200), 7200)
+        self.assertEqual(_sanitize_expires_in(100000000), 3600)
+
+
 if __name__ == "__main__":
     unittest.main()
 

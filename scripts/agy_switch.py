@@ -739,6 +739,41 @@ class AgySwitchEngine:
             "server_busy": busy,
         }
 
+
+def _sanitize_expires_in(raw_exp: Any, default: int = 3600) -> int:
+    """Sanitizes an expires_in value to a positive integer, falling back to default."""
+    if isinstance(raw_exp, bool):
+        return default
+    try:
+        val = float(raw_exp)
+        return int(val) if math.isfinite(val) and 0 < val <= 31536000 else default
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+AUTH_ERROR_CODE_PATTERN = re.compile(r"\b(401|403)\b")
+HTTP_SERVER_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
+AUTH_PHRASES = (
+    "no token",
+    "token refresh rejected",
+    "invalid_grant",
+    "unauthorized",
+    "revoked",
+)
+
+
+def _has_auth_indicator(text: Any) -> bool:
+    """Checks whether an error message contains auth/token corruption keywords or HTTP 401/403 status codes."""
+    if text is None:
+        return False
+    lower = str(text).lower()
+    if any(phrase in lower for phrase in AUTH_PHRASES):
+        return True
+    if AUTH_ERROR_CODE_PATTERN.search(lower):
+        return True
+    return False
+
+
 class QuotaClient:
     def __init__(
         self,
@@ -802,14 +837,7 @@ class QuotaClient:
                 if not isinstance(raw_token, str) or not raw_token.strip():
                     return None
                 raw_exp = token_data.get("expires_in", 3600)
-                if isinstance(raw_exp, bool):
-                    expires_in = 3600
-                else:
-                    try:
-                        val = float(raw_exp)
-                        expires_in = int(val) if math.isfinite(val) and val > 0 else 3600
-                    except (ValueError, TypeError, OverflowError):
-                        expires_in = 3600
+                expires_in = _sanitize_expires_in(raw_exp, default=3600)
                 return {
                     "access_token": raw_token.strip(),
                     "expires_in": expires_in,
@@ -1184,14 +1212,7 @@ def fetch_account_quota(
             if not access_tok:
                 return
             raw_exp = new_token_data.get("expires_in", 3600)
-            if isinstance(raw_exp, bool):
-                exp_sec = 3600
-            else:
-                try:
-                    val = float(raw_exp)
-                    exp_sec = int(val) if math.isfinite(val) and val > 0 else 3600
-                except (ValueError, TypeError, OverflowError):
-                    exp_sec = 3600
+            exp_sec = _sanitize_expires_in(raw_exp, default=3600)
             expiry_iso = (datetime.now(timezone.utc) + timedelta(seconds=exp_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
             engine.update_account_access_token(acc_name, access_tok, expiry=expiry_iso)
         else:
@@ -1217,12 +1238,12 @@ def fetch_account_quota(
         raw_err = getattr(client, "last_error", None)
         err_msg = raw_err if isinstance(raw_err, str) and raw_err else "Fetch failed"
         raw_type = getattr(client, "last_error_type", None)
-        if raw_type == "http" and any(code in err_msg for code in ("500", "502", "503", "504")):
+        if raw_type == "http" and bool(HTTP_SERVER_ERROR_PATTERN.search(err_msg)):
             err_type = "network"
         elif isinstance(raw_type, str) and raw_type:
             err_type = raw_type
         else:
-            err_type = "auth" if any(k in err_msg.lower() for k in ("unauthorized", "invalid_grant", "revoked", "no token", "token refresh rejected", "401", "403")) else "network"
+            err_type = "auth" if _has_auth_indicator(err_msg) else "network"
         return acc_name, {"error": err_msg, "error_type": err_type}
     except Exception as e:
         err_str = str(e)
@@ -1908,6 +1929,12 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
             return True
         if isinstance(raw_type, str) and raw_type.strip() and raw_type.strip() != "auth":
             return False
+        code = error_val.get("code") or error_val.get("status_code")
+        if isinstance(code, int):
+            if code in (401, 403):
+                return True
+            if code in (500, 502, 503, 504):
+                return False
         err_str = str(error_val.get("error", "")).lower()
     elif isinstance(error_val, Exception):
         if isinstance(error_val, urllib.error.HTTPError):
@@ -1925,8 +1952,7 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
     else:
         err_str = str(error_val).lower()
 
-    auth_keywords = ["no token", "token refresh rejected", "invalid_grant", "unauthorized", "401", "403", "revoked"]
-    if any(k in err_str for k in auth_keywords):
+    if _has_auth_indicator(err_str):
         return True
 
     if client is not None:
@@ -1934,7 +1960,7 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
         if isinstance(c_type, str) and c_type == "auth":
             return True
         c_err = getattr(client, "last_error", None)
-        if isinstance(c_err, str) and any(k in c_err.lower() for k in auth_keywords):
+        if isinstance(c_err, str) and _has_auth_indicator(c_err):
             return True
 
     return False
@@ -1959,7 +1985,7 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
             if isinstance(code, int):
                 return code in (500, 502, 503, 504)
             err_str = str(error_val.get("error", "")).lower()
-            return any(k in err_str for k in ("500", "502", "503", "504"))
+            return bool(HTTP_SERVER_ERROR_PATTERN.search(err_str))
         err_str = str(error_val.get("error", "")).lower()
     elif isinstance(error_val, Exception):
         err_str = str(error_val).lower()
@@ -1971,14 +1997,11 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
     net_keywords = [
         "timeout", "timed out", "urlerror", "network", "unreachable",
         "connection", "reset by peer", "failed to connect", "socket",
-        "dns", "authoritative", "500", "502", "503", "504",
+        "dns", "authoritative",
     ]
-    auth_indicators = (
-        "401", "403", "unauthorized", "invalid_grant", "revoked",
-        "no token", "token refresh rejected",
-    )
-    if any(k in err_str for k in net_keywords):
-        if not any(a in err_str for a in auth_indicators):
+    is_net_error = any(k in err_str for k in net_keywords) or bool(HTTP_SERVER_ERROR_PATTERN.search(err_str))
+    if is_net_error:
+        if not _has_auth_indicator(err_str):
             return True
 
     if client is not None:
@@ -1987,12 +2010,13 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
             return True
         if isinstance(c_type, str) and c_type == "http":
             c_err = getattr(client, "last_error", None)
-            if isinstance(c_err, str) and any(code in c_err for code in ("500", "502", "503", "504")):
+            if isinstance(c_err, str) and bool(HTTP_SERVER_ERROR_PATTERN.search(c_err)):
                 return True
         c_err = getattr(client, "last_error", None)
         if isinstance(c_err, str):
             c_err_lower = c_err.lower()
-            if any(k in c_err_lower for k in net_keywords) and not any(a in c_err_lower for a in auth_indicators):
+            c_is_net = any(k in c_err_lower for k in net_keywords) or bool(HTTP_SERVER_ERROR_PATTERN.search(c_err_lower))
+            if c_is_net and not _has_auth_indicator(c_err_lower):
                 return True
 
     return False
@@ -2131,7 +2155,8 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 combined_quotas[active_name] = active_entry
 
             # If active account had auth corruption, remove it from combined_quotas so it does not fall back to stale cache
-            if active_name and probe_error is not None and _is_auth_error(probe_error, client=client):
+            err_obj = active_quota if isinstance(active_quota, dict) else probe_error
+            if active_name and probe_error is not None and _is_auth_error(err_obj, client=client):
                 combined_quotas.pop(active_name, None)
                 evict_keys.add(active_name)
 

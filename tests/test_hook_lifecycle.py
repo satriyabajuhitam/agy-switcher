@@ -1500,6 +1500,104 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertEqual(out_capture.getvalue().strip(), "{}")
 
 
+    def test_hook_tier2_401ms_probe_error_retains_active_via_cache_without_tier3_auth_failover(self):
+        """Active account probe error containing '401ms' falls back to valid cache rather than triggering Tier 3 auth failover."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 with 50% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 50, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 90, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        # Tier 2 returns 'Timed out after 401ms'
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "Timed out after 401ms", "error_type": "network"})):
+                with patch("agy_switch.fetch_all_accounts_quota") as mock_standby_fetch:
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # 401ms must NOT trigger Tier 3 failover
+        mock_standby_fetch.assert_not_called()
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+        self.assertEqual(out_capture.getvalue().strip(), "{}")
+
+    def test_hook_tier3_active_network_error_not_evicted_from_combined_quotas(self):
+        """Active account experiencing network error is not evicted from combined_quotas during Tier 3 rotation."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 (10% - below 15% threshold so Tier 2 falls through) and acc2 (80%)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        cache_file.write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 10, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 80, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        # Tier 2 returns network error with 401ms
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "Timed out after 401ms", "error_type": "network"})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # acc1 has network error, NOT auth corruption. It should NOT be evicted from disk cache
+        disk_data = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertIn("acc1", disk_data.get("accounts", {}))
+        self.assertIn("acc2", disk_data.get("accounts", {}))
+
+
 if __name__ == "__main__":
     unittest.main()
 
