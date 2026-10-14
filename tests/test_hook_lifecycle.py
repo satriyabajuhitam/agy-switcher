@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -116,7 +117,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         script_path = REPO_ROOT / "scripts" / "agy_switch.py"
         sample_input = json.dumps({
             "conversationId": "test-conv-123",
-            "modelName": "gemini-3.7-flash-high",
+            "modelName": "gemini-3.8-pro",
             "invocationNum": 1,
             "workspacePaths": ["/srv/agy-workspaces/booster/agy-switcher"]
         })
@@ -153,8 +154,8 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             except json.JSONDecodeError as e:
                 self.fail(f"stdout is not valid JSON for input {bad_input!r}: {proc.stdout!r}, error: {e}")
 
-    def test_hook_pre_invocation_empty_quotas_warns_exhausted(self):
-        """When auto-switch is on and all network quotas fail (empty quotas), output exhausted warning ephemeralMessage."""
+    def test_hook_pre_invocation_empty_quotas_proceeds_silently(self):
+        """When auto-switch is on and all network quotas fail (empty quotas/network outage), hook must proceed silently with {} without emitting false alarm."""
         from agy_switch import handle_pre_invocation_hook
         import io
 
@@ -169,7 +170,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         }))
         self.engine.set_active_name("acc1")
 
-        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        input_payload = json.dumps({"modelName": "gemini-3.8-pro"})
 
         # Mock QuotaClient.fetch_quota to return empty dict (simulating network failure)
         with patch("agy_switch.QuotaClient.fetch_quota", return_value={}):
@@ -180,13 +181,8 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
 
         self.assertEqual(ret, 0)
         output = json.loads(out_capture.getvalue())
-        self.assertIn("injectSteps", output, "Hook should output injectSteps warning when quotas are empty")
-        self.assertEqual(len(output["injectSteps"]), 1)
-        step = output["injectSteps"][0]
-        self.assertIn("ephemeralMessage", step)
-        self.assertNotIn("type", step)
-        self.assertNotIn("message", step)
-        self.assertIn("exhausted their gemini-1.5-pro quota", step["ephemeralMessage"])
+        self.assertEqual(output, {}, "Hook must proceed silently with {} when network quotas fail without valid cache")
+        self.assertEqual(self.engine.get_active_name(), "acc1")
 
     def test_hook_pre_invocation_all_quotas_zero_warns_exhausted(self):
         """When auto-switch is on and all accounts have 0 quota, output exhausted warning ephemeralMessage."""
@@ -203,7 +199,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         }))
         self.engine.set_active_name("acc1")
 
-        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        input_payload = json.dumps({"modelName": "gemini-3.8-pro"})
         zero_quota = {
             "groups": [
                 {
@@ -226,7 +222,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertIn("ephemeralMessage", step)
         self.assertNotIn("type", step)
         self.assertNotIn("message", step)
-        self.assertIn("exhausted their gemini-1.5-pro quota", step["ephemeralMessage"])
+        self.assertIn("exhausted their gemini-3.8-pro quota", step["ephemeralMessage"])
 
     def test_hook_pre_invocation_uses_get_account_tokens(self):
         """Hook must call engine.get_account_tokens instead of directly parsing token dicts."""
@@ -243,7 +239,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         }))
         self.engine.set_active_name("acc1")
 
-        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        input_payload = json.dumps({"modelName": "auto"})
 
         with patch.object(self.engine, "get_account_tokens", wraps=self.engine.get_account_tokens) as spy_tokens:
             with patch("agy_switch.QuotaClient.fetch_quota", return_value={}):
@@ -270,7 +266,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         }))
         self.engine.set_active_name("acc1")
 
-        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        input_payload = json.dumps({"modelName": "gemini-3.8-pro"})
         dummy_quota = {
             "groups": [
                 {
@@ -306,7 +302,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             }))
         self.engine.set_active_name("acc1")
 
-        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        input_payload = json.dumps({"modelName": "gemini-3.8-pro"})
 
         mock_quotas = {
             "tok_acc1": {"gemini": {"quota": 5, "reset_time": 1700000000}},
@@ -348,7 +344,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             }))
         self.engine.set_active_name("acc1")
 
-        input_payload = json.dumps({"modelName": "gemini-1.5-pro"})
+        input_payload = json.dumps({"modelName": "gemini-3.8-pro"})
 
         mock_quotas = {
             "tok_acc1": {"gemini": {"quota": 0, "reset_time": 1700000000}},
@@ -445,6 +441,1614 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertNotIn("message", step)
         self.assertIn("Auto-rotated to **acc2**", step["ephemeralMessage"])
 
+    def test_tier_1_healthy_cache_bypasses_with_zero_network_and_disk_io(self):
+        """Tier 1 bypasses execution with 0 network calls and 0 disk writes when active account has cached quota >= 25% and cached_at within 300s."""
+        from agy_switch import handle_pre_invocation_hook, QuotaClient
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "token1", "refresh_token": "r1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.sig",
+        }))
+        self.engine.set_active_name("acc1")
+
+        # Seed cache with fresh quota (cached_at = 1000.0, quota = 80%)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        cache_file.write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                }
+            }
+        }), encoding="utf-8")
+
+        input_payload = json.dumps({"modelName": "gemini-3.8-pro"})
+
+        # Virtual clock at 1100.0 (delta = 100s <= 300s)
+        with patch("time.time", return_value=1100.0):
+            with patch("agy_switch.fetch_account_quota") as mock_fetch:
+                with patch.object(QuotaClient, "save_cache") as mock_save:
+                    with patch("sys.stdin", io.StringIO(input_payload)):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(json.loads(out_capture.getvalue()), {})
+        # Strictly zero network calls and zero disk writes
+        mock_fetch.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_tier_1_model_name_mapping(self):
+        """Stdin payload modelName correctly maps to 'gemini' or 'claude' when looking up quota cache."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "token1", "refresh_token": "r1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.sig",
+        }))
+        self.engine.set_active_name("acc1")
+
+        # Cache where Gemini is healthy (80%) but Claude is low (10%)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                    "claude": {"quota": 10, "reset_time": 1700000000},
+                }
+            }
+        }), encoding="utf-8")
+
+        # 1. gemini-3.8-pro -> maps to gemini (80% >= 25%) -> Tier 1 bypasses (0 network calls)
+        with patch("time.time", return_value=1100.0):
+            with patch("agy_switch.fetch_account_quota") as mock_fetch:
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+                self.assertEqual(ret, 0)
+                self.assertEqual(json.loads(out_capture.getvalue()), {})
+                mock_fetch.assert_not_called()
+
+        # 2. auto -> maps to gemini (80% >= 25%) -> Tier 1 bypasses (0 network calls)
+        with patch("time.time", return_value=1100.0):
+            with patch("agy_switch.fetch_account_quota") as mock_fetch:
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "auto"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+                self.assertEqual(ret, 0)
+                self.assertEqual(json.loads(out_capture.getvalue()), {})
+                mock_fetch.assert_not_called()
+
+        # 3. claude-3-5-sonnet -> maps to claude (10% < 25%) -> Tier 1 does NOT bypass (probes active account)
+        with patch("time.time", return_value=1100.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"claude": {"quota": 85}})) as mock_fetch:
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "claude-3-5-sonnet"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+                self.assertEqual(ret, 0)
+                mock_fetch.assert_called_once()
+
+    def test_tier_2_single_account_probe_when_cache_expired(self):
+        """Cache expiration (> 300s) triggers Tier 2 single probe and updates cache with fresh cached_at; standby accounts not probed."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache created at 1000.0
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        cache_file.write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                },
+                "acc2": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 90, "reset_time": 1700000000},
+                }
+            }
+        }), encoding="utf-8")
+
+        # Virtual time at 1350.0 (delta = 350s > 300s TTL)
+        fresh_quota = {"gemini": {"quota": 85, "reset_time": 1700000000}}
+        with patch("time.time", return_value=1350.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", fresh_quota)) as mock_fetch:
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(json.loads(out_capture.getvalue()), {})
+        # Tier 2 probes ONLY active account 'acc1'; zero calls to standby 'acc2'
+        self.assertEqual(mock_fetch.call_count, 1)
+        self.assertEqual(mock_fetch.call_args[0][1], "acc1")
+
+        # Verify cache persisted with fresh cached_at = 1350.0 and merged standby preserved
+        saved_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved_cache["accounts"]["acc1"]["cached_at"], 1350.0)
+        self.assertEqual(saved_cache["accounts"]["acc1"]["gemini"]["quota"], 85)
+        self.assertIn("acc2", saved_cache["accounts"])
+
+    def test_tier_2_single_account_probe_when_quota_intermediate(self):
+        """Intermediate quota (15% <= quota < 25%) triggers Tier 2 single probe even if cache is fresh."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache created at 1000.0 with 20% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 20, "reset_time": 1700000000},
+                },
+                "acc2": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 90, "reset_time": 1700000000},
+                }
+            }
+        }), encoding="utf-8")
+
+        # Virtual clock at 1050.0 (delta = 50s <= 300s, but quota 20% is intermediate)
+        fresh_quota = {"gemini": {"quota": 22, "reset_time": 1700000000}}
+        with patch("time.time", return_value=1050.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", fresh_quota)) as mock_fetch:
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(json.loads(out_capture.getvalue()), {})
+        # Only active account probed
+        mock_fetch.assert_called_once()
+        self.assertEqual(mock_fetch.call_args[0][1], "acc1")
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+
+    def test_tier_2_probe_auth_corruption_skips_cache_and_fails_over(self):
+        """Auth corruption on active account skips cache fallback and triggers failover to healthy standby."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # acc1 has high cached quota (90%), but expired cache (delta > 300s)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 90, "reset_time": 1700000000},
+                },
+            }
+        }), encoding="utf-8")
+
+        mock_quotas = {
+            "tok_acc1": {},  # token revoked / invalid
+            "tok_acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+        }
+
+        # Mock fetch_quota returning HTTPError 401 Unauthorized for acc1 (revoked token)
+        def fake_fetch_quota(tok, refresh_token=None, on_refresh=None):
+            if tok == "tok_acc1":
+                raise urllib.error.HTTPError("https://cloudcode-pa.googleapis.com", 401, "Unauthorized", {}, io.BytesIO(b""))
+            return mock_quotas.get(tok, {})
+
+        with patch("time.time", return_value=1350.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=fake_fetch_quota):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Auth failure on acc1 must NOT fall back to 90% cache; must rotate to acc2
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        self.assertIn("Auto-rotated to **acc2**", output["injectSteps"][0]["ephemeralMessage"])
+
+    def test_tier_2_probe_network_timeout_with_cached_quota_retains_active_silently(self):
+        """Network timeout with cached quota >= 15% retains active account silently without emitting false alarms."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "tok1", "refresh_token": "ref1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.sig",
+        }))
+        self.engine.set_active_name("acc1")
+
+        # Cache with 50% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 50, "reset_time": 1700000000},
+                }
+            }
+        }), encoding="utf-8")
+
+        # Virtual clock at 1400.0 (cache expired). Probe fails with TimeoutError.
+        with patch("time.time", return_value=1400.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=TimeoutError("Timed out")):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Retained active account silently: output is {} and no false alarm warning emitted
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {})
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+
+    def test_tier_2_probe_quota_drops_below_15_triggers_failover(self):
+        """When Tier 2 single probe reveals active quota < 15%, hook proceeds to Tier 3 failover."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache expired (delta > 300s)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                },
+                "acc2": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 90, "reset_time": 1700000000},
+                }
+            }
+        }), encoding="utf-8")
+
+        mock_quotas = {
+            "tok_acc1": {"gemini": {"quota": 10, "reset_time": 1700000000}},
+            "tok_acc2": {"gemini": {"quota": 90, "reset_time": 1700000000}},
+        }
+
+        with patch("time.time", return_value=1350.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=lambda tok, refresh_token=None: mock_quotas.get(tok, {})):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        self.assertIn("Auto-rotated to **acc2**", output["injectSteps"][0]["ephemeralMessage"])
+
+    def test_total_network_failure_no_cache_proceeds_silently(self):
+        """When network probe fails and no cache exists in vault, hook proceeds silently with {} without false alarm."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "tok1", "refresh_token": "ref1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.sig",
+        }))
+        self.engine.set_active_name("acc1")
+
+        # No cache file exists
+        with patch("time.time", return_value=1000.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=TimeoutError("Network down")):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Must output empty {} without injecting false alarm")
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+
+    def test_partial_standby_unreachable_does_not_warn_exhausted(self):
+        """Acc 1 is 0%, Acc 2 probe times out (no cache) -> Hook does NOT emit all-exhausted warning; outputs {} and remains on acc1."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        def fake_fetch_quota(tok, refresh_token=None):
+            if tok == "tok_acc1":
+                return {"gemini": {"quota": 0, "reset_time": 1700000000}}
+            raise TimeoutError("Standby unreachable")
+
+        with patch("time.time", return_value=1000.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=fake_fetch_quota):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        # Standby status is indeterminate: hook must NOT emit all-exhausted warning
+        self.assertEqual(output, {})
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+
+    def test_tier_3_standby_probes_persist_to_cache(self):
+        """Tier 3 concurrent probe across standby accounts persists fresh telemetry with cached_at to cache."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+
+        mock_quotas = {
+            "tok_acc1": {"gemini": {"quota": 5, "reset_time": 1700000000}},
+            "tok_acc2": {"gemini": {"quota": 95, "reset_time": 1700000000}},
+        }
+
+        with patch("time.time", return_value=2000.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=lambda tok, refresh_token=None: mock_quotas.get(tok, {})):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+
+        # Verify cache persisted both accounts with cached_at = 2000.0
+        self.assertTrue(cache_file.is_file())
+        saved_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved_cache["accounts"]["acc2"]["cached_at"], 2000.0)
+        self.assertEqual(saved_cache["accounts"]["acc2"]["gemini"]["quota"], 95)
+        self.assertEqual(saved_cache["accounts"]["acc1"]["cached_at"], 2000.0)
+        self.assertEqual(saved_cache["accounts"]["acc1"]["gemini"]["quota"], 5)
+
+    def test_tier_1_model_name_auto_and_missing_defaults_to_gemini(self):
+        """When modelName is None, missing, or non-string, hook defaults safely to auto/gemini without crashing."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        acc_dir = self.vault_dir / "accounts" / "acc1"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps({
+            "token": {"access_token": "tok1", "refresh_token": "ref1", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+            "auth_method": "oauth",
+            "id_token": "header.eyJlbWFpbCI6ICJhY2MxQGV4YW1wbGUuY29tIn0.sig",
+        }))
+        self.engine.set_active_name("acc1")
+
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                }
+            }
+        }), encoding="utf-8")
+
+        for payload_dict in [{}, {"modelName": None}, {"modelName": 123}, {"modelName": ""}, {"modelName": "auto"}]:
+            with patch("time.time", return_value=1100.0):
+                with patch("agy_switch.fetch_account_quota") as mock_fetch:
+                    with patch("sys.stdin", io.StringIO(json.dumps(payload_dict))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+                    self.assertEqual(ret, 0)
+                    self.assertEqual(json.loads(out_capture.getvalue()), {})
+                    # Tier 1 healthy bypass on gemini quota (80% >= 25%)
+                    mock_fetch.assert_not_called()
+
+    def test_tier_3_revoked_refresh_token_failover_to_standby(self):
+        """Active account refresh token rejection (e.g. HTTP 400 Bad Request on OAuth token refresh) triggers Tier 3 failover to standby."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Stale cache for acc1 indicating 90% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 90, "reset_time": 1700000000},
+                },
+            }
+        }), encoding="utf-8")
+
+        mock_quotas = {
+            "tok_acc2": {"gemini": {"quota": 85, "reset_time": 1700000000}},
+        }
+
+        # Mock QuotaClient.fetch_quota:
+        # For acc1, simulates 401 on CloudCode and refresh failure (returns {} and sets auth error)
+        # For acc2, returns valid 85% quota
+        def fake_fetch_quota(client_self, tok, refresh_token=None, on_refresh=None):
+            if tok == "tok_acc1":
+                client_self.last_error = "Token refresh rejected"
+                client_self.last_error_type = "auth"
+                return {}
+            return mock_quotas.get(tok, {})
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", new=fake_fetch_quota):
+                with patch.object(self.engine, "switch_tokens", wraps=self.engine.switch_tokens) as spy_switch:
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        err_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Succeeded in failover to acc2
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        spy_switch.assert_called_once_with("acc2", restart_server=False, force=True)
+
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        step = output["injectSteps"][0]
+        self.assertIn("ephemeralMessage", step)
+        self.assertIn("Auto-rotated to **acc2**", step["ephemeralMessage"])
+        self.assertIn("85% remaining", step["ephemeralMessage"])
+
+        # Credential protection assertion: never leak token strings
+        stderr_text = err_capture.getvalue()
+        stdout_text = out_capture.getvalue()
+        for secret in ["tok_acc1", "ref_acc1", "tok_acc2", "ref_acc2"]:
+            self.assertNotIn(secret, stderr_text)
+            self.assertNotIn(secret, stdout_text)
+
+    def test_tier_3_all_registered_accounts_zero_warns_exhausted(self):
+        """When all registered accounts in vault are verified at 0% quota, hook strictly emits exhaustion warning."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2", "acc3"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        zero_quota = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1000.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", return_value=zero_quota):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        step = output["injectSteps"][0]
+        self.assertIn("ephemeralMessage", step)
+        self.assertIn("⚠️ All Antigravity accounts have exhausted their gemini-3.8-pro quota.", step["ephemeralMessage"])
+        # Active account remains acc1
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+
+    def test_tier_3_partial_standby_unreachable_multi_accounts_proceeds_silently(self):
+        """When 2 accounts are 0% and 1 standby account is unreachable without cache, all_exhausted is False and hook proceeds silently with {}."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2", "acc3"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        def fake_fetch_quota(tok, refresh_token=None):
+            if tok in ("tok_acc1", "tok_acc2"):
+                return {"gemini": {"quota": 0, "reset_time": 1700000000}}
+            raise TimeoutError("acc3 network timeout")
+
+        with patch("time.time", return_value=1000.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=fake_fetch_quota):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        # Must output empty {} without false alarm
+        self.assertEqual(output, {})
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+
+    def test_tier_3_standby_probe_failure_falls_back_to_standby_cache(self):
+        """When active account quota drops < 15% and standby probe fails but standby has valid cached quota, hook rotates to standby using cache."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache with 75% quota for acc2
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 10, "reset_time": 1700000000},
+                },
+                "acc2": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 75, "reset_time": 1700000000},
+                },
+            }
+        }), encoding="utf-8")
+
+        # Probe for acc1 returns 10%, probe for acc2 fails with TimeoutError
+        def fake_fetch_quota(tok, refresh_token=None):
+            if tok == "tok_acc1":
+                return {"gemini": {"quota": 10, "reset_time": 1700000000}}
+            raise TimeoutError("Standby acc2 timeout")
+
+        with patch("time.time", return_value=1200.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=fake_fetch_quota):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Rotated to acc2 using cached telemetry
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        self.assertIn("Auto-rotated to **acc2**", output["injectSteps"][0]["ephemeralMessage"])
+        self.assertIn("75% remaining", output["injectSteps"][0]["ephemeralMessage"])
+
+    def test_tier_3_standby_auth_corruption_purged_from_combined_quotas(self):
+        """When standby account in cache suffers auth corruption during Tier 3 probe, it is evicted from combined_quotas so engine does not rotate to it."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Stale cache has acc2 with 90% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 10, "reset_time": 1700000000},
+                },
+                "acc2": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 90, "reset_time": 1700000000},
+                },
+            }
+        }), encoding="utf-8")
+
+        # acc1 has 10% quota. acc2 fails with 401 Unauthorized (revoked)
+        def fake_fetch_quota(tok, refresh_token=None):
+            if tok == "tok_acc1":
+                return {"gemini": {"quota": 10, "reset_time": 1700000000}}
+            raise urllib.error.HTTPError("https://cloudcode-pa.googleapis.com", 401, "Unauthorized", {}, io.BytesIO(b""))
+
+        with patch("time.time", return_value=1200.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", side_effect=fake_fetch_quota):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # acc2 must NOT be rotated to because its token is corrupted, even though cache had 90%
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {})
+
+    def test_tier_3_excludes_active_account_from_standby_probe(self):
+        """Tier 3 concurrent probe only queries standby accounts, never active_name."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2", "acc3"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Mock fetch_account_quota (Tier 2 probe for active account) to return 10% (< 15%)
+        with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 10, "reset_time": 1700000000}})):
+            with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+                "acc3": {"gemini": {"quota": 90, "reset_time": 1700000000}},
+            }) as mock_fetch_all:
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    with patch("sys.stdout", io.StringIO()):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        mock_fetch_all.assert_called_once()
+        probed_accounts = mock_fetch_all.call_args[0][1]
+        probed_names = [a.get("name") for a in probed_accounts]
+        self.assertNotIn("acc1", probed_names)
+        self.assertIn("acc2", probed_names)
+        self.assertIn("acc3", probed_names)
+
+    def test_tier_2_does_not_write_cache_on_critical_quota_fallthrough(self):
+        """Tier 2 does not write to disk cache when quota < 15%, deferring single write to Tier 3."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 10, "reset_time": 1700000000}})):
+            with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+            }):
+                with patch("agy_switch.QuotaClient.save_cache") as mock_save:
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        with patch("sys.stdout", io.StringIO()):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Exactly 1 save_cache call in Tier 3, NOT 2 (Tier 2 did not write before fallthrough)
+        self.assertEqual(mock_save.call_count, 1)
+
+    def test_fallback_model_name_defaults_to_auto_and_sanitizes_display_to_gemini(self):
+        """Fallback modelName defaults to 'auto' and sanitizes warning display to 'Gemini'."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # acc1 has 0% quota
+        with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 0, "reset_time": 1700000000}})):
+            with patch("agy_switch.fetch_all_accounts_quota", return_value={}):
+                # Test with empty payload (no modelName)
+                with patch("sys.stdin", io.StringIO("{}")):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        self.assertEqual(
+            output["injectSteps"][0]["ephemeralMessage"],
+            "⚠️ All Antigravity accounts have exhausted their Gemini quota.",
+        )
+
+    def test_combined_quotas_strictly_excludes_unregistered_vault_accounts(self):
+        """combined_quotas only retains accounts currently registered in the vault."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        # Vault only has acc1 and acc2
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache file has a stale deleted account 'acc_deleted' with 100% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 10, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 80, "reset_time": 1700000000}},
+                "acc_deleted": {"cached_at": 1000.0, "gemini": {"quota": 100, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        with patch("time.time", return_value=1200.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 10, "reset_time": 1700000000}})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        with patch("sys.stdout", io.StringIO()):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Rotated to acc2 (80%), NOT acc_deleted (100%) because acc_deleted was purged from combined_quotas
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+
+    def test_hook_active_auth_error_standby_timeout_rotates_to_standby_without_eviction(self):
+        """Active auth corruption + standby transient network timeout retains standby cache and rotates."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 (10%) and acc2 (80%)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 10, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 80, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        # acc1 fails with auth error setting client.last_error_type="auth"; acc2 fails with transient network timeout
+        def fake_fetch_quota(self_client, token, refresh_token=None, on_refresh=None):
+            self_client.last_error = "HTTP Error 401: Unauthorized"
+            self_client.last_error_type = "auth"
+            return {}
+
+        with patch("time.time", return_value=1200.0):
+            with patch("agy_switch.QuotaClient.fetch_quota", new=fake_fetch_quota):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"error": "Timed out", "error_type": "network"},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # acc2 must NOT be evicted despite client.last_error_type="auth" from Tier 2
+        # Switcher should successfully rotate to acc2
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+        out_json = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", out_json)
+        self.assertIn("acc2", out_json["injectSteps"][0]["ephemeralMessage"])
+
+    def test_hook_tier3_permanently_purges_deleted_vault_accounts_from_disk_cache(self):
+        """Deleted vault accounts are permanently removed from last_known_quota.json on disk."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        # Vault only has acc1 and acc2
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache file on disk contains acc1, acc2, and deleted account acc_deleted
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        cache_file.write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 10, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 80, "reset_time": 1700000000}},
+                "acc_deleted": {"cached_at": 1000.0, "gemini": {"quota": 100, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        with patch("time.time", return_value=1200.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 10, "reset_time": 1700000000}})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        with patch("sys.stdout", io.StringIO()):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Directly inspect disk cache file
+        disk_data = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertIn("acc1", disk_data.get("accounts", {}))
+        self.assertIn("acc2", disk_data.get("accounts", {}))
+        self.assertNotIn("acc_deleted", disk_data.get("accounts", {}))
+
+    def test_hook_tier2_http_5xx_retains_active_via_cache_without_standby_probe(self):
+        """Active account probe returning HTTP 5xx falls back to cache without triggering Tier 3 probe."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 with 50% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 50, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        # Tier 2 returns HTTP 503 (stale cache >300s bypasses Tier 1)
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "HTTP Error 503: Service Unavailable", "error_type": "http"})):
+                with patch("agy_switch.fetch_all_accounts_quota") as mock_standby_fetch:
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Standby probe must NOT be called
+        mock_standby_fetch.assert_not_called()
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+        self.assertEqual(out_capture.getvalue().strip(), "{}")
+
+
+    def test_hook_tier2_401ms_probe_error_retains_active_via_cache_without_tier3_auth_failover(self):
+        """Active account probe error containing '401ms' falls back to valid cache rather than triggering Tier 3 auth failover."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 with 50% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 50, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 90, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        # Tier 2 returns 'Timed out after 401ms'
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "Timed out after 401ms", "error_type": "network"})):
+                with patch("agy_switch.fetch_all_accounts_quota") as mock_standby_fetch:
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # 401ms must NOT trigger Tier 3 failover
+        mock_standby_fetch.assert_not_called()
+        self.assertEqual(self.engine.get_active_name(), "acc1")
+        self.assertEqual(out_capture.getvalue().strip(), "{}")
+
+    def test_hook_tier3_active_network_error_not_evicted_from_combined_quotas(self):
+        """Active account experiencing network error is not evicted from combined_quotas during Tier 3 rotation."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 (10% - below 15% threshold so Tier 2 falls through) and acc2 (80%)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        cache_file.write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 10, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 80, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        # Tier 2 returns network error with 401ms
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "Timed out after 401ms", "error_type": "network"})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # acc1 has network error, NOT auth corruption. It should NOT be evicted from disk cache
+        disk_data = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertIn("acc1", disk_data.get("accounts", {}))
+        self.assertIn("acc2", disk_data.get("accounts", {}))
+
+    def test_hook_active_zero_standby_auth_corruption_warns_exhausted(self):
+        """Account 1 is 0% quota, Account 2 has revoked token (auth corruption) -> emits exhaustion warning."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # acc1 returns verified 0% quota
+        zero_quota = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        def fake_fetch_account_quota(eng, name, client=None):
+            if name == "acc1":
+                return "acc1", zero_quota
+            return "acc2", {"error": "HTTP Error 401: Unauthorized", "error_type": "auth"}
+
+        def fake_fetch_all(eng, accounts, client=None, max_workers=5):
+            return {"acc2": {"error": "HTTP Error 401: Unauthorized", "error_type": "auth"}}
+
+        with patch("agy_switch.fetch_account_quota", side_effect=fake_fetch_account_quota):
+            with patch("agy_switch.fetch_all_accounts_quota", side_effect=fake_fetch_all):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output, "Must emit injectSteps when all functional accounts are 0% and others dead from auth error")
+        step = output["injectSteps"][0]
+        self.assertIn("ephemeralMessage", step)
+        self.assertIn("exhausted their gemini-3.8-pro quota", step["ephemeralMessage"])
+
+    def test_hook_active_zero_standby_timeout_expired_cache_proceeds_silently(self):
+        """Account 1 is 0% quota, Account 2 probe times out with expired 0% cache -> outputs {} (no false alarm)."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc2 with 0% quota from hours ago (>300s TTL)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 0, "reset_time": 1100.0}},
+            }
+        }), encoding="utf-8")
+
+        zero_quota = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", zero_quota)):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"error": "Timed out", "error_type": "network"},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Standby probe timeout with expired 0% cache must output {} without false warning")
+
+    def test_hook_active_zero_standby_timeout_reset_elapsed_cache_proceeds_silently(self):
+        """Account 1 is 0% quota, Account 2 probe times out with fresh cached_at but elapsed reset_time -> outputs {}."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache has acc2 cached_at=1450.0 (fresh <= 300s relative to now=1500.0), but reset_time=1400.0 (elapsed!)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1450.0,
+            "accounts": {
+                "acc2": {"cached_at": 1450.0, "gemini": {"quota": 0, "reset_time": 1400.0}},
+            }
+        }), encoding="utf-8")
+
+        zero_quota = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", zero_quota)):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"error": "Network unreachable", "error_type": "network"},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Standby probe timeout with elapsed reset_time must output {} without false alarm")
+
+    def test_hook_active_auth_corruption_standby_zero_warns_exhausted(self):
+        """Active account suffers auth corruption, standby account has verified 0% quota -> emits exhaustion warning."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        zero_quota = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "HTTP Error 401: Unauthorized", "error_type": "auth"})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": zero_quota,
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        step = output["injectSteps"][0]
+        self.assertIn("ephemeralMessage", step)
+        self.assertIn("exhausted their gemini-3.8-pro quota", step["ephemeralMessage"])
+
+    def test_hook_active_auth_error_standby_timeout_no_err_type_does_not_leak_auth(self):
+        """Active account auth error must not contaminate standby network timeout lacking error_type key."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # acc1 active probe fails with 401 Unauthorized, setting client.last_error_type="auth"
+        # acc2 standby probe fails with bare error dict without error_type key
+        def fake_fetch_account_quota(eng, name, client=None):
+            if name == "acc1":
+                if client is not None:
+                    client.last_error = "HTTP Error 401: Unauthorized"
+                    client.last_error_type = "auth"
+                return "acc1", {"error": "HTTP Error 401: Unauthorized", "error_type": "auth"}
+            return "acc2", {"error": "Connection timed out"}
+
+        with patch("agy_switch.fetch_account_quota", side_effect=fake_fetch_account_quota):
+            with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                "acc2": {"error": "Connection timed out"},
+            }):
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        # acc2 must NOT be treated as terminal auth corruption; output must be empty {}
+        self.assertEqual(output, {}, "Standby network timeout without error_type must not be poisoned by active auth error")
+
+    def test_hook_active_zero_standby_timeout_missing_cached_at_proceeds_silently(self):
+        """Cache entry with 0% quota but missing/zero cached_at is treated as expired even when now <= 300s."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc2 with 0% quota and missing cached_at (or 0)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 100.0,
+            "accounts": {
+                "acc2": {"gemini": {"quota": 0, "reset_time": 2000.0}},
+            }
+        }), encoding="utf-8")
+
+        zero_quota = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=100.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", zero_quota)):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"error": "Timed out", "error_type": "network"},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Missing cached_at must be treated as expired and proceed silently without false alarm")
+
+    def test_hook_model_mismatch_missing_model_quota_does_not_warn_exhausted(self):
+        """Accounts with healthy Gemini quota but missing Claude quota must not trigger false Claude exhaustion alarm."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Both accounts have valid Gemini quota, but NO Claude quota
+        gemini_quota_1 = {"gemini": {"quota": 80, "reset_time": 1700000000}}
+        gemini_quota_2 = {"gemini": {"quota": 90, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", gemini_quota_1)):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": gemini_quota_2,
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "claude-3-5-sonnet"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Missing model quota must not trigger false all-exhausted warning")
+
+    def test_hook_active_timeout_stale_cache_standby_zero_proceeds_silently(self):
+        """Active account probe timeout with stale 0% cache is dropped, preventing false exhaustion warning."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 with 0% quota and old cached_at (1000s ago)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 0, "reset_time": 2000.0}, "cached_at": 1000.0},
+            }
+        }), encoding="utf-8")
+
+        standby_zero = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "Connection timed out", "error_type": "network"})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": standby_zero,
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Active timeout with stale 0% cache must be indeterminate and proceed silently")
+
+    def test_hook_all_accounts_auth_corruption_proceeds_silently(self):
+        """When all accounts suffer auth corruption, no verified accounts exist, so hook proceeds silently."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "HTTP Error 401: Unauthorized", "error_type": "auth"})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"error": "HTTP Error 401: Unauthorized", "error_type": "auth"},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Complete auth corruption across all accounts must not emit false quota exhaustion warning")
+
+    def test_hook_active_dict_network_error_triggers_stale_cache_evaluation(self):
+        """Active account probe returning a dict network error with stale 0% cache drops active account from combined quotas."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 with 0% quota and old cached_at (1000s ago)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 0, "reset_time": 2000.0}, "cached_at": 1000.0},
+            }
+        }), encoding="utf-8")
+
+        standby_zero = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "Connection reset by peer", "error_type": "network"})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": standby_zero,
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Active network error with stale 0% cache must evict stale cache and proceed silently")
+
+    def test_hook_active_guard_symmetry_ast_contract(self):
+        """Line 2226 in handle_pre_invocation_hook must inspect both probe_error and active_quota.get('error') for symmetry with line 2219."""
+        import inspect
+        from agy_switch import handle_pre_invocation_hook
+
+        source = inspect.getsource(handle_pre_invocation_hook)
+        # Check specific guard symmetry in Tier 3
+        expected_guard = 'elif active_name and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error"))):'
+        self.assertIn(expected_guard, source)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

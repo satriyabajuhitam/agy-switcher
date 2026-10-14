@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -280,8 +281,13 @@ class AgySwitchEngine:
         cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
         self._atomic_write_file(cli_token_path, token_payload, mode=0o600)
 
-    def update_account_access_token(self, name: str, access_token: str) -> bool:
+    def update_account_access_token(self, name: str, access_token: str, expiry: str | None = None) -> bool:
         """Updates the access token in vault and syncs to active targets if current."""
+        if not name or not isinstance(name, str) or not name.strip():
+            return False
+        name = name.strip()
+        if not access_token or not isinstance(access_token, str) or not access_token.strip():
+            return False
         token_path = self.accounts_dir / name / "token.json"
         if not token_path.is_file():
             return False
@@ -290,7 +296,10 @@ class AgySwitchEngine:
             data = json.loads(raw)
             if "token" not in data or not isinstance(data["token"], dict):
                 return False
-            data["token"]["access_token"] = access_token
+            data["token"]["access_token"] = access_token.strip()
+            if expiry is not None:
+                if isinstance(expiry, str) and expiry.strip():
+                    data["token"]["expiry"] = expiry.strip()
             self._atomic_write_json(token_path, data)
 
             if name == self.get_active_name():
@@ -730,6 +739,44 @@ class AgySwitchEngine:
             "server_busy": busy,
         }
 
+
+def _sanitize_expires_in(raw_exp: Any, default: int = 3600) -> int:
+    """Sanitizes an expires_in value to a positive integer, falling back to default."""
+    if isinstance(raw_exp, bool):
+        return default
+    try:
+        val = float(raw_exp)
+        return int(val) if math.isfinite(val) and 0 < val <= 31536000 else default
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+AUTH_ERROR_CODE_PATTERN = re.compile(r"\b(401|403)\b")
+HTTP_SERVER_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
+AUTH_PHRASES = (
+    "no token",
+    "token refresh rejected",
+    "invalid_grant",
+    "unauthorized",
+    "revoked",
+    "forbidden",
+    "access_denied",
+    "invalid_client",
+)
+
+
+def _has_auth_indicator(text: Any) -> bool:
+    """Checks whether an error message contains auth/token corruption keywords or HTTP 401/403 status codes."""
+    if text is None:
+        return False
+    lower = str(text).lower()
+    if any(phrase in lower for phrase in AUTH_PHRASES):
+        return True
+    if AUTH_ERROR_CODE_PATTERN.search(lower):
+        return True
+    return False
+
+
 class QuotaClient:
     def __init__(
         self,
@@ -753,13 +800,32 @@ class QuotaClient:
         self.token_endpoint = "https://oauth2.googleapis.com/token"
         self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
         self.cache_file = getattr(target_engine, "cache_file", None) or (self.cache_dir / "last_known_quota.json")
+        self._local = threading.local()
 
-    def refresh_access_token(self, refresh_token: str) -> str | None:
+    @property
+    def last_error(self) -> str | None:
+        return getattr(self._local, "last_error", None)
+
+    @last_error.setter
+    def last_error(self, val: str | None) -> None:
+        self._local.last_error = val
+
+    @property
+    def last_error_type(self) -> str | None:
+        return getattr(self._local, "last_error_type", None)
+
+    @last_error_type.setter
+    def last_error_type(self, val: str | None) -> None:
+        self._local.last_error_type = val
+
+    def refresh_access_token(self, refresh_token: str) -> dict[str, Any] | None:
         """Refreshes the OAuth access token."""
+        if not refresh_token or not isinstance(refresh_token, str) or not refresh_token.strip():
+            return None
         data = urllib.parse.urlencode({
             "client_id": self.client_id,
             "client_secret": self.client_secret,
-            "refresh_token": refresh_token,
+            "refresh_token": refresh_token.strip(),
             "grant_type": "refresh_token",
         }).encode("utf-8")
 
@@ -768,8 +834,18 @@ class QuotaClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8")
                 token_data = json.loads(body)
-                return token_data.get("access_token")
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+                if not isinstance(token_data, dict) or "error" in token_data:
+                    return None
+                raw_token = token_data.get("access_token")
+                if not isinstance(raw_token, str) or not raw_token.strip():
+                    return None
+                raw_exp = token_data.get("expires_in", 3600)
+                expires_in = _sanitize_expires_in(raw_exp, default=3600)
+                return {
+                    "access_token": raw_token.strip(),
+                    "expires_in": expires_in,
+                }
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
             print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
             return None
 
@@ -883,6 +959,19 @@ class QuotaClient:
         on_refresh: Any | None = None,
     ) -> dict[str, Any]:
         """Fetches quota from the internal CloudCode API."""
+        if isinstance(access_token, dict):
+            access_token = str(access_token.get("access_token", "")).strip()
+        elif isinstance(access_token, str):
+            access_token = access_token.strip()
+        else:
+            access_token = str(access_token or "").strip()
+
+        self.last_error = None
+        self.last_error_type = None
+
+        if not access_token:
+            return {}
+
         req = urllib.request.Request(
             self.quota_endpoint,
             data=b'{"project": ""}',
@@ -900,25 +989,35 @@ class QuotaClient:
                 return self.parse_quota_response(raw_data)
         except urllib.error.HTTPError as e:
             if e.code == 401 and refresh_token:
-                new_access_token = self.refresh_access_token(refresh_token)
-                if new_access_token:
-                    if on_refresh:
-                        try:
-                            on_refresh(new_access_token)
-                        except Exception:
-                            pass
-                    return self.fetch_quota(new_access_token, refresh_token=None)
+                new_token_data = self.refresh_access_token(refresh_token)
+                if new_token_data:
+                    new_tok_str = new_token_data.get("access_token") if isinstance(new_token_data, dict) else str(new_token_data)
+                    if new_tok_str and isinstance(new_tok_str, str) and new_tok_str.strip():
+                        if on_refresh:
+                            try:
+                                on_refresh(new_token_data)
+                            except Exception:
+                                pass
+                        return self.fetch_quota(new_tok_str.strip(), refresh_token=None)
+                self.last_error = "Token refresh rejected"
+                self.last_error_type = "auth"
+            else:
+                self.last_error = f"HTTP Error {e.code}: {e.reason}"
+                self.last_error_type = "auth" if e.code in (401, 403) else "http"
             print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
             return {}
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            self.last_error = f"Network or Parse Error: {e}"
+            self.last_error_type = "network" if isinstance(e, (urllib.error.URLError, TimeoutError)) else "parse"
             print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
             return {}
 
     def load_cache(self) -> dict[str, Any]:
         """Loads cached quota data from vault cache or legacy fallback."""
-        if self.cache_file.is_file():
+        cache_path = Path(self.cache_file)
+        if cache_path.is_file():
             try:
-                return json.loads(self.cache_file.read_text(encoding="utf-8"))
+                return json.loads(cache_path.read_text(encoding="utf-8"))
             except Exception:
                 return {}
         legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
@@ -929,61 +1028,160 @@ class QuotaClient:
                 return {}
         return {}
 
-    def save_cache(self, data: dict[str, Any], merge: bool = True) -> None:
+    def save_cache(
+        self,
+        data: dict[str, Any],
+        merge: bool = True,
+        evict_keys: list[str] | set[str] | None = None,
+    ) -> None:
         """Atomically saves quota cache to vault cache directory.
 
-        When merge=True and data contains an 'accounts' dict, existing cached
-        accounts not present in the new data are preserved (Cache Merge Invariant).
+        Guarantees:
+        1. Top-level 'timestamp' field is always present, defaulting to time.time()
+           if absent, boolean, non-positive, or invalid in incoming data.
+        2. When merge=True and data contains an 'accounts' dict, existing valid
+           standby accounts and their respective 'cached_at' timestamps are preserved.
+        3. For valid incoming accounts lacking 'cached_at', 'cached_at' is automatically
+           set to root_ts, ensuring independent freshness tracking across all callers.
+        4. Invalid or error-laden accounts in incoming data are filtered out
+           without corrupting existing valid cache entries. Errored model sub-keys
+           (e.g. claude: {"error": ...}) are stripped while preserving healthy models.
+        5. Permissions: cache directory is 0700 and cache file is 0600.
+        6. Cross-mount resilience: temporary files are created in cache_file.parent,
+           preventing EXDEV errors when cache_file is customized.
         """
-        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache_target_file = Path(self.cache_file)
+        target_dir = cache_target_file.parent
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            os.chmod(self.cache_dir, 0o700)
+            os.chmod(target_dir, 0o700)
         except OSError:
             pass
+        if self.cache_dir != target_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(self.cache_dir, 0o700)
+            except OSError:
+                pass
 
-        data_to_write = data
-        if isinstance(data, dict) and isinstance(data.get("accounts"), dict):
-            # Exclude accounts containing "error" or nested gemini error payloads
-            def _is_valid_entry(acc_val: Any) -> bool:
-                if not isinstance(acc_val, dict) or acc_val.get("error"):
-                    return False
-                g = acc_val.get("gemini")
-                if isinstance(g, dict) and g.get("error"):
-                    return False
-                return True
-
-            incoming_valid = {
-                k: v for k, v in data["accounts"].items()
-                if _is_valid_entry(v)
+        if not isinstance(data, dict):
+            data_to_write = {
+                "timestamp": time.time(),
+                "accounts": {},
             }
+        else:
+            # Determine root timestamp: default to time.time() if absent, bool, or invalid
+            root_ts_val = data.get("timestamp")
+            if root_ts_val is None or isinstance(root_ts_val, bool):
+                root_ts = time.time()
+            elif isinstance(root_ts_val, (int, float)):
+                root_ts = float(root_ts_val) if math.isfinite(root_ts_val) and root_ts_val > 0 else time.time()
+            else:
+                try:
+                    parsed_ts = float(root_ts_val)
+                    root_ts = parsed_ts if math.isfinite(parsed_ts) and parsed_ts > 0 else time.time()
+                except (ValueError, TypeError, OverflowError):
+                    root_ts = time.time()
+
+            def _sanitize_account_entry(acc_val: Any) -> dict[str, Any] | None:
+                if not isinstance(acc_val, dict) or not acc_val or acc_val.get("error"):
+                    return None
+                entry = dict(acc_val)
+                # Strip errored or invalid model sub-keys (e.g. claude: {"error": ...})
+                for m_key in ("gemini", "claude"):
+                    if m_key in entry:
+                        m_val = entry[m_key]
+                        if not isinstance(m_val, dict) or m_val.get("error"):
+                            del entry[m_key]
+
+                # Strip any other sub-dict containing an error key
+                for k in list(entry.keys()):
+                    if k not in ("cached_at", "timestamp"):
+                        v = entry[k]
+                        if isinstance(v, dict) and v.get("error"):
+                            del entry[k]
+
+                # Must contain at least one valid model container or valid quota payload
+                has_model = isinstance(entry.get("gemini"), dict) or isinstance(entry.get("claude"), dict)
+                has_quota = "quota" in entry or "groups" in entry
+                if not (has_model or has_quota):
+                    return None
+
+                # Normalize cached_at timestamp
+                cached_at_val = entry.get("cached_at")
+                if cached_at_val is None or isinstance(cached_at_val, bool):
+                    entry["cached_at"] = root_ts
+                elif isinstance(cached_at_val, (int, float)):
+                    if not math.isfinite(cached_at_val) or cached_at_val <= 0:
+                        entry["cached_at"] = root_ts
+                else:
+                    try:
+                        p_cat = float(cached_at_val)
+                        entry["cached_at"] = p_cat if math.isfinite(p_cat) and p_cat > 0 else root_ts
+                    except (ValueError, TypeError, OverflowError):
+                        entry["cached_at"] = root_ts
+                return entry
+
+            def _extract_valid_accounts(accounts_map: Any) -> dict[str, Any]:
+                valid: dict[str, Any] = {}
+                if isinstance(accounts_map, dict):
+                    for k, v in accounts_map.items():
+                        if isinstance(k, str) and k.strip():
+                            sanitized = _sanitize_account_entry(v)
+                            if sanitized is not None:
+                                valid[k.strip()] = sanitized
+                return valid
+
+            incoming_valid = _extract_valid_accounts(data.get("accounts"))
+
             if merge:
                 current = self.load_cache()
-                merged_accounts: dict[str, Any] = {}
-                if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
-                    # Preserve existing cached accounts that do not have errors
-                    merged_accounts = {
-                        k: v for k, v in current["accounts"].items()
-                        if _is_valid_entry(v)
-                    }
-                merged_accounts.update(incoming_valid)
+                merged_accounts: dict[str, Any] = (
+                    _extract_valid_accounts(current.get("accounts"))
+                    if isinstance(current, dict)
+                    else {}
+                )
+                for acc_name, incoming_acc in incoming_valid.items():
+                    if acc_name in merged_accounts:
+                        merged_entry = dict(merged_accounts[acc_name])
+                        merged_entry.update(incoming_acc)
+                        merged_accounts[acc_name] = merged_entry
+                    else:
+                        merged_accounts[acc_name] = incoming_acc
+                if evict_keys:
+                    for ev in evict_keys:
+                        if isinstance(ev, str) and ev.strip() in merged_accounts:
+                            del merged_accounts[ev.strip()]
                 merged_data = dict(current) if isinstance(current, dict) else {}
-                merged_data.update(data)
+                for k, v in data.items():
+                    if k != "accounts":
+                        merged_data[k] = v
                 merged_data["accounts"] = merged_accounts
+                merged_data["timestamp"] = root_ts
                 data_to_write = merged_data
             else:
-                data_to_write = dict(data)
+                data_to_write = {k: v for k, v in data.items() if k != "accounts"}
+                if evict_keys:
+                    for ev in evict_keys:
+                        if isinstance(ev, str) and ev.strip() in incoming_valid:
+                            del incoming_valid[ev.strip()]
                 data_to_write["accounts"] = incoming_valid
+                data_to_write["timestamp"] = root_ts
 
         tmp_file = None
         try:
-            tmp_fd, tmp_file = tempfile.mkstemp(dir=self.cache_dir, prefix="quota-cache-", suffix=".tmp")
+            tmp_fd, tmp_file = tempfile.mkstemp(dir=target_dir, prefix="quota-cache-", suffix=".tmp")
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 json.dump(data_to_write, f, indent=2)
             os.chmod(tmp_file, 0o600)
-            os.replace(tmp_file, self.cache_file)
+            os.replace(tmp_file, cache_target_file)
+            try:
+                os.chmod(cache_target_file, 0o600)
+            except OSError:
+                pass
             tmp_file = None
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[QuotaClient] Failed to persist quota cache to {self.cache_file}: {e}", file=sys.stderr)
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:
@@ -1007,17 +1205,26 @@ def fetch_account_quota(
         acc_name = str(account)
 
     if not acc_name:
-        return "", {"error": "Invalid account name"}
+        return "", {"error": "Invalid account name", "error_type": "validation"}
 
     if client is None:
         client = QuotaClient(timeout=2.0, engine=engine)
 
     tokens = engine.get_account_tokens(acc_name)
     if not tokens or not tokens.get("access_token"):
-        return acc_name, {"error": "No token"}
+        return acc_name, {"error": "No token", "error_type": "auth"}
 
-    def _on_token_refreshed(new_tok: str) -> None:
-        engine.update_account_access_token(acc_name, new_tok)
+    def _on_token_refreshed(new_token_data: dict[str, Any] | str) -> None:
+        if isinstance(new_token_data, dict):
+            access_tok = str(new_token_data.get("access_token", "")).strip()
+            if not access_tok:
+                return
+            raw_exp = new_token_data.get("expires_in", 3600)
+            exp_sec = _sanitize_expires_in(raw_exp, default=3600)
+            expiry_iso = (datetime.now(timezone.utc) + timedelta(seconds=exp_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            engine.update_account_access_token(acc_name, access_tok, expiry=expiry_iso)
+        else:
+            engine.update_account_access_token(acc_name, str(new_token_data))
 
     try:
         try:
@@ -1026,14 +1233,30 @@ def fetch_account_quota(
                 refresh_token=tokens.get("refresh_token"),
                 on_refresh=_on_token_refreshed,
             )
-        except TypeError:
-            quota_res = client.fetch_quota(
-                tokens["access_token"],
-                refresh_token=tokens.get("refresh_token"),
-            )
-        return acc_name, quota_res if quota_res else {"error": "Fetch failed"}
+        except TypeError as te:
+            if "on_refresh" in str(te):
+                quota_res = client.fetch_quota(
+                    tokens["access_token"],
+                    refresh_token=tokens.get("refresh_token"),
+                )
+            else:
+                raise
+        if quota_res:
+            return acc_name, quota_res
+        raw_err = getattr(client, "last_error", None)
+        err_msg = raw_err if isinstance(raw_err, str) and raw_err else "Fetch failed"
+        raw_type = getattr(client, "last_error_type", None)
+        if raw_type == "http" and bool(HTTP_SERVER_ERROR_PATTERN.search(err_msg)):
+            err_type = "network"
+        elif isinstance(raw_type, str) and raw_type:
+            err_type = raw_type
+        else:
+            err_type = "auth" if _has_auth_indicator(err_msg) else "network"
+        return acc_name, {"error": err_msg, "error_type": err_type}
     except Exception as e:
-        return acc_name, {"error": str(e)}
+        err_str = str(e)
+        err_type = "network" if _is_network_error(e) else ("auth" if _is_auth_error(e) else "general")
+        return acc_name, {"error": err_str, "error_type": err_type}
 
 
 def fetch_all_accounts_quota(
@@ -1704,6 +1927,147 @@ class RotationEngine:
         return candidates[0].account_id
 
 
+def _is_auth_error(error_val: Any, client: Any = None) -> bool:
+    """Classifies whether an error represents auth/token corruption (401/403, revoked, no token)."""
+    if error_val is None:
+        return False
+    if isinstance(error_val, dict):
+        raw_type = error_val.get("error_type")
+        if raw_type == "auth":
+            return True
+        code = error_val.get("code") or error_val.get("status_code")
+        if isinstance(code, str) and code.isdigit():
+            code = int(code)
+        if isinstance(code, int):
+            if code in (401, 403):
+                return True
+            if code in (500, 502, 503, 504):
+                return False
+        err_str = str(error_val.get("error", "")).lower()
+        if raw_type == "http" and _has_auth_indicator(err_str):
+            return True
+        if isinstance(raw_type, str) and raw_type.strip() and raw_type.strip() != "auth":
+            return False
+    elif isinstance(error_val, Exception):
+        if isinstance(error_val, urllib.error.HTTPError):
+            if error_val.code in (401, 403):
+                return True
+            if error_val.code in (500, 502, 503, 504):
+                return False
+        if isinstance(error_val, (TimeoutError, ConnectionError)):
+            return False
+        if isinstance(error_val, urllib.error.URLError) and not isinstance(error_val, urllib.error.HTTPError):
+            return False
+        err_str = str(error_val).lower()
+    elif isinstance(error_val, str):
+        err_str = error_val.lower()
+    else:
+        err_str = str(error_val).lower()
+
+    if _has_auth_indicator(err_str):
+        return True
+
+    if client is not None:
+        c_type = getattr(client, "last_error_type", None)
+        if isinstance(c_type, str) and c_type == "auth":
+            return True
+        c_err = getattr(client, "last_error", None)
+        if isinstance(c_err, str) and _has_auth_indicator(c_err):
+            return True
+
+    return False
+
+
+def _is_network_error(error_val: Any, client: Any = None) -> bool:
+    """Classifies whether an error represents a transient network transport failure."""
+    if error_val is None:
+        return False
+    if isinstance(error_val, urllib.error.HTTPError):
+        # Only classify 5xx server errors as transient network/transport errors
+        return error_val.code in (500, 502, 503, 504)
+    if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(error_val, dict):
+        if error_val.get("error_type") == "network":
+            return True
+        if error_val.get("error_type") == "auth":
+            return False
+        if error_val.get("error_type") == "http":
+            code = error_val.get("code") or error_val.get("status_code")
+            if isinstance(code, int):
+                return code in (500, 502, 503, 504)
+            err_str = str(error_val.get("error", "")).lower()
+            return bool(HTTP_SERVER_ERROR_PATTERN.search(err_str))
+        err_str = str(error_val.get("error", "")).lower()
+    elif isinstance(error_val, Exception):
+        err_str = str(error_val).lower()
+    elif isinstance(error_val, str):
+        err_str = error_val.lower()
+    else:
+        err_str = str(error_val).lower()
+
+    net_keywords = [
+        "timeout", "timed out", "urlerror", "network", "unreachable",
+        "connection", "reset by peer", "failed to connect", "socket",
+        "dns", "authoritative",
+    ]
+    is_net_error = any(k in err_str for k in net_keywords) or bool(HTTP_SERVER_ERROR_PATTERN.search(err_str))
+    if is_net_error:
+        if not _has_auth_indicator(err_str):
+            return True
+
+    if client is not None:
+        c_type = getattr(client, "last_error_type", None)
+        if isinstance(c_type, str) and c_type == "network":
+            return True
+        if isinstance(c_type, str) and c_type == "http":
+            c_err = getattr(client, "last_error", None)
+            if isinstance(c_err, str) and bool(HTTP_SERVER_ERROR_PATTERN.search(c_err)):
+                return True
+        c_err = getattr(client, "last_error", None)
+        if isinstance(c_err, str):
+            c_err_lower = c_err.lower()
+            c_is_net = any(k in c_err_lower for k in net_keywords) or bool(HTTP_SERVER_ERROR_PATTERN.search(c_err_lower))
+            if c_is_net and not _has_auth_indicator(c_err_lower):
+                return True
+
+    return False
+
+
+def _is_stale_exhausted_cache(
+    cached_entry: Any,
+    rot_engine: RotationEngine,
+    model_key: str,
+    now: float,
+    ttl_seconds: float = 300.0,
+    clock_skew_tolerance: float = 5.0,
+) -> bool:
+    """Returns True if cached_entry is non-dict, unparseable, or holds a 0% quota that is stale/expired."""
+    if not isinstance(cached_entry, dict):
+        return True
+    status = rot_engine.get_quota_status(cached_entry, model_key=model_key)
+    if status is None:
+        return True
+    if status.fraction > 0.0:
+        return False
+    cached_at_val = cached_entry.get("cached_at")
+    try:
+        c_at = float(cached_at_val)
+        if not math.isfinite(c_at) or c_at <= 0 or isinstance(cached_at_val, bool):
+            c_at = 0.0
+    except (ValueError, TypeError, OverflowError):
+        c_at = 0.0
+
+    is_expired = (c_at <= 0.0) or (now - c_at > ttl_seconds) or (now - c_at < -clock_skew_tolerance)
+    try:
+        curr_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        is_reset_elapsed = status.reset_time <= curr_dt
+    except (ValueError, TypeError, OverflowError, OSError):
+        is_reset_elapsed = False
+
+    return is_expired or is_reset_elapsed
+
+
 def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
     if not engine.get_auto_switch():
         sys.stdout.write(json.dumps({}) + "\n")
@@ -1711,56 +2075,217 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
         return 0
     try:
         raw = sys.stdin.read()
-        _payload = json.loads(raw) if raw.strip() else {}
-        model_name = _payload.get("modelName", "gemini-1.5-pro")
-        
+        try:
+            _payload = json.loads(raw) if raw and raw.strip() else {}
+        except Exception:
+            _payload = {}
+        if not isinstance(_payload, dict):
+            _payload = {}
+        raw_model = _payload.get("modelName")
+        if isinstance(raw_model, str) and raw_model.strip():
+            model_name = raw_model.strip()
+        else:
+            model_name = "auto"
+        model_key = "claude" if "claude" in model_name.lower() else "gemini"
+        display_model = "Gemini" if model_name.lower() in ("auto", "gemini", "") else model_name
+
         # Wire in QuotaClient and RotationEngine
         try:
-            
             active_name = engine.get_active_name()
-            accounts_data = engine.list_accounts().get("accounts", [])
-            
-            client = QuotaClient(timeout=2.0)
-            raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
-            quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
-                            
+            client = QuotaClient(timeout=2.0, engine=engine)
             rot_engine = RotationEngine(model_name=model_name, active_account_id=active_name)
-            target_account = rot_engine.evaluate(quotas, current_active=active_name, target_model=model_name)
-            
-            print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
-            
-            # Check if all network quotas failed or all accounts are exhausted
-            all_exhausted = (
-                not quotas
-                or not any(rot_engine.has_available_quota(q) for q in quotas.values())
+
+            cached_data = client.load_cache()
+            accounts_cache = (
+                cached_data.get("accounts", {})
+                if isinstance(cached_data, dict) and isinstance(cached_data.get("accounts"), dict)
+                else {}
             )
-            
+            active_cache = accounts_cache.get(active_name) if active_name else None
+            now = time.time()
+
+            # Tier 1 (Healthy Pass - 0ms Overhead)
+            if active_name and isinstance(active_cache, dict):
+                try:
+                    cached_at_val = float(active_cache.get("cached_at", 0))
+                except (ValueError, TypeError, OverflowError):
+                    cached_at_val = 0.0
+
+                is_fresh = math.isfinite(cached_at_val) and cached_at_val > 0 and (-5.0 <= (now - cached_at_val) <= 300.0)
+                if is_fresh:
+                    status = rot_engine.get_quota_status(active_cache, model_key=model_key)
+                    if status is not None and status.fraction >= 0.25:
+                        # 0ms pass: strictly zero network calls and zero disk writes
+                        sys.stdout.write(json.dumps({}) + "\n")
+                        sys.stdout.flush()
+                        return 0
+
+            # Tier 2 (Single-Account Probe - ~300ms Overhead)
+            probe_error = None
+            active_quota = None
+            if active_name:
+                try:
+                    _, active_quota = fetch_account_quota(engine, active_name, client=client)
+                    if isinstance(active_quota, dict) and active_quota.get("error"):
+                        probe_error = active_quota.get("error")
+                except Exception as probe_exc:
+                    probe_error = probe_exc
+                    active_quota = {"error": str(probe_exc)}
+
+                if probe_error is not None:
+                    # Active Probe Error Classification
+                    err_obj = active_quota if isinstance(active_quota, dict) else probe_error
+                    if _is_auth_error(err_obj, client=client):
+                        # Auth/token corruption: do not fall back to cache; signal Tier 3 failover
+                        print(f"[agy-switch hook] Active account '{active_name}' auth corruption: {probe_error}. Triggering Tier 3 failover.", file=sys.stderr)
+                    elif _is_network_error(err_obj, client=client) or _is_network_error(probe_error, client=client):
+                        # Transient transport failure: attempt fallback to cached quota
+                        if isinstance(active_cache, dict):
+                            cached_status = rot_engine.get_quota_status(active_cache, model_key=model_key)
+                            if cached_status is not None and cached_status.fraction >= 0.15:
+                                # Retain active account silently without emitting false alarms
+                                print(f"[agy-switch hook] Active account '{active_name}' network error: {probe_error}. Retaining active via cache ({cached_status.remaining_percentage()}%).", file=sys.stderr)
+                                sys.stdout.write(json.dumps({}) + "\n")
+                                sys.stdout.flush()
+                                return 0
+                        # If active cache is missing or low (< 15%), check if any standby account has cached quota
+                        has_standby_cache = any(
+                            acc_id != active_name and isinstance(q_data, dict) and rot_engine.has_available_quota(q_data)
+                            for acc_id, q_data in accounts_cache.items()
+                        )
+                        if not has_standby_cache:
+                            print(f"[agy-switch hook] Active account '{active_name}' network error: {probe_error}. Retaining active silently (no standby cache).", file=sys.stderr)
+                            sys.stdout.write(json.dumps({}) + "\n")
+                            sys.stdout.flush()
+                            return 0
+                else:
+                    # Probe succeeded without error
+                    if isinstance(active_quota, dict) and not active_quota.get("error"):
+                        active_status = rot_engine.get_quota_status(active_quota, model_key=model_key)
+                        if (
+                            rot_engine.has_available_quota(active_quota)
+                            and active_status is not None
+                            and active_status.fraction >= 0.15
+                        ):
+                            active_entry = dict(active_quota)
+                            active_entry["cached_at"] = time.time()
+                            client.save_cache({"accounts": {active_name: active_entry}}, merge=True)
+                            print(f"[agy-switch hook] Tier 2 probe for '{active_name}' healthy ({active_status.remaining_percentage()}%). Retaining active account.", file=sys.stderr)
+                            sys.stdout.write(json.dumps({}) + "\n")
+                            sys.stdout.flush()
+                            return 0
+
+            # Tier 3 (Full Standby Probe & Rotation)
+            accounts_data = engine.list_accounts().get("accounts", [])
+            registered_accounts = [acc for acc in accounts_data if isinstance(acc, dict) and acc.get("name")]
+            registered_names = {acc["name"] for acc in registered_accounts}
+            standby_accounts = [acc for acc in registered_accounts if acc["name"] != active_name]
+            raw_quotas = fetch_all_accounts_quota(engine, standby_accounts, client=client)
+
+            combined_quotas = {k: v for k, v in accounts_cache.items() if k in registered_names}
+            now = time.time()
+            evict_keys: set[str] = set(accounts_cache.keys()) - registered_names
+            terminal_auth_keys: set[str] = set()
+
+            for s_acc in standby_accounts:
+                acc_name = s_acc.get("name")
+                if not acc_name:
+                    continue
+                q_data = raw_quotas.get(acc_name)
+                if isinstance(q_data, dict) and "error" not in q_data and q_data:
+                    entry = dict(q_data)
+                    entry["cached_at"] = now
+                    combined_quotas[acc_name] = entry
+                elif q_data is not None and _is_auth_error(q_data):
+                    combined_quotas.pop(acc_name, None)
+                    evict_keys.add(acc_name)
+                    terminal_auth_keys.add(acc_name)
+                else:
+                    # Standby probe failed due to transport / network error (or no probe response)
+                    cached_entry = combined_quotas.get(acc_name)
+                    if _is_stale_exhausted_cache(cached_entry, rot_engine, model_key, now):
+                        combined_quotas.pop(acc_name, None)
+
+            # If active_quota from Tier 2 was successful, ensure it is in combined_quotas
+            if active_name and isinstance(active_quota, dict) and not active_quota.get("error") and active_quota:
+                active_entry = dict(active_quota)
+                active_entry["cached_at"] = now
+                combined_quotas[active_name] = active_entry
+
+            # If active account had auth corruption, remove it from combined_quotas so it does not fall back to stale cache
+            err_obj = active_quota if isinstance(active_quota, dict) else probe_error
+            is_active_auth_err = (
+                active_name
+                and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error")))
+                and _is_auth_error(err_obj, client=client)
+            )
+            if is_active_auth_err:
+                combined_quotas.pop(active_name, None)
+                evict_keys.add(active_name)
+                terminal_auth_keys.add(active_name)
+            elif active_name and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error"))):
+                # Active account probe encountered network error; check if cached data is stale 0%
+                active_entry = combined_quotas.get(active_name)
+                if _is_stale_exhausted_cache(active_entry, rot_engine, model_key, now):
+                    combined_quotas.pop(active_name, None)
+
+            # Persist fresh telemetry to cache
+            client.save_cache({"accounts": combined_quotas}, merge=True, evict_keys=evict_keys)
+
+            target_account = rot_engine.evaluate(combined_quotas, current_active=active_name, target_model=model_name)
+            print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
+
+            # Exhaustion Evaluation Invariant:
+            total_registered = len(registered_accounts)
+            evaluated_count = len([
+                acc for acc in registered_accounts
+                if (acc["name"] in combined_quotas or acc["name"] in terminal_auth_keys)
+            ])
+            verified_accounts = [
+                acc for acc in registered_accounts
+                if acc["name"] in combined_quotas
+            ]
+            verified_count = len(verified_accounts)
+            has_verified_account = verified_count > 0
+            verified_exhausted_count = 0
+            for acc in verified_accounts:
+                st = rot_engine.get_quota_status(combined_quotas[acc["name"]], model_key=model_key)
+                if st is not None and st.is_exhausted():
+                    verified_exhausted_count += 1
+
+            all_exhausted = (
+                total_registered > 0
+                and evaluated_count == total_registered
+                and has_verified_account
+                and verified_exhausted_count == verified_count
+            )
+
             if all_exhausted:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "ephemeralMessage": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
+                            "ephemeralMessage": f"⚠️ All Antigravity accounts have exhausted their {display_model} quota."
                         }
                     ]
                 }) + "\n")
                 sys.stdout.flush()
                 return 0
-                
+
             if target_account and target_account != active_name:
                 engine.switch_tokens(target_account, restart_server=False, force=True)
-                
-                status = rot_engine.get_quota_status(quotas.get(target_account, {}))
+
+                status = rot_engine.get_quota_status(combined_quotas.get(target_account, {}), model_key=model_key)
                 pct = status.remaining_percentage() if status is not None else "Unknown"
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "ephemeralMessage": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
+                            "ephemeralMessage": f"🔄 Auto-rotated to **{target_account}** for {display_model} ({pct}% remaining)."
                         }
                     ]
                 }) + "\n")
                 sys.stdout.flush()
                 return 0
-                
+
         except Exception as qc_exc:
             print(f"[agy-switch hook] QuotaClient/RotationEngine error: {qc_exc}", file=sys.stderr)
     except Exception as exc:
