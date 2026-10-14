@@ -202,6 +202,20 @@ class TestPresenceDetector(unittest.TestCase):
         self.assertIsInstance(transcript_path, Path)
         self.assertEqual(transcript_path, expected_transcript)
 
+    def test_get_active_transcript_path_with_session_id_bypasses_proc_scan(self):
+        """When session_id is provided, get_active_transcript_path reuses it and bypasses /proc scans."""
+        uuid = "reuse-1111-2222-3333-444455556666"
+        session_brain = self.brain_dir / uuid
+        session_brain.mkdir(parents=True, exist_ok=True)
+        expected_transcript = session_brain / ".system_generated" / "logs" / "transcript.jsonl"
+
+        with patch.object(self.detector, "get_active_session_id") as mock_get_session:
+            with patch.object(self.detector, "_discover_from_proc") as mock_proc:
+                res = self.detector.get_active_transcript_path(session_id=uuid)
+                self.assertEqual(res, expected_transcript)
+                mock_get_session.assert_not_called()
+                mock_proc.assert_not_called()
+
     def test_active_transcript_path_when_session_dir_missing(self):
         """Returns None if active session ID exists in presence, but session dir under brain/ does not exist."""
         uuid = "dddddddd-1111-2222-3333-444444444444"
@@ -780,6 +794,24 @@ class TestLogWatcherProcessing(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
+    def test_default_log_dirs_contains_only_cli_log_dir(self):
+        """LogWatcher.__init__ default self.log_dirs contains only cli_log_dir and does not include antigravity/log."""
+        default_watcher = LogWatcher(engine=self.engine_mock)
+        expected_cli_log_dir = str(default_watcher.presence_detector.cli_log_dir)
+        self.assertEqual(default_watcher.log_dirs, [expected_cli_log_dir])
+        self.assertNotIn("antigravity/log", "".join(default_watcher.log_dirs))
+
+    def test_scan_active_targets_passes_session_id_to_get_active_transcript_path(self):
+        """scan_active_targets() passes discovered session_id to get_active_transcript_path avoiding duplicate /proc scan."""
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "session-dedup"
+        mock_detector.get_active_transcript_path.return_value = Path("/dummy/transcript.jsonl")
+        mock_detector.get_watch_targets.return_value = ["/dummy/transcript.jsonl"]
+        self.watcher.presence_detector = mock_detector
+
+        self.watcher.scan_active_targets()
+        mock_detector.get_active_transcript_path.assert_called_with(session_id="session-dedup")
+
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
     def test_jsonl_error_status_resource_exhausted_triggers_switch(self, mock_switch):
         """Line with status == 'ERROR' and RESOURCE_EXHAUSTED in content triggers rotation."""
@@ -1334,6 +1366,33 @@ class TestDaemonLifecycle(unittest.TestCase):
         self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", output)
         self.assertIn("StandardOutput=append:%h/.antigravity-vault/watch.log", output)
 
+    def test_cli_watch_generate_systemd_clean_stdout_when_auto_migration_runs(self):
+        """Running agy-switch watch --generate-systemd produces 100% valid unit definition on stdout without diagnostic strings even when auto-migration runs."""
+        from io import StringIO
+        from scripts import agy_switch
+
+        mock_engine = MagicMock()
+        mock_engine.vault_dir = self.vault_dir
+        mock_engine.auto_migrate_if_needed.return_value = ["migrated_acc1", "migrated_acc2"]
+
+        out = StringIO()
+        err = StringIO()
+        with patch("sys.stdout", out), patch("sys.stderr", err):
+            code = agy_switch.main(["watch", "--generate-systemd"], engine=mock_engine)
+
+        self.assertEqual(code, 0)
+        stdout_val = out.getvalue()
+        stderr_val = err.getvalue()
+
+        # stdout must strictly contain the unit definition and begin with [Unit]
+        self.assertTrue(stdout_val.strip().startswith("[Unit]"))
+        self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", stdout_val)
+        self.assertNotIn("Auto-migrated", stdout_val)
+
+        # Diagnostic auto-migration notification must be in stderr
+        self.assertIn("Auto-migrated", stderr_val)
+        self.assertIn("migrated_acc1", stderr_val)
+
     def test_cli_watch_start_stop_status_dispatch(self):
         """CLI agy-switch watch start/stop/status dispatches to DaemonManager."""
         from io import StringIO
@@ -1482,14 +1541,19 @@ class TestDaemonLifecycle(unittest.TestCase):
             self.assertIsNone(st["pid"])
             self.assertFalse(self.dm.pid_file.exists())
 
-    def test_daemon_stop_handles_permission_error_gracefully(self):
-        """stop() handles PermissionError from os.kill gracefully and unlinks the PID file."""
+    def test_stop_permission_error_handles_gracefully(self):
+        """stop() retains watch.pid, emits error to stderr, and returns False when PermissionError is raised on os.kill."""
+        from io import StringIO
         self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        err_out = StringIO()
         with patch.object(self.dm, "get_running_pid", return_value=12345):
-            with patch("os.kill", side_effect=PermissionError("Access denied")):
+            with patch("os.kill", side_effect=PermissionError("Access denied")), patch("sys.stderr", err_out):
                 res = self.dm.stop()
-                self.assertTrue(res)
-                self.assertFalse(self.dm.pid_file.exists())
+                self.assertFalse(res)
+                self.assertTrue(self.dm.pid_file.exists())
+                self.assertIn("Permission denied", err_out.getvalue())
+
+    test_daemon_stop_handles_permission_error_gracefully = test_stop_permission_error_handles_gracefully
 
     def test_daemon_start_log_file_symlink_cleaned(self):
         """If watch.log is a pre-existing symlink, start() unlinks it to prevent writing through symlinks."""

@@ -199,12 +199,14 @@ class PresenceDetector:
         except OSError:
             return None
 
-    def get_active_transcript_path(self) -> Path | None:
+    def get_active_transcript_path(self, session_id: str | None = None) -> Path | None:
         """
         Returns Path to brain/<active-id>/.system_generated/logs/transcript.jsonl
         when the session directory exists, or None.
+        If session_id is provided, bypasses calling get_active_session_id() again.
         """
-        session_id = self.get_active_session_id()
+        if session_id is None:
+            session_id = self.get_active_session_id()
         if not session_id:
             return None
 
@@ -214,7 +216,7 @@ class PresenceDetector:
 
         return session_dir / ".system_generated" / "logs" / "transcript.jsonl"
 
-    def get_watch_targets(self, as_str: bool = False) -> list[Path] | list[str]:
+    def get_watch_targets(self, as_str: bool = False, session_id: str | None = None) -> list[Path] | list[str]:
         """
         Returns list of active log targets to watch:
         - Active transcript.jsonl if resolved and existing on disk.
@@ -222,7 +224,7 @@ class PresenceDetector:
         Omits non-existent paths.
         """
         targets: list[Path] = []
-        active_transcript = self.get_active_transcript_path()
+        active_transcript = self.get_active_transcript_path(session_id=session_id)
         if active_transcript is not None and active_transcript.is_file():
             targets.append(active_transcript)
 
@@ -246,14 +248,8 @@ class CooldownManager:
     """
 
     def __init__(self, cache_dir: Path | str, default_cooldown_seconds: int = 3600):
-        if isinstance(cache_dir, (str, Path, os.PathLike)):
-            self.cache_dir = Path(cache_dir).expanduser()
-            self.cooldown_file = self.cache_dir / "cooldown.json"
-        else:
-            self.cache_dir = cache_dir
-            self.cooldown_file = getattr(cache_dir, "cooldown_file", None) or (
-                cache_dir / "cooldown.json" if hasattr(cache_dir, "__truediv__") else None
-            )
+        self.cache_dir = Path(cache_dir).expanduser()
+        self.cooldown_file = self.cache_dir / "cooldown.json"
         self.default_cooldown_seconds = default_cooldown_seconds
 
     @staticmethod
@@ -324,15 +320,6 @@ class CooldownManager:
         Ensures temporary files reside in the same directory and are replaced atomically.
         Cleans up temporary files in case of error.
         """
-        if not isinstance(self.cache_dir, (str, Path, os.PathLike)):
-            # Test mock fallback: if cache_dir is a test MagicMock rather than filesystem path, handle gracefully
-            try:
-                if hasattr(self.cooldown_file, "write_text"):
-                    self.cooldown_file.write_text(json.dumps(records, indent=2))
-            except Exception:
-                pass
-            return
-
         cache_path = Path(self.cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -606,6 +593,16 @@ class CooldownManager:
             return None
 
         now = time.time()
+        has_nested_models = any(isinstance(acc_data.get(k), dict) for k in ("gemini", "claude"))
+
+        if not has_nested_models:
+            # Flat cache schema support: e.g. {"quota": 0, "reset_time": 1791201600}
+            if "reset_time" in acc_data:
+                rt_val = self._parse_timestamp(acc_data["reset_time"])
+                if math.isfinite(rt_val) and rt_val > now:
+                    return rt_val
+            return None
+
         if model_hint:
             model_key = model_hint.lower()
             m_data = acc_data.get(model_key)
@@ -658,10 +655,8 @@ class LogWatcher:
         if log_dirs is not None:
             self.log_dirs = log_dirs
         else:
-            gemini_dir = getattr(self.presence_detector, "gemini_dir", Path.home() / ".gemini")
             self.log_dirs = [
                 str(self.presence_detector.cli_log_dir),
-                str(Path(gemini_dir) / "antigravity" / "log"),
             ]
         self.cooldown_minutes = cooldown_minutes
 
@@ -856,9 +851,39 @@ class LogWatcher:
         log_file = Path(vault_dir) / "watch.log"
         try:
             log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            with open(log_file, "a", encoding="utf-8") as f:
-                ts = datetime.now(timezone.utc).isoformat()
-                f.write(f"[{ts}] Switched to '{target_account}' ({reason})\n")
+            try:
+                os.chmod(log_file.parent, 0o700)
+            except OSError:
+                pass
+
+            if log_file.is_symlink():
+                try:
+                    log_file.unlink()
+                except OSError:
+                    pass
+
+            log_fd = os.open(
+                log_file,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                os.fchmod(log_fd, 0o600)
+            except OSError:
+                pass
+
+            try:
+                with open(log_fd, "a", encoding="utf-8", closefd=True) as f:
+                    log_fd = None
+                    ts = datetime.now(timezone.utc).isoformat()
+                    f.write(f"[{ts}] Switched to '{target_account}' ({reason})\n")
+                    f.flush()
+            finally:
+                if log_fd is not None:
+                    try:
+                        os.close(log_fd)
+                    except OSError:
+                        pass
         except Exception:
             pass
 
@@ -966,7 +991,7 @@ class LogWatcher:
                 if prev_path_str in self.file_cursors:
                     del self.file_cursors[prev_path_str]
             self.active_session_id = current_session_id
-            self.active_transcript_path = self.presence_detector.get_active_transcript_path()
+            self.active_transcript_path = self.presence_detector.get_active_transcript_path(session_id=current_session_id)
 
         # Clean up any stale jsonl transcript cursors not matching active transcript
         active_transcript_str = str(self.active_transcript_path) if self.active_transcript_path else None
@@ -974,7 +999,7 @@ class LogWatcher:
             if path_key.endswith(".jsonl") and path_key != active_transcript_str:
                 del self.file_cursors[path_key]
 
-        targets = list(self.presence_detector.get_watch_targets(as_str=True))
+        targets = list(self.presence_detector.get_watch_targets(as_str=True, session_id=current_session_id))
 
         # Check custom log_dirs if provided
         if getattr(self, "log_dirs", None):
@@ -1029,7 +1054,14 @@ class LogWatcher:
                     with open(target, "r", encoding="utf-8", errors="replace") as f:
                         f.seek(cursor)
                         lines = f.readlines()
-                        self.file_cursors[target] = f.tell()
+                        new_cursor = f.tell()
+
+                        if lines and not lines[-1].endswith("\n"):
+                            incomplete_bytes = len(lines[-1].encode("utf-8"))
+                            new_cursor = max(cursor, new_cursor - incomplete_bytes)
+                            lines.pop()
+
+                        self.file_cursors[target] = new_cursor
 
                         is_jsonl = target.endswith(".jsonl") or target.endswith("transcript.jsonl")
                         for line in lines:
@@ -1358,10 +1390,14 @@ WantedBy=default.target
 
         try:
             os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+        except PermissionError as e:
+            print(f"Error stopping daemon: Permission denied for PID {pid} ({e})", file=sys.stderr)
+            return False
+        except ProcessLookupError:
             self._clean_pid_file()
-            return True
-        except OSError:
+            return False
+        except OSError as e:
+            print(f"Error stopping daemon: {e}", file=sys.stderr)
             self._clean_pid_file()
             return False
 

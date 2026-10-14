@@ -2397,7 +2397,12 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     # Perform auto-migration if needed on startup
     migrated = engine.auto_migrate_if_needed()
     if migrated and len(migrated) > 0 and args.command != "migrate":
-        if args.command == "hook-pre-invocation" or getattr(args, "json", False):
+        if (
+            args.command == "hook-pre-invocation"
+            or getattr(args, "json", False)
+            or getattr(args, "generate_systemd", False)
+            or getattr(args, "install_systemd", False)
+        ):
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}", file=sys.stderr)
         else:
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}")
