@@ -463,7 +463,7 @@ class AgySwitchEngine:
                 existing = {}
 
         script_abs_path = str(Path(__file__).resolve())
-        hook_cmd = f"python3 {script_abs_path} hook-pre-invocation"
+        hook_cmd = f"python3 {shlex.quote(script_abs_path)} hook-pre-invocation"
 
         hook_def = {
             "enabled": True,
@@ -736,8 +736,10 @@ class AgySwitchEngine:
             except Exception as e:
                 try:
                     tmp_rename.rename(old_dir)
-                except Exception:
-                    pass
+                except Exception as rb_exc:
+                    raise AgySwitchError(
+                        f"Failed to rename account directory: {e}. Rollback also failed: {rb_exc}"
+                    ) from e
                 raise AgySwitchError(f"Failed to rename account directory: {e}") from e
         else:
             try:
@@ -1005,7 +1007,7 @@ class AgySwitchEngine:
                             continue
                         stat_file = p_dir / "stat"
                         try:
-                            content = stat_file.read_text(encoding="utf-8")
+                            content = stat_file.read_bytes().decode("utf-8", errors="replace")
                             rparen = content.rfind(")")
                             if rparen != -1:
                                 rest = content[rparen + 1:].strip().split()
@@ -1013,7 +1015,7 @@ class AgySwitchEngine:
                                     if rest[0] == "Z":
                                         continue
                                     return True
-                        except (OSError, IndexError):
+                        except (OSError, IndexError, ValueError):
                             continue
                 except OSError:
                     pass
@@ -1137,7 +1139,7 @@ class AgySwitchEngine:
         if self.accounts_dir.is_dir():
             dirs_to_check.append(self.accounts_dir)
             for acc in self.accounts_dir.iterdir():
-                if acc.is_dir():
+                if acc.is_dir() and not acc.name.startswith("."):
                     dirs_to_check.append(acc)
         if self.cache_dir.is_dir():
             dirs_to_check.append(self.cache_dir)
@@ -1153,7 +1155,7 @@ class AgySwitchEngine:
         files_to_check: list[Path] = []
         if self.accounts_dir.is_dir():
             for acc in self.accounts_dir.iterdir():
-                if acc.is_dir():
+                if acc.is_dir() and not acc.name.startswith("."):
                     for f in acc.iterdir():
                         if f.is_file():
                             files_to_check.append(f)
@@ -1562,12 +1564,14 @@ class AgySwitchEngine:
                 can_fix=True,
             )
 
-        if not str(target_path).endswith(".py") and not os.access(target_path, os.X_OK):
+        is_direct_script = bool(parts and parts[0] == str(target_path))
+        needs_exec = (not str(target_path).endswith(".py")) or is_direct_script
+        if needs_exec and not os.access(target_path, os.X_OK):
             return DiagnosticItem(
                 category="hooks",
                 name="Antigravity PreInvocation Hook",
                 status="WARN",
-                message=f"PreInvocation hook executable wrapper is not executable: {target_path}.",
+                message=f"PreInvocation hook executable target is not executable: {target_path}.",
                 can_fix=True,
             )
 
@@ -1617,16 +1621,19 @@ class AgySwitchEngine:
                     else:
                         try:
                             raw = cmdline_file.read_bytes().replace(b"\x00", b" ").lower()
+                            raw_tokens = raw.split()
                             is_watch = False
-                            has_script = (
-                                b"watch.py" in raw
-                                or b"agy_switch" in raw
-                                or b"agy-switch" in raw
+                            has_script = any(
+                                tok.endswith(b"watch.py")
+                                or tok.endswith(b"agy_switch.py")
+                                or tok.endswith(b"agy_switch")
+                                or tok.endswith(b"agy-switch")
+                                or tok in (b"watch.py", b"scripts.watch", b"agy_switch", b"agy-switch")
+                                for tok in raw_tokens
                             )
-                            has_action = (
-                                b"watch" in raw
-                                or b"run" in raw
-                                or b"daemon" in raw
+                            has_action = any(
+                                tok in (b"run", b"daemon", b"watch")
+                                for tok in raw_tokens[1:]
                             )
                             if has_script and has_action:
                                 is_watch = True
@@ -2959,7 +2966,7 @@ class RotationEngine:
         """Calculates reset delta in minutes."""
         return QuotaStatus(fraction=0.0, reset_time=reset_time).get_reset_delta_minutes(current_time)
 
-    def _is_cooldown_penalized_for_model(
+    def is_cooldown_penalized_for_model(
         self,
         model_key: str,
         fraction: float,
@@ -3006,6 +3013,8 @@ class RotationEngine:
             return False
 
         return True
+
+    _is_cooldown_penalized_for_model = is_cooldown_penalized_for_model
 
     def evaluate(
         self,
@@ -3810,7 +3819,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 if is_active_in_cooldown and active_status is not None:
                     rec = cooldowns[active_name]
                     q_data = valid_quotas.get(active_name, {})
-                    is_active_in_cooldown = rot_engine._is_cooldown_penalized_for_model(
+                    is_active_in_cooldown = rot_engine.is_cooldown_penalized_for_model(
                         target_model, active_fraction, rec, q_data
                     )
 
@@ -3824,7 +3833,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             args.account = target_account
             
         elif getattr(args, "account", None) is None:
-            print("Error: account name must be provided if --auto is not used.", file=sys.stderr)
+            print("[agy-switch] Error: account name must be provided if --auto is not used.", file=sys.stderr)
             return 1
 
         try:
@@ -3842,10 +3851,14 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 print("  - Server : language_server not running or no restart needed")
             return 0
         except ActiveTurnRunningError as e:
-            print(f"Warning: {e}", file=sys.stderr)
+            print(f"[agy-switch] Warning: {e}", file=sys.stderr)
             return 2
         except AgySwitchError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            err_msg = str(e)
+            if err_msg.startswith("[agy-switch]"):
+                print(err_msg, file=sys.stderr)
+            else:
+                print(f"[agy-switch] Error: {err_msg}", file=sys.stderr)
             return 1
 
     if args.command == "add":
