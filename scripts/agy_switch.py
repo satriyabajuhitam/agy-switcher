@@ -2722,6 +2722,50 @@ def format_status_report(status: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_diagnostic_report(report: DiagnosticReport) -> str:
+    """Formats 5-layer diagnostic report as a numbered terminal listicle with visual status indicators."""
+    lines: list[str] = [
+        "Antigravity System Diagnostics:",
+        "-------------------------------------------------------------",
+    ]
+
+    unfixable_accounts: list[str] = []
+
+    for idx, item in enumerate(report.items, start=1):
+        lines.append(f"{idx}. [{item.status}] {item.name}: {item.message}")
+        if item.status in ("WARN", "FAIL") and not item.can_fix:
+            if item.category in ("token_integrity", "dual_sync"):
+                matches = re.findall(r"'([a-zA-Z0-9._-]+)'", item.message)
+                if matches:
+                    for acc in matches:
+                        lines.append(f"   -> Action required: Run 'agy-switch login {acc}' to re-authenticate.")
+                        if acc not in unfixable_accounts:
+                            unfixable_accounts.append(acc)
+                else:
+                    lines.append("   -> Action required: Run 'agy-switch login <alias>' to re-authenticate.")
+                    if "<alias>" not in unfixable_accounts:
+                        unfixable_accounts.append("<alias>")
+
+    lines.append("-------------------------------------------------------------")
+
+    rep_dict = report.to_dict()
+    summary = rep_dict.get("summary", {})
+    lines.append("Diagnostic Summary:")
+    lines.append(f"  • Total Checks : {summary.get('total', len(report.items))}")
+    lines.append(f"  • Passed       : {summary.get('passed', 0)}")
+    lines.append(f"  • Warnings     : {summary.get('warned', 0)}")
+    lines.append(f"  • Failures     : {summary.get('failed', 0)}")
+    lines.append(f"  • Overall      : {report.overall_status}")
+
+    if unfixable_accounts:
+        lines.append("-------------------------------------------------------------")
+        lines.append("Action Required for Unfixable Items:")
+        for acc in unfixable_accounts:
+            lines.append(f"  • Run 'agy-switch login {acc}' to re-authenticate or restore credentials.")
+
+    return "\n".join(lines)
+
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -3415,6 +3459,14 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     # Command: status
     subparsers.add_parser("status", help="Show system status, active account, and server health")
 
+    # Command: doctor
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run 5-layer self-healing diagnostics on vault, credentials, and processes",
+    )
+    doctor_parser.add_argument("--fix", action="store_true", help="Automatically repair fixable anomalies")
+    doctor_parser.add_argument("--json", action="store_true", help="Output pure JSON report for automated ingestion")
+
     # Command: switch
     switch_parser = subparsers.add_parser("switch", help="Switch active account across Antigravity 2.0 and CLI")
     switch_parser.add_argument("account", nargs="?", help="Name of the account to switch to")
@@ -3558,6 +3610,44 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             
         print(format_status_report(status_info))
         return 0
+
+    if args.command == "doctor":
+        is_json = getattr(args, "json", False)
+        do_fix = getattr(args, "fix", False)
+
+        report = engine.run_diagnostics()
+
+        if do_fix:
+            has_fixable = any(item.can_fix and not item.fixed for item in report.items)
+            fixes = engine.fix_diagnostics(report) if has_fixable else []
+
+            if not is_json:
+                if fixes:
+                    print(f"[agy-switch doctor] Applied {len(fixes)} automatic repair(s):")
+                    for fix_desc in fixes:
+                        print(f"  • {fix_desc}")
+                    print()
+                elif has_fixable:
+                    print("[agy-switch doctor] No repairs were applied.\n")
+                else:
+                    if report.overall_status == "PASS":
+                        print("[agy-switch doctor] All diagnostics healthy. No repairs needed.\n")
+                    else:
+                        print("[agy-switch doctor] No automatic repairs available for detected issues.\n")
+            else:
+                if fixes:
+                    for fix_desc in fixes:
+                        print(f"[agy-switch doctor] Applied repair: {fix_desc}", file=sys.stderr)
+
+            # Re-run diagnostics to get clean post-repair report
+            report = engine.run_diagnostics()
+
+        if is_json:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            print(format_diagnostic_report(report))
+
+        return report.exit_code
 
     if args.command == "internal-probe":
         accounts_data = engine.list_accounts().get("accounts", [])

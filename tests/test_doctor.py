@@ -2,7 +2,9 @@
 """Tests for Ticket 03: 5-Layer Self-Healing Diagnostics Core Engine (agy-switch)."""
 
 import base64
+import contextlib
 from datetime import datetime, timedelta, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,8 @@ from agy_switch import (
     AgySwitchEngine,
     DiagnosticItem,
     DiagnosticReport,
+    format_diagnostic_report,
+    main,
 )
 
 
@@ -719,6 +723,244 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         self.assertEqual(rep_dict["summary"]["failed"], 0)
         self.assertEqual(rep_dict["summary"]["warned"], 0)
         self.assertEqual(rep_dict["summary"]["passed"], rep_dict["summary"]["total"])
+
+
+
+class TestDoctorCLIIntegration(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.gemini_dir = self.base_path / ".gemini"
+        self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.proc_dir = self.base_path / "proc"
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _setup_pristine_environment(self) -> str:
+        acc_name = "acc_primary"
+        acc_dir = self.vault_dir / "accounts" / acc_name
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(acc_dir, 0o700)
+
+        token_data = create_sample_token(email="primary@example.com")
+        token_path = acc_dir / "token.json"
+        token_path.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
+        os.chmod(token_path, 0o600)
+
+        self.engine.set_active_name(acc_name)
+        os.chmod(self.engine.active_file, 0o600)
+
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.engine.cache_dir, 0o700)
+        self.engine.cache_file.write_text("{}", encoding="utf-8")
+        os.chmod(self.engine.cache_file, 0o600)
+
+        desktop_token = self.gemini_dir / "jetski-standalone-oauth-token"
+        desktop_token.parent.mkdir(parents=True, exist_ok=True)
+        desktop_token.write_text(json.dumps(token_data), encoding="utf-8")
+        os.chmod(desktop_token, 0o600)
+
+        cli_token = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        cli_token.parent.mkdir(parents=True, exist_ok=True)
+        cli_token.write_text(json.dumps(token_data, indent=4), encoding="utf-8")
+        os.chmod(cli_token, 0o600)
+
+        self.engine.install_hook()
+
+        ls_pid_dir = self.proc_dir / "101"
+        ls_pid_dir.mkdir(parents=True, exist_ok=True)
+        (ls_pid_dir / "cmdline").write_bytes(b"/usr/bin/language_server\x00--standalone\x00")
+        (ls_pid_dir / "stat").write_text("101 (language_server) S 1 101 101 0 0 0 0 0 0 0 0 0")
+
+        watch_pid_dir = self.proc_dir / "202"
+        watch_pid_dir.mkdir(parents=True, exist_ok=True)
+        (watch_pid_dir / "cmdline").write_bytes(b"python3\x00scripts/watch.py\x00run\x00")
+        (watch_pid_dir / "stat").write_text("202 (python3) S 1 202 202 0 0 0 0 0 0 0 0 0")
+
+        watch_pid_file = self.vault_dir / "watch.pid"
+        watch_pid_file.write_text("202\n", encoding="utf-8")
+        os.chmod(watch_pid_file, 0o600)
+
+        os.chmod(self.vault_dir, 0o700)
+        os.chmod(self.vault_dir / "accounts", 0o700)
+
+        return acc_name
+
+    def test_cli_doctor_registered_with_flags(self):
+        """Verifies subcommand 'doctor' is registered and accepts --fix and --json flags."""
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                main(["doctor", "--help"], engine=self.engine)
+            except SystemExit:
+                pass
+        help_text = stdout.getvalue()
+        self.assertIn("--fix", help_text)
+        self.assertIn("--json", help_text)
+
+    def test_cli_doctor_pristine_terminal_listicle(self):
+        """Verifies pristine environment returns exit code 0 and renders numbered listicle with [PASS]."""
+        self._setup_pristine_environment()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor"], engine=self.engine)
+
+        self.assertEqual(code, 0)
+        out = stdout.getvalue()
+        self.assertIn("1. [PASS]", out)
+        self.assertIn("2. [PASS]", out)
+        self.assertIn("3. [PASS]", out)
+        self.assertIn("4. [PASS]", out)
+        self.assertIn("5. [PASS]", out)
+        self.assertIn("Diagnostic Summary", out)
+        self.assertIn("PASS", out)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_cli_doctor_pure_json_stdout_pristine(self):
+        """Verifies pure JSON stdout guarantee: valid JSON conforming to schema on stdout, exit code 0."""
+        self._setup_pristine_environment()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor", "--json"], engine=self.engine)
+
+        self.assertEqual(code, 0)
+        out = stdout.getvalue().strip()
+        data = json.loads(out)
+        self.assertEqual(data["overall_status"], "PASS")
+        self.assertEqual(data["exit_code"], 0)
+        self.assertEqual(data["summary"]["total"], 5)
+        self.assertEqual(data["summary"]["passed"], 5)
+        self.assertEqual(data["summary"]["warned"], 0)
+        self.assertEqual(data["summary"]["failed"], 0)
+        self.assertEqual(len(data["checks"]), 5)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_cli_doctor_exit_code_warn(self):
+        """Verifies non-critical warning (e.g. language_server stopped) exits with code 1."""
+        self._setup_pristine_environment()
+        shutil.rmtree(self.proc_dir / "101")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor"], engine=self.engine)
+
+        self.assertEqual(code, 1)
+        out = stdout.getvalue()
+        self.assertIn("[WARN]", out)
+        self.assertIn("WARN", out)
+
+    def test_cli_doctor_exit_code_fail(self):
+        """Verifies critical failure (e.g. permissions leak) exits with code 2."""
+        self._setup_pristine_environment()
+        os.chmod(self.vault_dir, 0o777)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor"], engine=self.engine)
+
+        self.assertEqual(code, 2)
+        out = stdout.getvalue()
+        self.assertIn("[FAIL]", out)
+        self.assertIn("FAIL", out)
+
+    def test_cli_doctor_fix_workflow_terminal(self):
+        """Verifies --fix workflow: runs repairs, reports applied fixes, re-runs diagnostics, exits with code 0."""
+        self._setup_pristine_environment()
+        os.chmod(self.vault_dir, 0o777)
+        acc_dir = self.vault_dir / "accounts" / "acc_primary"
+        os.chmod(acc_dir, 0o755)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor", "--fix"], engine=self.engine)
+
+        self.assertEqual(code, 0)
+        out = stdout.getvalue()
+        self.assertIn("Applied", out)
+        self.assertIn("Restored POSIX permissions", out)
+        self.assertIn("[PASS]", out)
+        self.assertEqual(stat.S_IMODE(self.vault_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(acc_dir.stat().st_mode), 0o700)
+
+    def test_cli_doctor_fix_workflow_json(self):
+        """Verifies --fix with --json emits pure JSON on stdout with post-repair status and exit code 0."""
+        self._setup_pristine_environment()
+        os.chmod(self.vault_dir, 0o777)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor", "--fix", "--json"], engine=self.engine)
+
+        self.assertEqual(code, 0)
+        out = stdout.getvalue().strip()
+        data = json.loads(out)
+        self.assertEqual(data["overall_status"], "PASS")
+        self.assertEqual(data["exit_code"], 0)
+        self.assertEqual(data["summary"]["passed"], 5)
+        self.assertEqual(stat.S_IMODE(self.vault_dir.stat().st_mode), 0o700)
+
+    def test_cli_doctor_unfixable_item_notifies_login(self):
+        """Verifies unfixable items (corrupt token) explicitly notify user to execute agy-switch login <alias>."""
+        self._setup_pristine_environment()
+        token_path = self.vault_dir / "accounts" / "acc_primary" / "token.json"
+        token_path.write_text("{bad json", encoding="utf-8")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor"], engine=self.engine)
+
+        self.assertEqual(code, 2)
+        out = stdout.getvalue()
+        self.assertIn("[FAIL]", out)
+        self.assertIn("agy-switch login", out)
+
+        stdout_fix = io.StringIO()
+        stderr_fix = io.StringIO()
+        with contextlib.redirect_stdout(stdout_fix), contextlib.redirect_stderr(stderr_fix):
+            code_fix = main(["doctor", "--fix"], engine=self.engine)
+
+        self.assertEqual(code_fix, 2)
+        out_fix = stdout_fix.getvalue()
+        self.assertIn("agy-switch login", out_fix)
+
+    def test_cli_doctor_pure_json_stdout_isolation_with_auto_migration(self):
+        """Verifies auto-migration notices are routed to stderr when --json is passed to doctor."""
+        legacy_acc = self.legacy_root / "accounts" / "legacy_user"
+        legacy_token_dir = legacy_acc / ".gemini" / "antigravity-cli"
+        legacy_token_dir.mkdir(parents=True, exist_ok=True)
+        leg_tok = create_sample_token(email="legacy@example.com")
+        (legacy_token_dir / "antigravity-oauth-token").write_text(json.dumps(leg_tok), encoding="utf-8")
+        (self.legacy_root / "active").write_text("legacy_user\n", encoding="utf-8")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["doctor", "--json"], engine=self.engine)
+
+        self.assertIn(code, (0, 1, 2))
+        out = stdout.getvalue().strip()
+        data = json.loads(out)
+        self.assertIsInstance(data, dict)
+        err = stderr.getvalue()
+        self.assertIn("Auto-migrated", err)
 
 
 if __name__ == "__main__":
