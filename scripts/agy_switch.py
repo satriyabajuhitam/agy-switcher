@@ -251,18 +251,34 @@ class AgySwitchEngine:
         self.set_active_name(account_name)
         return account_name
 
+    def _atomic_write_file(self, target_path: Path, content: str, mode: int = 0o600) -> None:
+        """Writes content to a target path atomically with specified permissions."""
+        target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp_fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=f"{target_path.name}.tmp-")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(tmp_file, mode)
+            os.replace(tmp_file, target_path)
+            tmp_file = None
+        finally:
+            if tmp_file and os.path.exists(tmp_file):
+                try:
+                    os.unlink(tmp_file)
+                except OSError:
+                    pass
+
     def _atomic_write_json(self, target_path: Path, payload: dict[str, Any]) -> None:
         """Writes JSON to a target path atomically with 0600 permissions."""
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = target_path.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            content = json.dumps(payload, indent=2) + "\n"
-            temp_file.write_text(content, encoding="utf-8")
-            os.chmod(temp_file, 0o600)
-            os.replace(temp_file, target_path)
-        finally:
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
+        self._atomic_write_file(target_path, json.dumps(payload, indent=2) + "\n", mode=0o600)
+
+    def _sync_tokens_to_targets(self, token_payload: str) -> None:
+        """Atomically emits token payload to both Desktop and CLI target files."""
+        jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
+        self._atomic_write_file(jetski_token_path, token_payload, mode=0o600)
+
+        cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        self._atomic_write_file(cli_token_path, token_payload, mode=0o600)
 
     def update_account_access_token(self, name: str, access_token: str) -> bool:
         """Updates the access token in vault and syncs to active targets if current."""
@@ -279,25 +295,7 @@ class AgySwitchEngine:
 
             if name == self.get_active_name():
                 token_payload = json.dumps(data, indent=2) + "\n"
-                jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
-                temp_jetski = jetski_token_path.with_suffix(f".tmp.{os.getpid()}")
-                try:
-                    temp_jetski.write_text(token_payload, encoding="utf-8")
-                    os.chmod(temp_jetski, 0o600)
-                    os.replace(temp_jetski, jetski_token_path)
-                finally:
-                    if temp_jetski.exists():
-                        temp_jetski.unlink(missing_ok=True)
-
-                cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
-                temp_cli = cli_token_path.with_suffix(f".tmp.{os.getpid()}")
-                try:
-                    temp_cli.write_text(token_payload, encoding="utf-8")
-                    os.chmod(temp_cli, 0o600)
-                    os.replace(temp_cli, cli_token_path)
-                finally:
-                    if temp_cli.exists():
-                        temp_cli.unlink(missing_ok=True)
+                self._sync_tokens_to_targets(token_payload)
             return True
         except Exception:
             return False
@@ -373,14 +371,7 @@ class AgySwitchEngine:
 
     def set_active_name(self, name: str) -> None:
         """Sets the active account name in the vault."""
-        temp_file = self.active_file.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            temp_file.write_text(f"{name.strip()}\n", encoding="utf-8")
-            os.chmod(temp_file, 0o600)
-            os.replace(temp_file, self.active_file)
-        finally:
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
+        self._atomic_write_file(self.active_file, f"{name.strip()}\n", mode=0o600)
 
     def list_accounts(self) -> dict[str, Any]:
         """Lists all accounts registered in the vault and marks the active account."""
@@ -436,29 +427,8 @@ class AgySwitchEngine:
         token_data = self.validate_token_file(token_file)
         token_payload = json.dumps(token_data, indent=2) + "\n"
 
-        # 1. Update Antigravity 2.0 (WSL / Desktop) token
-        jetski_token_path = self.gemini_dir / "jetski-standalone-oauth-token"
-        jetski_token_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_jetski = jetski_token_path.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            temp_jetski.write_text(token_payload, encoding="utf-8")
-            os.chmod(temp_jetski, 0o600)
-            os.replace(temp_jetski, jetski_token_path)
-        finally:
-            if temp_jetski.exists():
-                temp_jetski.unlink(missing_ok=True)
-
-        # 2. Update Antigravity CLI token
-        cli_token_path = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
-        cli_token_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_cli = cli_token_path.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            temp_cli.write_text(token_payload, encoding="utf-8")
-            os.chmod(temp_cli, 0o600)
-            os.replace(temp_cli, cli_token_path)
-        finally:
-            if temp_cli.exists():
-                temp_cli.unlink(missing_ok=True)
+        # 1 & 2. Update Antigravity 2.0 (WSL / Desktop) and CLI tokens atomically
+        self._sync_tokens_to_targets(token_payload)
 
         # 3. Update vault active marker
         self.set_active_name(name)
@@ -959,22 +929,49 @@ class QuotaClient:
                 return {}
         return {}
 
-    def save_cache(self, data: dict[str, Any]) -> None:
-        """Atomically saves quota cache to vault cache directory."""
+    def save_cache(self, data: dict[str, Any], merge: bool = True) -> None:
+        """Atomically saves quota cache to vault cache directory.
+
+        When merge=True and data contains an 'accounts' dict, existing cached
+        accounts not present in the new data are preserved (Cache Merge Invariant).
+        """
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self.cache_dir, 0o700)
         except OSError:
             pass
-        
+
+        data_to_write = data
+        if merge and isinstance(data, dict) and isinstance(data.get("accounts"), dict):
+            current = self.load_cache()
+            if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
+                merged_accounts = dict(current["accounts"])
+                for k, v in data["accounts"].items():
+                    if isinstance(v, dict) and not v.get("error"):
+                        merged_accounts[k] = v
+                    elif k not in merged_accounts:
+                        merged_accounts[k] = v
+                merged_data = dict(current)
+                merged_data.update(data)
+                merged_data["accounts"] = merged_accounts
+                data_to_write = merged_data
+
+        tmp_file = None
         try:
             tmp_fd, tmp_file = tempfile.mkstemp(dir=self.cache_dir, prefix="quota-cache-", suffix=".tmp")
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data_to_write, f, indent=2)
             os.chmod(tmp_file, 0o600)
             os.replace(tmp_file, self.cache_file)
+            tmp_file = None
         except Exception:
             pass
+        finally:
+            if tmp_file and os.path.exists(tmp_file):
+                try:
+                    os.unlink(tmp_file)
+                except OSError:
+                    pass
 
 
 def fetch_account_quota(
@@ -995,7 +992,7 @@ def fetch_account_quota(
         return "", {"error": "Invalid account name"}
 
     if client is None:
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
 
     tokens = engine.get_account_tokens(acc_name)
     if not tokens or not tokens.get("access_token"):
@@ -1031,7 +1028,7 @@ def fetch_all_accounts_quota(
     import concurrent.futures
 
     if client is None:
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
 
     if not accounts:
         return {}
@@ -1150,6 +1147,109 @@ def sort_accounts_by_quota(accounts: list[dict[str, Any]] | None) -> list[dict[s
         return (-quota_val, reset_time, name)
 
     return sorted(accounts, key=_sort_key)
+
+
+def run_quota_pipeline(
+    engine: AgySwitchEngine,
+    data: dict[str, Any] | None,
+    client: QuotaClient | None = None,
+) -> dict[str, Any]:
+    """Executes the standard quota telemetry pipeline:
+
+    1. Fetches quotas concurrently for all accounts via fetch_all_accounts_quota.
+    2. Enforces Cache Merge Invariant: merges newly fetched valid account data into last_known_quota.json.
+    3. For accounts failing network fetch, loads last known cached telemetry if present and marks cached=True.
+       Accounts without cache are marked as Error / Unreachable.
+    4. Sorts accounts deterministically using sort_accounts_by_quota.
+    """
+    if not isinstance(data, dict):
+        return {"active": None, "accounts": []}
+
+    if client is None:
+        client = QuotaClient(timeout=2.0, engine=engine)
+
+    raw_accounts = data.get("accounts", [])
+    if not isinstance(raw_accounts, list) or not raw_accounts:
+        return data
+
+    # Defensive copy of accounts to avoid in-place mutation of caller data
+    accounts = [dict(acc) for acc in raw_accounts if isinstance(acc, dict)]
+
+    # 1. Concurrently fetch quotas
+    raw_quotas = fetch_all_accounts_quota(engine, accounts, client=client)
+
+    # 2. Extract valid quotas and merge into cache
+    valid_quotas: dict[str, Any] = {}
+    for name, q in raw_quotas.items():
+        if isinstance(q, dict) and not q.get("error") and q.get("gemini"):
+            valid_quotas[name] = q
+
+    if valid_quotas:
+        client.save_cache({
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+            "accounts": valid_quotas,
+        }, merge=True)
+
+    # Reload merged cache to get all historical + new entries
+    cache_data = client.load_cache()
+    cached_accounts = (
+        cache_data.get("accounts", {})
+        if isinstance(cache_data, dict) and isinstance(cache_data.get("accounts"), dict)
+        else {}
+    )
+
+    # 3. Apply quota / cache fallback per account
+    for acc in accounts:
+        acc_name = acc.get("name", "")
+        live_q = raw_quotas.get(acc_name)
+
+        if isinstance(live_q, dict) and not live_q.get("error") and live_q.get("gemini"):
+            # Live telemetry succeeded
+            q_copy = dict(live_q)
+            gemini_copy = dict(q_copy.get("gemini", {}))
+            gemini_copy["cached"] = False
+            q_copy["gemini"] = gemini_copy
+            acc["quota"] = q_copy
+        else:
+            # Live fetch failed or error returned: check cache
+            cached_acc = cached_accounts.get(acc_name)
+            has_valid_gemini_cache = (
+                isinstance(cached_acc, dict)
+                and isinstance(cached_acc.get("gemini"), dict)
+                and not cached_acc["gemini"].get("error")
+                and "quota" in cached_acc["gemini"]
+            )
+            has_legacy_cache = (
+                isinstance(cached_acc, dict)
+                and "quota" in cached_acc
+                and not cached_acc.get("error")
+            )
+
+            if has_valid_gemini_cache:
+                q_copy = dict(cached_acc)
+                gemini_copy = dict(q_copy["gemini"])
+                gemini_copy["cached"] = True
+                q_copy["gemini"] = gemini_copy
+                acc["quota"] = q_copy
+            elif has_legacy_cache:
+                gemini_copy = {
+                    "quota": cached_acc.get("quota", 0),
+                    "reset_time": cached_acc.get("reset_time", 0),
+                    "cached": True,
+                    "buckets": {},
+                }
+                acc["quota"] = {"gemini": gemini_copy}
+            else:
+                # No cache available: mark as Unreachable
+                acc["quota"] = {
+                    "gemini": None,
+                    "error": "Unreachable",
+                }
+
+    # 4. Sort accounts deterministically
+    result = dict(data)
+    result["accounts"] = sort_accounts_by_quota(accounts)
+    return result
 
 
 def _format_bucket_countdown(reset_ts: Any, current_timestamp: float | None = None) -> str:
@@ -1309,11 +1409,11 @@ def format_status_report(status: dict[str, Any]) -> str:
     email = status.get("email") or "unknown"
     if active:
         lines.append(f"Active Account    : {active} ({email})")
-        if "cached_quota" in status:
+        if "cached_quota" in status and isinstance(status["cached_quota"], dict):
             q_data = status["cached_quota"]
-            if "gemini" in q_data:
+            if isinstance(q_data.get("gemini"), dict):
                 lines.append(f"Cached Quota      : {q_data['gemini'].get('quota', 0)}% (Gemini)")
-            elif "claude" in q_data:
+            elif isinstance(q_data.get("claude"), dict):
                 lines.append(f"Cached Quota      : {q_data['claude'].get('quota', 0)}% (Claude)")
     else:
         lines.append("Active Account    : None (No account active)")
@@ -1659,6 +1759,11 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     list_parser.add_argument("--format", choices=["table", "list"], default="table", help="Output format: table (default) or list (listicle)")
     list_parser.add_argument("--quota", action="store_true", help="Fetch and display quota concurrently")
 
+    # Command: quota
+    quota_parser = subparsers.add_parser("quota", help="Fetch and display current quota rankings across all accounts")
+    quota_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    quota_parser.add_argument("--format", choices=["table", "list"], default="table", help="Output format: table (default) or list (listicle)")
+
     # Command: status
     subparsers.add_parser("status", help="Show system status, active account, and server health")
 
@@ -1716,30 +1821,41 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     # Perform auto-migration if needed on startup
     migrated = engine.auto_migrate_if_needed()
-    if migrated and args.command != "migrate":
-        if args.command == "hook-pre-invocation":
+    if migrated and len(migrated) > 0 and args.command != "migrate":
+        if args.command == "hook-pre-invocation" or getattr(args, "json", False):
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}", file=sys.stderr)
         else:
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}")
 
-    if args.command == "list" or not args.command:
+    if args.command == "quota":
         data = engine.list_accounts()
-        if getattr(args, "quota", False):
-            client = QuotaClient(timeout=2.0)
-            quotas = fetch_all_accounts_quota(engine, data.get("accounts", []), client=client)
-            for acc in data.get("accounts", []):
-                acc["quota"] = quotas.get(acc["name"], {})
-                
+        data = run_quota_pipeline(engine, data)
         if getattr(args, "json", False):
             print(json.dumps(data, indent=2))
+        elif getattr(args, "format", "table") == "list":
+            print(format_accounts_listicle(data, show_quota=True))
         else:
-            print(format_accounts_table(data, show_quota=getattr(args, "quota", False)))
+            print(format_accounts_table(data, show_quota=True))
+        return 0
+
+    if args.command == "list" or not args.command:
+        data = engine.list_accounts()
+        show_quota = getattr(args, "quota", False)
+        if show_quota:
+            data = run_quota_pipeline(engine, data)
+
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2))
+        elif getattr(args, "format", "table") == "list":
+            print(format_accounts_listicle(data, show_quota=show_quota))
+        else:
+            print(format_accounts_table(data, show_quota=show_quota))
         return 0
 
     if args.command == "status":
         status_info = engine.get_status()
         
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
         cache_data = client.load_cache()
         
         now = datetime.now(timezone.utc).timestamp()
@@ -1760,7 +1876,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     if args.command == "internal-probe":
         accounts_data = engine.list_accounts().get("accounts", [])
-        client = QuotaClient(timeout=2.0)
+        client = QuotaClient(timeout=2.0, engine=engine)
         raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
         valid_quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
                     
@@ -1775,7 +1891,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             active_name = engine.get_active_name()
             accounts_data = engine.list_accounts().get("accounts", [])
             
-            client = QuotaClient(timeout=2.0)
+            client = QuotaClient(timeout=2.0, engine=engine)
             raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
             valid_quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
             
