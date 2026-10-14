@@ -761,6 +761,8 @@ class QuotaClient:
         self.token_endpoint = "https://oauth2.googleapis.com/token"
         self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
         self.cache_file = getattr(target_engine, "cache_file", None) or (self.cache_dir / "last_known_quota.json")
+        self.last_error: str | None = None
+        self.last_error_type: str | None = None
 
     def refresh_access_token(self, refresh_token: str) -> dict[str, Any] | None:
         """Refreshes the OAuth access token."""
@@ -917,6 +919,9 @@ class QuotaClient:
         else:
             access_token = str(access_token or "").strip()
 
+        self.last_error = None
+        self.last_error_type = None
+
         if not access_token:
             return {}
 
@@ -947,9 +952,16 @@ class QuotaClient:
                             except Exception:
                                 pass
                         return self.fetch_quota(new_tok_str.strip(), refresh_token=None)
+                self.last_error = "Token refresh rejected"
+                self.last_error_type = "auth"
+            else:
+                self.last_error = f"HTTP Error {e.code}: {e.reason}"
+                self.last_error_type = "auth" if e.code in (401, 403) else "http"
             print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
             return {}
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            self.last_error = f"Network or Parse Error: {e}"
+            self.last_error_type = "network" if isinstance(e, (urllib.error.URLError, TimeoutError)) else "parse"
             print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
             return {}
 
@@ -1019,7 +1031,7 @@ class QuotaClient:
                     if not isinstance(c, dict) or c.get("error"):
                         return False
                 # Must contain at least one valid model container or valid quota payload
-                return bool(isinstance(g, dict) or isinstance(c, dict) or "quota" in acc_val)
+                return bool(isinstance(g, dict) or isinstance(c, dict) or "quota" in acc_val or "groups" in acc_val)
 
             def _normalize_account_entry(acc_dict: dict[str, Any]) -> dict[str, Any]:
                 entry = dict(acc_dict)
@@ -1819,6 +1831,66 @@ class RotationEngine:
         return candidates[0].account_id
 
 
+def _is_auth_error(error_val: Any, client: Any = None) -> bool:
+    """Classifies whether an error represents auth/token corruption (401/403, revoked, no token)."""
+    if error_val is None:
+        return False
+    if isinstance(error_val, Exception):
+        if isinstance(error_val, urllib.error.HTTPError) and error_val.code in (401, 403):
+            return True
+        err_str = str(error_val).lower()
+    elif isinstance(error_val, str):
+        err_str = error_val.lower()
+    elif isinstance(error_val, dict):
+        err_str = str(error_val.get("error", "")).lower()
+    else:
+        err_str = str(error_val).lower()
+
+    auth_keywords = ["no token", "token refresh rejected", "invalid_grant", "unauthorized", "401", "revoked", "auth"]
+    if any(k in err_str for k in auth_keywords):
+        return True
+
+    if client is not None:
+        c_type = getattr(client, "last_error_type", None)
+        if isinstance(c_type, str) and c_type == "auth":
+            return True
+        c_err = getattr(client, "last_error", None)
+        if isinstance(c_err, str) and any(k in c_err.lower() for k in auth_keywords):
+            return True
+
+    return False
+
+
+def _is_network_error(error_val: Any, client: Any = None) -> bool:
+    """Classifies whether an error represents a transient network transport failure."""
+    if error_val is None:
+        return False
+    if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(error_val, Exception):
+        err_str = str(error_val).lower()
+    elif isinstance(error_val, str):
+        err_str = error_val.lower()
+    elif isinstance(error_val, dict):
+        err_str = str(error_val.get("error", "")).lower()
+    else:
+        err_str = str(error_val).lower()
+
+    net_keywords = ["timeout", "timed out", "urlerror", "network", "unreachable", "connection", "reset by peer", "failed to connect", "socket", "dns"]
+    if any(k in err_str for k in net_keywords):
+        return True
+
+    if client is not None:
+        c_type = getattr(client, "last_error_type", None)
+        if isinstance(c_type, str) and c_type == "network":
+            return True
+        c_err = getattr(client, "last_error", None)
+        if isinstance(c_err, str) and any(k in c_err.lower() for k in net_keywords):
+            return True
+
+    return False
+
+
 def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
     if not engine.get_auto_switch():
         sys.stdout.write(json.dumps({}) + "\n")
@@ -1826,30 +1898,142 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
         return 0
     try:
         raw = sys.stdin.read()
-        _payload = json.loads(raw) if raw.strip() else {}
-        model_name = _payload.get("modelName", "gemini-1.5-pro")
-        
+        try:
+            _payload = json.loads(raw) if raw and raw.strip() else {}
+        except Exception:
+            _payload = {}
+        if not isinstance(_payload, dict):
+            _payload = {}
+        raw_model = _payload.get("modelName")
+        if isinstance(raw_model, str) and raw_model.strip():
+            model_name = raw_model.strip()
+        else:
+            model_name = "auto"
+        model_key = "claude" if "claude" in model_name.lower() else "gemini"
+
         # Wire in QuotaClient and RotationEngine
         try:
-            
             active_name = engine.get_active_name()
-            accounts_data = engine.list_accounts().get("accounts", [])
-            
-            client = QuotaClient(timeout=2.0)
-            raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
-            quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
-                            
+            client = QuotaClient(timeout=2.0, engine=engine)
             rot_engine = RotationEngine(model_name=model_name, active_account_id=active_name)
-            target_account = rot_engine.evaluate(quotas, current_active=active_name, target_model=model_name)
-            
-            print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
-            
-            # Check if all network quotas failed or all accounts are exhausted
-            all_exhausted = (
-                not quotas
-                or not any(rot_engine.has_available_quota(q) for q in quotas.values())
+
+            cached_data = client.load_cache()
+            accounts_cache = (
+                cached_data.get("accounts", {})
+                if isinstance(cached_data, dict) and isinstance(cached_data.get("accounts"), dict)
+                else {}
             )
-            
+            active_cache = accounts_cache.get(active_name) if active_name else None
+            now = time.time()
+
+            # Tier 1 (Healthy Pass - 0ms Overhead)
+            if active_name and isinstance(active_cache, dict):
+                try:
+                    cached_at_val = float(active_cache.get("cached_at", 0))
+                except (ValueError, TypeError, OverflowError):
+                    cached_at_val = 0.0
+
+                is_fresh = math.isfinite(cached_at_val) and cached_at_val > 0 and (-5.0 <= (now - cached_at_val) <= 300.0)
+                if is_fresh:
+                    status = rot_engine.get_quota_status(active_cache, model_key=model_key)
+                    if status is not None and status.fraction >= 0.25:
+                        # 0ms pass: strictly zero network calls and zero disk writes
+                        sys.stdout.write(json.dumps({}) + "\n")
+                        sys.stdout.flush()
+                        return 0
+
+            # Tier 2 (Single-Account Probe - ~300ms Overhead)
+            probe_error = None
+            active_quota = None
+            if active_name:
+                try:
+                    _, active_quota = fetch_account_quota(engine, active_name, client=client)
+                    if isinstance(active_quota, dict) and active_quota.get("error"):
+                        probe_error = active_quota.get("error")
+                except Exception as probe_exc:
+                    probe_error = probe_exc
+                    active_quota = {"error": str(probe_exc)}
+
+                if probe_error is not None:
+                    # Active Probe Error Classification
+                    if _is_auth_error(probe_error, client=client):
+                        # Auth/token corruption: do not fall back to cache; signal Tier 3 failover
+                        print(f"[agy-switch hook] Active account '{active_name}' auth corruption: {probe_error}. Triggering Tier 3 failover.", file=sys.stderr)
+                    elif _is_network_error(probe_error, client=client):
+                        # Transient transport failure: attempt fallback to cached quota
+                        if isinstance(active_cache, dict):
+                            cached_status = rot_engine.get_quota_status(active_cache, model_key=model_key)
+                            if cached_status is not None and cached_status.fraction >= 0.15:
+                                # Retain active account silently without emitting false alarms
+                                print(f"[agy-switch hook] Active account '{active_name}' network error: {probe_error}. Retaining active via cache ({cached_status.remaining_percentage()}%).", file=sys.stderr)
+                                sys.stdout.write(json.dumps({}) + "\n")
+                                sys.stdout.flush()
+                                return 0
+                        # If active cache is missing or low (< 15%), check if any standby account has cached quota
+                        has_standby_cache = any(
+                            acc_id != active_name and isinstance(q_data, dict) and rot_engine.has_available_quota(q_data)
+                            for acc_id, q_data in accounts_cache.items()
+                        )
+                        if not has_standby_cache:
+                            print(f"[agy-switch hook] Active account '{active_name}' network error: {probe_error}. Retaining active silently (no standby cache).", file=sys.stderr)
+                            sys.stdout.write(json.dumps({}) + "\n")
+                            sys.stdout.flush()
+                            return 0
+                else:
+                    # Probe succeeded without error
+                    if isinstance(active_quota, dict) and not active_quota.get("error"):
+                        active_entry = dict(active_quota)
+                        active_entry["cached_at"] = time.time()
+                        client.save_cache({"accounts": {active_name: active_entry}}, merge=True)
+
+                        active_status = rot_engine.get_quota_status(active_quota, model_key=model_key)
+                        if (
+                            rot_engine.has_available_quota(active_quota)
+                            and active_status is not None
+                            and active_status.fraction >= 0.15
+                        ):
+                            print(f"[agy-switch hook] Tier 2 probe for '{active_name}' healthy ({active_status.remaining_percentage()}%). Retaining active account.", file=sys.stderr)
+                            sys.stdout.write(json.dumps({}) + "\n")
+                            sys.stdout.flush()
+                            return 0
+
+            # Tier 3 (Full Standby Probe & Rotation)
+            accounts_data = engine.list_accounts().get("accounts", [])
+            raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
+
+            combined_quotas = dict(accounts_cache)
+            now = time.time()
+            for acc_name, q_data in raw_quotas.items():
+                if isinstance(q_data, dict) and "error" not in q_data and q_data:
+                    entry = dict(q_data)
+                    entry["cached_at"] = now
+                    combined_quotas[acc_name] = entry
+
+            # If active_quota from Tier 2 was successful, ensure it is in combined_quotas
+            if isinstance(active_quota, dict) and not active_quota.get("error") and active_quota:
+                active_entry = dict(active_quota)
+                active_entry["cached_at"] = now
+                combined_quotas[active_name] = active_entry
+
+            # If active account had auth corruption, remove it from combined_quotas so it does not fall back to stale cache
+            if active_name and probe_error is not None and _is_auth_error(probe_error, client=client):
+                combined_quotas.pop(active_name, None)
+
+            # Persist fresh telemetry to cache
+            client.save_cache({"accounts": combined_quotas}, merge=True)
+
+            target_account = rot_engine.evaluate(combined_quotas, current_active=active_name, target_model=model_name)
+            print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
+
+            # Exhaustion Evaluation Invariant:
+            total_registered = len(accounts_data)
+            evaluated_count = len([acc for acc in accounts_data if acc.get("name") in combined_quotas])
+            all_exhausted = (
+                total_registered > 0
+                and evaluated_count == total_registered
+                and not any(rot_engine.has_available_quota(combined_quotas[acc["name"]]) for acc in accounts_data)
+            )
+
             if all_exhausted:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
@@ -1860,11 +2044,11 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 }) + "\n")
                 sys.stdout.flush()
                 return 0
-                
+
             if target_account and target_account != active_name:
                 engine.switch_tokens(target_account, restart_server=False, force=True)
-                
-                status = rot_engine.get_quota_status(quotas.get(target_account, {}))
+
+                status = rot_engine.get_quota_status(combined_quotas.get(target_account, {}), model_key=model_key)
                 pct = status.remaining_percentage() if status is not None else "Unknown"
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
@@ -1875,7 +2059,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 }) + "\n")
                 sys.stdout.flush()
                 return 0
-                
+
         except Exception as qc_exc:
             print(f"[agy-switch hook] QuotaClient/RotationEngine error: {qc_exc}", file=sys.stderr)
     except Exception as exc:
