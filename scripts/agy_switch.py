@@ -2022,6 +2022,40 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
     return False
 
 
+def _is_stale_exhausted_cache(
+    cached_entry: Any,
+    rot_engine: RotationEngine,
+    model_key: str,
+    now: float,
+    ttl_seconds: float = 300.0,
+    clock_skew_tolerance: float = 5.0,
+) -> bool:
+    """Returns True if cached_entry is non-dict, unparseable, or holds a 0% quota that is stale/expired."""
+    if not isinstance(cached_entry, dict):
+        return True
+    status = rot_engine.get_quota_status(cached_entry, model_key=model_key)
+    if status is None:
+        return True
+    if status.fraction > 0.0:
+        return False
+    cached_at_val = cached_entry.get("cached_at")
+    try:
+        c_at = float(cached_at_val)
+        if not math.isfinite(c_at) or c_at <= 0 or isinstance(cached_at_val, bool):
+            c_at = 0.0
+    except (ValueError, TypeError, OverflowError):
+        c_at = 0.0
+
+    is_expired = (c_at <= 0.0) or (now - c_at > ttl_seconds) or (now - c_at < -clock_skew_tolerance)
+    try:
+        curr_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        is_reset_elapsed = status.reset_time <= curr_dt
+    except (ValueError, TypeError, OverflowError, OSError):
+        is_reset_elapsed = False
+
+    return is_expired or is_reset_elapsed
+
+
 def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
     if not engine.get_auto_switch():
         sys.stdout.write(json.dumps({}) + "\n")
@@ -2131,22 +2165,34 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
 
             # Tier 3 (Full Standby Probe & Rotation)
             accounts_data = engine.list_accounts().get("accounts", [])
-            registered_names = {acc.get("name") for acc in accounts_data if isinstance(acc, dict) and acc.get("name")}
-            standby_accounts = [acc for acc in accounts_data if isinstance(acc, dict) and acc.get("name") != active_name]
+            registered_accounts = [acc for acc in accounts_data if isinstance(acc, dict) and acc.get("name")]
+            registered_names = {acc["name"] for acc in registered_accounts}
+            standby_accounts = [acc for acc in registered_accounts if acc["name"] != active_name]
             raw_quotas = fetch_all_accounts_quota(engine, standby_accounts, client=client)
 
             combined_quotas = {k: v for k, v in accounts_cache.items() if k in registered_names}
             now = time.time()
             evict_keys: set[str] = set(accounts_cache.keys()) - registered_names
-            for acc_name, q_data in raw_quotas.items():
+            terminal_auth_keys: set[str] = set()
+
+            for s_acc in standby_accounts:
+                acc_name = s_acc.get("name")
+                if not acc_name:
+                    continue
+                q_data = raw_quotas.get(acc_name)
                 if isinstance(q_data, dict) and "error" not in q_data and q_data:
                     entry = dict(q_data)
                     entry["cached_at"] = now
                     combined_quotas[acc_name] = entry
-                elif isinstance(q_data, dict) and q_data.get("error"):
-                    if _is_auth_error(q_data):
+                elif q_data is not None and _is_auth_error(q_data):
+                    combined_quotas.pop(acc_name, None)
+                    evict_keys.add(acc_name)
+                    terminal_auth_keys.add(acc_name)
+                else:
+                    # Standby probe failed due to transport / network error (or no probe response)
+                    cached_entry = combined_quotas.get(acc_name)
+                    if _is_stale_exhausted_cache(cached_entry, rot_engine, model_key, now):
                         combined_quotas.pop(acc_name, None)
-                        evict_keys.add(acc_name)
 
             # If active_quota from Tier 2 was successful, ensure it is in combined_quotas
             if active_name and isinstance(active_quota, dict) and not active_quota.get("error") and active_quota:
@@ -2156,9 +2202,20 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
 
             # If active account had auth corruption, remove it from combined_quotas so it does not fall back to stale cache
             err_obj = active_quota if isinstance(active_quota, dict) else probe_error
-            if active_name and probe_error is not None and _is_auth_error(err_obj, client=client):
+            is_active_auth_err = (
+                active_name
+                and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error")))
+                and _is_auth_error(err_obj, client=client)
+            )
+            if is_active_auth_err:
                 combined_quotas.pop(active_name, None)
                 evict_keys.add(active_name)
+                terminal_auth_keys.add(active_name)
+            elif active_name and probe_error is not None:
+                # Active account probe encountered network error; check if cached data is stale 0%
+                active_entry = combined_quotas.get(active_name)
+                if _is_stale_exhausted_cache(active_entry, rot_engine, model_key, now):
+                    combined_quotas.pop(active_name, None)
 
             # Persist fresh telemetry to cache
             client.save_cache({"accounts": combined_quotas}, merge=True, evict_keys=evict_keys)
@@ -2167,16 +2224,28 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
             print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
 
             # Exhaustion Evaluation Invariant:
-            total_registered = len(accounts_data)
-            evaluated_count = len([acc for acc in accounts_data if acc.get("name") and acc.get("name") in combined_quotas])
+            total_registered = len(registered_accounts)
+            evaluated_count = len([
+                acc for acc in registered_accounts
+                if (acc["name"] in combined_quotas or acc["name"] in terminal_auth_keys)
+            ])
+            verified_accounts = [
+                acc for acc in registered_accounts
+                if acc["name"] in combined_quotas
+            ]
+            verified_count = len(verified_accounts)
+            has_verified_account = verified_count > 0
+            verified_exhausted_count = 0
+            for acc in verified_accounts:
+                st = rot_engine.get_quota_status(combined_quotas[acc["name"]], model_key=model_key)
+                if st is not None and st.is_exhausted():
+                    verified_exhausted_count += 1
+
             all_exhausted = (
                 total_registered > 0
                 and evaluated_count == total_registered
-                and not any(
-                    rot_engine.has_available_quota(combined_quotas[acc["name"]])
-                    for acc in accounts_data
-                    if acc.get("name") and acc.get("name") in combined_quotas
-                )
+                and has_verified_account
+                and verified_exhausted_count == verified_count
             )
 
             if all_exhausted:
