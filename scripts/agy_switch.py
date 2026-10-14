@@ -1119,27 +1119,32 @@ class QuotaClient:
                         entry["cached_at"] = root_ts
                 return entry
 
-            def _is_valid_entry(acc_val: Any) -> bool:
-                return _sanitize_account_entry(acc_val) is not None
-
-            incoming_valid: dict[str, Any] = {}
-            if isinstance(data.get("accounts"), dict):
-                for k, v in data["accounts"].items():
-                    if isinstance(k, str) and k.strip():
-                        sanitized = _sanitize_account_entry(v)
-                        if sanitized is not None:
-                            incoming_valid[k.strip()] = sanitized
-
-            if merge:
-                current = self.load_cache()
-                merged_accounts: dict[str, Any] = {}
-                if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
-                    for k, v in current["accounts"].items():
+            def _extract_valid_accounts(accounts_map: Any) -> dict[str, Any]:
+                valid: dict[str, Any] = {}
+                if isinstance(accounts_map, dict):
+                    for k, v in accounts_map.items():
                         if isinstance(k, str) and k.strip():
                             sanitized = _sanitize_account_entry(v)
                             if sanitized is not None:
-                                merged_accounts[k.strip()] = sanitized
-                merged_accounts.update(incoming_valid)
+                                valid[k.strip()] = sanitized
+                return valid
+
+            incoming_valid = _extract_valid_accounts(data.get("accounts"))
+
+            if merge:
+                current = self.load_cache()
+                merged_accounts: dict[str, Any] = (
+                    _extract_valid_accounts(current.get("accounts"))
+                    if isinstance(current, dict)
+                    else {}
+                )
+                for acc_name, incoming_acc in incoming_valid.items():
+                    if acc_name in merged_accounts:
+                        merged_entry = dict(merged_accounts[acc_name])
+                        merged_entry.update(incoming_acc)
+                        merged_accounts[acc_name] = merged_entry
+                    else:
+                        merged_accounts[acc_name] = incoming_acc
                 if evict_keys:
                     for ev in evict_keys:
                         if isinstance(ev, str) and ev.strip() in merged_accounts:
@@ -1927,15 +1932,19 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
         raw_type = error_val.get("error_type")
         if raw_type == "auth":
             return True
-        if isinstance(raw_type, str) and raw_type.strip() and raw_type.strip() != "auth":
-            return False
         code = error_val.get("code") or error_val.get("status_code")
+        if isinstance(code, str) and code.isdigit():
+            code = int(code)
         if isinstance(code, int):
             if code in (401, 403):
                 return True
             if code in (500, 502, 503, 504):
                 return False
         err_str = str(error_val.get("error", "")).lower()
+        if raw_type == "http" and _has_auth_indicator(err_str):
+            return True
+        if isinstance(raw_type, str) and raw_type.strip() and raw_type.strip() != "auth":
+            return False
     elif isinstance(error_val, Exception):
         if isinstance(error_val, urllib.error.HTTPError):
             if error_val.code in (401, 403):

@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from agy_switch import (
+    AUTH_PHRASES,
     QuotaClient,
     _is_auth_error,
     _is_network_error,
@@ -996,6 +997,41 @@ class TestQuotaClient(unittest.TestCase):
         self.assertFalse(_is_auth_error({"error": "Server error", "error_type": "http"}, client=auth_client))
         self.assertFalse(_is_auth_error({"error": "General failure", "error_type": "general"}, client=auth_client))
 
+    def test_is_auth_error_http_status_code_precedence_and_expanded_phrases(self):
+        """_is_auth_error evaluates HTTP 401/403 status codes before non-auth error_type and supports expanded auth phrases."""
+        # 1. Status code precedence when error_type is 'http'
+        self.assertTrue(_is_auth_error({"error_type": "http", "code": 401}))
+        self.assertTrue(_is_auth_error({"error_type": "http", "code": 403}))
+        self.assertTrue(_is_auth_error({"error_type": "http", "status_code": 401}))
+        self.assertTrue(_is_auth_error({"error_type": "http", "status_code": 403}))
+        self.assertTrue(_is_auth_error({"error_type": "http", "code": "401"}))
+        self.assertTrue(_is_auth_error({"error_type": "http", "status_code": "403"}))
+
+        # 5xx must not be auth errors
+        self.assertFalse(_is_auth_error({"error_type": "http", "code": 500}))
+        self.assertFalse(_is_auth_error({"error_type": "http", "code": 502}))
+
+        # Other HTTP codes (e.g. 404, 400) without auth phrase should not be auth errors
+        self.assertFalse(_is_auth_error({"error_type": "http", "code": 404}))
+
+        # 2. Expanded AUTH_PHRASES presence
+        self.assertIn("forbidden", AUTH_PHRASES)
+        self.assertIn("access_denied", AUTH_PHRASES)
+        self.assertIn("invalid_client", AUTH_PHRASES)
+
+        # 3. String & message auth classification with expanded phrases
+        self.assertTrue(_is_auth_error("Access Forbidden"))
+        self.assertTrue(_is_auth_error("OAuth error: access_denied"))
+        self.assertTrue(_is_auth_error("Client rejected: invalid_client"))
+        self.assertTrue(_is_auth_error({"error": "Access Forbidden"}))
+        self.assertTrue(_is_auth_error({"error": "OAuth error: access_denied"}))
+        self.assertTrue(_is_auth_error({"error": "Client rejected: invalid_client"}))
+
+        # 4. Error dict with error_type == 'http' and auth indicator in error string
+        self.assertTrue(_is_auth_error({"error_type": "http", "error": "Access Forbidden"}))
+        self.assertTrue(_is_auth_error({"error_type": "http", "error": "HTTP Error 401: Unauthorized"}))
+        self.assertTrue(_is_auth_error({"error_type": "http", "error": "OAuth error: access_denied"}))
+
     def test_fetch_account_quota_hardening_token_endpoint_and_5xx(self):
         """fetch_account_quota classifies token endpoint timeout and HTTP 5xx as network errors."""
         mock_engine = MagicMock()
@@ -1143,6 +1179,115 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(_sanitize_expires_in(None), 3600)
         self.assertEqual(_sanitize_expires_in("bad", default=7200), 7200)
         self.assertEqual(_sanitize_expires_in(100000000), 3600)
+
+    def test_save_cache_deep_merge_preserves_claude_when_updating_gemini(self):
+        """save_cache(merge=True) preserves existing cached Claude data when incoming update only has Gemini."""
+        initial_data = {
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                    "claude": {"quota": 50, "reset_time": 1700000000},
+                }
+            }
+        }
+        self.client.save_cache(initial_data, merge=False)
+
+        # Update acc1 with only Gemini data
+        self.client.save_cache({
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1100.0,
+                    "gemini": {"quota": 85, "reset_time": 1700005000},
+                }
+            }
+        }, merge=True)
+
+        loaded = self.client.load_cache()
+        self.assertIn("acc1", loaded["accounts"])
+        acc1 = loaded["accounts"]["acc1"]
+        self.assertEqual(acc1["cached_at"], 1100.0)
+        self.assertEqual(acc1["gemini"]["quota"], 85)
+        self.assertEqual(acc1["gemini"]["reset_time"], 1700005000)
+        # Claude data must be preserved intact
+        self.assertIn("claude", acc1)
+        self.assertEqual(acc1["claude"]["quota"], 50)
+        self.assertEqual(acc1["claude"]["reset_time"], 1700000000)
+
+    def test_save_cache_deep_merge_preserves_gemini_when_updating_claude(self):
+        """save_cache(merge=True) preserves existing cached Gemini data when incoming update only has Claude."""
+        initial_data = {
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                    "claude": {"quota": 50, "reset_time": 1700000000},
+                }
+            }
+        }
+        self.client.save_cache(initial_data, merge=False)
+
+        # Update acc1 with only Claude data
+        self.client.save_cache({
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1200.0,
+                    "claude": {"quota": 65, "reset_time": 1700006000},
+                }
+            }
+        }, merge=True)
+
+        loaded = self.client.load_cache()
+        self.assertIn("acc1", loaded["accounts"])
+        acc1 = loaded["accounts"]["acc1"]
+        self.assertEqual(acc1["cached_at"], 1200.0)
+        self.assertEqual(acc1["claude"]["quota"], 65)
+        self.assertEqual(acc1["claude"]["reset_time"], 1700006000)
+        # Gemini data must be preserved intact
+        self.assertIn("gemini", acc1)
+        self.assertEqual(acc1["gemini"]["quota"], 80)
+        self.assertEqual(acc1["gemini"]["reset_time"], 1700000000)
+
+    def test_save_cache_deep_merge_respects_evict_keys(self):
+        """save_cache(merge=True) permanently removes accounts in evict_keys even with deep model merge."""
+        initial_data = {
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700000000},
+                    "claude": {"quota": 50, "reset_time": 1700000000},
+                },
+                "acc2": {
+                    "cached_at": 1000.0,
+                    "gemini": {"quota": 70, "reset_time": 1700000000},
+                }
+            }
+        }
+        self.client.save_cache(initial_data, merge=False)
+
+        # Update acc1 while evicting acc1 and acc2
+        self.client.save_cache({
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1300.0,
+                    "gemini": {"quota": 95, "reset_time": 1700009000},
+                }
+            }
+        }, merge=True, evict_keys=["acc1", "acc2"])
+
+        loaded = self.client.load_cache()
+        self.assertNotIn("acc1", loaded.get("accounts", {}))
+        self.assertNotIn("acc2", loaded.get("accounts", {}))
+
+    def test_orphaned_is_valid_entry_purged_from_source(self):
+        """Verify orphaned _is_valid_entry helper has been purged from scripts/agy_switch.py."""
+        import inspect
+        import agy_switch
+        source = inspect.getsource(agy_switch)
+        self.assertNotIn("def _is_valid_entry", source)
 
 
 if __name__ == "__main__":
