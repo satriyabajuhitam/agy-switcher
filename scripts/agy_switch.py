@@ -983,9 +983,10 @@ class QuotaClient:
 
     def load_cache(self) -> dict[str, Any]:
         """Loads cached quota data from vault cache or legacy fallback."""
-        if self.cache_file.is_file():
+        cache_path = Path(self.cache_file)
+        if cache_path.is_file():
             try:
-                return json.loads(self.cache_file.read_text(encoding="utf-8"))
+                return json.loads(cache_path.read_text(encoding="utf-8"))
             except Exception:
                 return {}
         legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
@@ -1012,14 +1013,25 @@ class QuotaClient:
         3. For valid incoming accounts lacking 'cached_at', 'cached_at' is automatically
            set to root_ts, ensuring independent freshness tracking across all callers.
         4. Invalid or error-laden accounts in incoming data are filtered out
-           without corrupting existing valid cache entries.
+           without corrupting existing valid cache entries. Errored model sub-keys
+           (e.g. claude: {"error": ...}) are stripped while preserving healthy models.
         5. Permissions: cache directory is 0700 and cache file is 0600.
+        6. Cross-mount resilience: temporary files are created in cache_file.parent,
+           preventing EXDEV errors when cache_file is customized.
         """
-        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache_target_file = Path(self.cache_file)
+        target_dir = cache_target_file.parent
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            os.chmod(self.cache_dir, 0o700)
+            os.chmod(target_dir, 0o700)
         except OSError:
             pass
+        if self.cache_dir != target_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(self.cache_dir, 0o700)
+            except OSError:
+                pass
 
         if not isinstance(data, dict):
             data_to_write = {
@@ -1040,22 +1052,31 @@ class QuotaClient:
                 except (ValueError, TypeError, OverflowError):
                     root_ts = time.time()
 
-            def _is_valid_entry(acc_val: Any) -> bool:
+            def _sanitize_account_entry(acc_val: Any) -> dict[str, Any] | None:
                 if not isinstance(acc_val, dict) or not acc_val or acc_val.get("error"):
-                    return False
-                g = acc_val.get("gemini")
-                if g is not None:
-                    if not isinstance(g, dict) or g.get("error"):
-                        return False
-                c = acc_val.get("claude")
-                if c is not None:
-                    if not isinstance(c, dict) or c.get("error"):
-                        return False
-                # Must contain at least one valid model container or valid quota payload
-                return bool(isinstance(g, dict) or isinstance(c, dict) or "quota" in acc_val or "groups" in acc_val)
+                    return None
+                entry = dict(acc_val)
+                # Strip errored or invalid model sub-keys (e.g. claude: {"error": ...})
+                for m_key in ("gemini", "claude"):
+                    if m_key in entry:
+                        m_val = entry[m_key]
+                        if not isinstance(m_val, dict) or m_val.get("error"):
+                            del entry[m_key]
 
-            def _normalize_account_entry(acc_dict: dict[str, Any]) -> dict[str, Any]:
-                entry = dict(acc_dict)
+                # Strip any other sub-dict containing an error key
+                for k in list(entry.keys()):
+                    if k not in ("cached_at", "timestamp"):
+                        v = entry[k]
+                        if isinstance(v, dict) and v.get("error"):
+                            del entry[k]
+
+                # Must contain at least one valid model container or valid quota payload
+                has_model = isinstance(entry.get("gemini"), dict) or isinstance(entry.get("claude"), dict)
+                has_quota = "quota" in entry or "groups" in entry
+                if not (has_model or has_quota):
+                    return None
+
+                # Normalize cached_at timestamp
                 cached_at_val = entry.get("cached_at")
                 if cached_at_val is None or isinstance(cached_at_val, bool):
                     entry["cached_at"] = root_ts
@@ -1070,22 +1091,26 @@ class QuotaClient:
                         entry["cached_at"] = root_ts
                 return entry
 
+            def _is_valid_entry(acc_val: Any) -> bool:
+                return _sanitize_account_entry(acc_val) is not None
+
+            incoming_valid: dict[str, Any] = {}
             if isinstance(data.get("accounts"), dict):
-                incoming_valid = {
-                    k.strip(): _normalize_account_entry(v) for k, v in data["accounts"].items()
-                    if isinstance(k, str) and k.strip() and _is_valid_entry(v)
-                }
-            else:
-                incoming_valid = {}
+                for k, v in data["accounts"].items():
+                    if isinstance(k, str) and k.strip():
+                        sanitized = _sanitize_account_entry(v)
+                        if sanitized is not None:
+                            incoming_valid[k.strip()] = sanitized
 
             if merge:
                 current = self.load_cache()
                 merged_accounts: dict[str, Any] = {}
                 if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
-                    merged_accounts = {
-                        k.strip(): dict(v) for k, v in current["accounts"].items()
-                        if isinstance(k, str) and k.strip() and _is_valid_entry(v)
-                    }
+                    for k, v in current["accounts"].items():
+                        if isinstance(k, str) and k.strip():
+                            sanitized = _sanitize_account_entry(v)
+                            if sanitized is not None:
+                                merged_accounts[k.strip()] = sanitized
                 merged_accounts.update(incoming_valid)
                 if evict_keys:
                     for ev in evict_keys:
@@ -1109,13 +1134,13 @@ class QuotaClient:
 
         tmp_file = None
         try:
-            tmp_fd, tmp_file = tempfile.mkstemp(dir=self.cache_dir, prefix="quota-cache-", suffix=".tmp")
+            tmp_fd, tmp_file = tempfile.mkstemp(dir=target_dir, prefix="quota-cache-", suffix=".tmp")
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 json.dump(data_to_write, f, indent=2)
             os.chmod(tmp_file, 0o600)
-            os.replace(tmp_file, self.cache_file)
+            os.replace(tmp_file, cache_target_file)
             try:
-                os.chmod(self.cache_file, 0o600)
+                os.chmod(cache_target_file, 0o600)
             except OSError:
                 pass
             tmp_file = None

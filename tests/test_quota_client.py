@@ -596,6 +596,131 @@ class TestQuotaClient(unittest.TestCase):
         self.assertIn("[QuotaClient] Failed to persist quota cache", err_output)
         self.assertIn("Disk full", err_output)
 
+    def test_save_cache_custom_cache_file_distinct_directory(self):
+        """save_cache creates temporary files in cache_file.parent, preventing EXDEV across mounts."""
+        dir_distinct = tempfile.TemporaryDirectory()
+        try:
+            custom_cache_file = Path(dir_distinct.name) / "custom_subdir" / "custom_quota.json"
+            self.client.cache_file = custom_cache_file
+
+            orig_mkstemp = tempfile.mkstemp
+            mkstemp_dirs = []
+
+            def spy_mkstemp(*args, **kwargs):
+                if "dir" in kwargs:
+                    mkstemp_dirs.append(Path(kwargs["dir"]).resolve())
+                elif len(args) >= 3:
+                    mkstemp_dirs.append(Path(args[2]).resolve())
+                return orig_mkstemp(*args, **kwargs)
+
+            with patch("tempfile.mkstemp", side_effect=spy_mkstemp):
+                self.client.save_cache({"accounts": {"acc1": {"gemini": {"quota": 80}}}})
+
+            self.assertTrue(custom_cache_file.is_file())
+            self.assertEqual(stat.S_IMODE(os.stat(custom_cache_file).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(custom_cache_file.parent).st_mode), 0o700)
+            self.assertTrue(len(mkstemp_dirs) > 0)
+            self.assertEqual(mkstemp_dirs[0], custom_cache_file.parent.resolve())
+            self.assertNotEqual(mkstemp_dirs[0], self.cache_dir.resolve())
+            loaded = self.client.load_cache()
+            self.assertIn("acc1", loaded["accounts"])
+            self.assertEqual(loaded["accounts"]["acc1"]["gemini"]["quota"], 80)
+        finally:
+            dir_distinct.cleanup()
+
+    def test_save_cache_partial_multi_model_preserves_healthy_gemini_and_strips_errored_claude(self):
+        """save_cache strips errored model sub-keys (claude error) while preserving healthy models (gemini)."""
+        incoming = {
+            "accounts": {
+                "acc_mixed": {
+                    "gemini": {"quota": 85, "reset_time": 5000},
+                    "claude": {"error": "Model not found"},
+                }
+            }
+        }
+        self.client.save_cache(incoming, merge=False)
+        loaded = self.client.load_cache()
+        self.assertIn("acc_mixed", loaded["accounts"])
+        self.assertIn("gemini", loaded["accounts"]["acc_mixed"])
+        self.assertEqual(loaded["accounts"]["acc_mixed"]["gemini"]["quota"], 85)
+        self.assertNotIn("claude", loaded["accounts"]["acc_mixed"])
+
+    def test_save_cache_partial_multi_model_preserves_healthy_claude_and_strips_errored_gemini(self):
+        """save_cache strips errored model sub-keys (gemini error) while preserving healthy models (claude)."""
+        incoming = {
+            "accounts": {
+                "acc_mixed": {
+                    "gemini": {"error": "Quota error"},
+                    "claude": {"quota": 90, "reset_time": 6000},
+                }
+            }
+        }
+        self.client.save_cache(incoming, merge=False)
+        loaded = self.client.load_cache()
+        self.assertIn("acc_mixed", loaded["accounts"])
+        self.assertIn("claude", loaded["accounts"]["acc_mixed"])
+        self.assertEqual(loaded["accounts"]["acc_mixed"]["claude"]["quota"], 90)
+        self.assertNotIn("gemini", loaded["accounts"]["acc_mixed"])
+
+    def test_save_cache_custom_cache_file_as_string_path(self):
+        """save_cache seamlessly handles cache_file set as a string path."""
+        dir_distinct = tempfile.TemporaryDirectory()
+        try:
+            custom_path_str = os.path.join(dir_distinct.name, "nested_dir", "quota_str.json")
+            self.client.cache_file = custom_path_str
+
+            self.client.save_cache({"accounts": {"acc_str_path": {"gemini": {"quota": 77}}}})
+
+            self.assertTrue(os.path.isfile(custom_path_str))
+            loaded = self.client.load_cache()
+            self.assertIn("acc_str_path", loaded["accounts"])
+            self.assertEqual(loaded["accounts"]["acc_str_path"]["gemini"]["quota"], 77)
+        finally:
+            dir_distinct.cleanup()
+
+    def test_save_cache_all_models_errored_discards_account(self):
+        """save_cache completely drops account if all models in payload return errors."""
+        incoming = {
+            "accounts": {
+                "acc_all_fail": {
+                    "gemini": {"error": "Gemini quota exhausted"},
+                    "claude": {"error": "Claude not provisioned"},
+                },
+                "acc_healthy": {
+                    "gemini": {"quota": 88},
+                }
+            }
+        }
+        self.client.save_cache(incoming, merge=False)
+        loaded = self.client.load_cache()
+        self.assertNotIn("acc_all_fail", loaded["accounts"])
+        self.assertIn("acc_healthy", loaded["accounts"])
+
+    def test_save_cache_partial_multi_model_strips_string_and_none_errors(self):
+        """save_cache strips model entries that are raw strings or None while keeping valid models."""
+        incoming = {
+            "accounts": {
+                "acc_str_err": {
+                    "gemini": {"quota": 92},
+                    "claude": "500 Internal Server Error",
+                },
+                "acc_none_err": {
+                    "gemini": None,
+                    "claude": {"quota": 75},
+                }
+            }
+        }
+        self.client.save_cache(incoming, merge=False)
+        loaded = self.client.load_cache()
+        self.assertIn("acc_str_err", loaded["accounts"])
+        self.assertIn("gemini", loaded["accounts"]["acc_str_err"])
+        self.assertNotIn("claude", loaded["accounts"]["acc_str_err"])
+
+        self.assertIn("acc_none_err", loaded["accounts"])
+        self.assertIn("claude", loaded["accounts"]["acc_none_err"])
+        self.assertNotIn("gemini", loaded["accounts"]["acc_none_err"])
+
+
 
     @patch("urllib.request.urlopen")
     def test_refresh_access_token_success(self, mock_urlopen):
@@ -956,4 +1081,5 @@ class TestQuotaClient(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
