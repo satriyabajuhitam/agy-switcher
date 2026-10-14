@@ -26,6 +26,7 @@ from agy_switch import (
     sort_accounts_by_quota,
     format_accounts_listicle,
     format_accounts_table,
+    _parse_timestamp_defensive,
     main,
 )
 
@@ -1027,6 +1028,62 @@ class TestFormatAccountsListicle(unittest.TestCase):
         res = format_accounts_listicle(data, show_quota=True)
         self.assertIn("• [*] ok (-) — Gemini: 85% (Cached)", res)
         self.assertIn("Active Account: ok", res)
+
+    def test_format_partial_bucket_5h_only(self):
+        """Account with only a 5h bucket does not fabricate a synthetic wk quota in listicle or table views."""
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc1",
+                    "email": "acc1@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {
+                            "quota": 80,
+                            "reset_time": 1791201600,
+                            "cached": False,
+                            "buckets": {
+                                "5h": {"quota": 80, "reset_time": 1791201600},
+                            },
+                        }
+                    },
+                }
+            ],
+        }
+        res = format_accounts_listicle(data, show_quota=True, current_timestamp=1791194400.0)
+        self.assertIn("80% [5h: 80% (in 2h)]", res)
+        self.assertNotIn("wk:", res)
+
+        table_res = format_accounts_table(data, show_quota=True, current_timestamp=1791194400.0)
+        self.assertIn("80% [5h: 80% (in 2h)]", table_res)
+        self.assertNotIn("wk:", table_res)
+
+    def test_parse_timestamp_defensive_utc_and_clamping(self):
+        """Naive ISO strings evaluate in UTC, and negative/zero/non-finite timestamps clamp to float('inf')."""
+        ts_naive = _parse_timestamp_defensive("2026-10-05T12:00:00")
+        self.assertEqual(ts_naive, 1791201600.0)
+
+        ts_z = _parse_timestamp_defensive("2026-10-05T12:00:00Z")
+        self.assertEqual(ts_z, 1791201600.0)
+
+        self.assertEqual(_parse_timestamp_defensive(-100), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive(-0.5), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive(0), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive(0.0), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive("-500"), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive("0"), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive("1969-12-31T23:59:59Z"), float("inf"))
+
+        self.assertEqual(_parse_timestamp_defensive(float("nan")), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive(float("inf")), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive(float("-inf")), float("inf"))
+
+        self.assertEqual(_parse_timestamp_defensive(None), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive(True), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive(False), float("inf"))
+        self.assertEqual(_parse_timestamp_defensive("corrupted"), float("inf"))
 
 
 class TestFormatAccountsTable(unittest.TestCase):

@@ -321,6 +321,50 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(res["gemini"]["buckets"]["5h"]["reset_time"], 0)
         self.assertEqual(res["gemini"]["buckets"]["weekly"]["reset_time"], 0)
 
+    def test_parse_quota_response_float_tie_breaking(self):
+        # When rounded integer percentages tie (e.g. 5%), raw unrounded float remainingFraction breaks the tie
+        payload = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        # Bucket B: 0.054 -> rounds to 5%, earlier reset time
+                        {"bucketId": "weekly", "remainingFraction": 0.054, "resetTime": "2026-10-01T12:00:00Z"},
+                        # Bucket A: 0.046 -> rounds to 5%, later reset time, but lower raw fraction (worst case)
+                        {"bucketId": "5h", "remainingFraction": 0.046, "resetTime": "2026-10-05T12:00:00Z"},
+                    ]
+                }
+            ]
+        }
+        res = self.client.parse_quota_response(payload)
+        self.assertEqual(res["gemini"]["quota"], 5)
+        # Raw float 0.046 < 0.054, so 5h (1791201600) must win as worst case despite later resetTime
+        self.assertEqual(res["gemini"]["reset_time"], 1791201600)
+
+    def test_save_cache_excludes_error_entries(self):
+        # Pre-seed cache with a valid account
+        self.client.save_cache({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc_existing": {"gemini": {"quota": 90, "reset_time": 5000}}
+            }
+        })
+
+        # Save with merge=True where incoming has a valid account and an error account
+        incoming = {
+            "timestamp": 2000.0,
+            "accounts": {
+                "acc_valid": {"gemini": {"quota": 80, "reset_time": 6000}},
+                "acc_error": {"error": "Fetch failed"},
+            }
+        }
+        self.client.save_cache(incoming, merge=True)
+
+        loaded = self.client.load_cache()
+        self.assertIn("acc_existing", loaded["accounts"])
+        self.assertIn("acc_valid", loaded["accounts"])
+        self.assertNotIn("acc_error", loaded["accounts"])
+
 
 if __name__ == "__main__":
     unittest.main()

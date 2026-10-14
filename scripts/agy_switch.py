@@ -802,7 +802,7 @@ class QuotaClient:
                 continue
 
             buckets: dict[str, dict[str, Any]] = {}
-            parsed_buckets_list: list[tuple[float, int, int, dict[str, Any]]] = []
+            parsed_buckets_list: list[tuple[int, float, int, dict[str, Any]]] = []
 
             for b in buckets_raw:
                 if not isinstance(b, dict):
@@ -858,12 +858,12 @@ class QuotaClient:
                 continue
 
             # Deterministic 2-tier comparison for top-level worst-case values:
-            # Primary: lowest quota_pct (remaining percentage) ascending
+            # Primary: lowest remainingFraction ascending (raw unrounded float)
             # Secondary: earliest reset_time ascending (break ties by earliest reset timestamp)
-            def _worst_key(item: tuple[int, float, int, dict[str, Any]]) -> tuple[int, float]:
+            def _worst_key(item: tuple[int, float, int, dict[str, Any]]) -> tuple[float, float]:
                 pct, _f_val, r_time, _ = item
                 r_key = float(r_time) if r_time > 0 else float("inf")
-                return (pct, r_key)
+                return (_f_val, r_key)
 
             worst_pct, worst_frac, worst_reset, _ = min(parsed_buckets_list, key=_worst_key)
 
@@ -935,26 +935,44 @@ class QuotaClient:
         When merge=True and data contains an 'accounts' dict, existing cached
         accounts not present in the new data are preserved (Cache Merge Invariant).
         """
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self.cache_dir, 0o700)
         except OSError:
             pass
 
         data_to_write = data
-        if merge and isinstance(data, dict) and isinstance(data.get("accounts"), dict):
-            current = self.load_cache()
-            if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
-                merged_accounts = dict(current["accounts"])
-                for k, v in data["accounts"].items():
-                    if isinstance(v, dict) and not v.get("error"):
-                        merged_accounts[k] = v
-                    elif k not in merged_accounts:
-                        merged_accounts[k] = v
-                merged_data = dict(current)
+        if isinstance(data, dict) and isinstance(data.get("accounts"), dict):
+            # Exclude accounts containing "error" or nested gemini error payloads
+            def _is_valid_entry(acc_val: Any) -> bool:
+                if not isinstance(acc_val, dict) or acc_val.get("error"):
+                    return False
+                g = acc_val.get("gemini")
+                if isinstance(g, dict) and g.get("error"):
+                    return False
+                return True
+
+            incoming_valid = {
+                k: v for k, v in data["accounts"].items()
+                if _is_valid_entry(v)
+            }
+            if merge:
+                current = self.load_cache()
+                merged_accounts: dict[str, Any] = {}
+                if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
+                    # Preserve existing cached accounts that do not have errors
+                    merged_accounts = {
+                        k: v for k, v in current["accounts"].items()
+                        if _is_valid_entry(v)
+                    }
+                merged_accounts.update(incoming_valid)
+                merged_data = dict(current) if isinstance(current, dict) else {}
                 merged_data.update(data)
                 merged_data["accounts"] = merged_accounts
                 data_to_write = merged_data
+            else:
+                data_to_write = dict(data)
+                data_to_write["accounts"] = incoming_valid
 
         tmp_file = None
         try:
@@ -1042,7 +1060,7 @@ def fetch_all_accounts_quota(
 
 
 def _parse_timestamp_defensive(val: Any) -> float:
-    """Safely extracts a positive float UNIX epoch timestamp or returns float('inf')."""
+    """Safely extracts a positive float UNIX epoch timestamp in UTC or returns float('inf')."""
     if val is None or isinstance(val, bool):
         return float("inf")
     if isinstance(val, (int, float)):
@@ -1053,12 +1071,16 @@ def _parse_timestamp_defensive(val: Any) -> float:
             num = float(cleaned)
             if math.isfinite(num) and num > 0:
                 return num
+            return float("inf")
         except ValueError:
             pass
         try:
             iso_str = cleaned.replace("Z", "+00:00")
             dt = datetime.fromisoformat(iso_str)
-            return dt.timestamp()
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
+            return ts if math.isfinite(ts) and ts > 0 else float("inf")
         except Exception:
             pass
     return float("inf")
@@ -1204,12 +1226,10 @@ def run_quota_pipeline(
         live_q = raw_quotas.get(acc_name)
 
         if isinstance(live_q, dict) and not live_q.get("error") and live_q.get("gemini"):
-            # Live telemetry succeeded
-            q_copy = dict(live_q)
-            gemini_copy = dict(q_copy.get("gemini", {}))
+            # Live telemetry succeeded: sanitize to strictly {"gemini": gemini_copy}
+            gemini_copy = dict(live_q["gemini"])
             gemini_copy["cached"] = False
-            q_copy["gemini"] = gemini_copy
-            acc["quota"] = q_copy
+            acc["quota"] = {"gemini": gemini_copy}
         else:
             # Live fetch failed or error returned: check cache
             cached_acc = cached_accounts.get(acc_name)
@@ -1226,11 +1246,9 @@ def run_quota_pipeline(
             )
 
             if has_valid_gemini_cache:
-                q_copy = dict(cached_acc)
-                gemini_copy = dict(q_copy["gemini"])
+                gemini_copy = dict(cached_acc["gemini"])
                 gemini_copy["cached"] = True
-                q_copy["gemini"] = gemini_copy
-                acc["quota"] = q_copy
+                acc["quota"] = {"gemini": gemini_copy}
             elif has_legacy_cache:
                 gemini_copy = {
                     "quota": cached_acc.get("quota", 0),
@@ -1294,19 +1312,23 @@ def _format_gemini_quota_summary(acc: dict[str, Any], current_timestamp: float |
     b_5h = buckets.get("5h") if isinstance(buckets.get("5h"), dict) else {}
     b_wk = buckets.get("weekly") if isinstance(buckets.get("weekly"), dict) else (buckets.get("wk") if isinstance(buckets.get("wk"), dict) else {})
 
-    raw_5h = b_5h.get("quota")
-    parsed_5h = _parse_quota_defensive(raw_5h)
-    q_5h = int(round(parsed_5h)) if parsed_5h >= 0 else quota
-    ts_5h = b_5h.get("reset_time", gemini_data.get("reset_time") if not buckets else None)
-    cd_5h = _format_bucket_countdown(ts_5h, current_timestamp=current_timestamp)
+    def _render_bucket(tag: str, b_data: dict[str, Any]) -> str:
+        raw_b = b_data.get("quota")
+        parsed_b = _parse_quota_defensive(raw_b)
+        q_b = int(round(parsed_b)) if parsed_b >= 0 else quota
+        ts_b = b_data.get("reset_time")
+        cd_b = _format_bucket_countdown(ts_b, current_timestamp=current_timestamp)
+        return f"{tag}: {q_b}%{cd_b}"
 
-    raw_wk = b_wk.get("quota")
-    parsed_wk = _parse_quota_defensive(raw_wk)
-    q_wk = int(round(parsed_wk)) if parsed_wk >= 0 else quota
-    ts_wk = b_wk.get("reset_time")
-    cd_wk = _format_bucket_countdown(ts_wk, current_timestamp=current_timestamp)
+    parts: list[str] = []
+    if b_5h:
+        parts.append(_render_bucket("5h", b_5h))
+    if b_wk:
+        parts.append(_render_bucket("wk", b_wk))
 
-    return f"{quota}% [5h: {q_5h}%{cd_5h} | wk: {q_wk}%{cd_wk}]"
+    if parts:
+        return f"{quota}% [{' | '.join(parts)}]"
+    return f"{quota}%"
 
 
 def format_accounts_listicle(
@@ -1518,7 +1540,9 @@ class RotationEngine:
             q_val = target_info.get("quota")
             r_val = target_info.get("reset_time")
             if q_val is not None:
-                if isinstance(q_val, (int, float)):
+                if isinstance(q_val, int):
+                    fraction = max(0.0, min(1.0, float(q_val) / 100.0))
+                elif isinstance(q_val, float):
                     if q_val > 1.0:
                         fraction = float(q_val) / 100.0
                     elif q_val >= 0.0:
@@ -1827,20 +1851,9 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         else:
             print(f"[agy-switch] Auto-migrated {len(migrated)} account(s) from agy-cli-manager: {', '.join(migrated)}")
 
-    if args.command == "quota":
+    if args.command in ("quota", "list") or not args.command:
         data = engine.list_accounts()
-        data = run_quota_pipeline(engine, data)
-        if getattr(args, "json", False):
-            print(json.dumps(data, indent=2))
-        elif getattr(args, "format", "table") == "list":
-            print(format_accounts_listicle(data, show_quota=True))
-        else:
-            print(format_accounts_table(data, show_quota=True))
-        return 0
-
-    if args.command == "list" or not args.command:
-        data = engine.list_accounts()
-        show_quota = getattr(args, "quota", False)
+        show_quota = True if args.command == "quota" else getattr(args, "quota", False)
         if show_quota:
             data = run_quota_pipeline(engine, data)
 
@@ -1863,7 +1876,6 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         
         if cache_age > 60:
             script_abs_path = str(Path(__file__).resolve())
-            import subprocess
             subprocess.Popen([sys.executable, script_abs_path, "internal-probe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
         if "accounts" in cache_data and status_info.get("active"):

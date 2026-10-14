@@ -198,6 +198,36 @@ class TestCLI(unittest.TestCase):
         self.assertFalse(acc1["quota"]["gemini"]["cached"])
         self.assertIn("buckets", acc1["quota"]["gemini"])
 
+    @patch('agy_switch.QuotaClient')
+    def test_quota_subcommand_json_sanitizes_claude(self, mock_qc_class):
+        mock_qc = mock_qc_class.return_value
+        mock_qc.fetch_quota.return_value = {
+            "gemini": {
+                "quota": 80,
+                "reset_time": 1791201600,
+                "cached": False,
+                "buckets": {"5h": {"quota": 80, "reset_time": 1791201600}},
+            },
+            "claude": {
+                "quota": 60,
+                "reset_time": 1791201600,
+                "cached": False,
+                "buckets": {"5h": {"quota": 60, "reset_time": 1791201600}},
+            },
+        }
+        mock_qc.load_cache.return_value = {}
+
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            exit_code = main(["quota", "--json"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        data = json.loads(buf.getvalue())
+        for acc in data["accounts"]:
+            self.assertIn("gemini", acc["quota"])
+            self.assertNotIn("claude", acc["quota"])
+            self.assertEqual(list(acc["quota"].keys()), ["gemini"])
+
     def test_list_format_listicle(self):
         buf = io.StringIO()
         with patch('sys.stdout', buf):
