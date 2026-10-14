@@ -10,6 +10,7 @@ import argparse
 import base64
 from datetime import datetime, timezone
 import json
+import math
 import os
 import re
 import shutil
@@ -1041,6 +1042,114 @@ def fetch_all_accounts_quota(
             for acc in accounts
         ]
         return dict(f.result() for f in concurrent.futures.as_completed(futures))
+
+
+def _parse_timestamp_defensive(val: Any) -> float:
+    """Safely extracts a positive float UNIX epoch timestamp or returns float('inf')."""
+    if val is None or isinstance(val, bool):
+        return float("inf")
+    if isinstance(val, (int, float)):
+        return float(val) if math.isfinite(val) and val > 0 else float("inf")
+    if isinstance(val, str):
+        cleaned = val.strip()
+        try:
+            num = float(cleaned)
+            if math.isfinite(num) and num > 0:
+                return num
+        except ValueError:
+            pass
+        try:
+            iso_str = cleaned.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso_str)
+            return dt.timestamp()
+        except Exception:
+            pass
+    return float("inf")
+
+
+def _parse_quota_defensive(val: Any) -> int | float:
+    """Safely extracts a non-negative quota percentage or returns -1."""
+    if val is None or isinstance(val, bool):
+        return -1
+    if isinstance(val, (int, float)):
+        return val if math.isfinite(val) and val >= 0 else -1
+    if isinstance(val, str):
+        try:
+            num = float(val.strip().rstrip("%"))
+            if math.isfinite(num) and num >= 0:
+                return num
+        except ValueError:
+            pass
+    return -1
+
+
+def format_countdown(reset_timestamp: int | float | str | None, current_timestamp: float | None = None) -> str:
+    """Converts a UNIX epoch reset timestamp into a relative human-readable countdown string.
+
+    Rules:
+    - If reset_timestamp is None, non-numeric/unparseable, or <= 0: returns "-"
+    - If delta <= 0: returns "expired"
+    - If delta < 3600: returns f"{max(1, delta // 60)}m" (e.g. "45m", "1m")
+    - If 3600 <= delta < 86400: returns f"{h}h {m}m" if m > 0 else f"{h}h" (e.g. "2h 15m", "2h")
+    - If delta >= 86400: returns f"{d}d {h}h" if h > 0 else f"{d}d" (e.g. "4d 2h", "3d")
+    """
+    ts = _parse_timestamp_defensive(reset_timestamp)
+    if math.isinf(ts) or ts <= 0:
+        return "-"
+
+    curr = current_timestamp if current_timestamp is not None else time.time()
+    if isinstance(curr, bool) or not isinstance(curr, (int, float)) or not math.isfinite(curr):
+        curr = time.time()
+
+    delta = int(ts - curr)
+
+    if delta <= 0:
+        return "expired"
+
+    if delta < 3600:
+        minutes = max(1, delta // 60)
+        return f"{minutes}m"
+
+    if delta < 86400:
+        h = delta // 3600
+        m = (delta % 3600) // 60
+        return f"{h}h {m}m" if m > 0 else f"{h}h"
+
+    d = delta // 86400
+    h = (delta % 86400) // 3600
+    return f"{d}d {h}h" if h > 0 else f"{d}d"
+
+
+def sort_accounts_by_quota(accounts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Sorts accounts deterministically using a 3-tier tie-breaking key:
+
+    1. Primary: -quota_val (highest available Gemini quota percentage first).
+    2. Secondary: reset_time (earliest reset timestamp first; accounts with reset time <= 0 or None map to float("inf")).
+    3. Tertiary: account name (alphabetical ascending for stable sorting).
+
+    Defensively handles missing, non-dict, or error quota payloads without crashing.
+    """
+    if not accounts:
+        return []
+
+    def _sort_key(acc: dict[str, Any]) -> tuple[int | float, float, str]:
+        if not isinstance(acc, dict):
+            return (1, float("inf"), "")
+
+        q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
+        q_data = q_root.get("gemini") if isinstance(q_root.get("gemini"), dict) else {}
+
+        quota_val: int | float = -1
+        reset_time: float = float("inf")
+
+        if isinstance(q_data, dict):
+            quota_val = _parse_quota_defensive(q_data.get("quota"))
+            reset_time = _parse_timestamp_defensive(q_data.get("reset_time"))
+
+        name = str(acc.get("name") or "")
+        return (-quota_val, reset_time, name)
+
+    return sorted(accounts, key=_sort_key)
 
 
 def format_accounts_table(result: dict[str, Any], show_quota: bool = False) -> str:

@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -21,6 +22,8 @@ from agy_switch import (
     InvalidTokenError,
     AccountNotFoundError,
     ActiveTurnRunningError,
+    format_countdown,
+    sort_accounts_by_quota,
     main,
 )
 
@@ -580,6 +583,234 @@ class TestInteractiveLogin(unittest.TestCase):
         }
         ret = main(["login", "clilogin", "--force"], engine=self.engine)
         self.assertEqual(ret, 0)
+
+
+class TestFormatCountdown(unittest.TestCase):
+    """Unit tests for format_countdown relative countdown engine."""
+
+    def test_none_zero_negative_timestamps(self):
+        """None, 0, or negative reset timestamps return '-'."""
+        self.assertEqual(format_countdown(None), "-")
+        self.assertEqual(format_countdown(0), "-")
+        self.assertEqual(format_countdown(-1), "-")
+        self.assertEqual(format_countdown(-1000), "-")
+
+    def test_non_numeric_timestamp_defensive(self):
+        """Non-numeric input returns '-' defensively."""
+        self.assertEqual(format_countdown("invalid"), "-")  # type: ignore
+        self.assertEqual(format_countdown([]), "-")  # type: ignore
+
+    def test_expired_countdown(self):
+        """delta <= 0 returns 'expired'."""
+        curr = 1000.0
+        self.assertEqual(format_countdown(1000, current_timestamp=curr), "expired")
+        self.assertEqual(format_countdown(999, current_timestamp=curr), "expired")
+        self.assertEqual(format_countdown(500, current_timestamp=curr), "expired")
+
+    def test_minutes_formatting(self):
+        """delta < 3600 returns f'{max(1, delta // 60)}m'."""
+        curr = 1000.0
+        # 10s -> max(1, 0) = 1m
+        self.assertEqual(format_countdown(1010, current_timestamp=curr), "1m")
+        # 59s -> 1m
+        self.assertEqual(format_countdown(1059, current_timestamp=curr), "1m")
+        # 60s -> 1m
+        self.assertEqual(format_countdown(1060, current_timestamp=curr), "1m")
+        # 119s -> 1m
+        self.assertEqual(format_countdown(1119, current_timestamp=curr), "1m")
+        # 120s -> 2m
+        self.assertEqual(format_countdown(1120, current_timestamp=curr), "2m")
+        # 45 minutes = 2700s
+        self.assertEqual(format_countdown(1000 + 2700, current_timestamp=curr), "45m")
+        # 59m 59s = 3599s
+        self.assertEqual(format_countdown(1000 + 3599, current_timestamp=curr), "59m")
+
+    def test_hours_formatting(self):
+        """3600 <= delta < 86400 formats as f'{h}h {m}m' if m > 0 else f'{h}h'."""
+        curr = 1000.0
+        # Exactly 1 hour (3600s)
+        self.assertEqual(format_countdown(1000 + 3600, current_timestamp=curr), "1h")
+        # Exactly 2 hours (7200s)
+        self.assertEqual(format_countdown(1000 + 7200, current_timestamp=curr), "2h")
+        # 2 hours 1 minute (7260s)
+        self.assertEqual(format_countdown(1000 + 7260, current_timestamp=curr), "2h 1m")
+        # 2 hours 15 minutes (8100s)
+        self.assertEqual(format_countdown(1000 + 8100, current_timestamp=curr), "2h 15m")
+        # 23 hours 59 minutes (86340s)
+        self.assertEqual(format_countdown(1000 + 86340, current_timestamp=curr), "23h 59m")
+
+    def test_days_formatting(self):
+        """delta >= 86400 formats as f'{d}d {h}h' if h > 0 else f'{d}d'."""
+        curr = 1000.0
+        # Exactly 1 day (86400s)
+        self.assertEqual(format_countdown(1000 + 86400, current_timestamp=curr), "1d")
+        # 1 day 4 hours (86400 + 14400 = 100800s)
+        self.assertEqual(format_countdown(1000 + 100800, current_timestamp=curr), "1d 4h")
+        # Exactly 3 days (259200s)
+        self.assertEqual(format_countdown(1000 + 259200, current_timestamp=curr), "3d")
+        # 4 days 2 hours (4 * 86400 + 7200 = 352800s)
+        self.assertEqual(format_countdown(1000 + 352800, current_timestamp=curr), "4d 2h")
+
+    def test_default_current_timestamp_uses_time(self):
+        """Omitting current_timestamp uses real time without error."""
+        future_ts = int(time.time() + 120)
+        res = format_countdown(future_ts)
+        self.assertIn(res, ["1m", "2m"])
+
+    def test_format_countdown_adversarial_bool_nan_inf(self):
+        """format_countdown gracefully handles booleans, NaN, and Inf without throwing."""
+        self.assertEqual(format_countdown(True), "-")
+        self.assertEqual(format_countdown(False), "-")
+        self.assertEqual(format_countdown(float("nan")), "-")
+        self.assertEqual(format_countdown(float("inf")), "-")
+        # Current timestamp as NaN or bool should not crash
+        res = format_countdown(int(time.time() + 100), current_timestamp=float("nan"))
+        self.assertIn(res, ["1m", "2m"])
+        res_bool = format_countdown(int(time.time() + 100), current_timestamp=True)  # type: ignore
+        self.assertIn(res_bool, ["1m", "2m"])
+
+    def test_format_countdown_string_and_iso_timestamps(self):
+        """String timestamps (numeric or ISO 8601) are parsed cleanly."""
+        curr = 1000.0
+        # Numeric string
+        self.assertEqual(format_countdown("1120", current_timestamp=curr), "2m")
+        # ISO string: 2 minutes after dt_curr
+        from datetime import datetime, timezone
+        dt_curr = datetime(2026, 10, 14, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(
+            format_countdown("2026-10-14T12:02:00Z", current_timestamp=dt_curr),
+            "2m",
+        )
+
+
+class TestSortAccountsByQuota(unittest.TestCase):
+    """Unit tests for sort_accounts_by_quota 3-tier deterministic sorting."""
+
+    def test_sort_by_quota_descending(self):
+        """Primary tier: Accounts with higher available quota appear first."""
+        accounts = [
+            {"name": "acc-low", "quota": {"gemini": {"quota": 40, "reset_time": 1000}}},
+            {"name": "acc-high", "quota": {"gemini": {"quota": 95, "reset_time": 2000}}},
+            {"name": "acc-mid", "quota": {"gemini": {"quota": 80, "reset_time": 1500}}},
+        ]
+        sorted_accs = sort_accounts_by_quota(accounts)
+        names = [a["name"] for a in sorted_accs]
+        self.assertEqual(names, ["acc-high", "acc-mid", "acc-low"])
+
+    def test_sort_break_quota_tie_by_earliest_reset_time(self):
+        """Secondary tier: Identical quota broken by earliest reset timestamp."""
+        accounts = [
+            {"name": "acc-later", "quota": {"gemini": {"quota": 80, "reset_time": 2000}}},
+            {"name": "acc-earliest", "quota": {"gemini": {"quota": 80, "reset_time": 1000}}},
+            {"name": "acc-middle", "quota": {"gemini": {"quota": 80, "reset_time": 1500}}},
+        ]
+        sorted_accs = sort_accounts_by_quota(accounts)
+        names = [a["name"] for a in sorted_accs]
+        self.assertEqual(names, ["acc-earliest", "acc-middle", "acc-later"])
+
+    def test_sort_break_reset_tie_by_name_alphabetical(self):
+        """Tertiary tier: Identical quota and reset time broken alphabetically by name."""
+        accounts = [
+            {"name": "charlie", "quota": {"gemini": {"quota": 80, "reset_time": 1000}}},
+            {"name": "alice", "quota": {"gemini": {"quota": 80, "reset_time": 1000}}},
+            {"name": "bob", "quota": {"gemini": {"quota": 80, "reset_time": 1000}}},
+        ]
+        sorted_accs = sort_accounts_by_quota(accounts)
+        names = [a["name"] for a in sorted_accs]
+        self.assertEqual(names, ["alice", "bob", "charlie"])
+
+    def test_sort_safely_handles_null_error_missing_quotas(self):
+        """Accounts with None quota, error dicts, or missing gemini sort safely to the bottom."""
+        accounts = [
+            {"name": "null-quota", "quota": None},
+            {"name": "healthy-50", "quota": {"gemini": {"quota": 50, "reset_time": 1000}}},
+            {"name": "error-quota", "quota": {"error": "Unreachable"}},
+            {"name": "empty-quota", "quota": {}},
+            {"name": "gemini-none", "quota": {"gemini": None}},
+            {"name": "zero-quota", "quota": {"gemini": {"quota": 0, "reset_time": 1000}}},
+        ]
+        sorted_accs = sort_accounts_by_quota(accounts)
+        names = [a["name"] for a in sorted_accs]
+
+        # healthy-50 (quota 50) first, zero-quota (quota 0) second
+        self.assertEqual(names[0], "healthy-50")
+        self.assertEqual(names[1], "zero-quota")
+
+        # Remaining (quota -1) all sorted to bottom alphabetically
+        bottom_names = names[2:]
+        self.assertEqual(
+            bottom_names,
+            sorted(["null-quota", "error-quota", "empty-quota", "gemini-none"]),
+        )
+
+    def test_sort_handles_missing_or_nonpositive_reset_time(self):
+        """None, 0, or negative reset_time treated as float('inf') in tie-breaking."""
+        accounts = [
+            {"name": "acc-none-reset", "quota": {"gemini": {"quota": 80, "reset_time": None}}},
+            {"name": "acc-valid-reset", "quota": {"gemini": {"quota": 80, "reset_time": 1000}}},
+            {"name": "acc-zero-reset", "quota": {"gemini": {"quota": 80, "reset_time": 0}}},
+            {"name": "acc-neg-reset", "quota": {"gemini": {"quota": 80, "reset_time": -100}}},
+        ]
+        sorted_accs = sort_accounts_by_quota(accounts)
+        # acc-valid-reset should be first because 1000 < inf
+        self.assertEqual(sorted_accs[0]["name"], "acc-valid-reset")
+        # Remaining tied at inf, sorted alphabetically by name
+        inf_names = [a["name"] for a in sorted_accs[1:]]
+        self.assertEqual(
+            inf_names,
+            sorted(["acc-none-reset", "acc-zero-reset", "acc-neg-reset"]),
+        )
+
+    def test_sort_empty_list_and_non_mutating(self):
+        """sort_accounts_by_quota returns a new list and handles empty list gracefully."""
+        self.assertEqual(sort_accounts_by_quota([]), [])
+        self.assertEqual(sort_accounts_by_quota(None), [])
+
+        orig = [{"name": "b", "quota": {}}, {"name": "a", "quota": {}}]
+        orig_copy = list(orig)
+        res = sort_accounts_by_quota(orig)
+        self.assertEqual(orig, orig_copy)
+        self.assertIsNot(res, orig)
+
+    def test_sort_handles_string_quotas_and_timestamps(self):
+        """String quotas and timestamps (numeric or ISO) are parsed gracefully."""
+        accounts = [
+            {"name": "acc-low", "quota": {"gemini": {"quota": "40%", "reset_time": "1791201000"}}},
+            {"name": "acc-high", "quota": {"gemini": {"quota": "95", "reset_time": "2026-10-14T12:00:00Z"}}},
+        ]
+        res = sort_accounts_by_quota(accounts)
+        self.assertEqual(res[0]["name"], "acc-high")
+        self.assertEqual(res[1]["name"], "acc-low")
+
+    def test_sort_defensive_against_non_dict_items(self):
+        """Non-dict items or items without name do not crash sorting."""
+        accounts = [
+            {"quota": {"gemini": {"quota": 10, "reset_time": 500}}},
+            "not-a-dict",  # type: ignore
+            None,  # type: ignore
+        ]
+        # Should not raise exception
+        res = sort_accounts_by_quota(accounts)
+        self.assertEqual(len(res), 3)
+
+    def test_sort_adversarial_bool_nan_inf(self):
+        """Adversarial values like True/False, NaN, and Inf are handled gracefully."""
+        accounts = [
+            {"name": "bool-quota", "quota": {"gemini": {"quota": True, "reset_time": 1000}}},
+            {"name": "nan-quota", "quota": {"gemini": {"quota": float("nan"), "reset_time": 1000}}},
+            {"name": "neg-quota", "quota": {"gemini": {"quota": -10, "reset_time": 1000}}},
+            {"name": "normal-quota", "quota": {"gemini": {"quota": 50, "reset_time": 1000}}},
+            {"name": "bool-reset", "quota": {"gemini": {"quota": 50, "reset_time": True}}},
+            {"name": "nan-reset", "quota": {"gemini": {"quota": 50, "reset_time": float("nan")}}},
+        ]
+        res = sort_accounts_by_quota(accounts)
+        # normal-quota and the two 50% accounts come first
+        top_names = [a["name"] for a in res[:3]]
+        self.assertIn("normal-quota", top_names)
+        self.assertIn("bool-reset", top_names)
+        self.assertIn("nan-reset", top_names)
+        # normal-quota has reset_time 1000, while bool-reset and nan-reset have reset_time inf
+        self.assertEqual(res[0]["name"], "normal-quota")
 
 
 if __name__ == "__main__":
