@@ -1,13 +1,14 @@
+import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.watch import PresenceDetector
+from scripts.watch import PresenceDetector, CooldownManager, LogWatcher
 
 
 class TestPresenceDetector(unittest.TestCase):
@@ -280,6 +281,462 @@ class TestPresenceDetector(unittest.TestCase):
 
         session_id = self.detector.get_active_session_id()
         self.assertEqual(session_id, uuid)
+
+
+class TestCooldownManager(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.tmp_dir.name)
+        self.cache_dir = self.base_dir / "cache"
+        self.manager = CooldownManager(
+            cache_dir=self.cache_dir,
+            default_cooldown_seconds=3600,
+        )
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_permission_hardening_0600(self):
+        """Created cooldown.json file strictly enforces mode 0600 (st_mode & 0o777 == 0o600)."""
+        self.manager.set_cooldown("account_test", reset_time=None)
+        self.assertTrue(self.manager.cooldown_file.is_file())
+        st_mode = self.manager.cooldown_file.stat().st_mode & 0o777
+        self.assertEqual(st_mode, 0o600)
+
+    def test_cache_directory_hardening_0700(self):
+        """Parent cache directory is hardened to mode 0700."""
+        self.manager.set_cooldown("account_test", reset_time=None)
+        st_mode = self.cache_dir.stat().st_mode & 0o777
+        self.assertEqual(st_mode, 0o700)
+
+    def test_atomic_write_uses_temp_file_and_replace(self):
+        """Writes are performed via temporary files and os.replace to guarantee atomicity."""
+        with patch("os.replace", wraps=os.replace) as mock_replace:
+            self.manager.set_cooldown("acc_atomic", reset_time=None)
+            self.assertEqual(mock_replace.call_count, 1)
+            src, dst = mock_replace.call_args[0]
+            src_path = Path(src)
+            dst_path = Path(dst)
+            self.assertEqual(dst_path.resolve(), self.manager.cooldown_file.resolve())
+            self.assertEqual(src_path.parent.resolve(), self.cache_dir.resolve())
+            self.assertTrue(src_path.name.startswith(".cooldown.json.tmp."))
+
+    def test_atomic_write_cleans_up_temp_file_on_write_error(self):
+        """If an error occurs during write/fsync, temporary file is cleaned up and not orphaned."""
+        with patch("os.fsync", side_effect=OSError("Simulated fsync error")):
+            with self.assertRaises(OSError):
+                self.manager.set_cooldown("acc_fail", reset_time=None)
+
+        tmp_files = list(self.cache_dir.glob(".cooldown.json.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_atomic_write_cleans_up_temp_file_on_replace_error(self):
+        """If os.replace fails, temporary file is deleted without leaking."""
+        with patch("os.replace", side_effect=OSError("Simulated replace error")):
+            with self.assertRaises(OSError):
+                self.manager.set_cooldown("acc_fail", reset_time=None)
+
+        tmp_files = list(self.cache_dir.glob(".cooldown.json.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_set_cooldown_with_future_reset_time(self):
+        """set_cooldown(account_name, reset_time=...) sets cooldown_until to reset_time when reset_time > now."""
+        now = 1700000000.0
+        future_reset = now + 1500.0
+        with patch("time.time", return_value=now):
+            record = self.manager.set_cooldown("acc_dynamic", reset_time=future_reset, reason="RATE_LIMITED")
+            self.assertEqual(record["cooldown_until"], future_reset)
+            self.assertEqual(record["exhausted_at"], now)
+            self.assertEqual(record["reason"], "RATE_LIMITED")
+            self.assertTrue(self.manager.is_in_cooldown("acc_dynamic"))
+
+    def test_set_cooldown_with_none_reset_time(self):
+        """set_cooldown(account_name, reset_time=None) sets cooldown_until to now + default_cooldown_seconds."""
+        now = 1700000000.0
+        with patch("time.time", return_value=now):
+            record = self.manager.set_cooldown("acc_default", reset_time=None)
+            self.assertEqual(record["cooldown_until"], now + 3600.0)
+            self.assertEqual(record["exhausted_at"], now)
+            self.assertEqual(record["reason"], "RESOURCE_EXHAUSTED")
+            self.assertTrue(self.manager.is_in_cooldown("acc_default"))
+
+    def test_set_cooldown_with_past_reset_time(self):
+        """set_cooldown with past reset_time defaults to now + default_cooldown_seconds."""
+        now = 1700000000.0
+        past_reset = now - 500.0
+        with patch("time.time", return_value=now):
+            record = self.manager.set_cooldown("acc_past", reset_time=past_reset)
+            self.assertEqual(record["cooldown_until"], now + 3600.0)
+            self.assertTrue(self.manager.is_in_cooldown("acc_past"))
+
+    def test_set_cooldown_with_equal_reset_time(self):
+        """set_cooldown with reset_time == now defaults to now + default_cooldown_seconds."""
+        now = 1700000000.0
+        with patch("time.time", return_value=now):
+            record = self.manager.set_cooldown("acc_equal", reset_time=now)
+            self.assertEqual(record["cooldown_until"], now + 3600.0)
+
+    def test_set_cooldown_invalid_account_raises_value_error(self):
+        """Calling set_cooldown with empty or null account raises ValueError."""
+        with self.assertRaises(ValueError):
+            self.manager.set_cooldown("")
+        with self.assertRaises(ValueError):
+            self.manager.set_cooldown(None)
+
+    def test_is_in_cooldown_active_and_expired(self):
+        """is_in_cooldown returns True for active cooldowns and False once cooldown_until <= now."""
+        now = 1700000000.0
+        with patch("time.time", return_value=now):
+            self.manager.set_cooldown("acc_test", reset_time=now + 500.0)
+
+        # Active at now + 499
+        with patch("time.time", return_value=now + 499.0):
+            self.assertTrue(self.manager.is_in_cooldown("acc_test"))
+
+        # Boundary: at exactly cooldown_until (now + 500.0), cooldown_until <= now is True -> cooldown False
+        with patch("time.time", return_value=now + 500.0):
+            self.assertFalse(self.manager.is_in_cooldown("acc_test"))
+
+        # Expired at now + 501
+        with patch("time.time", return_value=now + 501.0):
+            self.assertFalse(self.manager.is_in_cooldown("acc_test"))
+
+    def test_is_in_cooldown_non_existent(self):
+        """is_in_cooldown returns False for unknown account names or empty string."""
+        self.assertFalse(self.manager.is_in_cooldown("unknown_acc"))
+        self.assertFalse(self.manager.is_in_cooldown(""))
+
+    def test_get_cooldowns_legacy_flat_float_compatibility(self):
+        """get_cooldowns() parses legacy flat float records without error and preserves them until expired."""
+        now = 1700000000.0
+        legacy_exhausted = now - 1000.0  # Expiring at now - 1000 + 3600 = now + 2600 (still active)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        import json
+        self.manager.cooldown_file.write_text(json.dumps({"legacy_acc": legacy_exhausted}), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            cooldowns = self.manager.get_cooldowns()
+            self.assertIn("legacy_acc", cooldowns)
+            self.assertEqual(cooldowns["legacy_acc"]["exhausted_at"], legacy_exhausted)
+            self.assertEqual(cooldowns["legacy_acc"]["cooldown_until"], legacy_exhausted + 3600.0)
+            self.assertEqual(cooldowns["legacy_acc"]["reason"], "RESOURCE_EXHAUSTED")
+            self.assertTrue(self.manager.is_in_cooldown("legacy_acc"))
+
+    def test_auto_pruning_expired_records_on_query(self):
+        """Expired records are pruned automatically from cooldown.json during queries."""
+        now = 1700000000.0
+        data = {
+            "active_acc": {
+                "cooldown_until": now + 600.0,
+                "exhausted_at": now - 100.0,
+                "reason": "RESOURCE_EXHAUSTED",
+            },
+            "expired_acc": {
+                "cooldown_until": now - 50.0,
+                "exhausted_at": now - 3650.0,
+                "reason": "RESOURCE_EXHAUSTED",
+            },
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        import json
+        self.manager.cooldown_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            cooldowns = self.manager.get_cooldowns()
+            self.assertIn("active_acc", cooldowns)
+            self.assertNotIn("expired_acc", cooldowns)
+
+            # Check that file on disk was pruned
+            on_disk = json.loads(self.manager.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("active_acc", on_disk)
+            self.assertNotIn("expired_acc", on_disk)
+
+    def test_auto_pruning_expired_records_on_update(self):
+        """Expired records are pruned automatically from cooldown.json during updates."""
+        now = 1700000000.0
+        data = {
+            "expired_acc": {
+                "cooldown_until": now - 100.0,
+                "exhausted_at": now - 3700.0,
+                "reason": "RESOURCE_EXHAUSTED",
+            }
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        import json
+        self.manager.cooldown_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            self.manager.set_cooldown("new_acc", reset_time=now + 500.0)
+
+            on_disk = json.loads(self.manager.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("new_acc", on_disk)
+            self.assertNotIn("expired_acc", on_disk)
+
+    def test_corrupted_json_handled_gracefully(self):
+        """Corrupted JSON in cooldown.json returns {} and does not raise unhandled exceptions."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.manager.cooldown_file.write_text("{corrupted JSON content", encoding="utf-8")
+
+        self.assertEqual(self.manager.get_cooldowns(), {})
+        self.assertFalse(self.manager.is_in_cooldown("any_acc"))
+
+    def test_non_dict_json_handled_gracefully(self):
+        """Non-dict JSON (array, string, number) returns {} and resets safely."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        import json
+        self.manager.cooldown_file.write_text(json.dumps(["item1", "item2"]), encoding="utf-8")
+
+        self.assertEqual(self.manager.get_cooldowns(), {})
+
+        self.manager.cooldown_file.write_text(json.dumps("plain string"), encoding="utf-8")
+        self.assertEqual(self.manager.get_cooldowns(), {})
+
+    def test_clear_cooldown_single_and_all(self):
+        """clear_cooldown can clear an individual account or all accounts."""
+        now = 1700000000.0
+        with patch("time.time", return_value=now):
+            self.manager.set_cooldown("acc1", reset_time=now + 500.0)
+            self.manager.set_cooldown("acc2", reset_time=now + 500.0)
+
+            # Remove single
+            removed = self.manager.clear_cooldown("acc1")
+            self.assertTrue(removed)
+            self.assertFalse(self.manager.is_in_cooldown("acc1"))
+            self.assertTrue(self.manager.is_in_cooldown("acc2"))
+
+            # Clear all
+            cleared = self.manager.clear_cooldown()
+            self.assertTrue(cleared)
+            self.assertFalse(self.manager.is_in_cooldown("acc2"))
+            self.assertEqual(self.manager.get_cooldowns(), {})
+
+    def test_get_reset_time_from_cache(self):
+        """Helper get_reset_time_from_cache extracts future reset_time from last_known_quota.json."""
+        now = 1700000000.0
+        future_claude = now + 1200.0
+        future_gemini = now + 600.0
+        quota_data = {
+            "accounts": {
+                "acc_cached": {
+                    "gemini": {"quota": 0, "reset_time": future_gemini},
+                    "claude": {"quota": 0, "reset_time": future_claude},
+                }
+            }
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        import json
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            self.assertEqual(
+                self.manager.get_reset_time_from_cache("acc_cached", model_hint="claude"),
+                future_claude,
+            )
+            self.assertEqual(
+                self.manager.get_reset_time_from_cache("acc_cached", model_hint="gemini"),
+                future_gemini,
+            )
+            # Default lookup picks earliest future reset time
+    def test_get_reset_time_from_cache_with_expired_hint_returns_none(self):
+        """When a model_hint is supplied and that model is expired, returns None (no cross-model leakage)."""
+        now = 1700000000.0
+        quota_data = {
+            "accounts": {
+                "acc_leak_test": {
+                    "gemini": {"quota": 0, "reset_time": now - 100.0},  # expired
+                    "claude": {"quota": 100, "reset_time": now + 3600.0},  # in future
+                }
+            }
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # Model hint specified for gemini (expired) must return None, NOT claude's reset time
+            self.assertIsNone(
+                self.manager.get_reset_time_from_cache("acc_leak_test", model_hint="gemini")
+            )
+
+    def test_transient_oserror_does_not_wipe_cooldown_file(self):
+        """A transient OSError while reading cooldown.json must return {} in memory without wiping disk file."""
+        now = 1700000000.0
+        data = {
+            "important_acc": {
+                "cooldown_until": now + 1000.0,
+                "exhausted_at": now - 100.0,
+                "reason": "RESOURCE_EXHAUSTED",
+            }
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.manager.cooldown_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with patch.object(Path, "read_text", side_effect=OSError("Disk busy")):
+            res = self.manager.get_cooldowns()
+            self.assertEqual(res, {})
+
+        # Disk file must remain completely intact and un-wiped
+        disk_content = json.loads(self.manager.cooldown_file.read_text(encoding="utf-8"))
+        self.assertIn("important_acc", disk_content)
+
+    def test_schema_repair_missing_fields_persisted_to_disk(self):
+        """Records missing fields are normalized and written back to disk."""
+        now = 1700000000.0
+        partial_data = {
+            "acc_partial": {
+                "cooldown_until": now + 500.0
+                # missing exhausted_at and reason
+            }
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.manager.cooldown_file.write_text(json.dumps(partial_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            cooldowns = self.manager.get_cooldowns()
+            self.assertIn("acc_partial", cooldowns)
+            self.assertEqual(cooldowns["acc_partial"]["reason"], "RESOURCE_EXHAUSTED")
+            self.assertEqual(cooldowns["acc_partial"]["exhausted_at"], now)
+
+            # Check that file on disk was repaired
+            on_disk = json.loads(self.manager.cooldown_file.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["acc_partial"]["reason"], "RESOURCE_EXHAUSTED")
+
+    def test_non_finite_float_and_whitespace_account_names(self):
+        """Non-finite floats (inf/nan) and invalid account names are rejected or pruned."""
+        with self.assertRaises(ValueError):
+            self.manager.set_cooldown("   ")
+
+        now = 1700000000.0
+        with patch("time.time", return_value=now):
+            # reset_time as inf falls back to now + default_cooldown_seconds
+            rec = self.manager.set_cooldown("acc_inf", reset_time=float("inf"))
+            self.assertEqual(rec["cooldown_until"], now + 3600.0)
+
+    def test_iso_timestamp_in_reset_time(self):
+        """ISO-8601 strings in reset_time are parsed correctly."""
+        now = 1700000000.0
+        iso_str = "2026-10-14T10:00:00Z"
+        from datetime import datetime, timezone
+        expected_ts = datetime.fromisoformat("2026-10-14T10:00:00+00:00").timestamp()
+
+        with patch("time.time", return_value=now):
+            if expected_ts > now:
+                rec = self.manager.set_cooldown("acc_iso", reset_time=iso_str)
+                self.assertEqual(rec["cooldown_until"], expected_ts)
+
+
+class TestLogWatcherCooldownIntegration(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self.tmp_dir.name) / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cooldown_mgr = CooldownManager(self.cache_dir)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.cache_dir = self.cache_dir
+        self.watcher = LogWatcher(
+            engine=self.engine_mock,
+            cooldown_manager=self.cooldown_mgr,
+            log_dirs=[str(self.tmp_dir.name)],
+        )
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    @patch("scripts.watch.RotationEngine")
+    def test_trigger_switch_sets_cooldown_with_model_hint_and_reason(self, mock_rot_cls, mock_sleep):
+        """trigger_switch passes model hint to reset cache query and parses reason."""
+        now = 1700000000.0
+        future_claude = now + 1800.0
+        quota_data = {
+            "accounts": {
+                "acc1": {
+                    "claude": {"quota": 0, "reset_time": future_claude},
+                    "gemini": {"quota": 80, "reset_time": now + 600.0},
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        self.engine_mock.get_active_name.return_value = "acc1"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},
+            ],
+        }
+
+        mock_rot_instance = MagicMock()
+        mock_rot_instance.evaluate.return_value = "acc2"
+        mock_rot_cls.return_value = mock_rot_instance
+
+        with patch("time.time", return_value=now):
+            res = self.watcher.trigger_switch(
+                line="Error: Individual quota reached for claude-3-5-sonnet"
+            )
+            self.assertTrue(res)
+
+            # Check that acc1 was placed in cooldown until future_claude with parsed reason
+            cooldowns = self.cooldown_mgr.get_cooldowns()
+            self.assertIn("acc1", cooldowns)
+            self.assertEqual(cooldowns["acc1"]["cooldown_until"], future_claude)
+            self.assertEqual(cooldowns["acc1"]["reason"], "Individual quota reached")
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    @patch("scripts.watch.RotationEngine")
+    def test_trigger_switch_filters_candidates_in_cooldown(self, mock_rot_cls, mock_sleep):
+        """Candidates currently in cooldown are excluded before evaluate is called."""
+        now = 1700000000.0
+        self.engine_mock.get_active_name.return_value = "acc1"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},  # in cooldown
+                {"name": "acc3", "valid": True},  # available
+            ],
+        }
+
+        # Place acc2 in active cooldown
+        with patch("time.time", return_value=now):
+            self.cooldown_mgr.set_cooldown("acc2", reset_time=now + 500.0)
+
+        mock_rot_instance = MagicMock()
+        mock_rot_instance.evaluate.return_value = "acc3"
+        mock_rot_cls.return_value = mock_rot_instance
+
+        with patch("time.time", return_value=now):
+            res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertTrue(res)
+
+            # Verify acc2 was NOT passed in valid_accounts to rot_engine.evaluate
+            eval_args, _ = mock_rot_instance.evaluate.call_args
+            candidate_names = [a["name"] for a in eval_args[0]]
+            self.assertIn("acc3", candidate_names)
+            self.assertNotIn("acc2", candidate_names)
+            self.assertNotIn("acc1", candidate_names)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_trigger_switch_returns_false_when_all_standby_in_cooldown(self, mock_sleep):
+        """trigger_switch returns False when all other standby accounts are in cooldown."""
+        now = 1700000000.0
+        self.engine_mock.get_active_name.return_value = "acc1"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},
+            ],
+        }
+
+        # Place acc2 in cooldown
+        with patch("time.time", return_value=now):
+            self.cooldown_mgr.set_cooldown("acc2", reset_time=now + 500.0)
+
+        with patch("time.time", return_value=now):
+            res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertFalse(res)
 
 
 if __name__ == "__main__":
