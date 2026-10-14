@@ -157,7 +157,9 @@ class TestQuotaClient(unittest.TestCase):
 
         # Test load
         loaded = self.client.load_cache()
-        self.assertEqual(loaded, test_data)
+        self.assertEqual(loaded.get("test_key"), "test_val")
+        self.assertIn("timestamp", loaded)
+        self.assertIsInstance(loaded["timestamp"], float)
 
     def test_init_with_engine(self):
         engine_mock = MagicMock()
@@ -364,6 +366,229 @@ class TestQuotaClient(unittest.TestCase):
         self.assertIn("acc_existing", loaded["accounts"])
         self.assertIn("acc_valid", loaded["accounts"])
         self.assertNotIn("acc_error", loaded["accounts"])
+
+    def test_save_cache_auto_generates_root_timestamp_when_absent(self):
+        """save_cache guarantees top-level 'timestamp' defaulting to time.time() when absent."""
+        fixed_now = 1791200500.0
+        with patch("time.time", return_value=fixed_now):
+            self.client.save_cache({
+                "accounts": {
+                    "acc1": {"gemini": {"quota": 80, "reset_time": 5000}}
+                }
+            })
+
+        loaded = self.client.load_cache()
+        self.assertIn("timestamp", loaded)
+        self.assertEqual(loaded["timestamp"], fixed_now)
+        self.assertIn("acc1", loaded["accounts"])
+
+    def test_save_cache_preserves_provided_root_timestamp(self):
+        """save_cache preserves top-level 'timestamp' if explicitly provided."""
+        self.client.save_cache({
+            "timestamp": 12345.67,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 80, "reset_time": 5000}}
+            }
+        })
+        loaded = self.client.load_cache()
+        self.assertEqual(loaded.get("timestamp"), 12345.67)
+
+    def test_save_cache_preserves_account_level_cached_at(self):
+        """save_cache preserves account-level cached_at as epoch float or int."""
+        payload = {
+            "timestamp": 1791200000.0,
+            "accounts": {
+                "acc_float": {
+                    "cached_at": 1791200100.5,
+                    "gemini": {"quota": 85, "reset_time": 5000}
+                },
+                "acc_int": {
+                    "cached_at": 1791200200,
+                    "gemini": {"quota": 90, "reset_time": 6000}
+                }
+            }
+        }
+        self.client.save_cache(payload)
+        loaded = self.client.load_cache()
+        self.assertIn("accounts", loaded)
+        self.assertEqual(loaded["accounts"]["acc_float"]["cached_at"], 1791200100.5)
+        self.assertIsInstance(loaded["accounts"]["acc_float"]["cached_at"], float)
+        self.assertEqual(loaded["accounts"]["acc_int"]["cached_at"], 1791200200)
+        self.assertIsInstance(loaded["accounts"]["acc_int"]["cached_at"], int)
+
+    def test_save_cache_partial_merge_preserves_standby_and_cached_at(self):
+        """save_cache(merge=True) preserves standby accounts and their cached_at when updating single account."""
+        # Initial cache with standby and active accounts
+        self.client.save_cache({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc_active": {"cached_at": 1000.0, "gemini": {"quota": 50, "reset_time": 5000}},
+                "acc_standby": {"cached_at": 900.0, "gemini": {"quota": 90, "reset_time": 6000}},
+            }
+        })
+
+        # Single account update for active account with fresh cached_at and no top-level timestamp
+        fixed_now = 1500.0
+        with patch("time.time", return_value=fixed_now):
+            self.client.save_cache({
+                "accounts": {
+                    "acc_active": {"cached_at": 1500.0, "gemini": {"quota": 85, "reset_time": 5000}}
+                }
+            }, merge=True)
+
+        loaded = self.client.load_cache()
+        self.assertEqual(loaded["timestamp"], fixed_now)
+        # Standby account preserved with its original cached_at intact
+        self.assertIn("acc_standby", loaded["accounts"])
+        self.assertEqual(loaded["accounts"]["acc_standby"]["cached_at"], 900.0)
+        self.assertEqual(loaded["accounts"]["acc_standby"]["gemini"]["quota"], 90)
+        # Active account updated with fresh cached_at
+        self.assertIn("acc_active", loaded["accounts"])
+        self.assertEqual(loaded["accounts"]["acc_active"]["cached_at"], 1500.0)
+        self.assertEqual(loaded["accounts"]["acc_active"]["gemini"]["quota"], 85)
+
+    def test_save_cache_filters_error_laden_accounts_without_corrupting_valid_cache(self):
+        """save_cache excludes error-laden or malformed accounts without corrupting existing valid entries."""
+        self.client.save_cache({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc_valid": {"cached_at": 1000.0, "gemini": {"quota": 75, "reset_time": 5000}},
+            }
+        })
+
+        incoming = {
+            "accounts": {
+                "acc_valid": {"error": "Fetch failed"},  # Should not overwrite existing valid acc_valid
+                "acc_gem_err": {"gemini": {"error": "Quota error"}},
+                "acc_claude_err": {"claude": {"error": "Quota error"}},
+                "acc_empty": {},
+                "acc_none": None,
+                "acc_str": "malformed_string",
+                "acc_fresh": {"cached_at": 1200.0, "gemini": {"quota": 95, "reset_time": 6000}},
+            }
+        }
+        self.client.save_cache(incoming, merge=True)
+
+        loaded = self.client.load_cache()
+        # Existing valid account kept intact
+        self.assertIn("acc_valid", loaded["accounts"])
+        self.assertEqual(loaded["accounts"]["acc_valid"]["gemini"]["quota"], 75)
+        self.assertEqual(loaded["accounts"]["acc_valid"]["cached_at"], 1000.0)
+        # Fresh valid account added
+        self.assertIn("acc_fresh", loaded["accounts"])
+        self.assertEqual(loaded["accounts"]["acc_fresh"]["gemini"]["quota"], 95)
+        # Error-laden accounts filtered out
+        for invalid_key in ["acc_gem_err", "acc_claude_err", "acc_empty", "acc_none", "acc_str"]:
+            self.assertNotIn(invalid_key, loaded["accounts"])
+
+    def test_save_cache_directory_and_file_permissions_restoration(self):
+        """save_cache creates and restores 0700 dir permissions and 0600 file permissions."""
+        self.client.save_cache({"accounts": {"acc1": {"gemini": {"quota": 80}}}})
+        self.assertEqual(stat.S_IMODE(os.stat(self.cache_dir).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(self.client.cache_file).st_mode), 0o600)
+
+        # Deliberately loosen permissions
+        os.chmod(self.cache_dir, 0o755)
+        os.chmod(self.client.cache_file, 0o644)
+        self.assertEqual(stat.S_IMODE(os.stat(self.cache_dir).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(self.client.cache_file).st_mode), 0o644)
+
+        # Save again and verify permissions restored
+        self.client.save_cache({"accounts": {"acc1": {"gemini": {"quota": 85}}}})
+        self.assertEqual(stat.S_IMODE(os.stat(self.cache_dir).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(self.client.cache_file).st_mode), 0o600)
+
+    def test_save_cache_handles_non_dict_data_gracefully(self):
+        """save_cache gracefully handles non-dict data without crashing."""
+        for invalid_data in [None, "string", [1, 2, 3], 123]:
+            self.client.save_cache(invalid_data)  # type: ignore
+            loaded = self.client.load_cache()
+            self.assertIn("timestamp", loaded)
+            self.assertIsInstance(loaded["timestamp"], float)
+            self.assertEqual(loaded.get("accounts"), {})
+
+    def test_save_cache_malformed_accounts_field_does_not_corrupt_merge(self):
+        """save_cache(merge=True) preserves existing accounts when incoming accounts field is non-dict."""
+        self.client.save_cache({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc_standby": {"cached_at": 950.0, "gemini": {"quota": 80, "reset_time": 5000}}
+            }
+        })
+
+        for malformed_accounts in [None, "not_a_dict", [1, 2, 3], 123]:
+            self.client.save_cache({"accounts": malformed_accounts}, merge=True)  # type: ignore
+            loaded = self.client.load_cache()
+            self.assertIn("acc_standby", loaded["accounts"])
+            self.assertEqual(loaded["accounts"]["acc_standby"]["cached_at"], 950.0)
+
+    def test_save_cache_filters_whitespace_and_empty_account_keys(self):
+        """save_cache filters out empty strings or whitespace-only account keys."""
+        incoming = {
+            "accounts": {
+                "": {"gemini": {"quota": 50}},
+                "   ": {"gemini": {"quota": 60}},
+                "acc_real": {"gemini": {"quota": 70}},
+            }
+        }
+        self.client.save_cache(incoming, merge=False)
+        loaded = self.client.load_cache()
+        self.assertIn("acc_real", loaded["accounts"])
+        self.assertNotIn("", loaded["accounts"])
+        self.assertNotIn("   ", loaded["accounts"])
+
+    def test_save_cache_invalid_timestamp_types_fallback_to_time(self):
+        """save_cache falls back to time.time() if incoming timestamp is unparseable or non-finite."""
+        fixed_now = 1791200999.0
+        with patch("time.time", return_value=fixed_now):
+            for bad_ts in ["not_a_number", None, float("inf"), float("-inf"), float("nan"), True, False, -100, 0]:
+                self.client.save_cache({"timestamp": bad_ts, "accounts": {}})
+                loaded = self.client.load_cache()
+                self.assertEqual(loaded["timestamp"], fixed_now, f"Failed for bad timestamp: {bad_ts}")
+
+    def test_save_cache_auto_injects_cached_at_when_omitted(self):
+        """save_cache automatically injects cached_at equal to root timestamp when omitted by caller."""
+        fixed_now = 1791200555.0
+        with patch("time.time", return_value=fixed_now):
+            self.client.save_cache({
+                "accounts": {
+                    "acc_no_cached_at": {"gemini": {"quota": 80, "reset_time": 5000}}
+                }
+            })
+        loaded = self.client.load_cache()
+        self.assertIn("acc_no_cached_at", loaded["accounts"])
+        self.assertEqual(loaded["accounts"]["acc_no_cached_at"]["cached_at"], fixed_now)
+
+    def test_save_cache_rejects_non_dict_model_and_arbitrary_junk_payloads(self):
+        """save_cache rejects accounts with non-dict model data (e.g. string errors) or missing quota info."""
+        incoming = {
+            "accounts": {
+                "acc_str_gemini": {"gemini": "500 Internal Server Error"},
+                "acc_none_gemini": {"gemini": None},
+                "acc_arbitrary_junk": {"dummy_key": "some_value"},
+                "acc_valid_legacy": {"quota": 60, "reset_time": 5000},
+                "acc_valid_hybrid": {"gemini": {"quota": 90, "reset_time": 6000}},
+            }
+        }
+        self.client.save_cache(incoming, merge=False)
+        loaded = self.client.load_cache()
+        self.assertNotIn("acc_str_gemini", loaded["accounts"])
+        self.assertNotIn("acc_none_gemini", loaded["accounts"])
+        self.assertNotIn("acc_arbitrary_junk", loaded["accounts"])
+        self.assertIn("acc_valid_legacy", loaded["accounts"])
+        self.assertIn("acc_valid_hybrid", loaded["accounts"])
+
+    def test_save_cache_logs_stderr_on_write_failure(self):
+        """save_cache outputs diagnostic error to stderr when atomic write fails."""
+        import io
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with patch("os.replace", side_effect=OSError("Disk full")):
+                self.client.save_cache({"accounts": {"acc1": {"gemini": {"quota": 80}}}})
+        err_output = stderr_capture.getvalue()
+        self.assertIn("[QuotaClient] Failed to persist quota cache", err_output)
+        self.assertIn("Disk full", err_output)
+
 
     @patch("urllib.request.urlopen")
     def test_refresh_access_token_success(self, mock_urlopen):

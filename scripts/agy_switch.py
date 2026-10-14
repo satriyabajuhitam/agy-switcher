@@ -971,8 +971,16 @@ class QuotaClient:
     def save_cache(self, data: dict[str, Any], merge: bool = True) -> None:
         """Atomically saves quota cache to vault cache directory.
 
-        When merge=True and data contains an 'accounts' dict, existing cached
-        accounts not present in the new data are preserved (Cache Merge Invariant).
+        Guarantees:
+        1. Top-level 'timestamp' field is always present, defaulting to time.time()
+           if absent, boolean, non-positive, or invalid in incoming data.
+        2. When merge=True and data contains an 'accounts' dict, existing valid
+           standby accounts and their respective 'cached_at' timestamps are preserved.
+        3. For valid incoming accounts lacking 'cached_at', 'cached_at' is automatically
+           set to root_ts, ensuring independent freshness tracking across all callers.
+        4. Invalid or error-laden accounts in incoming data are filtered out
+           without corrupting existing valid cache entries.
+        5. Permissions: cache directory is 0700 and cache file is 0600.
         """
         self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -980,38 +988,83 @@ class QuotaClient:
         except OSError:
             pass
 
-        data_to_write = data
-        if isinstance(data, dict) and isinstance(data.get("accounts"), dict):
-            # Exclude accounts containing "error" or nested gemini error payloads
+        if not isinstance(data, dict):
+            data_to_write = {
+                "timestamp": time.time(),
+                "accounts": {},
+            }
+        else:
+            # Determine root timestamp: default to time.time() if absent, bool, or invalid
+            root_ts_val = data.get("timestamp")
+            if root_ts_val is None or isinstance(root_ts_val, bool):
+                root_ts = time.time()
+            elif isinstance(root_ts_val, (int, float)):
+                root_ts = float(root_ts_val) if math.isfinite(root_ts_val) and root_ts_val > 0 else time.time()
+            else:
+                try:
+                    parsed_ts = float(root_ts_val)
+                    root_ts = parsed_ts if math.isfinite(parsed_ts) and parsed_ts > 0 else time.time()
+                except (ValueError, TypeError, OverflowError):
+                    root_ts = time.time()
+
             def _is_valid_entry(acc_val: Any) -> bool:
-                if not isinstance(acc_val, dict) or acc_val.get("error"):
+                if not isinstance(acc_val, dict) or not acc_val or acc_val.get("error"):
                     return False
                 g = acc_val.get("gemini")
-                if isinstance(g, dict) and g.get("error"):
-                    return False
-                return True
+                if g is not None:
+                    if not isinstance(g, dict) or g.get("error"):
+                        return False
+                c = acc_val.get("claude")
+                if c is not None:
+                    if not isinstance(c, dict) or c.get("error"):
+                        return False
+                # Must contain at least one valid model container or valid quota payload
+                return bool(isinstance(g, dict) or isinstance(c, dict) or "quota" in acc_val)
 
-            incoming_valid = {
-                k: v for k, v in data["accounts"].items()
-                if _is_valid_entry(v)
-            }
+            def _normalize_account_entry(acc_dict: dict[str, Any]) -> dict[str, Any]:
+                entry = dict(acc_dict)
+                cached_at_val = entry.get("cached_at")
+                if cached_at_val is None or isinstance(cached_at_val, bool):
+                    entry["cached_at"] = root_ts
+                elif isinstance(cached_at_val, (int, float)):
+                    if not math.isfinite(cached_at_val) or cached_at_val <= 0:
+                        entry["cached_at"] = root_ts
+                else:
+                    try:
+                        p_cat = float(cached_at_val)
+                        entry["cached_at"] = p_cat if math.isfinite(p_cat) and p_cat > 0 else root_ts
+                    except (ValueError, TypeError, OverflowError):
+                        entry["cached_at"] = root_ts
+                return entry
+
+            if isinstance(data.get("accounts"), dict):
+                incoming_valid = {
+                    k.strip(): _normalize_account_entry(v) for k, v in data["accounts"].items()
+                    if isinstance(k, str) and k.strip() and _is_valid_entry(v)
+                }
+            else:
+                incoming_valid = {}
+
             if merge:
                 current = self.load_cache()
                 merged_accounts: dict[str, Any] = {}
                 if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
-                    # Preserve existing cached accounts that do not have errors
                     merged_accounts = {
-                        k: v for k, v in current["accounts"].items()
-                        if _is_valid_entry(v)
+                        k.strip(): dict(v) for k, v in current["accounts"].items()
+                        if isinstance(k, str) and k.strip() and _is_valid_entry(v)
                     }
                 merged_accounts.update(incoming_valid)
                 merged_data = dict(current) if isinstance(current, dict) else {}
-                merged_data.update(data)
+                for k, v in data.items():
+                    if k != "accounts":
+                        merged_data[k] = v
                 merged_data["accounts"] = merged_accounts
+                merged_data["timestamp"] = root_ts
                 data_to_write = merged_data
             else:
-                data_to_write = dict(data)
+                data_to_write = {k: v for k, v in data.items() if k != "accounts"}
                 data_to_write["accounts"] = incoming_valid
+                data_to_write["timestamp"] = root_ts
 
         tmp_file = None
         try:
@@ -1020,9 +1073,13 @@ class QuotaClient:
                 json.dump(data_to_write, f, indent=2)
             os.chmod(tmp_file, 0o600)
             os.replace(tmp_file, self.cache_file)
+            try:
+                os.chmod(self.cache_file, 0o600)
+            except OSError:
+                pass
             tmp_file = None
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[QuotaClient] Failed to persist quota cache to {self.cache_file}: {e}", file=sys.stderr)
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:
