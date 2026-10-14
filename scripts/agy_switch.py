@@ -2581,9 +2581,9 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     if args.command == "watch":
         try:
-            import watch
-        except ImportError:
             from scripts import watch
+        except ImportError:
+            import watch
 
         dm = watch.DaemonManager(
             vault_dir=engine.vault_dir,

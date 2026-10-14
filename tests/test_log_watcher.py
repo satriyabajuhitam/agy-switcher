@@ -560,6 +560,42 @@ class TestCooldownManager(unittest.TestCase):
                 future_gemini,
             )
             # Default lookup picks earliest future reset time
+            self.assertEqual(
+                self.manager.get_reset_time_from_cache("acc_cached"),
+                future_gemini,
+            )
+
+    def test_get_reset_time_from_flat_cache_schema(self):
+        """Flat cache schema {"quota": 0, "reset_time": future_time} extracts future reset_time correctly."""
+        now = 1700000000.0
+        future_reset = now + 1800.0
+        quota_data = {
+            "accounts": {
+                "acc_flat": {
+                    "quota": 0,
+                    "reset_time": future_reset,
+                },
+                "acc_flat_expired": {
+                    "quota": 0,
+                    "reset_time": now - 100.0,
+                },
+            }
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            self.assertEqual(
+                self.manager.get_reset_time_from_cache("acc_flat"),
+                future_reset,
+            )
+            self.assertIsNone(
+                self.manager.get_reset_time_from_cache("acc_flat_expired")
+            )
+            self.assertIsNone(
+                self.manager.get_reset_time_from_cache("non_existent_acc")
+            )
+
     def test_get_reset_time_from_cache_with_expired_hint_returns_none(self):
         """When a model_hint is supplied and that model is expired, returns None (no cross-model leakage)."""
         now = 1700000000.0
@@ -1110,6 +1146,136 @@ class TestLogWatcherProcessing(unittest.TestCase):
         # Cursor should adapt to the new truncated file size
         self.assertEqual(self.watcher.file_cursors[str(test_file)], test_file.stat().st_size)
 
+    def test_notify_desktop_foreground_watch_log_mode_0600(self):
+        """watch.log created during foreground _notify_desktop strictly enforces mode 0600."""
+        watch_log = self.vault_dir / "watch.log"
+        if watch_log.exists():
+            watch_log.unlink()
+
+        with patch("scripts.watch.shutil.which", return_value=None):
+            self.watcher._notify_desktop(target_account="acc2", reason="test exhaustion")
+
+        self.assertTrue(watch_log.is_file())
+        st_mode = watch_log.stat().st_mode & 0o777
+        self.assertEqual(st_mode, 0o600)
+        content = watch_log.read_text(encoding="utf-8")
+        self.assertIn("Switched to 'acc2' (test exhaustion)", content)
+
+    def test_poll_once_partial_chunk_buffering_and_completion(self):
+        """poll_once holds un-terminated chunk without advancing cursor or busy-reading; writing remainder parses cleanly."""
+        test_file = self.base_dir / "partial_test.transcript.jsonl"
+        test_file.write_bytes(b"")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "partial-session"
+        mock_detector.get_active_transcript_path.return_value = test_file
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        self.watcher.presence_detector = mock_detector
+
+        # Initial poll sets cursor to 0
+        self.watcher.poll_once()
+        self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
+
+        # Write partial chunk without newline
+        partial_bytes = b'{"status": "ERROR", "content": "RESOURCE_EXHAUSTED'
+        test_file.write_bytes(partial_bytes)
+
+        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            # First tick with incomplete line: must NOT advance cursor and must NOT trigger switch
+            switches = self.watcher.poll_once()
+            self.assertEqual(switches, 0)
+            mock_switch.assert_not_called()
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
+
+            # Stagnant tick with no new writes: must avoid busy-reading and hold cursor at 0
+            switches_stagnant = self.watcher.poll_once()
+            self.assertEqual(switches_stagnant, 0)
+            mock_switch.assert_not_called()
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
+
+            # Complete line arrival in next tick
+            with open(test_file, "ab") as f:
+                f.write(b' (code 429)"}\n')
+
+            switches_complete = self.watcher.poll_once()
+            self.assertEqual(switches_complete, 1)
+            mock_switch.assert_called_once()
+            expected_cursor = len(b'{"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"}\n')
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], expected_cursor)
+
+    def test_poll_once_multibyte_utf8_split_chunk(self):
+        """Splitting multibyte UTF-8 characters across chunk boundaries does not corrupt stream cursor or error detection."""
+        test_file = self.base_dir / "multibyte_test.log"
+        test_file.write_bytes(b"")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "multibyte-session"
+        mock_detector.get_active_transcript_path.return_value = None
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        self.watcher.presence_detector = mock_detector
+
+        self.watcher.poll_once()
+        self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
+
+        # Line 1: Normal line containing 4-byte UTF-8 emoji 🚀 (b'\xf0\x9f\x9a\x80') with newline
+        line1_bytes = "info 🚀 normal operation\n".encode("utf-8")
+        # Line 2 partial: Prefix ending in the FIRST 2 BYTES of 3-byte Japanese char 日本 ('\xe6\x97') without newline
+        line2_partial = "error prefix 日本".encode("utf-8")[: -2]  # cut mid-character
+        test_file.write_bytes(line1_bytes + line2_partial)
+
+        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            # Tick 1: Line 1 should be processed cleanly; partial multibyte Line 2 must be held at line 1 boundary
+            switches = self.watcher.poll_once()
+            self.assertEqual(switches, 0)
+            mock_switch.assert_not_called()
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(line1_bytes))
+
+            # Tick 2: Append remainder of multibyte character + error keyword + newline
+            line2_remainder = "error prefix 日本".encode("utf-8")[-2:] + b" RESOURCE_EXHAUSTED (code 429)\n"
+            with open(test_file, "ab") as f:
+                f.write(line2_remainder)
+
+            switches2 = self.watcher.poll_once()
+            self.assertEqual(switches2, 1)
+            mock_switch.assert_called_once()
+            full_line2_len = len("error prefix 日本 RESOURCE_EXHAUSTED (code 429)\n".encode("utf-8"))
+            self.assertEqual(
+                self.watcher.file_cursors[str(test_file)],
+                len(line1_bytes) + full_line2_len,
+            )
+
+    def test_poll_once_mid_batch_switch_advances_cursor_to_line_k(self):
+        """When failover triggers on line K of N, cursor advances to end of line K, preserving remaining lines."""
+        test_file = self.base_dir / "batch_test.log"
+        test_file.write_bytes(b"")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "batch-session"
+        mock_detector.get_active_transcript_path.return_value = None
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        self.watcher.presence_detector = mock_detector
+
+        self.watcher.poll_once()
+
+        line1 = b"line 1: startup normal\n"
+        line2 = b"line 2: RESOURCE_EXHAUSTED (code 429)\n"
+        line3 = b"line 3: subsequent message that must be preserved\n"
+        test_file.write_bytes(line1 + line2 + line3)
+
+        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            switches = self.watcher.poll_once()
+            self.assertEqual(switches, 1)
+            mock_switch.assert_called_once()
+            # Cursor MUST advance to end of line 2, NOT end of line 3
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(line1) + len(line2))
+
+        # In next tick, reading from cursor processes line 3
+        with patch.object(self.watcher, "process_line") as mock_proc:
+            mock_proc.return_value = False
+            self.watcher.poll_once()
+            mock_proc.assert_called_once_with(line3.decode("utf-8"), is_jsonl=False)
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(line1) + len(line2) + len(line3))
+
 
 class TestDaemonLifecycle(unittest.TestCase):
     def setUp(self):
@@ -1237,6 +1403,21 @@ class TestDaemonLifecycle(unittest.TestCase):
             self.assertTrue(stopped)
             self.assertEqual(signals_received, [signal.SIGTERM, signal.SIGKILL])
             self.assertFalse(self.dm.pid_file.exists())
+
+    def test_daemon_stop_survives_sigkill_retains_pid_and_returns_false(self):
+        """If daemon process survives SIGKILL, stop() does NOT delete watch.pid and returns False."""
+        self.dm.pid_file.write_text("12345\n", encoding="utf-8")
+        self._create_mock_proc(12345, b"python3\x00mock_watch.py\x00run\x00")
+
+        def mock_kill(pid, sig):
+            # Process survives both SIGTERM and SIGKILL
+            return None
+
+        with patch("os.kill", side_effect=mock_kill):
+            stopped = self.dm.stop(timeout=0.05)
+            self.assertFalse(stopped)
+            self.assertTrue(self.dm.pid_file.exists())
+            self.assertEqual(self.dm.pid_file.read_text(encoding="utf-8").strip(), "12345")
 
     def test_daemon_stop_default_timeout_is_5_seconds(self):
         """stop() uses 5 seconds default timeout before escalating to SIGKILL."""
@@ -1423,7 +1604,7 @@ class TestDaemonLifecycle(unittest.TestCase):
 
         # Check stop
         with patch("os.kill", side_effect=lambda pid, sig: None if sig in (0, signal.SIGTERM) else None):
-            with patch.object(watch.DaemonManager, "is_process_alive", side_effect=[True, False]):
+            with patch.object(watch.DaemonManager, "is_process_alive", side_effect=[True, False, False]):
                 out = StringIO()
                 with patch("sys.stdout", out):
                     code = agy_switch.main(["watch", "stop"], engine=mock_engine)

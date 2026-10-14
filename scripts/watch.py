@@ -643,6 +643,7 @@ class LogWatcher:
         self.damping_seconds = float(damping_seconds)
         self.last_switch_time: float = 0.0
         self.file_cursors: dict[str, int] = {}
+        self._stagnant_sizes: dict[str, int] = {}
         self.active_session_id: str | None = None
         self.active_transcript_path: Path | None = None
 
@@ -862,9 +863,10 @@ class LogWatcher:
                 except OSError:
                     pass
 
+            open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
             log_fd = os.open(
                 log_file,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                open_flags,
                 0o600,
             )
             try:
@@ -990,6 +992,7 @@ class LogWatcher:
                 prev_path_str = str(self.active_transcript_path)
                 if prev_path_str in self.file_cursors:
                     del self.file_cursors[prev_path_str]
+                self._stagnant_sizes.pop(prev_path_str, None)
             self.active_session_id = current_session_id
             self.active_transcript_path = self.presence_detector.get_active_transcript_path(session_id=current_session_id)
 
@@ -998,6 +1001,7 @@ class LogWatcher:
         for path_key in list(self.file_cursors.keys()):
             if path_key.endswith(".jsonl") and path_key != active_transcript_str:
                 del self.file_cursors[path_key]
+                self._stagnant_sizes.pop(path_key, None)
 
         targets = list(self.presence_detector.get_watch_targets(as_str=True, session_id=current_session_id))
 
@@ -1037,6 +1041,7 @@ class LogWatcher:
         for target in list(self.file_cursors.keys()):
             if not os.path.isfile(target):
                 del self.file_cursors[target]
+                self._stagnant_sizes.pop(target, None)
                 continue
 
             try:
@@ -1048,28 +1053,52 @@ class LogWatcher:
             if current_size < cursor:
                 # File was rotated/truncated: reset cursor to beginning
                 cursor = 0
+                self.file_cursors[target] = 0
+                self._stagnant_sizes.pop(target, None)
+
+            # Avoid busy-reading stagnant files where trailing bytes have no newline
+            if target in self._stagnant_sizes and current_size <= self._stagnant_sizes[target]:
+                continue
 
             if current_size > cursor:
                 try:
-                    with open(target, "r", encoding="utf-8", errors="replace") as f:
+                    with open(target, "rb") as f:
                         f.seek(cursor)
-                        lines = f.readlines()
-                        new_cursor = f.tell()
+                        chunk = f.read()
 
-                        if lines and not lines[-1].endswith("\n"):
-                            incomplete_bytes = len(lines[-1].encode("utf-8"))
-                            new_cursor = max(cursor, new_cursor - incomplete_bytes)
-                            lines.pop()
+                    if not chunk:
+                        continue
 
-                        self.file_cursors[target] = new_cursor
+                    last_nl = chunk.rfind(b"\n")
+                    if last_nl == -1:
+                        # No complete line has arrived; hold cursor and track file size
+                        self.file_cursors[target] = cursor
+                        self._stagnant_sizes[target] = current_size
+                        continue
 
-                        is_jsonl = target.endswith(".jsonl") or target.endswith("transcript.jsonl")
-                        for line in lines:
-                            if self.process_line(line, is_jsonl=is_jsonl):
-                                switches_triggered += 1
-                                # Failover triggered: break from remaining lines in this file
-                                # to prevent cascading triggers from duplicate burst lines
-                                break
+                    self._stagnant_sizes.pop(target, None)
+                    complete_bytes = chunk[:last_nl + 1]
+                    raw_lines = complete_bytes.splitlines(keepends=True)
+
+                    is_jsonl = target.endswith(".jsonl") or target.endswith("transcript.jsonl")
+                    processed_bytes = 0
+                    failover_occurred = False
+
+                    for raw_line in raw_lines:
+                        line_bytes_len = len(raw_line)
+                        line_text = raw_line.decode("utf-8", errors="replace")
+                        if self.process_line(line_text, is_jsonl=is_jsonl):
+                            switches_triggered += 1
+                            failover_occurred = True
+                            processed_bytes += line_bytes_len
+                            # Advance cursor precisely to the end of line K to preserve remaining lines
+                            self.file_cursors[target] = cursor + processed_bytes
+                            break
+                        processed_bytes += line_bytes_len
+
+                    if not failover_occurred:
+                        self.file_cursors[target] = cursor + (last_nl + 1)
+
                 except OSError:
                     continue
 
@@ -1327,9 +1356,10 @@ WantedBy=default.target
             except OSError:
                 pass
 
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         log_fd = os.open(
             self.log_file,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            open_flags,
             0o600,
         )
         try:
@@ -1433,6 +1463,9 @@ WantedBy=default.target
                 os.waitpid(pid, os.WNOHANG)
             except (ChildProcessError, OSError):
                 pass
+
+        if self.is_process_alive(pid):
+            return False
 
         self._clean_pid_file()
         return True
