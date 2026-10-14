@@ -1990,6 +1990,63 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         output = json.loads(out_capture.getvalue())
         self.assertEqual(output, {}, "Complete auth corruption across all accounts must not emit false quota exhaustion warning")
 
+    def test_hook_active_dict_network_error_triggers_stale_cache_evaluation(self):
+        """Active account probe returning a dict network error with stale 0% cache drops active account from combined quotas."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache contains acc1 with 0% quota and old cached_at (1000s ago)
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 0, "reset_time": 2000.0}, "cached_at": 1000.0},
+            }
+        }), encoding="utf-8")
+
+        standby_zero = {"gemini": {"quota": 0, "reset_time": 1700000000}}
+
+        with patch("time.time", return_value=1500.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"error": "Connection reset by peer", "error_type": "network"})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": standby_zero,
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        out_capture = io.StringIO()
+                        with patch("sys.stdout", out_capture):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertEqual(output, {}, "Active network error with stale 0% cache must evict stale cache and proceed silently")
+
+    def test_hook_active_guard_symmetry_ast_contract(self):
+        """Line 2226 in handle_pre_invocation_hook must inspect both probe_error and active_quota.get('error') for symmetry with line 2219."""
+        import inspect
+        from agy_switch import handle_pre_invocation_hook
+
+        source = inspect.getsource(handle_pre_invocation_hook)
+        # Check specific guard symmetry in Tier 3
+        expected_guard = 'elif active_name and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error"))):'
+        self.assertIn(expected_guard, source)
+
 
 if __name__ == "__main__":
     unittest.main()

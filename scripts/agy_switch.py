@@ -759,6 +759,9 @@ AUTH_PHRASES = (
     "invalid_grant",
     "unauthorized",
     "revoked",
+    "forbidden",
+    "access_denied",
+    "invalid_client",
 )
 
 
@@ -2220,7 +2223,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 combined_quotas.pop(active_name, None)
                 evict_keys.add(active_name)
                 terminal_auth_keys.add(active_name)
-            elif active_name and probe_error is not None:
+            elif active_name and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error"))):
                 # Active account probe encountered network error; check if cached data is stale 0%
                 active_entry = combined_quotas.get(active_name)
                 if _is_stale_exhausted_cache(active_entry, rot_engine, model_key, now):
