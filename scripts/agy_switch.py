@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -60,6 +62,71 @@ class ActiveTurnRunningError(AgySwitchError):
     """Raised when language_server is busy and switch is attempted without --force."""
 
 
+def normalize_model_name(model: str) -> str:
+    """Validates and normalizes model name to 'gemini' or 'claude'.
+
+    Tolerant of specific slugs like 'gemini-3.8-pro' or 'claude-3-5-sonnet'.
+    Raises AgySwitchError for unsupported models.
+    """
+    if not model or not isinstance(model, str):
+        raise AgySwitchError(f"Unsupported model '{model}'. Allowed models: 'gemini', 'claude'.")
+    m = model.strip().lower()
+    has_gemini = "gemini" in m
+    has_claude = "claude" in m
+    if has_gemini and not has_claude:
+        return "gemini"
+    elif has_claude and not has_gemini:
+        return "claude"
+    else:
+        raise AgySwitchError(f"Unsupported model '{model}'. Allowed models: 'gemini', 'claude'.")
+
+
+@dataclass
+class DiagnosticItem:
+    category: str               # "permissions", "token_integrity", "dual_sync", "hooks", "process"
+    name: str                   # Human-readable check title
+    status: str                 # "PASS", "WARN", "FAIL"
+    message: str                # Detailed finding
+    can_fix: bool               # True if --fix can automatically resolve
+    fixed: bool = False         # True if repaired during this execution
+    fix_action: str | None = None # Human-readable description of repair performed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "name": self.name,
+            "status": self.status,
+            "message": self.message,
+            "can_fix": self.can_fix,
+            "fixed": self.fixed,
+            "fix_action": self.fix_action,
+        }
+
+
+@dataclass
+class DiagnosticReport:
+    items: list[DiagnosticItem]
+    overall_status: str         # "PASS", "WARN", "FAIL"
+    exit_code: int              # 0 (PASS), 1 (WARN), 2 (FAIL)
+
+    def to_dict(self) -> dict[str, Any]:
+        total = len(self.items)
+        passed = sum(1 for item in self.items if item.status == "PASS")
+        warned = sum(1 for item in self.items if item.status == "WARN")
+        failed = sum(1 for item in self.items if item.status == "FAIL")
+        return {
+            "overall_status": self.overall_status,
+            "exit_code": self.exit_code,
+            "summary": {
+                "total": total,
+                "passed": passed,
+                "warned": warned,
+                "failed": failed,
+            },
+            "checks": [item.to_dict() for item in self.items],
+        }
+
+
 class AgySwitchEngine:
     """Core engine managing account vaulting, auto-migration, and listing."""
 
@@ -68,14 +135,17 @@ class AgySwitchEngine:
         vault_dir: Path | None = None,
         gemini_dir: Path | None = None,
         legacy_root: Path | None = None,
+        proc_dir: Path | None = None,
     ) -> None:
         self.vault_dir = Path(vault_dir or DEFAULT_VAULT_DIR).expanduser()
         self.gemini_dir = Path(gemini_dir or DEFAULT_GEMINI_DIR).expanduser()
         self.legacy_root = Path(legacy_root or DEFAULT_LEGACY_ROOT).expanduser()
+        self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
         self.accounts_dir = self.vault_dir / "accounts"
         self.active_file = self.vault_dir / "active"
         self.cache_dir = self.vault_dir / "cache"
         self.cache_file = self.cache_dir / "last_known_quota.json"
+        self.cooldown_file = self.cache_dir / "cooldown.json"
         self.config_file = self.vault_dir / "config.json"
 
         self.init_vault()
@@ -334,6 +404,48 @@ class AgySwitchEngine:
         self.save_config(cfg)
         return cfg
 
+    def get_default_model(self) -> str:
+        """Returns configured default model from config.json, defaulting to 'gemini'."""
+        cfg = self.load_config()
+        raw = cfg.get("default_model")
+        if raw and isinstance(raw, str):
+            try:
+                return normalize_model_name(raw)
+            except AgySwitchError:
+                return "gemini"
+        return "gemini"
+
+    def set_default_model(self, model: str) -> dict[str, Any]:
+        """Persists validated default model ('gemini' or 'claude') to config.json."""
+        normalized = normalize_model_name(model)
+        cfg = self.load_config()
+        cfg["default_model"] = normalized
+        self.save_config(cfg)
+        return cfg
+
+    def get_cooldowns(self) -> dict[str, Any]:
+        """Returns currently active cooldown records from cache/cooldown.json."""
+        cooldown_file = self.cache_dir / "cooldown.json"
+        if not cooldown_file.is_file():
+            return {}
+        try:
+            raw = json.loads(cooldown_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return {}
+            now = time.time()
+            active = {}
+            for acc, rec in raw.items():
+                until = 0.0
+                if isinstance(rec, dict):
+                    until = _parse_timestamp_defensive(rec.get("cooldown_until"))
+                elif isinstance(rec, (int, float, str)):
+                    until = _parse_timestamp_defensive(rec)
+                if math.isfinite(until) and until > now:
+                    active[acc] = rec
+            return active
+        except Exception:
+            return {}
+
     def install_hook(self, hooks_file: Path | None = None) -> Path:
         """Installs the PreInvocation lifecycle hook into hooks.json via deep JSON merge."""
         target_hooks = Path(hooks_file or (self.gemini_dir / "config" / "hooks.json")).expanduser()
@@ -351,7 +463,7 @@ class AgySwitchEngine:
                 existing = {}
 
         script_abs_path = str(Path(__file__).resolve())
-        hook_cmd = f"python3 {script_abs_path} hook-pre-invocation"
+        hook_cmd = f"python3 {shlex.quote(script_abs_path)} hook-pre-invocation"
 
         hook_def = {
             "enabled": True,
@@ -389,7 +501,7 @@ class AgySwitchEngine:
 
         if self.accounts_dir.is_dir():
             for acc_path in sorted(self.accounts_dir.iterdir()):
-                if not acc_path.is_dir():
+                if not acc_path.is_dir() or acc_path.name.startswith("."):
                     continue
                 name = acc_path.name
                 token_file = acc_path / "token.json"
@@ -496,6 +608,227 @@ class AgySwitchEngine:
             self.active_file.unlink(missing_ok=True)
 
         shutil.rmtree(acc_dir)
+
+    @staticmethod
+    def validate_account_alias(alias: str) -> str:
+        """Validates that an account alias matches ^[a-zA-Z0-9._-]+$ with length 1–64,
+
+        rejecting spaces, slashes, and path traversal elements ('..', '.').
+        """
+        if not isinstance(alias, str):
+            raise AgySwitchError("Account alias must be a string.")
+        clean = alias.strip()
+        if not clean:
+            raise AgySwitchError("Account alias cannot be empty.")
+        if len(clean) > 64:
+            raise AgySwitchError(f"Account alias too long ({len(clean)} > 64 chars): '{clean}'")
+        if not re.match(r"^[a-zA-Z0-9._-]+$", clean):
+            raise AgySwitchError(
+                f"Invalid account alias '{clean}'. Allowed characters: letters, digits, '.', '_', '-'"
+            )
+        if ".." in clean or clean in (".", ".."):
+            raise AgySwitchError(f"Account alias contains invalid path traversal element: '{clean}'")
+        return clean
+
+    def _validate_preflight_writes(self) -> None:
+        """Verifies write access on accounts_dir, active_file, cache_file, and cooldown_file before mutating."""
+        if not os.access(self.accounts_dir, os.W_OK | os.X_OK):
+            raise AgySwitchError(f"Pre-flight check failed: accounts directory '{self.accounts_dir}' is not writable.")
+
+        targets = [
+            (self.active_file, "active pointer file"),
+            (self.cache_file, "cache file"),
+            (self.cooldown_file, "cooldown file"),
+        ]
+        for path, desc in targets:
+            parent = path.parent
+            if not (parent.exists() and os.access(parent, os.W_OK | os.X_OK)):
+                raise AgySwitchError(
+                    f"Pre-flight check failed: directory for {desc} '{parent}' is not writable."
+                )
+            if path.exists() and not os.access(path, os.W_OK):
+                raise AgySwitchError(f"Pre-flight check failed: {desc} '{path}' is not writable.")
+
+    def rename_account(
+        self,
+        old_alias: str,
+        new_alias: str,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically renames account, updates active pointer with rollback guarantee, and migrates cache/cooldown.
+
+        Returns:
+            dict with structure:
+            {
+                "old_alias": str,
+                "new_alias": str,
+                "is_active": bool,
+                "cache_migrated": bool,
+                "cooldown_migrated": bool
+            }
+        """
+        if not isinstance(old_alias, str):
+            raise AgySwitchError("Account alias must be a string.")
+        clean_old = old_alias.strip()
+        if not clean_old:
+            raise AgySwitchError("Account alias cannot be empty.")
+
+        if not isinstance(new_alias, str):
+            raise AgySwitchError("Account alias must be a string.")
+        clean_new = new_alias.strip()
+        if not clean_new:
+            raise AgySwitchError("Account alias cannot be empty.")
+
+        if clean_old == clean_new:
+            raise AgySwitchError("Source and target account alias must be different.")
+
+        clean_old = self.validate_account_alias(clean_old)
+        clean_new = self.validate_account_alias(clean_new)
+
+        old_dir = self.accounts_dir / clean_old
+        if (
+            not old_dir.is_dir()
+            or old_dir.is_symlink()
+            or old_dir.resolve().parent != self.accounts_dir.resolve()
+        ):
+            available = sorted(
+                p.name for p in self.accounts_dir.iterdir()
+                if p.is_dir() and not p.name.startswith(".")
+            )
+            raise AccountNotFoundError(
+                f"Account '{clean_old}' not found in vault ({self.accounts_dir}). "
+                f"Available accounts: {', '.join(available) or 'None'}"
+            )
+
+        new_dir = self.accounts_dir / clean_new
+        is_case_only_rename = (clean_old.lower() == clean_new.lower())
+
+        if new_dir.exists() or new_dir.is_symlink():
+            if is_case_only_rename:
+                try:
+                    if not old_dir.samefile(new_dir):
+                        raise AgySwitchError(f"Account '{clean_new}' already exists in vault.")
+                except OSError:
+                    pass
+            else:
+                raise AgySwitchError(f"Account '{clean_new}' already exists in vault.")
+
+        active_name = self.get_active_name()
+        is_active = (active_name is not None and active_name.strip() == clean_old)
+
+        if is_active:
+            pid = self.locate_language_server_pid()
+            if self.is_server_busy(pid) and not force:
+                raise ActiveTurnRunningError(
+                    f"Antigravity is currently busy processing an agent turn or background task. "
+                    f"Cannot rename active account '{clean_old}'. Use --force to proceed anyway."
+                )
+
+        # Pre-flight write checks
+        self._validate_preflight_writes()
+
+        # Step 1: Directory rename (using temporary intermediate directory if case-only rename)
+        if is_case_only_rename:
+            tmp_rename = self.accounts_dir / f".tmp-rename-{os.getpid()}-{os.urandom(6).hex()}"
+            old_dir.rename(tmp_rename)
+            try:
+                tmp_rename.rename(new_dir)
+            except Exception as e:
+                try:
+                    tmp_rename.rename(old_dir)
+                except Exception as rb_exc:
+                    raise AgySwitchError(
+                        f"Failed to rename account directory: {e}. Rollback also failed: {rb_exc}"
+                    ) from e
+                raise AgySwitchError(f"Failed to rename account directory: {e}") from e
+        else:
+            try:
+                old_dir.rename(new_dir)
+            except Exception as e:
+                raise AgySwitchError(f"Failed to rename account directory: {e}") from e
+
+        # Step 2: Update active pointer if active, with rollback guarantee
+        if is_active:
+            try:
+                self.set_active_name(clean_new)
+            except Exception as exc:
+                # Rollback directory rename
+                try:
+                    if is_case_only_rename:
+                        tmp_rb = self.accounts_dir / f".tmp-rename-rb-{os.getpid()}-{os.urandom(6).hex()}"
+                        new_dir.rename(tmp_rb)
+                        tmp_rb.rename(old_dir)
+                    else:
+                        new_dir.rename(old_dir)
+                except Exception as rb_exc:
+                    raise AgySwitchError(
+                        f"Failed to update active account pointer: {exc}. Rollback also failed: {rb_exc}"
+                    ) from exc
+                # Also ensure active pointer points to old account if partially touched
+                try:
+                    if self.get_active_name() != clean_old:
+                        self.set_active_name(clean_old)
+                except Exception:
+                    pass
+                raise AgySwitchError(f"Failed to update active account pointer: {exc}") from exc
+
+            # Backward-compatibility bridge: Update ~/.agy-cli-manager/state.json if it exists
+            legacy_state_file = self.legacy_root / "state.json"
+            if legacy_state_file.is_file():
+                try:
+                    state_data = json.loads(legacy_state_file.read_text(encoding="utf-8"))
+                    if isinstance(state_data, dict) and state_data.get("active") == clean_old:
+                        state_data["active"] = clean_new
+                        self._atomic_write_json(legacy_state_file, state_data)
+                except Exception:
+                    pass
+
+        # Step 3: Migrate telemetry cache key
+        cache_migrated = False
+        if self.cache_file.is_file():
+            try:
+                raw_cache = self.cache_file.read_text(encoding="utf-8")
+                cache_data = json.loads(raw_cache)
+                if isinstance(cache_data, dict):
+                    migrated = False
+                    accounts_map = cache_data.get("accounts")
+                    if isinstance(accounts_map, dict) and clean_old in accounts_map:
+                        accounts_map[clean_new] = accounts_map.pop(clean_old)
+                        migrated = True
+                    # Legacy top-level account map fallback (ignoring metadata keys)
+                    if clean_old not in ("accounts", "timestamp") and clean_old in cache_data:
+                        cache_data[clean_new] = cache_data.pop(clean_old)
+                        migrated = True
+                    if migrated:
+                        self._atomic_write_json(self.cache_file, cache_data)
+                        cache_migrated = True
+            except json.JSONDecodeError as exc:
+                print(f"[agy-switch] Warning: Malformed cache file '{self.cache_file}': {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[agy-switch] Warning: Failed to migrate cache key: {exc}", file=sys.stderr)
+
+        # Step 4: Migrate cooldown key
+        cooldown_migrated = False
+        if self.cooldown_file.is_file():
+            try:
+                raw_cd = self.cooldown_file.read_text(encoding="utf-8")
+                cd_data = json.loads(raw_cd)
+                if isinstance(cd_data, dict) and clean_old in cd_data:
+                    cd_data[clean_new] = cd_data.pop(clean_old)
+                    self._atomic_write_json(self.cooldown_file, cd_data)
+                    cooldown_migrated = True
+            except json.JSONDecodeError as exc:
+                print(f"[agy-switch] Warning: Malformed cooldown file '{self.cooldown_file}': {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[agy-switch] Warning: Failed to migrate cooldown key: {exc}", file=sys.stderr)
+
+        return {
+            "old_alias": clean_old,
+            "new_alias": clean_new,
+            "is_active": is_active,
+            "cache_migrated": cache_migrated,
+            "cooldown_migrated": cooldown_migrated,
+        }
 
     def resolve_agy_binary(self, override_bin: str | None = None) -> str:
         """Finds the agy CLI binary path."""
@@ -614,8 +947,8 @@ class AgySwitchEngine:
 
     def locate_language_server_pid(self) -> int | None:
         """Finds the running language_server PID by scanning /proc or pgrep."""
-        # 1. Scan /proc for exact binary command line
-        proc_path = Path("/proc")
+        # 1. Scan proc_dir for exact binary command line
+        proc_path = self.proc_dir
         if proc_path.is_dir():
             try:
                 for pid_dir in proc_path.iterdir():
@@ -631,19 +964,20 @@ class AgySwitchEngine:
             except OSError:
                 pass
 
-        # 2. Fallback to pgrep
-        try:
-            res = subprocess.run(
-                ["pgrep", "-f", "language_server.*--standalone"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            lines = res.stdout.strip().split()
-            if lines and lines[0].isdigit():
-                return int(lines[0])
-        except Exception:
-            pass
+        # 2. Fallback to pgrep only if proc_dir is the real /proc
+        if self.proc_dir == Path("/proc"):
+            try:
+                res = subprocess.run(
+                    ["pgrep", "-f", "language_server.*--standalone"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                lines = res.stdout.strip().split()
+                if lines and lines[0].isdigit():
+                    return int(lines[0])
+            except Exception:
+                pass
 
         return None
 
@@ -665,7 +999,7 @@ class AgySwitchEngine:
 
         # 2. Check child processes of pid if provided
         if pid is not None:
-            proc_path = Path("/proc")
+            proc_path = self.proc_dir
             if proc_path.is_dir():
                 try:
                     for p_dir in proc_path.iterdir():
@@ -673,11 +1007,15 @@ class AgySwitchEngine:
                             continue
                         stat_file = p_dir / "stat"
                         try:
-                            content = stat_file.read_text(encoding="utf-8")
-                            parts = content.split()
-                            if len(parts) >= 4 and parts[3] == str(pid):
-                                return True
-                        except (OSError, IndexError):
+                            content = stat_file.read_bytes().decode("utf-8", errors="replace")
+                            rparen = content.rfind(")")
+                            if rparen != -1:
+                                rest = content[rparen + 1:].strip().split()
+                                if len(rest) >= 2 and rest[1] == str(pid):
+                                    if rest[0] == "Z":
+                                        continue
+                                    return True
+                        except (OSError, IndexError, ValueError):
                             continue
                 except OSError:
                     pass
@@ -738,6 +1076,770 @@ class AgySwitchEngine:
             "server_pid": pid,
             "server_busy": busy,
         }
+
+    def _is_valid_expiry(self, raw_expiry: Any) -> bool:
+        """Validates that expiry is a recognizable positive timestamp or ISO string."""
+        if raw_expiry is None or isinstance(raw_expiry, bool):
+            return False
+        if isinstance(raw_expiry, (int, float)):
+            return math.isfinite(raw_expiry) and raw_expiry > 0
+        if isinstance(raw_expiry, str):
+            cleaned = raw_expiry.strip()
+            try:
+                num = float(cleaned)
+                return math.isfinite(num) and num > 0
+            except ValueError:
+                pass
+            try:
+                iso_str = cleaned.replace("Z", "+00:00")
+                datetime.fromisoformat(iso_str)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _is_token_expired(self, raw_expiry: Any) -> bool:
+        """Determines if a token expiry representation is already in the past."""
+        if raw_expiry is None or isinstance(raw_expiry, bool):
+            return False
+        if isinstance(raw_expiry, (int, float)):
+            return raw_expiry <= time.time()
+        if isinstance(raw_expiry, str):
+            cleaned = raw_expiry.strip()
+            try:
+                num = float(cleaned)
+                if math.isfinite(num):
+                    return num <= time.time()
+            except ValueError:
+                pass
+            try:
+                iso_str = cleaned.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt <= datetime.now(timezone.utc)
+            except Exception:
+                pass
+        return False
+
+    def _check_permissions(self) -> DiagnosticItem:
+        """Layer 1: Verifies POSIX permissions (0700 for directories, 0600 for sensitive files)."""
+        if not self.vault_dir.is_dir():
+            return DiagnosticItem(
+                category="permissions",
+                name="Vault File & Directory Permissions",
+                status="FAIL",
+                message=f"Vault directory does not exist: {self.vault_dir}.",
+                can_fix=True,
+            )
+
+        insecure_paths: list[str] = []
+
+        dirs_to_check: list[Path] = [self.vault_dir]
+        if self.accounts_dir.is_dir():
+            dirs_to_check.append(self.accounts_dir)
+            for acc in self.accounts_dir.iterdir():
+                if acc.is_dir() and not acc.name.startswith("."):
+                    dirs_to_check.append(acc)
+        if self.cache_dir.is_dir():
+            dirs_to_check.append(self.cache_dir)
+
+        for d in dirs_to_check:
+            try:
+                mode = stat.S_IMODE(d.stat().st_mode)
+                if mode != 0o700:
+                    insecure_paths.append(f"{d.name}/ ({oct(mode)})")
+            except OSError:
+                pass
+
+        files_to_check: list[Path] = []
+        if self.accounts_dir.is_dir():
+            for acc in self.accounts_dir.iterdir():
+                if acc.is_dir() and not acc.name.startswith("."):
+                    for f in acc.iterdir():
+                        if f.is_file():
+                            files_to_check.append(f)
+        if self.active_file.is_file():
+            files_to_check.append(self.active_file)
+        if self.cache_dir.is_dir():
+            for cf in self.cache_dir.iterdir():
+                if cf.is_file():
+                    files_to_check.append(cf)
+        if self.config_file.is_file():
+            files_to_check.append(self.config_file)
+        watch_pid = self.vault_dir / "watch.pid"
+        if watch_pid.is_file() or watch_pid.is_symlink():
+            files_to_check.append(watch_pid)
+
+        for f in files_to_check:
+            try:
+                mode = stat.S_IMODE(f.stat().st_mode)
+                if mode != 0o600:
+                    insecure_paths.append(f"{f.name} ({oct(mode)})")
+            except OSError:
+                pass
+
+        if insecure_paths:
+            return DiagnosticItem(
+                category="permissions",
+                name="Vault File & Directory Permissions",
+                status="FAIL",
+                message=f"Insecure permissions detected on: {', '.join(insecure_paths)}.",
+                can_fix=True,
+            )
+
+        return DiagnosticItem(
+            category="permissions",
+            name="Vault File & Directory Permissions",
+            status="PASS",
+            message="All directory (0700) and file (0600) permissions are secure.",
+            can_fix=False,
+        )
+
+    def _check_token_integrity(self) -> DiagnosticItem:
+        """Layer 2: Validates OAuth token JSON schema, extracts JWT identity, and detects expired tokens."""
+        if not self.accounts_dir.is_dir():
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="WARN",
+                message="No accounts registered in vault.",
+                can_fix=False,
+            )
+
+        accounts = sorted([p for p in self.accounts_dir.iterdir() if p.is_dir() and not p.name.startswith(".")])
+        if not accounts:
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="WARN",
+                message="No accounts registered in vault.",
+                can_fix=False,
+            )
+
+        active_account = self.get_active_name()
+        corrupt_accounts: list[tuple[str, str]] = []
+        expired_active: list[str] = []
+        expired_secondary: list[str] = []
+
+        for acc in accounts:
+            acc_name = acc.name
+            token_path = acc / "token.json"
+            if not token_path.is_file():
+                corrupt_accounts.append((acc_name, "token.json does not exist"))
+                continue
+
+            try:
+                raw_text = token_path.read_text(encoding="utf-8")
+                data = json.loads(raw_text)
+                self.validate_token_dict(data)
+            except Exception as e:
+                corrupt_accounts.append((acc_name, str(e)))
+                continue
+
+            id_tok = data.get("id_token", "")
+            email = self.extract_email_from_jwt(id_tok)
+            if not email:
+                corrupt_accounts.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
+                continue
+
+            token_obj = data.get("token", {})
+            raw_expiry = token_obj.get("expiry")
+            if not self._is_valid_expiry(raw_expiry):
+                corrupt_accounts.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
+                continue
+
+            if self._is_token_expired(raw_expiry):
+                if active_account and acc_name == active_account.strip():
+                    expired_active.append(acc_name)
+                else:
+                    expired_secondary.append(acc_name)
+
+        if corrupt_accounts:
+            err_details = [f"'{a}': {msg}" for a, msg in corrupt_accounts]
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=f"Corrupt or invalid token schema detected for: {', '.join(err_details)}.",
+                can_fix=False,
+            )
+
+        if expired_active:
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=f"Active account '{expired_active[0]}' token is expired.",
+                can_fix=False,
+            )
+
+        if expired_secondary:
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="WARN",
+                message=f"Secondary account token(s) expired: {', '.join(expired_secondary)}.",
+                can_fix=False,
+            )
+
+        return DiagnosticItem(
+            category="token_integrity",
+            name="OAuth Token & JWT Identity Integrity",
+            status="PASS",
+            message=f"All {len(accounts)} account tokens valid and unexpired.",
+            can_fix=False,
+        )
+
+    def _check_dual_sync(self) -> DiagnosticItem:
+        """Layer 3: Compares semantic JSON credentials of Desktop and CLI tokens against active vault account."""
+        active = self.get_active_name()
+        if not active or not (self.accounts_dir / active).is_dir():
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message="No valid active account configured in vault.",
+                can_fix=False,
+            )
+
+        vault_token_path = self.accounts_dir / active / "token.json"
+        if not vault_token_path.is_file():
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message=f"Active account '{active}' token file is missing.",
+                can_fix=False,
+            )
+
+        try:
+            vault_data = json.loads(vault_token_path.read_text(encoding="utf-8"))
+        except Exception:
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message=f"Active account '{active}' token JSON is corrupt.",
+                can_fix=False,
+            )
+
+        if not isinstance(vault_data, dict):
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message=f"Active account '{active}' token JSON is corrupt (root is not a JSON object).",
+                can_fix=False,
+            )
+
+        vault_tok = vault_data.get("token", {}) if isinstance(vault_data.get("token"), dict) else {}
+        v_access = vault_tok.get("access_token")
+        v_refresh = vault_tok.get("refresh_token")
+        v_auth = vault_data.get("auth_method")
+
+        if not v_access or not v_refresh or not v_auth:
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message=f"Active account '{active}' token credentials are incomplete or missing.",
+                can_fix=False,
+            )
+
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+        cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+
+        desktop_exists = desktop_file.is_file()
+        cli_exists = cli_file.is_file()
+
+        if not desktop_exists or not cli_exists:
+            missing: list[str] = []
+            if not desktop_exists:
+                missing.append("Desktop")
+            if not cli_exists:
+                missing.append("CLI")
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="WARN",
+                message=f"{' and '.join(missing)} token file missing from disk.",
+                can_fix=True,
+            )
+
+        try:
+            desktop_data = json.loads(desktop_file.read_text(encoding="utf-8"))
+            cli_data = json.loads(cli_file.read_text(encoding="utf-8"))
+        except Exception:
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message="Desktop or CLI token file contains corrupt or malformed JSON.",
+                can_fix=True,
+            )
+
+        if not isinstance(desktop_data, dict) or not isinstance(cli_data, dict):
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message="Desktop or CLI token file contains corrupt or malformed JSON (not a JSON object).",
+                can_fix=True,
+            )
+
+        d_tok = desktop_data.get("token", {}) if isinstance(desktop_data.get("token"), dict) else {}
+        c_tok = cli_data.get("token", {}) if isinstance(cli_data.get("token"), dict) else {}
+
+        d_match = (
+            d_tok.get("access_token") == v_access
+            and d_tok.get("refresh_token") == v_refresh
+            and desktop_data.get("auth_method") == v_auth
+        )
+        c_match = (
+            c_tok.get("access_token") == v_access
+            and c_tok.get("refresh_token") == v_refresh
+            and cli_data.get("auth_method") == v_auth
+        )
+
+        if d_match and c_match:
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="PASS",
+                message=f"Desktop and CLI tokens match active account '{active}'.",
+                can_fix=False,
+            )
+
+        mismatched: list[str] = []
+        if not d_match:
+            mismatched.append("Desktop")
+        if not c_match:
+            mismatched.append("CLI")
+
+        return DiagnosticItem(
+            category="dual_sync",
+            name="Dual-Destination Credential Sync",
+            status="FAIL",
+            message=f"{' and '.join(mismatched)} token credentials desynchronized from active account '{active}'.",
+            can_fix=True,
+        )
+
+    def _check_lifecycle_hooks(self) -> DiagnosticItem:
+        """Layer 4: Checks ~/.gemini/config/hooks.json for PreInvocation lifecycle hook."""
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        if not hooks_file.is_file():
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="hooks.json configuration file not found.",
+                can_fix=True,
+            )
+
+        content = hooks_file.read_text(encoding="utf-8").strip()
+        if not content:
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="FAIL",
+                message="Malformed hooks.json detected (0-byte file).",
+                can_fix=True,
+            )
+
+        try:
+            data = json.loads(content)
+        except Exception:
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="FAIL",
+                message="Malformed hooks.json detected (invalid JSON syntax).",
+                can_fix=True,
+            )
+
+        if not isinstance(data, dict):
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="FAIL",
+                message="Malformed hooks.json detected (root is not a JSON object).",
+                can_fix=True,
+            )
+
+        entry = data.get("agy-switch-auto-rotate")
+        if not isinstance(entry, dict) or not entry.get("enabled", False):
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook not configured or disabled in hooks.json.",
+                can_fix=True,
+            )
+
+        pre_inv = entry.get("PreInvocation")
+        if not isinstance(pre_inv, list) or not pre_inv:
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook list is missing or empty in hooks.json.",
+                can_fix=True,
+            )
+
+        cmd_item = pre_inv[0]
+        if not isinstance(cmd_item, dict):
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook definition is invalid (not a JSON object).",
+                can_fix=True,
+            )
+
+        cmd_str = cmd_item.get("command")
+        if not cmd_str or not isinstance(cmd_str, str) or not cmd_str.strip():
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook command is missing or empty.",
+                can_fix=True,
+            )
+
+        try:
+            parts = shlex.split(cmd_str)
+        except ValueError:
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook command syntax is invalid (unbalanced quotes).",
+                can_fix=True,
+            )
+
+        if not parts:
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message="PreInvocation hook command is missing or empty.",
+                can_fix=True,
+            )
+
+        target_path: Path | None = None
+        for part in parts:
+            if part.endswith(".py"):
+                target_path = Path(part)
+                break
+
+        if target_path is None:
+            first = parts[0]
+            if first in ("python", "python3", "bash", "sh") and len(parts) > 1 and not parts[1].startswith("-"):
+                target_path = Path(parts[1])
+            else:
+                target_path = Path(first)
+
+        if not target_path.is_file():
+            if "/" not in str(target_path):
+                resolved = shutil.which(str(target_path))
+                if resolved:
+                    target_path = Path(resolved)
+
+        if not target_path.is_file():
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message=f"PreInvocation hook target script does not exist: {target_path}.",
+                can_fix=True,
+            )
+
+        if not os.access(target_path, os.R_OK):
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message=f"PreInvocation hook target script is not readable: {target_path}.",
+                can_fix=True,
+            )
+
+        is_direct_script = bool(parts and parts[0] == str(target_path))
+        needs_exec = (not str(target_path).endswith(".py")) or is_direct_script
+        if needs_exec and not os.access(target_path, os.X_OK):
+            return DiagnosticItem(
+                category="hooks",
+                name="Antigravity PreInvocation Hook",
+                status="WARN",
+                message=f"PreInvocation hook executable target is not executable: {target_path}.",
+                can_fix=True,
+            )
+
+        return DiagnosticItem(
+            category="hooks",
+            name="Antigravity PreInvocation Hook",
+            status="PASS",
+            message="PreInvocation hook registered and executable.",
+            can_fix=False,
+        )
+
+    def _check_process_health(self) -> DiagnosticItem:
+        """Layer 5: Inspects language_server and watch daemon via /proc/<pid>/cmdline."""
+        ls_pid = self.locate_language_server_pid()
+        ls_running = ls_pid is not None
+        ls_busy = self.is_server_busy(ls_pid) if ls_running else False
+
+        if ls_running:
+            ls_msg = f"language_server running (PID {ls_pid}, {'busy' if ls_busy else 'idle'})"
+        else:
+            ls_msg = "language_server not running"
+
+        watch_pid_file = self.vault_dir / "watch.pid"
+        watch_stale = False
+        watch_active = False
+        watch_msg = "watcher daemon not running"
+
+        if watch_pid_file.is_file() or watch_pid_file.is_symlink():
+            if watch_pid_file.is_symlink() and not watch_pid_file.exists():
+                watch_stale = True
+                watch_msg = "stale watch daemon PID file detected (broken symlink)"
+            else:
+                try:
+                    pid_content = watch_pid_file.read_text(encoding="utf-8").strip()
+                    watch_pid = int(pid_content)
+                except Exception:
+                    watch_pid = -1
+
+                if watch_pid <= 1 or watch_pid == os.getpid():
+                    watch_stale = True
+                    watch_msg = "stale watch daemon PID file detected"
+                else:
+                    cmdline_file = self.proc_dir / str(watch_pid) / "cmdline"
+                    if not cmdline_file.is_file():
+                        watch_stale = True
+                        watch_msg = f"stale watch daemon PID {watch_pid} detected (process not running)"
+                    else:
+                        try:
+                            raw = cmdline_file.read_bytes().replace(b"\x00", b" ").lower()
+                            raw_tokens = raw.split()
+                            is_watch = False
+                            has_script = any(
+                                tok.endswith(b"watch.py")
+                                or tok.endswith(b"agy_switch.py")
+                                or tok.endswith(b"agy_switch")
+                                or tok.endswith(b"agy-switch")
+                                or tok in (b"watch.py", b"scripts.watch", b"agy_switch", b"agy-switch")
+                                for tok in raw_tokens
+                            )
+                            has_action = any(
+                                tok in (b"run", b"daemon", b"watch")
+                                for tok in raw_tokens[1:]
+                            )
+                            if has_script and has_action:
+                                is_watch = True
+
+                            if is_watch:
+                                watch_active = True
+                                watch_msg = f"watcher active (PID {watch_pid})"
+                            else:
+                                watch_stale = True
+                                watch_msg = f"stale watch daemon PID {watch_pid} detected (recycled PID)"
+                        except OSError:
+                            watch_stale = True
+                            watch_msg = f"stale watch daemon PID {watch_pid} detected"
+
+        combined_msg = f"{ls_msg}; {watch_msg}."
+
+        if watch_stale:
+            return DiagnosticItem(
+                category="process",
+                name="Language Server & Watcher Daemon",
+                status="WARN",
+                message=combined_msg,
+                can_fix=True,
+            )
+        elif not ls_running:
+            return DiagnosticItem(
+                category="process",
+                name="Language Server & Watcher Daemon",
+                status="WARN",
+                message=combined_msg,
+                can_fix=False,
+            )
+        else:
+            return DiagnosticItem(
+                category="process",
+                name="Language Server & Watcher Daemon",
+                status="PASS",
+                message=combined_msg,
+                can_fix=False,
+            )
+
+    def run_diagnostics(self) -> DiagnosticReport:
+        """Performs 5-layer health check across vault, tokens, dual sync, hooks, and processes."""
+        items: list[DiagnosticItem] = [
+            self._check_permissions(),
+            self._check_token_integrity(),
+            self._check_dual_sync(),
+            self._check_lifecycle_hooks(),
+            self._check_process_health(),
+        ]
+
+        if any(item.status == "FAIL" for item in items):
+            overall_status = "FAIL"
+            exit_code = 2
+        elif any(item.status == "WARN" for item in items):
+            overall_status = "WARN"
+            exit_code = 1
+        else:
+            overall_status = "PASS"
+            exit_code = 0
+
+        return DiagnosticReport(
+            items=items,
+            overall_status=overall_status,
+            exit_code=exit_code,
+        )
+
+    def fix_diagnostics(self, report: DiagnosticReport) -> list[str]:
+        """Applies non-destructive automatic repairs to all fixable anomalies in the report."""
+        fixes: list[str] = []
+
+        for item in report.items:
+            if not item.can_fix or item.fixed:
+                continue
+
+            if item.category == "permissions":
+                try:
+                    self.init_vault()
+                    chmod_errors: list[str] = []
+
+                    def _safe_chmod(target: Path, mode: int) -> None:
+                        try:
+                            os.chmod(target, mode)
+                        except OSError as e:
+                            chmod_errors.append(f"{target.name}: {e}")
+
+                    if self.vault_dir.is_dir():
+                        _safe_chmod(self.vault_dir, 0o700)
+                    if self.accounts_dir.is_dir():
+                        _safe_chmod(self.accounts_dir, 0o700)
+                        for acc_dir in self.accounts_dir.iterdir():
+                            if acc_dir.is_dir():
+                                _safe_chmod(acc_dir, 0o700)
+                                for f in acc_dir.iterdir():
+                                    if f.is_file():
+                                        _safe_chmod(f, 0o600)
+                    if self.active_file.is_file():
+                        _safe_chmod(self.active_file, 0o600)
+                    if self.cache_dir.is_dir():
+                        _safe_chmod(self.cache_dir, 0o700)
+                        for cf in self.cache_dir.iterdir():
+                            if cf.is_file():
+                                _safe_chmod(cf, 0o600)
+                    if self.config_file.is_file():
+                        _safe_chmod(self.config_file, 0o600)
+                    watch_pid = self.vault_dir / "watch.pid"
+                    if watch_pid.is_file() or watch_pid.is_symlink():
+                        _safe_chmod(watch_pid, 0o600)
+
+                    if chmod_errors:
+                        item.fixed = False
+                        item.status = "FAIL"
+                        item.fix_action = f"Failed to restore permissions: {'; '.join(chmod_errors)}"
+                    else:
+                        action_str = "Restored POSIX permissions (0700 for directories, 0600 for files)"
+                        item.fixed = True
+                        item.status = "PASS"
+                        item.fix_action = action_str
+                        fixes.append(action_str)
+                except OSError as e:
+                    item.fixed = False
+                    item.status = "FAIL"
+                    item.fix_action = f"Failed to restore permissions: {e}"
+
+            elif item.category == "dual_sync":
+                active = self.get_active_name()
+                if active:
+                    tok_file = self.accounts_dir / active / "token.json"
+                    if tok_file.is_file():
+                        try:
+                            token_data = self.validate_token_file(tok_file)
+                            payload_str = json.dumps(token_data, indent=2) + "\n"
+                            self._sync_tokens_to_targets(payload_str)
+                            action_str = f"Re-synced Desktop and CLI tokens from active vault account '{active}'"
+                            item.fixed = True
+                            item.status = "PASS"
+                            item.fix_action = action_str
+                            fixes.append(action_str)
+                        except Exception:
+                            pass
+
+            elif item.category == "hooks":
+                hooks_file = self.gemini_dir / "config" / "hooks.json"
+                is_corrupt = False
+                if hooks_file.is_file() or hooks_file.is_symlink():
+                    try:
+                        content = hooks_file.read_text(encoding="utf-8").strip()
+                        if not content:
+                            is_corrupt = True
+                        else:
+                            loaded = json.loads(content)
+                            if not isinstance(loaded, dict):
+                                is_corrupt = True
+                    except Exception:
+                        is_corrupt = True
+
+                if item.status == "FAIL" or is_corrupt:
+                    ts = int(time.time() * 1000)
+                    bak_file = hooks_file.parent / f"hooks.json.corrupt.{ts}.bak"
+                    try:
+                        if hooks_file.exists():
+                            shutil.copy2(hooks_file, bak_file)
+                            hooks_file.unlink()
+                    except OSError:
+                        pass
+                    self.install_hook(hooks_file)
+                    action_str = f"Backed up corrupt hooks.json to {bak_file.name} and registered fresh PreInvocation hook"
+                    item.fixed = True
+                    item.status = "PASS"
+                    item.fix_action = action_str
+                    fixes.append(action_str)
+                else:
+                    self.install_hook(hooks_file)
+                    action_str = "Registered PreInvocation hook in hooks.json"
+                    item.fixed = True
+                    item.status = "PASS"
+                    item.fix_action = action_str
+                    fixes.append(action_str)
+
+            elif item.category == "process":
+                watch_pid = self.vault_dir / "watch.pid"
+                if watch_pid.is_file() or watch_pid.is_symlink():
+                    try:
+                        watch_pid.unlink()
+                        action_str = "Unlinked stale watch.pid file"
+                        item.fixed = True
+                        item.status = "PASS"
+                        item.fix_action = action_str
+                        fixes.append(action_str)
+                    except OSError:
+                        pass
+
+        # Recalculate report overall status and exit code
+        has_failed = any(it.status == "FAIL" for it in report.items)
+        has_warned = any(it.status == "WARN" for it in report.items)
+        if has_failed:
+            report.overall_status = "FAIL"
+            report.exit_code = 2
+        elif has_warned:
+            report.overall_status = "WARN"
+            report.exit_code = 1
+        else:
+            report.overall_status = "PASS"
+            report.exit_code = 0
+
+        return fixes
 
 
 def _sanitize_expires_in(raw_exp: Any, default: int = 3600) -> int:
@@ -1677,6 +2779,50 @@ def format_status_report(status: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_diagnostic_report(report: DiagnosticReport) -> str:
+    """Formats 5-layer diagnostic report as a numbered terminal listicle with visual status indicators."""
+    lines: list[str] = [
+        "Antigravity System Diagnostics:",
+        "-------------------------------------------------------------",
+    ]
+
+    unfixable_accounts: list[str] = []
+
+    for idx, item in enumerate(report.items, start=1):
+        lines.append(f"{idx}. [{item.status}] {item.name}: {item.message}")
+        if item.status in ("WARN", "FAIL") and not item.can_fix:
+            if item.category in ("token_integrity", "dual_sync"):
+                matches = re.findall(r"'([a-zA-Z0-9._-]+)'", item.message)
+                if matches:
+                    for acc in matches:
+                        lines.append(f"   -> Action required: Run 'agy-switch login {acc}' to re-authenticate.")
+                        if acc not in unfixable_accounts:
+                            unfixable_accounts.append(acc)
+                else:
+                    lines.append("   -> Action required: Run 'agy-switch login <alias>' to re-authenticate.")
+                    if "<alias>" not in unfixable_accounts:
+                        unfixable_accounts.append("<alias>")
+
+    lines.append("-------------------------------------------------------------")
+
+    rep_dict = report.to_dict()
+    summary = rep_dict.get("summary", {})
+    lines.append("Diagnostic Summary:")
+    lines.append(f"  • Total Checks : {summary.get('total', len(report.items))}")
+    lines.append(f"  • Passed       : {summary.get('passed', 0)}")
+    lines.append(f"  • Warnings     : {summary.get('warned', 0)}")
+    lines.append(f"  • Failures     : {summary.get('failed', 0)}")
+    lines.append(f"  • Overall      : {report.overall_status}")
+
+    if unfixable_accounts:
+        lines.append("-------------------------------------------------------------")
+        lines.append("Action Required for Unfixable Items:")
+        for acc in unfixable_accounts:
+            lines.append(f"  • Run 'agy-switch login {acc}' to re-authenticate or restore credentials.")
+
+    return "\n".join(lines)
+
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -1756,7 +2902,7 @@ class RotationEngine:
         target_info = None
         if m_key in quota_data and isinstance(quota_data[m_key], dict):
             target_info = quota_data[m_key]
-        elif "quota" in quota_data and not isinstance(quota_data["quota"], dict):
+        elif "quota" in quota_data and not isinstance(quota_data["quota"], dict) and m_key == "gemini":
             target_info = quota_data
 
         if target_info is not None and isinstance(target_info, dict):
@@ -1820,12 +2966,63 @@ class RotationEngine:
         """Calculates reset delta in minutes."""
         return QuotaStatus(fraction=0.0, reset_time=reset_time).get_reset_delta_minutes(current_time)
 
+    def is_cooldown_penalized_for_model(
+        self,
+        model_key: str,
+        fraction: float,
+        rec: Any,
+        q_data: dict,
+    ) -> bool:
+        """Determines if an account in cooldown is penalized for the target model_key.
+
+        An account in cooldown is exempt from penalty for model_key ONLY if:
+        1. It has healthy quota (> 15%) for the target model.
+        2. The cooldown was triggered by exhaustion of the alternate model family.
+        3. The cooldown does not explicitly penalize the target model family.
+        """
+        if fraction <= 0.15:
+            return True
+
+        norm_key = "claude" if "claude" in model_key.lower() else "gemini"
+        if norm_key == "claude":
+            target_tokens = ("claude", "anthropic")
+            alt_model_key = "gemini"
+            alt_tokens = ("gemini",)
+        else:
+            target_tokens = ("gemini",)
+            alt_model_key = "claude"
+            alt_tokens = ("claude", "anthropic")
+
+        is_alt_exhausted = False
+        is_explicitly_target = False
+
+        if isinstance(rec, dict):
+            r_str = str(rec.get("reason", "")).lower()
+            m_str = str(rec.get("model", "")).lower()
+            if any(tok in r_str or tok in m_str for tok in target_tokens):
+                is_explicitly_target = True
+            if any(tok in r_str or tok in m_str for tok in alt_tokens):
+                is_alt_exhausted = True
+
+        if not is_explicitly_target and not is_alt_exhausted:
+            alt_status = self.get_quota_status(q_data, model_key=alt_model_key)
+            if alt_status is not None and alt_status.fraction <= 0.0:
+                is_alt_exhausted = True
+
+        if is_alt_exhausted and not is_explicitly_target:
+            return False
+
+        return True
+
+    _is_cooldown_penalized_for_model = is_cooldown_penalized_for_model
+
     def evaluate(
         self,
         accounts: list[dict] | dict,
         current_active: str | None = None,
-        target_model: str = "gemini",
+        target_model: str | None = None,
         current_time: datetime | None = None,
+        cooldowns: dict | None = None,
     ) -> str | None:
         """Evaluates accounts and returns the optimal account to switch to, or None if current_active is optimal."""
         if current_time is None:
@@ -1833,12 +3030,12 @@ class RotationEngine:
         elif current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=timezone.utc)
 
-        if not target_model:
-            target_model = self.model_name or "gemini"
+        target_model = target_model or self.model_name or "gemini"
         model_key = "claude" if "claude" in target_model.lower() else "gemini"
 
         # Normalize accounts into a list of (account_id, quota_dict)
         items: list[tuple[str, dict]] = []
+        raw_quota_map: dict[str, dict] = {}
         if isinstance(accounts, dict):
             if "accounts" in accounts and isinstance(accounts["accounts"], dict):
                 raw_dict = accounts["accounts"]
@@ -1868,6 +3065,7 @@ class RotationEngine:
         reset_deltas: dict[str, float] = {}
 
         for acc_id, q_data in items:
+            raw_quota_map[acc_id] = q_data
             status = self.get_quota_status(q_data, model_key=model_key)
             if status is not None:
                 evaluated[acc_id] = status
@@ -1877,16 +3075,24 @@ class RotationEngine:
             return None
 
         active_status = evaluated.get(current_active) if current_active else None
+        is_active_in_cooldown = bool(cooldowns and current_active and current_active in cooldowns)
+        if is_active_in_cooldown and active_status is not None:
+            rec = cooldowns[current_active]
+            q_data = raw_quota_map.get(current_active, {})
+            is_active_in_cooldown = self._is_cooldown_penalized_for_model(
+                model_key, active_status.fraction, rec, q_data
+            )
 
-        # 1. cache_optimized heuristic: retain current active if fraction > 0.15 (> 15%)
-        if active_status is not None and active_status.fraction > 0.15:
-            return None
-
-        # 2. drain_window heuristic: retain current active if fraction > 0.05 and reset in <= 30m
-        if active_status is not None and active_status.fraction > 0.05:
-            reset_delta = reset_deltas.get(current_active, float("inf"))
-            if 0 <= reset_delta <= 30:
+        if not is_active_in_cooldown:
+            # 1. cache_optimized heuristic: retain current active if fraction > 0.15 (> 15%)
+            if active_status is not None and active_status.fraction > 0.15:
                 return None
+
+            # 2. drain_window heuristic: retain current active if fraction > 0.05 and reset in <= 30m
+            if active_status is not None and active_status.fraction > 0.05:
+                reset_delta = reset_deltas.get(current_active, float("inf"))
+                if 0 <= reset_delta <= 30:
+                    return None
 
         # 3. Candidate evaluation
         # Active account is explicitly excluded from being selected as the fallback.
@@ -1897,6 +3103,14 @@ class RotationEngine:
                 continue
             if status.fraction <= 0.0 or not status.has_available_quota():
                 continue
+
+            # Model-aware cooldown evaluation
+            if cooldowns and acc_id in cooldowns:
+                rec = cooldowns[acc_id]
+                q_data = raw_quota_map.get(acc_id, {})
+                if self._is_cooldown_penalized_for_model(model_key, status.fraction, rec, q_data):
+                    continue
+
             candidates.append(
                 EvaluationCandidate(
                     account_id=acc_id,
@@ -2086,6 +3300,10 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
             model_name = raw_model.strip()
         else:
             model_name = "auto"
+        if model_name.lower() in ("auto", ""):
+            resolved_default = engine.get_default_model()
+            if resolved_default and resolved_default != "gemini":
+                model_name = resolved_default
         model_key = "claude" if "claude" in model_name.lower() else "gemini"
         display_model = "Gemini" if model_name.lower() in ("auto", "gemini", "") else model_name
 
@@ -2316,12 +3534,21 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     # Command: status
     subparsers.add_parser("status", help="Show system status, active account, and server health")
 
+    # Command: doctor
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run 5-layer self-healing diagnostics on vault, credentials, and processes",
+    )
+    doctor_parser.add_argument("--fix", action="store_true", help="Automatically repair fixable anomalies")
+    doctor_parser.add_argument("--json", action="store_true", help="Output pure JSON report for automated ingestion")
+
     # Command: switch
     switch_parser = subparsers.add_parser("switch", help="Switch active account across Antigravity 2.0 and CLI")
     switch_parser.add_argument("account", nargs="?", help="Name of the account to switch to")
     switch_parser.add_argument("--no-restart", action="store_true", help="Do not restart language_server process")
     switch_parser.add_argument("--force", action="store_true", help="Force switch even if active turns are detected")
     switch_parser.add_argument("--auto", action="store_true", help="Auto-switch to optimal account")
+    switch_parser.add_argument("--model", type=str, default=None, help="Target model for auto-switch (e.g. gemini, claude)")
 
     # Command: add
     add_parser = subparsers.add_parser("add", help="Register a new account from token JSON file")
@@ -2332,6 +3559,19 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     remove_parser = subparsers.add_parser("remove", help="Remove an account from vault")
     remove_parser.add_argument("name", help="Account name to remove")
     remove_parser.add_argument("--force", action="store_true", help="Force removal even if active")
+
+    # Command: rename
+    rename_parser = subparsers.add_parser(
+        "rename",
+        help="Rename an account alias across vault, active pointer, and cache",
+    )
+    rename_parser.add_argument("old_alias", help="Current account alias to rename")
+    rename_parser.add_argument("new_alias", help="New account alias")
+    rename_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force rename even if language_server is busy on an active turn",
+    )
 
     # Command: migrate
     subparsers.add_parser("migrate", help="Import legacy accounts from ~/.agy-cli-manager")
@@ -2348,6 +3588,10 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     config_subparsers = config_parser.add_subparsers(dest="config_command")
     auto_switch_parser = config_subparsers.add_parser("auto-switch", help="Configure auto-switch toggle (on/off)")
     auto_switch_parser.add_argument("state", nargs="?", choices=["on", "off"], help="State (on/off)")
+    default_model_parser = config_subparsers.add_parser(
+        "default-model", help="Configure persistent default model (gemini or claude)"
+    )
+    default_model_parser.add_argument("model", nargs="?", help="Default model family (gemini or claude)")
 
     # Command: hook
     hook_parser = subparsers.add_parser("hook", help="Manage Antigravity lifecycle hooks")
@@ -2442,6 +3686,44 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         print(format_status_report(status_info))
         return 0
 
+    if args.command == "doctor":
+        is_json = getattr(args, "json", False)
+        do_fix = getattr(args, "fix", False)
+
+        report = engine.run_diagnostics()
+
+        if do_fix:
+            has_fixable = any(item.can_fix and not item.fixed for item in report.items)
+            fixes = engine.fix_diagnostics(report) if has_fixable else []
+
+            if not is_json:
+                if fixes:
+                    print(f"[agy-switch doctor] Applied {len(fixes)} automatic repair(s):")
+                    for fix_desc in fixes:
+                        print(f"  • {fix_desc}")
+                    print()
+                elif has_fixable:
+                    print("[agy-switch doctor] No repairs were applied.\n")
+                else:
+                    if report.overall_status == "PASS":
+                        print("[agy-switch doctor] All diagnostics healthy. No repairs needed.\n")
+                    else:
+                        print("[agy-switch doctor] No automatic repairs available for detected issues.\n")
+            else:
+                if fixes:
+                    for fix_desc in fixes:
+                        print(f"[agy-switch doctor] Applied repair: {fix_desc}", file=sys.stderr)
+
+            # Re-run diagnostics to get clean post-repair report
+            report = engine.run_diagnostics()
+
+        if is_json:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            print(format_diagnostic_report(report))
+
+        return report.exit_code
+
     if args.command == "internal-probe":
         accounts_data = engine.list_accounts().get("accounts", [])
         client = QuotaClient(timeout=2.0, engine=engine)
@@ -2455,6 +3737,16 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         return 0
 
     if args.command == "switch":
+        cli_model = getattr(args, "model", None)
+        if cli_model is not None:
+            try:
+                target_model = normalize_model_name(cli_model)
+            except AgySwitchError:
+                print(f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.", file=sys.stderr)
+                return 1
+        else:
+            target_model = engine.get_default_model()
+
         if getattr(args, "auto", False):
             active_name = engine.get_active_name()
             accounts_data = engine.list_accounts().get("accounts", [])
@@ -2464,7 +3756,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             valid_quotas = {k: v for k, v in raw_quotas.items() if "error" not in v and v}
             
             if not valid_quotas:
-                print(f"[agy-switch] No valid quota info available to auto-switch.")
+                print(f"[agy-switch] No valid quota info available to auto-switch.", file=sys.stderr)
                 return 1
 
             client.save_cache({
@@ -2475,17 +3767,73 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             for acc in accounts_data:
                 acc["quota"] = valid_quotas.get(acc["name"], {})
             
-            rot_engine = RotationEngine(model_name="gemini", active_account_id=active_name)
-            target_account = rot_engine.evaluate(accounts_data, current_active=active_name, target_model="gemini")
+            rot_engine = RotationEngine(model_name=target_model, active_account_id=active_name)
+
+            # Quota telemetry presence check for target_model
+            accounts_with_telemetry = []
+            for acc in accounts_data:
+                q_data = acc.get("quota", {})
+                status = rot_engine.get_quota_status(q_data, model_key=target_model)
+                if status is not None:
+                    accounts_with_telemetry.append((acc, status))
+
+            if not accounts_with_telemetry:
+                print(f"[agy-switch] No accounts found with available quota telemetry for model '{target_model}'.", file=sys.stderr)
+                return 1
+
+            # Strict quota isolation: check if all accounts have verified 0% quota
+            def _is_zero(st: Any) -> bool:
+                try:
+                    f = getattr(st, "fraction", 1.0)
+                    return float(f) <= 0.0
+                except (TypeError, ValueError):
+                    return False
+
+            if all(_is_zero(status) for _, status in accounts_with_telemetry):
+                print(f"[agy-switch] All accounts exhausted for model '{target_model}'. Cannot auto-switch.", file=sys.stderr)
+                return 1
+
+            cooldowns = engine.get_cooldowns()
+            target_account = rot_engine.evaluate(
+                accounts_data,
+                current_active=active_name,
+                target_model=target_model,
+                cooldowns=cooldowns,
+            )
             
             if target_account is None or target_account == active_name:
-                print(f"[agy-switch] Active account '{active_name}' is optimal. No switch needed.")
-                return 0
+                active_status = None
+                for acc, status in accounts_with_telemetry:
+                    if acc.get("name") == active_name:
+                        active_status = status
+                        break
+
+                active_fraction = 1.0
+                try:
+                    if active_status is not None:
+                        active_fraction = float(getattr(active_status, "fraction", 1.0))
+                except (TypeError, ValueError):
+                    active_fraction = 1.0
+
+                is_active_in_cooldown = bool(cooldowns and active_name in cooldowns)
+                if is_active_in_cooldown and active_status is not None:
+                    rec = cooldowns[active_name]
+                    q_data = valid_quotas.get(active_name, {})
+                    is_active_in_cooldown = rot_engine.is_cooldown_penalized_for_model(
+                        target_model, active_fraction, rec, q_data
+                    )
+
+                if active_status is not None and active_fraction > 0.0 and not is_active_in_cooldown:
+                    print(f"[agy-switch] Active account '{active_name}' is optimal. No switch needed.")
+                    return 0
+
+                print(f"[agy-switch] All accounts exhausted for model '{target_model}'. Cannot auto-switch.", file=sys.stderr)
+                return 1
                 
             args.account = target_account
             
         elif getattr(args, "account", None) is None:
-            print("Error: account name must be provided if --auto is not used.", file=sys.stderr)
+            print("[agy-switch] Error: account name must be provided if --auto is not used.", file=sys.stderr)
             return 1
 
         try:
@@ -2503,10 +3851,14 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 print("  - Server : language_server not running or no restart needed")
             return 0
         except ActiveTurnRunningError as e:
-            print(f"Warning: {e}", file=sys.stderr)
+            print(f"[agy-switch] Warning: {e}", file=sys.stderr)
             return 2
         except AgySwitchError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            err_msg = str(e)
+            if err_msg.startswith("[agy-switch]"):
+                print(err_msg, file=sys.stderr)
+            else:
+                print(f"[agy-switch] Error: {err_msg}", file=sys.stderr)
             return 1
 
     if args.command == "add":
@@ -2547,6 +3899,28 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
+    if args.command == "rename":
+        try:
+            res = engine.rename_account(args.old_alias, args.new_alias, force=args.force)
+            print(f"[agy-switch] Successfully renamed account '{res['old_alias']}' to '{res['new_alias']}'.")
+            if res.get("is_active"):
+                print(f"  - Active Pointer: Updated to '{res['new_alias']}'")
+            if res.get("cache_migrated"):
+                print(f"  - Telemetry Cache: Migrated quota keys to '{res['new_alias']}'")
+            if res.get("cooldown_migrated"):
+                print(f"  - Cooldown Cache: Migrated cooldown keys to '{res['new_alias']}'")
+            return 0
+        except ActiveTurnRunningError as e:
+            print(f"Warning: {e}", file=sys.stderr)
+            return 2
+        except AgySwitchError as e:
+            err_msg = str(e)
+            if err_msg.startswith("[agy-switch]"):
+                print(err_msg, file=sys.stderr)
+            else:
+                print(f"[agy-switch] {err_msg}", file=sys.stderr)
+            return 1
+
     if args.command == "migrate":
         if migrated:
             print(f"[agy-switch] Successfully migrated {len(migrated)} account(s): {', '.join(migrated)}")
@@ -2567,6 +3941,20 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 current = engine.get_auto_switch()
                 print(f"[agy-switch] auto-switch is currently {'on' if current else 'off'}.")
             return 0
+        if getattr(args, "config_command", None) == "default-model":
+            model_arg = getattr(args, "model", None)
+            if model_arg is None:
+                current = engine.get_default_model()
+                print(f"[agy-switch] default-model is currently '{current}'.")
+                return 0
+            try:
+                normalized = normalize_model_name(model_arg)
+                engine.set_default_model(normalized)
+                print(f"[agy-switch] default-model set to '{normalized}'.")
+                return 0
+            except AgySwitchError:
+                print(f"[agy-switch] Unsupported model '{model_arg}'. Allowed models: 'gemini', 'claude'.", file=sys.stderr)
+                return 1
         cfg = engine.load_config()
         print(json.dumps(cfg, indent=2))
         return 0
