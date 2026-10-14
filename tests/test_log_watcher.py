@@ -1734,8 +1734,6 @@ class TestDaemonLifecycle(unittest.TestCase):
                 self.assertTrue(self.dm.pid_file.exists())
                 self.assertIn("Permission denied", err_out.getvalue())
 
-    test_daemon_stop_handles_permission_error_gracefully = test_stop_permission_error_handles_gracefully
-
     def test_daemon_start_log_file_symlink_cleaned(self):
         """If watch.log is a pre-existing symlink, start() unlinks it to prevent writing through symlinks."""
         symlink_target = self.base_dir / "some_target.log"

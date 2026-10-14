@@ -43,6 +43,29 @@ except ImportError:
 
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
+DEFAULT_MAX_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB read bound
+
+
+def _open_secure_log_file(log_file: Path | str) -> int:
+    """Safely open an append-only log file with 0600 permissions and O_NOFOLLOW protection.
+
+    If log_file is a pre-existing symlink, it is unlinked first to avoid writing through symlinks.
+    Returns the opened file descriptor.
+    """
+    path = Path(log_file)
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    log_fd = os.open(path, open_flags, 0o600)
+    try:
+        os.fchmod(log_fd, 0o600)
+    except OSError:
+        pass
+    return log_fd
 
 
 class DaemonError(AgySwitchError, RuntimeError):
@@ -635,6 +658,7 @@ class LogWatcher:
         log_dirs: list[str] | None = None,
         cooldown_minutes: int = 60,
         presence_detector: PresenceDetector | None = None,
+        max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     ):
         self.engine = engine
         if isinstance(damping_seconds, list):
@@ -646,6 +670,7 @@ class LogWatcher:
         self._stagnant_sizes: dict[str, int] = {}
         self.active_session_id: str | None = None
         self.active_transcript_path: Path | None = None
+        self.max_chunk_bytes = int(max_chunk_bytes)
 
         if presence_detector is not None:
             self.presence_detector = presence_detector
@@ -857,23 +882,7 @@ class LogWatcher:
             except OSError:
                 pass
 
-            if log_file.is_symlink():
-                try:
-                    log_file.unlink()
-                except OSError:
-                    pass
-
-            open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-            log_fd = os.open(
-                log_file,
-                open_flags,
-                0o600,
-            )
-            try:
-                os.fchmod(log_fd, 0o600)
-            except OSError:
-                pass
-
+            log_fd = _open_secure_log_file(log_file)
             try:
                 with open(log_fd, "a", encoding="utf-8", closefd=True) as f:
                     log_fd = None
@@ -1064,7 +1073,7 @@ class LogWatcher:
                 try:
                     with open(target, "rb") as f:
                         f.seek(cursor)
-                        chunk = f.read()
+                        chunk = f.read(self.max_chunk_bytes)
 
                     if not chunk:
                         continue
@@ -1076,7 +1085,6 @@ class LogWatcher:
                         self._stagnant_sizes[target] = current_size
                         continue
 
-                    self._stagnant_sizes.pop(target, None)
                     complete_bytes = chunk[:last_nl + 1]
                     raw_lines = complete_bytes.splitlines(keepends=True)
 
@@ -1093,11 +1101,16 @@ class LogWatcher:
                             processed_bytes += line_bytes_len
                             # Advance cursor precisely to the end of line K to preserve remaining lines
                             self.file_cursors[target] = cursor + processed_bytes
+                            self._stagnant_sizes.pop(target, None)
                             break
                         processed_bytes += line_bytes_len
 
                     if not failover_occurred:
                         self.file_cursors[target] = cursor + (last_nl + 1)
+                        if len(chunk) > last_nl + 1 and (cursor + len(chunk) >= current_size):
+                            self._stagnant_sizes[target] = current_size
+                        else:
+                            self._stagnant_sizes.pop(target, None)
 
                 except OSError:
                     continue
@@ -1350,22 +1363,7 @@ WantedBy=default.target
         except OSError:
             pass
 
-        if self.log_file.is_symlink():
-            try:
-                self.log_file.unlink()
-            except OSError:
-                pass
-
-        open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-        log_fd = os.open(
-            self.log_file,
-            open_flags,
-            0o600,
-        )
-        try:
-            os.fchmod(log_fd, 0o600)
-        except OSError:
-            pass
+        log_fd = _open_secure_log_file(self.log_file)
 
         cmd = [self.python_bin, str(self.watch_script), "run"]
         if cooldown is not None:
