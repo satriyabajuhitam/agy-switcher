@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -13,7 +14,13 @@ from unittest.mock import MagicMock, patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from agy_switch import QuotaClient
+from agy_switch import (
+    QuotaClient,
+    _is_auth_error,
+    _is_network_error,
+    fetch_account_quota,
+    fetch_all_accounts_quota,
+)
 
 
 class TestQuotaClient(unittest.TestCase):
@@ -784,6 +791,117 @@ class TestQuotaClient(unittest.TestCase):
 
         res = self.client.fetch_quota(self.access_token)
         self.assertEqual(res, {})
+
+    def test_save_cache_with_evict_keys(self):
+        """save_cache permanently evicts specified accounts from disk and memory."""
+        # Initial save with 2 accounts
+        initial_data = {
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 80, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 50, "reset_time": 1700000000}},
+            }
+        }
+        self.client.save_cache(initial_data, merge=False)
+        loaded = self.client.load_cache()
+        self.assertIn("acc1", loaded.get("accounts", {}))
+        self.assertIn("acc2", loaded.get("accounts", {}))
+
+        # Evict acc2 with merge=True
+        self.client.save_cache(
+            {"accounts": {"acc1": {"cached_at": 1100.0, "gemini": {"quota": 85, "reset_time": 1700000000}}}},
+            merge=True,
+            evict_keys=["acc2"],
+        )
+        loaded_after_evict = self.client.load_cache()
+        self.assertIn("acc1", loaded_after_evict.get("accounts", {}))
+        self.assertNotIn("acc2", loaded_after_evict.get("accounts", {}))
+
+        # Evict acc1 with merge=False
+        self.client.save_cache(
+            {"accounts": {"acc1": {"cached_at": 1200.0, "gemini": {"quota": 90, "reset_time": 1700000000}}}},
+            merge=False,
+            evict_keys=["acc1"],
+        )
+        loaded_empty = self.client.load_cache()
+        self.assertNotIn("acc1", loaded_empty.get("accounts", {}))
+
+    def test_error_classification_authoritative_nameserver_is_network_not_auth(self):
+        """Authoritative nameserver unreachable is classified as network, not auth."""
+        err_msg = "Authoritative nameserver unreachable"
+        self.assertFalse(_is_auth_error(err_msg))
+        self.assertTrue(_is_network_error(err_msg))
+
+        # Dict with error_type
+        self.assertFalse(_is_auth_error({"error": err_msg, "error_type": "network"}))
+        self.assertTrue(_is_network_error({"error": err_msg, "error_type": "network"}))
+
+        # Auth error classification
+        auth_msg = "Token refresh rejected"
+        self.assertTrue(_is_auth_error(auth_msg))
+        self.assertFalse(_is_network_error(auth_msg))
+
+    def test_quota_client_thread_local_error_isolation(self):
+        """QuotaClient last_error and last_error_type maintain isolated thread-local state."""
+        import threading
+
+        client = QuotaClient(timeout=1.0, cache_dir=self.cache_dir)
+        results = {}
+
+        def worker_auth():
+            client.last_error = "HTTP Error 401: Unauthorized"
+            client.last_error_type = "auth"
+            time.sleep(0.01)
+            results["auth"] = (client.last_error, client.last_error_type)
+
+        def worker_net():
+            client.last_error = "Timed out"
+            client.last_error_type = "network"
+            time.sleep(0.01)
+            results["net"] = (client.last_error, client.last_error_type)
+
+        t1 = threading.Thread(target=worker_auth)
+        t2 = threading.Thread(target=worker_net)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertEqual(results["auth"], ("HTTP Error 401: Unauthorized", "auth"))
+        self.assertEqual(results["net"], ("Timed out", "network"))
+
+    def test_fetch_all_accounts_quota_concurrent_error_type_isolation(self):
+        """fetch_all_accounts_quota isolates error types across concurrent worker threads."""
+        mock_engine = MagicMock()
+        mock_engine.get_account_tokens.side_effect = lambda name: {
+            "access_token": f"tok_{name}",
+            "refresh_token": f"ref_{name}",
+        }
+
+        client = QuotaClient(timeout=1.0, cache_dir=self.cache_dir)
+
+        def fake_fetch_quota(tok, refresh_token=None, on_refresh=None):
+            if "auth_fail" in tok:
+                client.last_error = "HTTP Error 401: Unauthorized"
+                client.last_error_type = "auth"
+                return {}
+            elif "net_fail" in tok:
+                client.last_error = "Connection reset by peer"
+                client.last_error_type = "network"
+                return {}
+            return {"gemini": {"quota": 80, "reset_time": 1700000000}}
+
+        with patch.object(client, "fetch_quota", side_effect=fake_fetch_quota):
+            accounts = [
+                {"name": "acc_auth_fail"},
+                {"name": "acc_net_fail"},
+                {"name": "acc_success"},
+            ]
+            results = fetch_all_accounts_quota(mock_engine, accounts, client=client, max_workers=3)
+
+        self.assertEqual(results["acc_auth_fail"].get("error_type"), "auth")
+        self.assertEqual(results["acc_net_fail"].get("error_type"), "network")
+        self.assertIn("gemini", results["acc_success"])
 
 
 if __name__ == "__main__":

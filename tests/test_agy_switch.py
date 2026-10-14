@@ -1378,10 +1378,13 @@ class TestTokenExpiryAndUnpacking(unittest.TestCase):
         mock_client = MagicMock(spec=QuotaClient)
         # Client returns empty dict on revoked refresh
         mock_client.fetch_quota.return_value = {}
+        mock_client.last_error = "Fetch failed"
+        mock_client.last_error_type = "auth"
 
         name, q = fetch_account_quota(self.engine, "active_acc", client=mock_client)
         self.assertEqual(name, "active_acc")
-        self.assertEqual(q, {"error": "Fetch failed"})
+        self.assertEqual(q.get("error"), "Fetch failed")
+        self.assertEqual(q.get("error_type"), "auth")
 
     def test_update_account_access_token_empty_token_rejected(self):
         """update_account_access_token rejects empty or whitespace access tokens."""

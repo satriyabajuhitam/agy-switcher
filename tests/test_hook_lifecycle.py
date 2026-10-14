@@ -1188,6 +1188,164 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         output = json.loads(out_capture.getvalue())
         self.assertEqual(output, {})
 
+    def test_tier_3_excludes_active_account_from_standby_probe(self):
+        """Tier 3 concurrent probe only queries standby accounts, never active_name."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2", "acc3"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Mock fetch_account_quota (Tier 2 probe for active account) to return 10% (< 15%)
+        with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 10, "reset_time": 1700000000}})):
+            with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+                "acc3": {"gemini": {"quota": 90, "reset_time": 1700000000}},
+            }) as mock_fetch_all:
+                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                    with patch("sys.stdout", io.StringIO()):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        mock_fetch_all.assert_called_once()
+        probed_accounts = mock_fetch_all.call_args[0][1]
+        probed_names = [a.get("name") for a in probed_accounts]
+        self.assertNotIn("acc1", probed_names)
+        self.assertIn("acc2", probed_names)
+        self.assertIn("acc3", probed_names)
+
+    def test_tier_2_does_not_write_cache_on_critical_quota_fallthrough(self):
+        """Tier 2 does not write to disk cache when quota < 15%, deferring single write to Tier 3."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 10, "reset_time": 1700000000}})):
+            with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+            }):
+                with patch("agy_switch.QuotaClient.save_cache") as mock_save:
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        with patch("sys.stdout", io.StringIO()):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Exactly 1 save_cache call in Tier 3, NOT 2 (Tier 2 did not write before fallthrough)
+        self.assertEqual(mock_save.call_count, 1)
+
+    def test_fallback_model_name_defaults_to_auto_and_sanitizes_display_to_gemini(self):
+        """Fallback modelName defaults to 'auto' and sanitizes warning display to 'Gemini'."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        for acc_name in ["acc1"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # acc1 has 0% quota
+        with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 0, "reset_time": 1700000000}})):
+            with patch("agy_switch.fetch_all_accounts_quota", return_value={}):
+                # Test with empty payload (no modelName)
+                with patch("sys.stdin", io.StringIO("{}")):
+                    out_capture = io.StringIO()
+                    with patch("sys.stdout", out_capture):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        self.assertEqual(
+            output["injectSteps"][0]["ephemeralMessage"],
+            "⚠️ All Antigravity accounts have exhausted their Gemini quota.",
+        )
+
+    def test_combined_quotas_strictly_excludes_unregistered_vault_accounts(self):
+        """combined_quotas only retains accounts currently registered in the vault."""
+        from agy_switch import handle_pre_invocation_hook
+        import io
+
+        self.engine.set_auto_switch(True)
+        # Vault only has acc1 and acc2
+        for acc_name in ["acc1", "acc2"]:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(json.dumps({
+                "token": {
+                    "access_token": f"tok_{acc_name}",
+                    "refresh_token": f"ref_{acc_name}",
+                    "token_type": "Bearer",
+                    "expiry": "2026-10-05T12:00:00Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+            }))
+        self.engine.set_active_name("acc1")
+
+        # Cache file has a stale deleted account 'acc_deleted' with 100% quota
+        cache_dir = self.vault_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "last_known_quota.json").write_text(json.dumps({
+            "timestamp": 1000.0,
+            "accounts": {
+                "acc1": {"cached_at": 1000.0, "gemini": {"quota": 10, "reset_time": 1700000000}},
+                "acc2": {"cached_at": 1000.0, "gemini": {"quota": 80, "reset_time": 1700000000}},
+                "acc_deleted": {"cached_at": 1000.0, "gemini": {"quota": 100, "reset_time": 1700000000}},
+            }
+        }), encoding="utf-8")
+
+        with patch("time.time", return_value=1200.0):
+            with patch("agy_switch.fetch_account_quota", return_value=("acc1", {"gemini": {"quota": 10, "reset_time": 1700000000}})):
+                with patch("agy_switch.fetch_all_accounts_quota", return_value={
+                    "acc2": {"gemini": {"quota": 80, "reset_time": 1700000000}},
+                }):
+                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):
+                        with patch("sys.stdout", io.StringIO()):
+                            ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        # Rotated to acc2 (80%), NOT acc_deleted (100%) because acc_deleted was purged from combined_quotas
+        self.assertEqual(self.engine.get_active_name(), "acc2")
+
 
 if __name__ == "__main__":
     unittest.main()

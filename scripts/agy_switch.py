@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -761,8 +762,23 @@ class QuotaClient:
         self.token_endpoint = "https://oauth2.googleapis.com/token"
         self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
         self.cache_file = getattr(target_engine, "cache_file", None) or (self.cache_dir / "last_known_quota.json")
-        self.last_error: str | None = None
-        self.last_error_type: str | None = None
+        self._local = threading.local()
+
+    @property
+    def last_error(self) -> str | None:
+        return getattr(self._local, "last_error", None)
+
+    @last_error.setter
+    def last_error(self, val: str | None) -> None:
+        self._local.last_error = val
+
+    @property
+    def last_error_type(self) -> str | None:
+        return getattr(self._local, "last_error_type", None)
+
+    @last_error_type.setter
+    def last_error_type(self, val: str | None) -> None:
+        self._local.last_error_type = val
 
     def refresh_access_token(self, refresh_token: str) -> dict[str, Any] | None:
         """Refreshes the OAuth access token."""
@@ -980,7 +996,12 @@ class QuotaClient:
                 return {}
         return {}
 
-    def save_cache(self, data: dict[str, Any], merge: bool = True) -> None:
+    def save_cache(
+        self,
+        data: dict[str, Any],
+        merge: bool = True,
+        evict_keys: list[str] | set[str] | None = None,
+    ) -> None:
         """Atomically saves quota cache to vault cache directory.
 
         Guarantees:
@@ -1066,6 +1087,10 @@ class QuotaClient:
                         if isinstance(k, str) and k.strip() and _is_valid_entry(v)
                     }
                 merged_accounts.update(incoming_valid)
+                if evict_keys:
+                    for ev in evict_keys:
+                        if isinstance(ev, str) and ev.strip() in merged_accounts:
+                            del merged_accounts[ev.strip()]
                 merged_data = dict(current) if isinstance(current, dict) else {}
                 for k, v in data.items():
                     if k != "accounts":
@@ -1075,6 +1100,10 @@ class QuotaClient:
                 data_to_write = merged_data
             else:
                 data_to_write = {k: v for k, v in data.items() if k != "accounts"}
+                if evict_keys:
+                    for ev in evict_keys:
+                        if isinstance(ev, str) and ev.strip() in incoming_valid:
+                            del incoming_valid[ev.strip()]
                 data_to_write["accounts"] = incoming_valid
                 data_to_write["timestamp"] = root_ts
 
@@ -1115,14 +1144,14 @@ def fetch_account_quota(
         acc_name = str(account)
 
     if not acc_name:
-        return "", {"error": "Invalid account name"}
+        return "", {"error": "Invalid account name", "error_type": "validation"}
 
     if client is None:
         client = QuotaClient(timeout=2.0, engine=engine)
 
     tokens = engine.get_account_tokens(acc_name)
     if not tokens or not tokens.get("access_token"):
-        return acc_name, {"error": "No token"}
+        return acc_name, {"error": "No token", "error_type": "auth"}
 
     def _on_token_refreshed(new_token_data: dict[str, Any] | str) -> None:
         if isinstance(new_token_data, dict):
@@ -1158,9 +1187,17 @@ def fetch_account_quota(
                 )
             else:
                 raise
-        return acc_name, quota_res if quota_res else {"error": "Fetch failed"}
+        if quota_res:
+            return acc_name, quota_res
+        raw_err = getattr(client, "last_error", None)
+        err_msg = raw_err if isinstance(raw_err, str) and raw_err else "Fetch failed"
+        raw_type = getattr(client, "last_error_type", None)
+        err_type = raw_type if isinstance(raw_type, str) and raw_type else ("auth" if any(k in err_msg.lower() for k in ("token", "unauthorized", "invalid_grant", "revoked", "401", "403")) else "network")
+        return acc_name, {"error": err_msg, "error_type": err_type}
     except Exception as e:
-        return acc_name, {"error": str(e)}
+        err_str = str(e)
+        err_type = "network" if _is_network_error(e) else ("auth" if _is_auth_error(e) else "general")
+        return acc_name, {"error": err_str, "error_type": err_type}
 
 
 def fetch_all_accounts_quota(
@@ -1835,18 +1872,20 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
     """Classifies whether an error represents auth/token corruption (401/403, revoked, no token)."""
     if error_val is None:
         return False
-    if isinstance(error_val, Exception):
+    if isinstance(error_val, dict):
+        if error_val.get("error_type") == "auth":
+            return True
+        err_str = str(error_val.get("error", "")).lower()
+    elif isinstance(error_val, Exception):
         if isinstance(error_val, urllib.error.HTTPError) and error_val.code in (401, 403):
             return True
         err_str = str(error_val).lower()
     elif isinstance(error_val, str):
         err_str = error_val.lower()
-    elif isinstance(error_val, dict):
-        err_str = str(error_val.get("error", "")).lower()
     else:
         err_str = str(error_val).lower()
 
-    auth_keywords = ["no token", "token refresh rejected", "invalid_grant", "unauthorized", "401", "revoked", "auth"]
+    auth_keywords = ["no token", "token refresh rejected", "invalid_grant", "unauthorized", "401", "403", "revoked"]
     if any(k in err_str for k in auth_keywords):
         return True
 
@@ -1867,16 +1906,18 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
         return False
     if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError)):
         return True
-    if isinstance(error_val, Exception):
+    if isinstance(error_val, dict):
+        if error_val.get("error_type") == "network":
+            return True
+        err_str = str(error_val.get("error", "")).lower()
+    elif isinstance(error_val, Exception):
         err_str = str(error_val).lower()
     elif isinstance(error_val, str):
         err_str = error_val.lower()
-    elif isinstance(error_val, dict):
-        err_str = str(error_val.get("error", "")).lower()
     else:
         err_str = str(error_val).lower()
 
-    net_keywords = ["timeout", "timed out", "urlerror", "network", "unreachable", "connection", "reset by peer", "failed to connect", "socket", "dns"]
+    net_keywords = ["timeout", "timed out", "urlerror", "network", "unreachable", "connection", "reset by peer", "failed to connect", "socket", "dns", "authoritative"]
     if any(k in err_str for k in net_keywords):
         return True
 
@@ -1910,6 +1951,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
         else:
             model_name = "auto"
         model_key = "claude" if "claude" in model_name.lower() else "gemini"
+        display_model = "Gemini" if model_name.lower() in ("auto", "gemini", "") else model_name
 
         # Wire in QuotaClient and RotationEngine
         try:
@@ -1982,16 +2024,15 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 else:
                     # Probe succeeded without error
                     if isinstance(active_quota, dict) and not active_quota.get("error"):
-                        active_entry = dict(active_quota)
-                        active_entry["cached_at"] = time.time()
-                        client.save_cache({"accounts": {active_name: active_entry}}, merge=True)
-
                         active_status = rot_engine.get_quota_status(active_quota, model_key=model_key)
                         if (
                             rot_engine.has_available_quota(active_quota)
                             and active_status is not None
                             and active_status.fraction >= 0.15
                         ):
+                            active_entry = dict(active_quota)
+                            active_entry["cached_at"] = time.time()
+                            client.save_cache({"accounts": {active_name: active_entry}}, merge=True)
                             print(f"[agy-switch hook] Tier 2 probe for '{active_name}' healthy ({active_status.remaining_percentage()}%). Retaining active account.", file=sys.stderr)
                             sys.stdout.write(json.dumps({}) + "\n")
                             sys.stdout.flush()
@@ -1999,21 +2040,25 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
 
             # Tier 3 (Full Standby Probe & Rotation)
             accounts_data = engine.list_accounts().get("accounts", [])
-            raw_quotas = fetch_all_accounts_quota(engine, accounts_data, client=client)
+            registered_names = {acc.get("name") for acc in accounts_data if isinstance(acc, dict) and acc.get("name")}
+            standby_accounts = [acc for acc in accounts_data if isinstance(acc, dict) and acc.get("name") != active_name]
+            raw_quotas = fetch_all_accounts_quota(engine, standby_accounts, client=client)
 
-            combined_quotas = dict(accounts_cache)
+            combined_quotas = {k: v for k, v in accounts_cache.items() if k in registered_names}
             now = time.time()
+            evict_keys: set[str] = set()
             for acc_name, q_data in raw_quotas.items():
                 if isinstance(q_data, dict) and "error" not in q_data and q_data:
                     entry = dict(q_data)
                     entry["cached_at"] = now
                     combined_quotas[acc_name] = entry
                 elif isinstance(q_data, dict) and q_data.get("error"):
-                    if _is_auth_error(q_data.get("error"), client=client):
+                    if _is_auth_error(q_data, client=client):
                         combined_quotas.pop(acc_name, None)
+                        evict_keys.add(acc_name)
 
             # If active_quota from Tier 2 was successful, ensure it is in combined_quotas
-            if isinstance(active_quota, dict) and not active_quota.get("error") and active_quota:
+            if active_name and isinstance(active_quota, dict) and not active_quota.get("error") and active_quota:
                 active_entry = dict(active_quota)
                 active_entry["cached_at"] = now
                 combined_quotas[active_name] = active_entry
@@ -2021,9 +2066,10 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
             # If active account had auth corruption, remove it from combined_quotas so it does not fall back to stale cache
             if active_name and probe_error is not None and _is_auth_error(probe_error, client=client):
                 combined_quotas.pop(active_name, None)
+                evict_keys.add(active_name)
 
             # Persist fresh telemetry to cache
-            client.save_cache({"accounts": combined_quotas}, merge=True)
+            client.save_cache({"accounts": combined_quotas}, merge=True, evict_keys=evict_keys)
 
             target_account = rot_engine.evaluate(combined_quotas, current_active=active_name, target_model=model_name)
             print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
@@ -2045,7 +2091,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "ephemeralMessage": f"⚠️ All Antigravity accounts have exhausted their {model_name} quota."
+                            "ephemeralMessage": f"⚠️ All Antigravity accounts have exhausted their {display_model} quota."
                         }
                     ]
                 }) + "\n")
@@ -2060,7 +2106,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 sys.stdout.write(json.dumps({
                     "injectSteps": [
                         {
-                            "ephemeralMessage": f"🔄 Auto-rotated to **{target_account}** for {model_name} ({pct}% remaining)."
+                            "ephemeralMessage": f"🔄 Auto-rotated to **{target_account}** for {display_model} ({pct}% remaining)."
                         }
                     ]
                 }) + "\n")
