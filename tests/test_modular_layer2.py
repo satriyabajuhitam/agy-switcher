@@ -294,6 +294,54 @@ class TestRotationEngineLayer2(unittest.TestCase):
         self.assertEqual(res, "acc2", "acc2 should be exempt from cooldown for Gemini")
 
 
+    def test_spec_constructor_and_evaluate_candidates_list_str(self):
+        """RotationEngine supports spec constructor with vault_dir and evaluate with list[str] candidates."""
+        tmp_vault = self.base_time  # just a dummy, let's create a real temp dir
+        with tempfile.TemporaryDirectory() as td:
+            v_dir = Path(td) / ".antigravity-vault"
+            cache_dir = v_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = cache_dir / "last_known_quota.json"
+
+            t_future = int((self.base_time + timedelta(hours=2)).timestamp())
+            cache_payload = {
+                "acc1": {"gemini": {"quota": 10, "reset_time": t_future}},
+                "acc2": {"gemini": {"quota": 90, "reset_time": t_future}},
+            }
+            cache_file.write_text(json.dumps(cache_payload), encoding="utf-8")
+
+            # Spec constructor using kwargs
+            rot = RotationEngine(vault_dir=v_dir)
+            self.assertEqual(rot.vault_dir, v_dir)
+            self.assertEqual(rot.target_model_key, "gemini")
+
+            # evaluate with candidate list of strings and active kwarg alias
+            res = rot.evaluate(["acc1", "acc2"], active="acc1", current_time=self.base_time)
+            self.assertEqual(res, "acc2", "Should load quotas for string candidates from vault cache and select acc2")
+
+    def test_spec_constructor_positional_string_path_and_client_cache(self):
+        """RotationEngine positional string path is recognized as vault_dir, and client.load_cache is used."""
+        with tempfile.TemporaryDirectory() as td:
+            v_path_str = str(Path(td) / "vault")
+            mock_client = MagicMock()
+            t_future = int((self.base_time + timedelta(hours=2)).timestamp())
+            mock_client.load_cache.return_value = {
+                "acc_a": {"gemini": {"quota": 5, "reset_time": t_future}},
+                "acc_b": {"gemini": {"quota": 80, "reset_time": t_future}},
+            }
+            mock_cm = MagicMock()
+            mock_cm.get_active_cooldowns.return_value = {}
+
+            rot = RotationEngine(v_path_str, mock_client, mock_cm)
+            self.assertEqual(rot.vault_dir, Path(v_path_str))
+            self.assertEqual(rot.client, mock_client)
+            self.assertEqual(rot.cooldown_manager, mock_cm)
+
+            res = rot.evaluate(["acc_a", "acc_b"], current_active="acc_a", current_time=self.base_time)
+            self.assertEqual(res, "acc_b")
+            mock_client.load_cache.assert_called_once()
+
+
 class TestDoctorEngineLayer2(unittest.TestCase):
     """Detailed unit tests for DoctorEngine in agy_switcher.doctor."""
 
@@ -396,6 +444,8 @@ class TestDoctorEngineLayer2(unittest.TestCase):
         self.assertEqual(len(report.items), 5)
         for item in report.items:
             self.assertEqual(item.status, "PASS", f"Item {item.name} failed: {item.message}")
+            self.assertIn(item.layer, (1, 2, 3, 4, 5))
+            self.assertTrue(bool(item.title))
 
     def test_cmdline_pattern_matching_watcher_py(self):
         """Verifies that watcher.py is recognized as an active watcher daemon."""
@@ -449,6 +499,95 @@ class TestDoctorEngineLayer2(unittest.TestCase):
         self.assertEqual(mode, 0o700)
         self.assertFalse((self.vault_dir / "watch.pid").exists())
 
+    def test_doctor_spec_constructor_and_custom_token_paths(self):
+        """DoctorEngine supports the 8-argument spec constructor and custom desktop/cli token files."""
+        self._setup_pristine_environment()
+        custom_desktop = self.base_path / "custom_desktop_token"
+        custom_cli = self.base_path / "custom_cli_token"
+        token_data = create_sample_jwt_token(email="custom@example.com")
+        custom_desktop.write_text(json.dumps(token_data), encoding="utf-8")
+        custom_cli.write_text(json.dumps(token_data), encoding="utf-8")
+        os.chmod(custom_desktop, 0o600)
+        os.chmod(custom_cli, 0o600)
+
+        sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        cb = {"sync_tokens": MagicMock(), "get_active_account": lambda: "acc_primary"}
+
+        doc = DoctorEngine(
+            vault_dir=self.vault_dir,
+            accounts_dir=self.vault_dir / "accounts",
+            cache_dir=self.vault_dir / "cache",
+            config_file=self.vault_dir / "config.json",
+            desktop_token_file=custom_desktop,
+            cli_token_file=custom_cli,
+            supervisor=sup,
+            engine_callbacks=cb,
+        )
+
+        self.assertEqual(doc.desktop_token_file, custom_desktop)
+        self.assertEqual(doc.cli_token_file, custom_cli)
+        self.assertEqual(doc.get_active_name(), "acc_primary")
+
+        # Test positional spec constructor
+        doc_pos = DoctorEngine(
+            self.vault_dir,
+            self.vault_dir / "accounts",
+            self.vault_dir / "cache",
+            self.vault_dir / "config.json",
+            custom_desktop,
+            custom_cli,
+            sup,
+            cb,
+        )
+        self.assertEqual(doc_pos.desktop_token_file, custom_desktop)
+        self.assertEqual(doc_pos.cli_token_file, custom_cli)
+
+    def test_broken_symlink_watch_pid_does_not_break_permissions_repair(self):
+        """A broken symlink watch.pid is handled safely without crashing or failing permissions repair."""
+        self._setup_pristine_environment()
+        # Insecure permissions on accounts
+        os.chmod(self.vault_dir / "accounts", 0o777)
+        # Create broken symlink for watch.pid
+        watch_pid_file = self.vault_dir / "watch.pid"
+        if watch_pid_file.exists():
+            watch_pid_file.unlink()
+        watch_pid_file.symlink_to(self.base_path / "ghost_target.pid")
+
+        report = self.doctor.run_diagnostics()
+        self.assertEqual(report.overall_status, "FAIL")
+
+        fixes = self.doctor.fix_diagnostics(report)
+        self.assertIn("Restored POSIX permissions (0700 for directories, 0600 for files)", fixes)
+        self.assertIn("Unlinked stale watch.pid file", fixes)
+        self.assertFalse(watch_pid_file.exists())
+        self.assertEqual(stat.S_IMODE((self.vault_dir / "accounts").stat().st_mode), 0o700)
+
+    def test_lifecycle_hook_path_with_tilde_expansion(self):
+        """PreInvocation hook commands using '~/' are expanded correctly."""
+        self._setup_pristine_environment()
+        fake_home = self.base_path / "home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        script_file = fake_home / "test_hook.py"
+        script_file.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        os.chmod(script_file, 0o755)
+
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        hook_payload = {
+            "agy-switch-auto-rotate": {
+                "enabled": True,
+                "PreInvocation": [
+                    {
+                        "type": "command",
+                        "command": f"python3 ~/test_hook.py hook-pre-invocation",
+                    }
+                ],
+            }
+        }
+        hooks_file.write_text(json.dumps(hook_payload), encoding="utf-8")
+        with patch.dict(os.environ, {"HOME": str(fake_home)}):
+            item = self.doctor._check_lifecycle_hooks()
+            self.assertEqual(item.status, "PASS")
+
     def test_convenience_functions_run_doctor_and_auto_heal(self):
         self._setup_pristine_environment()
         report = run_doctor(
@@ -469,3 +608,4 @@ class TestDoctorEngineLayer2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

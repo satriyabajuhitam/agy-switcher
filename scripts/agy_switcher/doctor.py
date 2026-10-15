@@ -108,9 +108,19 @@ class DoctorEngine:
     def __init__(
         self,
         vault_dir: Path | str | None = None,
+        gemini_dir_or_accounts: Path | str | None = None,
+        proc_dir_or_cache: Path | str | None = None,
+        supervisor_or_config: Any | None = None,
+        desktop_token_file: Path | str | None = None,
+        cli_token_file: Path | str | None = None,
+        supervisor: ProcessSupervisor | None = None,
+        engine_callbacks: dict[str, Any] | None = None,
+        *,
+        accounts_dir: Path | str | None = None,
+        cache_dir: Path | str | None = None,
+        config_file: Path | str | None = None,
         gemini_dir: Path | str | None = None,
         proc_dir: Path | str | None = None,
-        supervisor: ProcessSupervisor | None = None,
         hook_installer: Callable[[Path | None], Path] | None = None,
         sync_tokens_callback: Callable[[str], None] | None = None,
         get_active_account_callback: Callable[[], str | None] | None = None,
@@ -119,16 +129,76 @@ class DoctorEngine:
     ) -> None:
         self.engine = engine
 
+        is_spec_positional = (
+            desktop_token_file is not None
+            or cli_token_file is not None
+            or (
+                supervisor_or_config is not None
+                and not isinstance(supervisor_or_config, ProcessSupervisor)
+            )
+        )
+
+        if is_spec_positional:
+            resolved_accounts = accounts_dir or gemini_dir_or_accounts
+            resolved_cache = cache_dir or proc_dir_or_cache
+            resolved_config = config_file or supervisor_or_config
+            resolved_desktop = desktop_token_file
+            resolved_cli = cli_token_file
+            resolved_supervisor = supervisor or (
+                supervisor_or_config if isinstance(supervisor_or_config, ProcessSupervisor) else None
+            )
+            resolved_gemini = gemini_dir
+            resolved_proc = proc_dir
+        else:
+            resolved_gemini = gemini_dir or gemini_dir_or_accounts
+            resolved_proc = proc_dir or proc_dir_or_cache
+            resolved_supervisor = supervisor or (
+                supervisor_or_config if isinstance(supervisor_or_config, ProcessSupervisor) else None
+            )
+            resolved_accounts = accounts_dir
+            resolved_cache = cache_dir
+            resolved_config = config_file
+            resolved_desktop = desktop_token_file
+            resolved_cli = cli_token_file
+
         if engine is not None:
             self._vault_dir = getattr(engine, "vault_dir", Path(vault_dir or DEFAULT_VAULT_DIR))
-            self._gemini_dir = getattr(engine, "gemini_dir", Path(gemini_dir or DEFAULT_GEMINI_DIR))
-            self._proc_dir = getattr(engine, "proc_dir", Path(proc_dir or "/proc"))
-            self._supervisor = supervisor or getattr(engine, "supervisor", None)
+            self._gemini_dir = getattr(engine, "gemini_dir", Path(resolved_gemini or DEFAULT_GEMINI_DIR))
+            self._proc_dir = getattr(engine, "proc_dir", Path(resolved_proc or "/proc"))
+            self._supervisor = resolved_supervisor or getattr(engine, "supervisor", None)
         else:
             self._vault_dir = Path(vault_dir or DEFAULT_VAULT_DIR).expanduser()
-            self._gemini_dir = Path(gemini_dir or DEFAULT_GEMINI_DIR).expanduser()
-            self._proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
-            self._supervisor = supervisor
+            self._gemini_dir = Path(resolved_gemini or DEFAULT_GEMINI_DIR).expanduser()
+            self._proc_dir = Path(resolved_proc) if resolved_proc else Path("/proc")
+            self._supervisor = resolved_supervisor
+
+        self._accounts_dir = Path(resolved_accounts).expanduser() if resolved_accounts else None
+        self._cache_dir = Path(resolved_cache).expanduser() if resolved_cache else None
+        self._config_file = Path(resolved_config).expanduser() if resolved_config else None
+        self._desktop_token_file = Path(resolved_desktop).expanduser() if resolved_desktop else None
+        self._cli_token_file = Path(resolved_cli).expanduser() if resolved_cli else None
+
+        if engine_callbacks:
+            sync_tokens_callback = (
+                sync_tokens_callback
+                or engine_callbacks.get("sync_tokens")
+                or engine_callbacks.get("sync_tokens_callback")
+            )
+            get_active_account_callback = (
+                get_active_account_callback
+                or engine_callbacks.get("get_active_account")
+                or engine_callbacks.get("get_active_account_callback")
+            )
+            init_vault_callback = (
+                init_vault_callback
+                or engine_callbacks.get("init_vault")
+                or engine_callbacks.get("init_vault_callback")
+            )
+            hook_installer = (
+                hook_installer
+                or engine_callbacks.get("install_hook")
+                or engine_callbacks.get("hook_installer")
+            )
 
         self.hook_installer = hook_installer
         self.sync_tokens_callback = sync_tokens_callback
@@ -167,6 +237,10 @@ class DoctorEngine:
 
     @property
     def accounts_dir(self) -> Path:
+        if self._accounts_dir is not None:
+            return self._accounts_dir
+        if self.engine is not None and hasattr(self.engine, "accounts_dir"):
+            return Path(self.engine.accounts_dir)
         return self.vault_dir / "accounts"
 
     @property
@@ -175,11 +249,31 @@ class DoctorEngine:
 
     @property
     def cache_dir(self) -> Path:
+        if self._cache_dir is not None:
+            return self._cache_dir
+        if self.engine is not None and hasattr(self.engine, "cache_dir"):
+            return Path(self.engine.cache_dir)
         return self.vault_dir / "cache"
 
     @property
     def config_file(self) -> Path:
+        if self._config_file is not None:
+            return self._config_file
+        if self.engine is not None and hasattr(self.engine, "config_file"):
+            return Path(self.engine.config_file)
         return self.vault_dir / "config.json"
+
+    @property
+    def desktop_token_file(self) -> Path:
+        if self._desktop_token_file is not None:
+            return self._desktop_token_file
+        return self.gemini_dir / "jetski-standalone-oauth-token"
+
+    @property
+    def cli_token_file(self) -> Path:
+        if self._cli_token_file is not None:
+            return self._cli_token_file
+        return self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
 
     @property
     def supervisor(self) -> ProcessSupervisor:
@@ -237,10 +331,8 @@ class DoctorEngine:
             self.engine._sync_tokens_to_targets(payload_str)
             return
 
-        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
-        _atomic_write_file(desktop_file, payload_str, mode=0o600)
-        cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
-        _atomic_write_file(cli_file, payload_str, mode=0o600)
+        _atomic_write_file(self.desktop_token_file, payload_str, mode=0o600)
+        _atomic_write_file(self.cli_token_file, payload_str, mode=0o600)
 
     def install_hook(self, hooks_file: Path | None = None) -> Path:
         """Installs the PreInvocation lifecycle hook into hooks.json via deep merge."""
@@ -385,7 +477,7 @@ class DoctorEngine:
         if self.config_file.is_file():
             files_to_check.append(self.config_file)
         watch_pid = self.vault_dir / "watch.pid"
-        if watch_pid.is_file() or watch_pid.is_symlink():
+        if (watch_pid.is_file() or watch_pid.is_symlink()) and watch_pid.exists():
             files_to_check.append(watch_pid)
 
         for f in files_to_check:
@@ -564,8 +656,8 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
-        cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        desktop_file = self.desktop_token_file
+        cli_file = self.cli_token_file
 
         desktop_exists = desktop_file.is_file()
         cli_exists = cli_file.is_file()
@@ -747,15 +839,15 @@ class DoctorEngine:
         target_path: Path | None = None
         for part in parts:
             if part.endswith(".py"):
-                target_path = Path(part)
+                target_path = Path(part).expanduser()
                 break
 
         if target_path is None:
             first = parts[0]
             if first in ("python", "python3", "bash", "sh") and len(parts) > 1 and not parts[1].startswith("-"):
-                target_path = Path(parts[1])
+                target_path = Path(parts[1]).expanduser()
             else:
-                target_path = Path(first)
+                target_path = Path(first).expanduser()
 
         if not target_path.is_file():
             if "/" not in str(target_path):
@@ -981,7 +1073,7 @@ class DoctorEngine:
                     if self.config_file.is_file():
                         _safe_chmod(self.config_file, 0o600)
                     watch_pid = self.vault_dir / "watch.pid"
-                    if watch_pid.is_file() or watch_pid.is_symlink():
+                    if (watch_pid.is_file() or watch_pid.is_symlink()) and watch_pid.exists():
                         _safe_chmod(watch_pid, 0o600)
 
                     if chmod_errors:
@@ -1091,9 +1183,16 @@ def run_doctor(
     gemini_dir: Path | str | None = None,
     proc_dir: Path | str | None = None,
     supervisor: ProcessSupervisor | None = None,
+    **kwargs: Any,
 ) -> DiagnosticReport:
     """Convenience functional entry point for running diagnostics."""
-    doctor = DoctorEngine(vault_dir=vault_dir, gemini_dir=gemini_dir, proc_dir=proc_dir, supervisor=supervisor)
+    doctor = DoctorEngine(
+        vault_dir=vault_dir,
+        gemini_dir=gemini_dir,
+        proc_dir=proc_dir,
+        supervisor=supervisor,
+        **kwargs,
+    )
     return doctor.run_diagnostics()
 
 
@@ -1103,9 +1202,16 @@ def auto_heal(
     gemini_dir: Path | str | None = None,
     proc_dir: Path | str | None = None,
     supervisor: ProcessSupervisor | None = None,
+    **kwargs: Any,
 ) -> list[str]:
     """Convenience functional entry point for repairing fixable diagnostic anomalies."""
-    doctor = DoctorEngine(vault_dir=vault_dir, gemini_dir=gemini_dir, proc_dir=proc_dir, supervisor=supervisor)
+    doctor = DoctorEngine(
+        vault_dir=vault_dir,
+        gemini_dir=gemini_dir,
+        proc_dir=proc_dir,
+        supervisor=supervisor,
+        **kwargs,
+    )
     return doctor.fix_diagnostics(report)
 
 

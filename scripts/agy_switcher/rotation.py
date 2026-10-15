@@ -7,7 +7,9 @@ Zero external dependencies. Pure Python 3.10+ standard library.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -21,31 +23,62 @@ class RotationEngine:
 
     def __init__(
         self,
-        model_name: str | None = "gemini",
+        vault_or_model: Path | str | None = None,
+        client_or_active: Any | None = None,
+        cooldown_manager: Any | None = None,
+        *,
+        model_name: str | None = None,
         active_account_id: str | None = None,
         vault_dir: Path | str | None = None,
         client: Any | None = None,
-        cooldown_manager: Any | None = None,
+        target_model: str | None = None,
     ) -> None:
-        # Flexible constructor: if first argument is a Path, treat as vault_dir
-        if isinstance(model_name, Path):
-            self.vault_dir: Path | None = model_name
-            self.model_name = "gemini"
-        else:
-            self.vault_dir = Path(vault_dir) if vault_dir else None
-            self.model_name = model_name or "gemini"
+        resolved_vault: Path | None = Path(vault_dir).expanduser() if vault_dir else None
+        resolved_client = client
+        resolved_active = active_account_id
+        resolved_model = model_name or target_model
+        resolved_cm = cooldown_manager
 
-        self.active_account_id = active_account_id
-        self.client = client
-        self.cooldown_manager = cooldown_manager
+        if vault_or_model is not None:
+            if isinstance(vault_or_model, Path):
+                resolved_vault = vault_or_model
+            elif isinstance(vault_or_model, str):
+                is_path = (
+                    "/" in vault_or_model
+                    or "\\" in vault_or_model
+                    or vault_or_model.startswith((".", "~"))
+                    or os.path.isdir(vault_or_model)
+                )
+                if is_path:
+                    resolved_vault = Path(vault_or_model).expanduser()
+                else:
+                    if resolved_model is None:
+                        resolved_model = vault_or_model
 
-        model_lower = (self.model_name or "gemini").lower()
-        if "claude" in model_lower:
+        if client_or_active is not None:
+            if hasattr(client_or_active, "fetch_quota") or hasattr(client_or_active, "load_cache"):
+                if resolved_client is None:
+                    resolved_client = client_or_active
+            else:
+                if resolved_active is None:
+                    resolved_active = str(client_or_active)
+
+        self.vault_dir = resolved_vault
+        self.client = resolved_client
+        self.cooldown_manager = resolved_cm
+        self.active_account_id = resolved_active
+        self.model_name = resolved_model or "gemini"
+
+        norm_model = (self.model_name or "gemini").strip()
+        try:
+            self.target_model_key = normalize_model_name(norm_model)
+        except Exception:
+            self.target_model_key = "claude" if "claude" in norm_model.lower() else "gemini"
+
+        if self.target_model_key == "claude":
             self.target_group_prefix = "Claude"
-            self.target_model_key = "claude"
         else:
             self.target_group_prefix = "Gemini"
-            self.target_model_key = "gemini"
 
     def _parse_time(self, t_val: Any) -> datetime:
         """Parses various timestamp representations into a timezone-aware UTC datetime."""
@@ -199,14 +232,36 @@ class RotationEngine:
 
     _is_cooldown_penalized_for_model = is_cooldown_penalized_for_model
 
+    def _load_quota_cache(self) -> dict[str, Any]:
+        """Loads quota cache from client or vault_dir/cache/last_known_quota.json."""
+        if self.client is not None and hasattr(self.client, "load_cache"):
+            try:
+                data = self.client.load_cache()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        if self.vault_dir is not None:
+            cache_file = self.vault_dir / "cache" / "last_known_quota.json"
+            if cache_file.is_file():
+                try:
+                    data = json.loads(cache_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    pass
+        return {}
+
     def evaluate(
         self,
-        accounts: list[dict] | dict,
+        accounts: list[dict] | list[str] | dict,
         current_active: str | None = None,
         target_model: str | None = None,
         current_time: datetime | None = None,
         cooldowns: dict | None = None,
         strategy: str = "auto_highest",
+        *,
+        active: str | None = None,
     ) -> str | None:
         """Evaluates accounts and returns the optimal account to switch to, or None if current_active is optimal.
 
@@ -216,13 +271,19 @@ class RotationEngine:
         3. auto_highest: select standby account with highest quota, prioritizing accounts nearing reset
            (<= 45m with >= 15% quota), tie-breaking by earliest reset delta.
         """
+        if current_active is None and active is not None:
+            current_active = active
+
         if current_time is None:
             current_time = datetime.now(timezone.utc)
         elif current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=timezone.utc)
 
         target_model = target_model or self.model_name or "gemini"
-        model_key = "claude" if "claude" in target_model.lower() else "gemini"
+        try:
+            model_key = normalize_model_name(target_model)
+        except Exception:
+            model_key = "claude" if "claude" in str(target_model).lower() else "gemini"
 
         # Resolve cooldowns from cooldown_manager if not provided explicitly
         if cooldowns is None and self.cooldown_manager is not None:
@@ -245,19 +306,27 @@ class RotationEngine:
             for acc_id, q_data in raw_dict.items():
                 items.append((acc_id, q_data if isinstance(q_data, dict) else {}))
         elif isinstance(accounts, list):
+            cached_data: dict[str, Any] | None = None
             for acc in accounts:
-                if not isinstance(acc, dict):
-                    continue
-                acc_name = acc.get("name") or acc.get("account") or acc.get("id")
-                if not acc_name:
-                    continue
-                if current_active is None and acc.get("is_active"):
-                    current_active = acc_name
-                if "quota" in acc and isinstance(acc["quota"], dict):
-                    q_data = acc["quota"]
-                else:
-                    q_data = acc
-                items.append((acc_name, q_data))
+                if isinstance(acc, str):
+                    acc_name = acc.strip()
+                    if not acc_name:
+                        continue
+                    if cached_data is None:
+                        cached_data = self._load_quota_cache()
+                    q_data = cached_data.get(acc_name, {})
+                    items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
+                elif isinstance(acc, dict):
+                    acc_name = acc.get("name") or acc.get("account") or acc.get("id")
+                    if not acc_name:
+                        continue
+                    if current_active is None and acc.get("is_active"):
+                        current_active = acc_name
+                    if "quota" in acc and isinstance(acc["quota"], dict):
+                        q_data = acc["quota"]
+                    else:
+                        q_data = acc
+                    items.append((acc_name, q_data))
 
         if current_active is None:
             current_active = self.active_account_id
