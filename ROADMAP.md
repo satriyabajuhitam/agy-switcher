@@ -72,6 +72,9 @@ Detail spesifikasi teknis dan analisis dampak sistem terdokumentasi di [`.scratc
   - Perintah `agy-switch rename <old_alias> <new_alias>`.
 
 ### Pilar 5: Modularisasi Arsitektur Internal (Zero External Dependencies)
-- **Status**: Prioritas 1 (Upcoming)
+- **Status**: Prioritas 1 (Upcoming / Architecture Settled - ADR 0009)
 - **Deskripsi**:
-  - Refaktorisasi berkas monolit `scripts/agy_switch.py` menjadi sub-paket internal terstruktur di bawah `scripts/agy_switcher/` (`vault.py`, `telemetry.py`, `rotation.py`, `supervisor.py`, `formatters.py`, `cli.py`) dengan entry point tetap kompatibel.
+  - Refaktorisasi berkas monolit `scripts/agy_switch.py` (4.064 baris) dan daemon `scripts/watch.py` (1.609 baris) menjadi sub-paket internal terstruktur di bawah `scripts/agy_switcher/` dengan *Strict 5-Layer DAG* (Layer 0: `exceptions.py`, `models.py`; Layer 1: `supervisor.py`, `formatters.py`, `telemetry.py`; Layer 2: `vault.py`, `rotation.py`, `watcher.py`; Layer 3: `doctor.py`, `hook.py`; Layer 4: `cli.py`).
+  - Mengubah `scripts/agy_switch.py` dan `scripts/watch.py` menjadi *Re-Export Facade Launchers* berbobot ringan untuk menjamin kompatibilitas mundur 100%.
+  - Penerapan *Dynamic Module Proxy Bridge* pada `hook.py` guna menjamin zero-regression pada seluruh 505 test case eksisting.
+
