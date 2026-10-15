@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive unit tests for Layer 2 Vault Engine and Layer 3 PreInvocation Hook modularization."""
 
+import base64
 import io
 import json
 import os
@@ -21,7 +22,7 @@ from agy_switcher.exceptions import (
     AgySwitchError,
     InvalidTokenError,
 )
-from agy_switcher.doctor import DoctorEngine
+from agy_switcher.doctor import DoctorEngine, DEFAULT_GEMINI_DIR
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.vault import (
     AgySwitchEngine,
@@ -31,6 +32,7 @@ from agy_switcher.vault import (
     validate_token_dict,
     validate_token_file,
 )
+import agy_switcher.telemetry as telemetry_mod
 from agy_switcher.hook import (
     handle_pre_invocation_hook,
     _is_stale_exhausted_cache,
@@ -39,6 +41,7 @@ from agy_switcher.hook import (
     _get_quota_client_class,
     _get_rotation_engine_class,
 )
+
 
 
 def create_sample_token(email: str = "test@example.com") -> dict:
@@ -203,6 +206,304 @@ class TestHookLifecycleModular(unittest.TestCase):
             self.assertEqual(ret, 0)
             mock_fetch.assert_called_once()
 
+    def test_hook_stale_cache_deduplicated_from_telemetry(self):
+        """_is_stale_exhausted_cache in hook must be imported directly from telemetry."""
+        self.assertIs(_is_stale_exhausted_cache, telemetry_mod._is_stale_exhausted_cache)
+
+
+class TestSecurityLayer0(unittest.TestCase):
+    """Unit tests for Layer 0 security.py module and token primitives."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_security_layer0_direct_import(self):
+        """Security primitives must be importable from agy_switcher.security."""
+        from agy_switcher.security import (
+            _atomic_write_file,
+            _atomic_write_json,
+            extract_email_from_jwt,
+            validate_token_dict,
+            validate_token_file,
+        )
+        self.assertTrue(callable(_atomic_write_file))
+        self.assertTrue(callable(_atomic_write_json))
+        self.assertTrue(callable(extract_email_from_jwt))
+        self.assertTrue(callable(validate_token_dict))
+        self.assertTrue(callable(validate_token_file))
+
+    def test_security_layer0_no_higher_layer_imports(self):
+        """security.py must not import modules above Layer 0."""
+        import ast
+        security_file = REPO_ROOT / "scripts" / "agy_switcher" / "security.py"
+        self.assertTrue(security_file.is_file())
+        tree = ast.parse(security_file.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(alias.name.startswith("agy_switcher.supervisor"))
+                    self.assertFalse(alias.name.startswith("agy_switcher.telemetry"))
+                    self.assertFalse(alias.name.startswith("agy_switcher.vault"))
+                    self.assertFalse(alias.name.startswith("agy_switcher.rotation"))
+                    self.assertFalse(alias.name.startswith("agy_switcher.doctor"))
+                    self.assertFalse(alias.name.startswith("agy_switcher.hook"))
+                    self.assertFalse(alias.name.startswith("agy_switcher.cli"))
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                self.assertFalse(mod.startswith("agy_switcher.supervisor"))
+                self.assertFalse(mod.startswith("agy_switcher.telemetry"))
+                self.assertFalse(mod.startswith("agy_switcher.vault"))
+                self.assertFalse(mod.startswith("agy_switcher.rotation"))
+                self.assertFalse(mod.startswith("agy_switcher.doctor"))
+                self.assertFalse(mod.startswith("agy_switcher.hook"))
+                self.assertFalse(mod.startswith("agy_switcher.cli"))
+
+    def test_atomic_write_file_permissions(self):
+        from agy_switcher.security import _atomic_write_file
+        target = self.base_path / "sub" / "secret.txt"
+        _atomic_write_file(target, "secret_content", mode=0o600)
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_text(encoding="utf-8"), "secret_content")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(target.parent.stat().st_mode), 0o700)
+
+    def test_atomic_write_json_custom_mode_and_indent(self):
+        from agy_switcher.security import _atomic_write_json
+        target = self.base_path / "custom.json"
+        _atomic_write_json(target, {"key": "value"}, mode=0o644, indent=4)
+        self.assertTrue(target.is_file())
+        data = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(data, {"key": "value"})
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_extract_email_from_jwt_edge_cases(self):
+        from agy_switcher.security import extract_email_from_jwt
+        tok = create_sample_token("user@example.com")
+        self.assertEqual(extract_email_from_jwt(tok["id_token"]), "user@example.com")
+        self.assertIsNone(extract_email_from_jwt(""))
+        self.assertIsNone(extract_email_from_jwt("corrupt"))
+        self.assertIsNone(extract_email_from_jwt("a.b"))
+        self.assertIsNone(extract_email_from_jwt("a.not_json.c"))
+
+    def test_validate_token_dict_and_file_edge_cases(self):
+        from agy_switcher.security import validate_token_dict, validate_token_file
+        tok = create_sample_token("valid@example.com")
+        self.assertEqual(validate_token_dict(tok), tok)
+
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict("not-a-dict")
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict({})
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict({"token": "not-a-dict"})
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict({"token": {"access_token": "a"}, "auth_method": "oauth"})
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict({
+                "token": {"access_token": "a", "refresh_token": "r", "token_type": "Bearer", "expiry": "e"},
+                "id_token": "jwt",
+            })
+
+        token_file = self.base_path / "token.json"
+        with self.assertRaises(InvalidTokenError):
+            validate_token_file(token_file)
+
+        token_file.write_text("invalid json", encoding="utf-8")
+        with self.assertRaises(InvalidTokenError):
+            validate_token_file(token_file)
+
+        token_file.write_text(json.dumps(tok), encoding="utf-8")
+        self.assertEqual(validate_token_file(token_file), tok)
+
+
+class TestDoctorHardening(unittest.TestCase):
+    """Unit tests for DoctorEngine hardening (positional 3-arg init & watch.log audit)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.accounts_dir = self.vault_dir / "accounts"
+        self.cache_dir = self.vault_dir / "cache"
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.accounts_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.vault_dir, 0o700)
+        os.chmod(self.accounts_dir, 0o700)
+        os.chmod(self.cache_dir, 0o700)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_doctor_engine_init_positional_3_arguments(self):
+        """DoctorEngine(vault_dir, accounts_dir, cache_dir) maps directories accurately."""
+        custom_accounts = self.base_path / "custom_accounts"
+        custom_cache = self.base_path / "custom_cache"
+        doc = DoctorEngine(self.vault_dir, custom_accounts, custom_cache)
+
+        self.assertEqual(doc.vault_dir, self.vault_dir)
+        self.assertEqual(doc.accounts_dir, custom_accounts)
+        self.assertEqual(doc.cache_dir, custom_cache)
+        # Must NOT map custom_accounts to gemini_dir or custom_cache to proc_dir
+        self.assertEqual(doc.gemini_dir, DEFAULT_GEMINI_DIR)
+        self.assertEqual(doc.proc_dir, Path("/proc"))
+
+    def test_doctor_engine_watch_log_permissions_audit_and_fix(self):
+        """DoctorEngine._check_permissions audits watch.log (0600) and fixes insecure modes."""
+        watch_log = self.vault_dir / "watch.log"
+        watch_log.write_text("2026-10-15 [watch] started\n", encoding="utf-8")
+        os.chmod(watch_log, 0o644)
+
+        doc = DoctorEngine(vault_dir=self.vault_dir)
+        report = doc.run_diagnostics()
+        perm_item = next(it for it in report.items if it.category == "permissions")
+        self.assertEqual(perm_item.status, "FAIL")
+        self.assertTrue(perm_item.can_fix)
+        self.assertIn("watch.log", perm_item.message)
+
+        fixes = doc.fix_diagnostics(report)
+        self.assertTrue(len(fixes) > 0)
+        self.assertEqual(stat.S_IMODE(watch_log.stat().st_mode), 0o600)
+
+        # Re-check after fix
+        report2 = doc.run_diagnostics()
+        perm_item2 = next(it for it in report2.items if it.category == "permissions")
+        self.assertEqual(perm_item2.status, "PASS")
+
+    def test_doctor_engine_init_positional_4_arguments_with_supervisor(self):
+        """DoctorEngine(vault, gemini, proc, supervisor) handles legacy 4-arg signature cleanly without TypeError."""
+        from agy_switcher.supervisor import ProcessSupervisor
+        sup = ProcessSupervisor()
+        doc = DoctorEngine(self.vault_dir, self.base_path / "custom_gemini", Path("/proc"), sup)
+
+        self.assertEqual(doc.vault_dir, self.vault_dir)
+        self.assertEqual(doc.gemini_dir, self.base_path / "custom_gemini")
+        self.assertEqual(doc.proc_dir, Path("/proc"))
+        self.assertIs(doc.supervisor, sup)
+        self.assertEqual(doc.accounts_dir, self.vault_dir / "accounts")
+        self.assertEqual(doc.cache_dir, self.vault_dir / "cache")
+        self.assertEqual(doc.config_file, self.vault_dir / "config.json")
+
+    def test_doctor_engine_init_positional_3_arguments_with_proc(self):
+        """DoctorEngine(vault, gemini, /proc) maps /proc to proc_dir, NOT cache_dir."""
+        doc = DoctorEngine(self.vault_dir, self.base_path / "custom_gemini", Path("/proc"))
+
+        self.assertEqual(doc.vault_dir, self.vault_dir)
+        self.assertEqual(doc.gemini_dir, self.base_path / "custom_gemini")
+        self.assertEqual(doc.proc_dir, Path("/proc"))
+        self.assertEqual(doc.accounts_dir, self.vault_dir / "accounts")
+        self.assertEqual(doc.cache_dir, self.vault_dir / "cache")
+
+    def test_doctor_engine_property_setters(self):
+        """DoctorEngine property setters update custom paths dynamically."""
+        doc = DoctorEngine(vault_dir=self.vault_dir)
+        new_acc = self.base_path / "new_acc"
+        new_cache = self.base_path / "new_cache"
+        new_cfg = self.base_path / "new_cfg.json"
+        new_desktop = self.base_path / "new_desktop"
+        new_cli = self.base_path / "new_cli"
+
+        doc.accounts_dir = new_acc
+        doc.cache_dir = new_cache
+        doc.config_file = new_cfg
+        doc.desktop_token_file = new_desktop
+        doc.cli_token_file = new_cli
+
+        self.assertEqual(doc.accounts_dir, new_acc)
+        self.assertEqual(doc.cache_dir, new_cache)
+        self.assertEqual(doc.config_file, new_cfg)
+        self.assertEqual(doc.desktop_token_file, new_desktop)
+        self.assertEqual(doc.cli_token_file, new_cli)
+
+
+class TestSecurityEdgeCasesAndTupleValidators(unittest.TestCase):
+    """Unit tests for string paths, tuple validators, and defensive JWT edge cases in security.py."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_security_string_paths_support(self):
+        """_atomic_write_file, _atomic_write_json, validate_token_file accept string paths."""
+        from agy_switcher.security import _atomic_write_file, _atomic_write_json, validate_token_file
+        str_file = str(self.base_path / "str_write.txt")
+        _atomic_write_file(str_file, "string_path_content")
+        self.assertTrue(Path(str_file).is_file())
+        self.assertEqual(Path(str_file).read_text(encoding="utf-8"), "string_path_content")
+
+        str_json = str(self.base_path / "str_write.json")
+        _atomic_write_json(str_json, {"hello": "world"})
+        self.assertTrue(Path(str_json).is_file())
+
+        tok = create_sample_token("str@example.com")
+        tok_file = str(self.base_path / "tok.json")
+        Path(tok_file).write_text(json.dumps(tok), encoding="utf-8")
+        val = validate_token_file(tok_file)
+        self.assertEqual(val["auth_method"], "oauth")
+
+    def test_security_tuple_validators(self):
+        """check_token_dict and check_token_file return non-raising tuples."""
+        from agy_switcher.security import check_token_dict, check_token_file, validate_token_dict, validate_token_file
+        tok = create_sample_token("tuple@example.com")
+
+        # Valid cases
+        ok, err = check_token_dict(tok)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+
+        ok2, err2 = validate_token_dict(tok, return_tuple=True)
+        self.assertTrue(ok2)
+        self.assertIsNone(err2)
+
+        tok_file = self.base_path / "tuple_tok.json"
+        tok_file.write_text(json.dumps(tok), encoding="utf-8")
+        ok_f, err_f, data = check_token_file(tok_file)
+        self.assertTrue(ok_f)
+        self.assertIsNone(err_f)
+        self.assertEqual(data, tok)
+
+        ok_f2, err_f2, data2 = validate_token_file(tok_file, return_tuple=True)
+        self.assertTrue(ok_f2)
+        self.assertIsNone(err_f2)
+        self.assertEqual(data2, tok)
+
+        # Invalid cases
+        ok_bad, err_bad = check_token_dict({"invalid": "schema"})
+        self.assertFalse(ok_bad)
+        self.assertIsNotNone(err_bad)
+
+        bad_file = self.base_path / "nonexistent.json"
+        ok_bad_f, err_bad_f, bad_data = check_token_file(bad_file)
+        self.assertFalse(ok_bad_f)
+        self.assertIsNotNone(err_bad_f)
+        self.assertIsNone(bad_data)
+
+    def test_extract_email_from_jwt_extra_defensive(self):
+        """extract_email_from_jwt handles None, non-strings, and malformed email payloads."""
+        from agy_switcher.security import extract_email_from_jwt
+        self.assertIsNone(extract_email_from_jwt(None))
+        self.assertIsNone(extract_email_from_jwt(12345))  # type: ignore
+
+        # JWT with whitespace email or non-string email
+        header = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode("utf-8").rstrip("=")
+        body_empty = base64.urlsafe_b64encode(b'{"email":""}').decode("utf-8").rstrip("=")
+        body_ws = base64.urlsafe_b64encode(b'{"email":"   "}').decode("utf-8").rstrip("=")
+        body_num = base64.urlsafe_b64encode(b'{"email":999}').decode("utf-8").rstrip("=")
+        body_arr = base64.urlsafe_b64encode(b'[1, 2, 3]').decode("utf-8").rstrip("=")
+
+        self.assertIsNone(extract_email_from_jwt(f"{header}.{body_empty}.sig"))
+        self.assertIsNone(extract_email_from_jwt(f"{header}.{body_ws}.sig"))
+        self.assertIsNone(extract_email_from_jwt(f"{header}.{body_num}.sig"))
+        self.assertIsNone(extract_email_from_jwt(f"{header}.{body_arr}.sig"))
+
 
 if __name__ == "__main__":
     unittest.main()
+

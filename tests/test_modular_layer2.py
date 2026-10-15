@@ -137,6 +137,7 @@ class TestLayer2DAGCompliance(unittest.TestCase):
         allowed_modules = {
             "agy_switcher.exceptions",
             "agy_switcher.models",
+            "agy_switcher.security",
             "agy_switcher.supervisor",
         }
 

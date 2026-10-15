@@ -38,7 +38,7 @@ _parent_dir = os.path.dirname(_real_script_dir)
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
-# Layer 0: Exceptions & Models
+# Layer 0: Exceptions, Models & Security
 from agy_switcher.exceptions import (
     AccountNotFoundError,
     ActiveTurnRunningError,
@@ -52,6 +52,15 @@ from agy_switcher.models import (
     DiagnosticReport,
     EvaluationCandidate,
     QuotaStatus,
+)
+from agy_switcher.security import (
+    _atomic_write_file,
+    _atomic_write_json,
+    extract_email_from_jwt,
+    validate_token_dict,
+    validate_token_file,
+    check_token_dict,
+    check_token_file,
 )
 
 # Layer 1: Services, Formatters & Telemetry
@@ -91,12 +100,8 @@ from agy_switcher.vault import (
     DEFAULT_LEGACY_ROOT,
     DEFAULT_VAULT_DIR,
     AgySwitchEngine,
-    _atomic_write_file,
-    _atomic_write_json,
-    extract_email_from_jwt,
-    validate_token_dict,
-    validate_token_file,
 )
+
 from agy_switcher.rotation import RotationEngine
 from agy_switcher.doctor import (
     DoctorEngine,
@@ -166,6 +171,8 @@ __all__ = [
     "extract_email_from_jwt",
     "validate_token_dict",
     "validate_token_file",
+    "check_token_dict",
+    "check_token_file",
     "RotationEngine",
     "DoctorEngine",
     "run_doctor",

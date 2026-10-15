@@ -11,7 +11,6 @@ Does not import Layer 3 (hook) or Layer 4 (cli).
 
 from __future__ import annotations
 
-import base64
 from datetime import datetime, timezone
 import json
 import math
@@ -34,6 +33,13 @@ from agy_switcher.exceptions import (
     InvalidTokenError,
 )
 from agy_switcher.models import DiagnosticItem, DiagnosticReport
+from agy_switcher.security import (
+    _atomic_write_file,
+    _atomic_write_json,
+    extract_email_from_jwt,
+    validate_token_dict,
+    validate_token_file,
+)
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.telemetry import (
     _parse_timestamp_defensive,
@@ -46,81 +52,8 @@ DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_LEGACY_ROOT = Path.home() / ".agy-cli-manager"
 
 
-def _atomic_write_file(target_path: Path, content: str, mode: int = 0o600) -> None:
-    """Writes content to a target path atomically with specified permissions."""
-    target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp_fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=f"{target_path.name}.tmp-")
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.chmod(tmp_file, mode)
-        os.replace(tmp_file, target_path)
-        tmp_file = None
-    finally:
-        if tmp_file and os.path.exists(tmp_file):
-            try:
-                os.unlink(tmp_file)
-            except OSError:
-                pass
-
-
-def _atomic_write_json(target_path: Path, payload: dict[str, Any]) -> None:
-    """Writes JSON to a target path atomically with 0600 permissions."""
-    _atomic_write_file(target_path, json.dumps(payload, indent=2) + "\n", mode=0o600)
-
-
-def extract_email_from_jwt(id_token: str) -> str | None:
-    """Decodes JWT payload to extract user email without external dependencies."""
-    try:
-        parts = id_token.split(".")
-        if len(parts) >= 2:
-            payload = parts[1]
-            payload += "=" * (-len(payload) % 4)
-            decoded = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")))
-            return decoded.get("email")
-    except Exception:
-        return None
-    return None
-
-
-def validate_token_dict(data: Any) -> dict[str, Any]:
-    """Validates that data complies with Google OAuth token JSON schema."""
-    if not isinstance(data, dict):
-        raise InvalidTokenError("Token payload must be a JSON object.")
-
-    token_obj = data.get("token")
-    if not isinstance(token_obj, dict):
-        raise InvalidTokenError("Missing required 'token' object in payload.")
-
-    required_token_keys = ("access_token", "refresh_token", "token_type", "expiry")
-    missing_keys = [k for k in required_token_keys if not token_obj.get(k)]
-    if missing_keys:
-        raise InvalidTokenError(f"Missing required token fields: {', '.join(missing_keys)}")
-
-    if not data.get("auth_method"):
-        raise InvalidTokenError("Missing required 'auth_method' field.")
-
-    id_token = data.get("id_token")
-    if not id_token or not isinstance(id_token, str):
-        raise InvalidTokenError("Missing or invalid 'id_token' JWT field.")
-
-    return data
-
-
-def validate_token_file(token_path: Path) -> dict[str, Any]:
-    """Reads and validates a token file from disk."""
-    if not token_path.is_file():
-        raise InvalidTokenError(f"Token file does not exist: {token_path}")
-    try:
-        raw = token_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as e:
-        raise InvalidTokenError(f"Failed to read/parse token JSON: {e}") from e
-
-    return validate_token_dict(data)
-
-
 class AgySwitchEngine:
+
     """Unified Facade managing account vaulting, auto-migration, dual-destination token swaps, and diagnostics."""
 
     def __init__(

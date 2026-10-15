@@ -24,6 +24,7 @@ from agy_switcher.telemetry import (
     _has_auth_indicator,
     _is_auth_error,
     _is_network_error,
+    _is_stale_exhausted_cache,
 )
 from agy_switcher.vault import AgySwitchEngine
 
@@ -64,40 +65,6 @@ def _get_error_classifiers() -> tuple[Callable, Callable]:
     auth_fn = getattr(mod, "_is_auth_error", None) if mod else None
     net_fn = getattr(mod, "_is_network_error", None) if mod else None
     return (auth_fn or _is_auth_error), (net_fn or _is_network_error)
-
-
-def _is_stale_exhausted_cache(
-    cached_entry: Any,
-    rot_engine: Any,
-    model_key: str,
-    now: float,
-    ttl_seconds: float = 300.0,
-    clock_skew_tolerance: float = 5.0,
-) -> bool:
-    """Returns True if cached_entry is non-dict, unparseable, or holds a 0% quota that is stale/expired."""
-    if not isinstance(cached_entry, dict):
-        return True
-    status = rot_engine.get_quota_status(cached_entry, model_key=model_key)
-    if status is None:
-        return True
-    if status.fraction > 0.0:
-        return False
-    cached_at_val = cached_entry.get("cached_at")
-    try:
-        c_at = float(cached_at_val)
-        if not math.isfinite(c_at) or c_at <= 0 or isinstance(cached_at_val, bool):
-            c_at = 0.0
-    except (ValueError, TypeError, OverflowError):
-        c_at = 0.0
-
-    is_expired = (c_at <= 0.0) or (now - c_at > ttl_seconds) or (now - c_at < -clock_skew_tolerance)
-    try:
-        curr_dt = datetime.fromtimestamp(now, tz=timezone.utc)
-        is_reset_elapsed = status.reset_time <= curr_dt
-    except (ValueError, TypeError, OverflowError, OSError):
-        is_reset_elapsed = False
-
-    return is_expired or is_reset_elapsed
 
 
 def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:

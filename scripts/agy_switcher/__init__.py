@@ -24,6 +24,14 @@ _EXPORTS: dict[str, str] = {
     "DiagnosticReport": "agy_switcher.models",
     "QuotaStatus": "agy_switcher.models",
     "EvaluationCandidate": "agy_switcher.models",
+    # Layer 0: Security
+    "_atomic_write_file": "agy_switcher.security",
+    "_atomic_write_json": "agy_switcher.security",
+    "extract_email_from_jwt": "agy_switcher.security",
+    "validate_token_dict": "agy_switcher.security",
+    "validate_token_file": "agy_switcher.security",
+    "check_token_dict": "agy_switcher.security",
+    "check_token_file": "agy_switcher.security",
     # Layer 1: Supervisor
     "ProcessSupervisor": "agy_switcher.supervisor",
     # Layer 1: Formatters
@@ -54,9 +62,7 @@ _EXPORTS: dict[str, str] = {
     "DEFAULT_VAULT_DIR": "agy_switcher.vault",
     "DEFAULT_GEMINI_DIR": "agy_switcher.vault",
     "DEFAULT_LEGACY_ROOT": "agy_switcher.vault",
-    "extract_email_from_jwt": "agy_switcher.vault",
-    "validate_token_dict": "agy_switcher.vault",
-    "validate_token_file": "agy_switcher.vault",
+
     # Layer 2: Rotation
     "RotationEngine": "agy_switcher.rotation",
     # Layer 2: Doctor

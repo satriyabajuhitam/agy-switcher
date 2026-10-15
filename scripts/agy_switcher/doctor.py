@@ -7,7 +7,6 @@ Strictly acyclic DAG: Does NOT import vault.py at the module level.
 
 from __future__ import annotations
 
-import base64
 from datetime import datetime, timezone
 import json
 import math
@@ -16,90 +15,22 @@ from pathlib import Path
 import shlex
 import shutil
 import stat
-import tempfile
 import time
 from typing import Any, Callable
 
 from agy_switcher.exceptions import InvalidTokenError
 from agy_switcher.models import DiagnosticItem, DiagnosticReport
+from agy_switcher.security import (
+    _atomic_write_file,
+    _atomic_write_json,
+    extract_email_from_jwt,
+    validate_token_dict,
+    validate_token_file,
+)
 from agy_switcher.supervisor import ProcessSupervisor
 
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
-
-
-def _atomic_write_file(target_path: Path, content: str, mode: int = 0o600) -> None:
-    """Writes content to a target path atomically with specified permissions."""
-    target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp_fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=f"{target_path.name}.tmp-")
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.chmod(tmp_file, mode)
-        os.replace(tmp_file, target_path)
-        tmp_file = None
-    finally:
-        if tmp_file and os.path.exists(tmp_file):
-            try:
-                os.unlink(tmp_file)
-            except OSError:
-                pass
-
-
-def _atomic_write_json(target_path: Path, payload: dict[str, Any]) -> None:
-    """Writes JSON to a target path atomically with 0600 permissions."""
-    _atomic_write_file(target_path, json.dumps(payload, indent=2) + "\n", mode=0o600)
-
-
-def extract_email_from_jwt(id_token: str) -> str | None:
-    """Decodes JWT payload to extract user email without external dependencies."""
-    try:
-        parts = id_token.split(".")
-        if len(parts) >= 2:
-            payload = parts[1]
-            payload += "=" * (-len(payload) % 4)
-            decoded = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")))
-            return decoded.get("email")
-    except Exception:
-        return None
-    return None
-
-
-def validate_token_dict(data: Any) -> dict[str, Any]:
-    """Validates that data complies with Google OAuth token JSON schema."""
-    if not isinstance(data, dict):
-        raise InvalidTokenError("Token payload must be a JSON object.")
-
-    token_obj = data.get("token")
-    if not isinstance(token_obj, dict):
-        raise InvalidTokenError("Missing required 'token' object in payload.")
-
-    required_token_keys = ("access_token", "refresh_token", "token_type", "expiry")
-    missing_keys = [k for k in required_token_keys if not token_obj.get(k)]
-    if missing_keys:
-        raise InvalidTokenError(f"Missing required token fields: {', '.join(missing_keys)}")
-
-    if not data.get("auth_method"):
-        raise InvalidTokenError("Missing required 'auth_method' field.")
-
-    id_token = data.get("id_token")
-    if not id_token or not isinstance(id_token, str):
-        raise InvalidTokenError("Missing or invalid 'id_token' JWT field.")
-
-    return data
-
-
-def validate_token_file(token_path: Path) -> dict[str, Any]:
-    """Reads and validates a token file from disk."""
-    if not token_path.is_file():
-        raise InvalidTokenError(f"Token file does not exist: {token_path}")
-    try:
-        raw = token_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as e:
-        raise InvalidTokenError(f"Failed to read/parse token JSON: {e}") from e
-
-    return validate_token_dict(data)
 
 
 class DoctorEngine:
@@ -108,17 +39,14 @@ class DoctorEngine:
     def __init__(
         self,
         vault_dir: Path | str | None = None,
-        gemini_dir_or_accounts: Path | str | None = None,
-        proc_dir_or_cache: Path | str | None = None,
-        supervisor_or_config: Any | None = None,
+        accounts_dir: Path | str | None = None,
+        cache_dir: Path | str | None = None,
+        config_file: Path | str | None = None,
         desktop_token_file: Path | str | None = None,
         cli_token_file: Path | str | None = None,
         supervisor: ProcessSupervisor | None = None,
         engine_callbacks: dict[str, Any] | None = None,
         *,
-        accounts_dir: Path | str | None = None,
-        cache_dir: Path | str | None = None,
-        config_file: Path | str | None = None,
         gemini_dir: Path | str | None = None,
         proc_dir: Path | str | None = None,
         hook_installer: Callable[[Path | None], Path] | None = None,
@@ -129,37 +57,38 @@ class DoctorEngine:
     ) -> None:
         self.engine = engine
 
-        is_spec_positional = (
-            desktop_token_file is not None
-            or cli_token_file is not None
-            or (
-                supervisor_or_config is not None
-                and not isinstance(supervisor_or_config, ProcessSupervisor)
-            )
-        )
-
-        if is_spec_positional:
-            resolved_accounts = accounts_dir or gemini_dir_or_accounts
-            resolved_cache = cache_dir or proc_dir_or_cache
-            resolved_config = config_file or supervisor_or_config
-            resolved_desktop = desktop_token_file
-            resolved_cli = cli_token_file
-            resolved_supervisor = supervisor or (
-                supervisor_or_config if isinstance(supervisor_or_config, ProcessSupervisor) else None
-            )
+        # Positional arguments disambiguation
+        if isinstance(config_file, ProcessSupervisor):
+            # Legacy 4-positional call: DoctorEngine(vault_dir, gemini_dir, proc_dir, supervisor)
+            resolved_supervisor = config_file
+            resolved_config = None
+            resolved_gemini = gemini_dir or accounts_dir
+            resolved_proc = proc_dir or cache_dir
+            resolved_accounts = None
+            resolved_cache = None
+        elif (
+            accounts_dir is not None
+            and cache_dir is not None
+            and config_file is None
+            and desktop_token_file is None
+            and cli_token_file is None
+            and (str(cache_dir) in ("/proc", "/proc/") or cache_dir == Path("/proc"))
+        ):
+            # Legacy 3-positional call with /proc: DoctorEngine(vault_dir, gemini_dir, proc_dir)
+            resolved_supervisor = supervisor
+            resolved_config = None
+            resolved_gemini = gemini_dir or accounts_dir
+            resolved_proc = proc_dir or cache_dir
+            resolved_accounts = None
+            resolved_cache = None
+        else:
+            # Canonical spec constructor: DoctorEngine(vault_dir, accounts_dir, cache_dir, config_file, ...)
+            resolved_supervisor = supervisor
+            resolved_config = config_file
             resolved_gemini = gemini_dir
             resolved_proc = proc_dir
-        else:
-            resolved_gemini = gemini_dir or gemini_dir_or_accounts
-            resolved_proc = proc_dir or proc_dir_or_cache
-            resolved_supervisor = supervisor or (
-                supervisor_or_config if isinstance(supervisor_or_config, ProcessSupervisor) else None
-            )
             resolved_accounts = accounts_dir
             resolved_cache = cache_dir
-            resolved_config = config_file
-            resolved_desktop = desktop_token_file
-            resolved_cli = cli_token_file
 
         if engine is not None:
             self._vault_dir = getattr(engine, "vault_dir", Path(vault_dir or DEFAULT_VAULT_DIR))
@@ -175,8 +104,9 @@ class DoctorEngine:
         self._accounts_dir = Path(resolved_accounts).expanduser() if resolved_accounts else None
         self._cache_dir = Path(resolved_cache).expanduser() if resolved_cache else None
         self._config_file = Path(resolved_config).expanduser() if resolved_config else None
-        self._desktop_token_file = Path(resolved_desktop).expanduser() if resolved_desktop else None
-        self._cli_token_file = Path(resolved_cli).expanduser() if resolved_cli else None
+        self._desktop_token_file = Path(desktop_token_file).expanduser() if desktop_token_file else None
+        self._cli_token_file = Path(cli_token_file).expanduser() if cli_token_file else None
+
 
         if engine_callbacks:
             sync_tokens_callback = (
@@ -243,6 +173,10 @@ class DoctorEngine:
             return Path(self.engine.accounts_dir)
         return self.vault_dir / "accounts"
 
+    @accounts_dir.setter
+    def accounts_dir(self, val: Path | str) -> None:
+        self._accounts_dir = Path(val).expanduser()
+
     @property
     def active_file(self) -> Path:
         return self.vault_dir / "active"
@@ -255,6 +189,10 @@ class DoctorEngine:
             return Path(self.engine.cache_dir)
         return self.vault_dir / "cache"
 
+    @cache_dir.setter
+    def cache_dir(self, val: Path | str) -> None:
+        self._cache_dir = Path(val).expanduser()
+
     @property
     def config_file(self) -> Path:
         if self._config_file is not None:
@@ -263,17 +201,29 @@ class DoctorEngine:
             return Path(self.engine.config_file)
         return self.vault_dir / "config.json"
 
+    @config_file.setter
+    def config_file(self, val: Path | str) -> None:
+        self._config_file = Path(val).expanduser()
+
     @property
     def desktop_token_file(self) -> Path:
         if self._desktop_token_file is not None:
             return self._desktop_token_file
         return self.gemini_dir / "jetski-standalone-oauth-token"
 
+    @desktop_token_file.setter
+    def desktop_token_file(self, val: Path | str) -> None:
+        self._desktop_token_file = Path(val).expanduser()
+
     @property
     def cli_token_file(self) -> Path:
         if self._cli_token_file is not None:
             return self._cli_token_file
         return self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+
+    @cli_token_file.setter
+    def cli_token_file(self, val: Path | str) -> None:
+        self._cli_token_file = Path(val).expanduser()
 
     @property
     def supervisor(self) -> ProcessSupervisor:
@@ -479,6 +429,9 @@ class DoctorEngine:
         watch_pid = self.vault_dir / "watch.pid"
         if (watch_pid.is_file() or watch_pid.is_symlink()) and watch_pid.exists():
             files_to_check.append(watch_pid)
+        watch_log = self.vault_dir / "watch.log"
+        if (watch_log.is_file() or watch_log.is_symlink()) and watch_log.exists():
+            files_to_check.append(watch_log)
 
         for f in files_to_check:
             try:
@@ -1075,6 +1028,9 @@ class DoctorEngine:
                     watch_pid = self.vault_dir / "watch.pid"
                     if (watch_pid.is_file() or watch_pid.is_symlink()) and watch_pid.exists():
                         _safe_chmod(watch_pid, 0o600)
+                    watch_log = self.vault_dir / "watch.log"
+                    if (watch_log.is_file() or watch_log.is_symlink()) and watch_log.exists():
+                        _safe_chmod(watch_log, 0o600)
 
                     if chmod_errors:
                         item.fixed = False

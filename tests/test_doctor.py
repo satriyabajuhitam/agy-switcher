@@ -213,12 +213,16 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         os.chmod(self.engine.active_file, 0o644)
         os.chmod(self.engine.cache_file, 0o666)
         os.chmod(self.vault_dir / "watch.pid", 0o644)
+        watch_log = self.vault_dir / "watch.log"
+        watch_log.write_text("test log\n", encoding="utf-8")
+        os.chmod(watch_log, 0o644)
 
         report = self.engine.run_diagnostics()
         perm_item = next(it for it in report.items if it.category == "permissions")
         self.assertEqual(perm_item.status, "FAIL")
         self.assertTrue(perm_item.can_fix)
         self.assertIn("Insecure permissions", perm_item.message)
+        self.assertIn("watch.log", perm_item.message)
 
         # Fix diagnostics
         fixes = self.engine.fix_diagnostics(report)
@@ -233,11 +237,13 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.engine.active_file.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.engine.cache_file.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.vault_dir / "watch.pid").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(watch_log.stat().st_mode), 0o600)
 
         # Post-fix report should be PASS
         post_report = self.engine.run_diagnostics()
         post_perm = next(it for it in post_report.items if it.category == "permissions")
         self.assertEqual(post_perm.status, "PASS")
+
 
     # ---------------------------------------------------------
     # Layer 2: Token & Identity Integrity

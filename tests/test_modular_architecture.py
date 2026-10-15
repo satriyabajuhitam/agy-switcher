@@ -47,6 +47,7 @@ PACKAGE_LAYER_MAP: dict[str, int] = {
     # Layer 0: Foundation
     "exceptions.py": 0,
     "models.py": 0,
+    "security.py": 0,
     # Layer 1: Core Services & IO
     "supervisor.py": 1,
     "formatters.py": 1,
@@ -72,6 +73,7 @@ LAUNCHER_LAYER_MAP: dict[str, int] = {
 MODULE_NAME_TO_LAYER: dict[str, int] = {
     "exceptions": 0,
     "models": 0,
+    "security": 0,
     "supervisor": 1,
     "formatters": 1,
     "telemetry": 1,
@@ -83,6 +85,7 @@ MODULE_NAME_TO_LAYER: dict[str, int] = {
     "hook": 3,
     "cli": 4,
 }
+
 
 
 class TestModularArchitectureDAG(unittest.TestCase):
