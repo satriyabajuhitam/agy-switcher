@@ -1289,6 +1289,16 @@ class TestQuotaClient(unittest.TestCase):
         source = inspect.getsource(agy_switch)
         self.assertNotIn("def _is_valid_entry", source)
 
+    def test_modular_telemetry_compatibility(self):
+        """Verify agy_switcher.telemetry QuotaClient compatibility with tests."""
+        from agy_switcher.telemetry import QuotaClient as ModQuotaClient
+        mod_client = ModQuotaClient(cache_dir=self.cache_dir)
+        self.assertEqual(mod_client.client_id, self.client.client_id)
+        self.assertEqual(mod_client.client_secret, self.client.client_secret)
+        self.assertTrue(hasattr(mod_client, "parse_quota_response"))
+        self.assertTrue(hasattr(mod_client, "save_cache"))
+        self.assertTrue(hasattr(mod_client, "load_cache"))
+
 
 if __name__ == "__main__":
     unittest.main()

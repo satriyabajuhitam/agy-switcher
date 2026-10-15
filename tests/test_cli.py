@@ -199,7 +199,7 @@ class TestCLI(unittest.TestCase):
         self.assertIn("buckets", acc1["quota"]["gemini"])
 
     @patch('agy_switch.QuotaClient')
-    def test_quota_subcommand_json_sanitizes_claude(self, mock_qc_class):
+    def test_quota_subcommand_json_preserves_claude(self, mock_qc_class):
         mock_qc = mock_qc_class.return_value
         mock_qc.fetch_quota.return_value = {
             "gemini": {
@@ -225,8 +225,46 @@ class TestCLI(unittest.TestCase):
         data = json.loads(buf.getvalue())
         for acc in data["accounts"]:
             self.assertIn("gemini", acc["quota"])
-            self.assertNotIn("claude", acc["quota"])
-            self.assertEqual(list(acc["quota"].keys()), ["gemini"])
+            self.assertIn("claude", acc["quota"])
+            self.assertEqual(set(acc["quota"].keys()), {"gemini", "claude"})
+
+    @patch('agy_switch.QuotaClient')
+    def test_quota_subcommand_model_claude_sorting(self, mock_qc_class):
+        """agy-switch quota --model claude --json sorts accounts by Claude quota descending."""
+        self.engine.get_account_tokens.side_effect = lambda name: {
+            "acc1": {"access_token": "tok1"},
+            "acc2": {"access_token": "tok2"},
+        }.get(name)
+        mock_qc = mock_qc_class.return_value
+        mock_qc.fetch_quota.side_effect = lambda tok, refresh_token=None, on_refresh=None: {
+            "tok1": {
+                "gemini": {"quota": 90, "reset_time": 1791201600, "cached": False, "buckets": {}},
+                "claude": {"quota": 20, "reset_time": 1791201600, "cached": False, "buckets": {}},
+            },
+            "tok2": {
+                "gemini": {"quota": 30, "reset_time": 1791201600, "cached": False, "buckets": {}},
+                "claude": {"quota": 85, "reset_time": 1791201600, "cached": False, "buckets": {}},
+            },
+        }.get(tok, {})
+        mock_qc.load_cache.return_value = {}
+
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            exit_code = main(["quota", "--model", "claude", "--json"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        data = json.loads(buf.getvalue())
+        order = [a["name"] for a in data["accounts"]]
+        self.assertEqual(order[0], "acc2")  # Claude 85% > 20%
+        self.assertEqual(order[1], "acc1")
+
+    def test_quota_subcommand_invalid_model_error(self):
+        """agy-switch quota --model invalid outputs error and returns exit code 1."""
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            exit_code = main(["quota", "--model", "unsupported"], engine=self.engine)
+            self.assertEqual(exit_code, 1)
+        self.assertIn("Unsupported model 'unsupported'", buf.getvalue())
 
     def test_list_format_listicle(self):
         buf = io.StringIO()

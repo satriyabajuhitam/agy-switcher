@@ -50,6 +50,26 @@ class TestLogWatcher(unittest.TestCase):
             
             self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=False, force=True)
 
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_trigger_switch_aborts_when_all_exhausted(self, sleep_mock):
+        line = "RESOURCE_EXHAUSTED (code 429)"
+        self.engine_mock.get_active_name.return_value = 'acc1'
+        self.engine_mock.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True, "is_active": True},
+                {"name": "acc2", "valid": True, "is_active": False},
+            ]
+        }
+        with patch("scripts.watch.RotationEngine") as rot_engine_class_mock:
+            rot_engine_mock = MagicMock()
+            rot_engine_class_mock.return_value = rot_engine_mock
+            rot_engine_mock.evaluate.return_value = None
+
+            switched = self.watcher.process_line(line)
+            self.assertFalse(switched)
+            self.engine_mock.switch_tokens.assert_not_called()
+
     def test_infer_target_model_claude_keywords(self):
         self.assertEqual(
             self.watcher.infer_target_model("RESOURCE_EXHAUSTED (code 429) for claude-3-5-sonnet"),

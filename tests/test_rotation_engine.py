@@ -303,7 +303,124 @@ class TestRotationEngine(unittest.TestCase):
         self.assertEqual(status_zero.fraction, 0.0)
         self.assertTrue(status_zero.is_exhausted())
 
+    def test_evaluate_list_of_strings_with_nested_cache(self):
+        """RotationEngine.evaluate(['acc1', 'acc2'], active='acc1') resolves nested 'accounts' cache dict."""
+        import tempfile
+        import json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_dir = Path(tmpdir)
+            cache_dir = vault_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "timestamp": int(self.base_time.timestamp()),
+                "accounts": {
+                    "acc1": {
+                        "gemini": {"quota": 10, "reset_time": int((self.base_time).timestamp()) + 3600}
+                    },
+                    "acc2": {
+                        "gemini": {"quota": 90, "reset_time": int((self.base_time).timestamp()) + 3600}
+                    },
+                },
+            }
+            (cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+
+            engine = RotationEngine(vault_dir=vault_dir, model_name="gemini")
+            best = engine.evaluate(["acc1", "acc2"], active="acc1", current_time=self.base_time)
+            self.assertEqual(best, "acc2")
+
+    def test_init_model_vs_local_directory(self):
+        """RotationEngine('claude') does not misidentify model name as local directory path even if dir exists."""
+        import tempfile
+        import os
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                os.mkdir("claude")
+                os.mkdir("gemini")
+
+                # Must resolve to model 'claude', not vault_dir
+                engine_claude = RotationEngine("claude")
+                self.assertEqual(engine_claude.model_name, "claude")
+                self.assertEqual(engine_claude.target_model_key, "claude")
+                self.assertIsNone(engine_claude.vault_dir)
+
+                # Must resolve to model 'gemini', not vault_dir
+                engine_gemini = RotationEngine("gemini")
+                self.assertEqual(engine_gemini.model_name, "gemini")
+                self.assertEqual(engine_gemini.target_model_key, "gemini")
+                self.assertIsNone(engine_gemini.vault_dir)
+
+                # Specific slug must resolve to model
+                engine_slug = RotationEngine("claude-3-5-sonnet")
+                self.assertEqual(engine_slug.model_name, "claude-3-5-sonnet")
+                self.assertEqual(engine_slug.target_model_key, "claude")
+                self.assertIsNone(engine_slug.vault_dir)
+
+                # Explicit relative path must still resolve to vault_dir
+                engine_path = RotationEngine("./claude")
+                self.assertIsNotNone(engine_path.vault_dir)
+                self.assertEqual(engine_path.vault_dir, Path("./claude").expanduser())
+            finally:
+                os.chdir(old_cwd)
+
+    def test_evaluate_dict_with_accounts_list(self):
+        """RotationEngine.evaluate with standard dict {'active': ..., 'accounts': [...]} evaluates correctly."""
+        engine = RotationEngine(model_name="gemini")
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "quota": {"gemini": {"quota": 10, "reset_time": int(self.base_time.timestamp()) + 3600}}},
+                {"name": "acc2", "quota": {"gemini": {"quota": 90, "reset_time": int(self.base_time.timestamp()) + 3600}}},
+            ],
+        }
+        best = engine.evaluate(data, current_time=self.base_time)
+        self.assertEqual(best, "acc2")
+
+    def test_evaluate_list_of_dicts_without_quota_field_using_cache(self):
+        """RotationEngine.evaluate([{'name': 'acc1'}, {'name': 'acc2'}]) falls back to cached quota."""
+        import tempfile
+        import json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_dir = Path(tmpdir)
+            cache_dir = vault_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "timestamp": int(self.base_time.timestamp()),
+                "accounts": {
+                    "acc1": {"gemini": {"quota": 10, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                    "acc2": {"gemini": {"quota": 90, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                },
+            }
+            (cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+
+            engine = RotationEngine(vault_dir=vault_dir, model_name="gemini")
+            best = engine.evaluate([{"name": "acc1"}, {"name": "acc2"}], active="acc1", current_time=self.base_time)
+            self.assertEqual(best, "acc2")
+
+    def test_evaluate_mixed_list_str_and_dict(self):
+        """RotationEngine.evaluate(['acc1', {'name': 'acc2', ...}]) handles mixed list seamlessly."""
+        import tempfile
+        import json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_dir = Path(tmpdir)
+            cache_dir = vault_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "timestamp": int(self.base_time.timestamp()),
+                "accounts": {
+                    "acc1": {"gemini": {"quota": 10, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                },
+            }
+            (cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+
+            engine = RotationEngine(vault_dir=vault_dir, model_name="gemini")
+            mixed = ["acc1", {"name": "acc2", "quota": {"gemini": {"quota": 95, "reset_time": int(self.base_time.timestamp()) + 3600}}}]
+            best = engine.evaluate(mixed, active="acc1", current_time=self.base_time)
+            self.assertEqual(best, "acc2")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
