@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 import sys
 
@@ -250,6 +250,85 @@ class TestProcessSupervisor(unittest.TestCase):
             with patch.object(self.supervisor, "is_server_busy", return_value=True):
                 with self.assertRaises(ActiveTurnRunningError):
                     self.supervisor.restart_language_server(force=False)
+
+    def test_restart_language_server_force_clean_sigterm_no_sigkill(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=False):
+                with patch.object(self.supervisor, "_send_signal") as mock_send:
+                    with patch.object(self.supervisor, "_poll_process_exit", return_value=True) as mock_poll:
+                        res = self.supervisor.restart_language_server(force=True)
+                        self.assertTrue(res)
+                        mock_send.assert_called_once_with(456, signal.SIGTERM)
+                        mock_poll.assert_called_once_with(456, timeout=3.0)
+
+    def test_restart_language_server_sigkill_escalation_on_timeout(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=False):
+                with patch.object(self.supervisor, "_send_signal") as mock_send:
+                    with patch.object(self.supervisor, "_poll_process_exit", side_effect=[False, True]) as mock_poll:
+                        res = self.supervisor.restart_language_server(force=True)
+                        self.assertTrue(res)
+                        mock_send.assert_has_calls([call(456, signal.SIGTERM), call(456, signal.SIGKILL)], any_order=False)
+                        mock_poll.assert_has_calls([call(456, timeout=3.0), call(456, timeout=1.0)], any_order=False)
+
+    def test_restart_language_server_sigkill_escalation_fails_after_sigkill(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=False):
+                with patch.object(self.supervisor, "_send_signal") as mock_send:
+                    with patch.object(self.supervisor, "_poll_process_exit", side_effect=[False, False]) as mock_poll:
+                        res = self.supervisor.restart_language_server(force=True)
+                        self.assertFalse(res)
+                        mock_send.assert_has_calls([call(456, signal.SIGTERM), call(456, signal.SIGKILL)], any_order=False)
+                        mock_poll.assert_has_calls([call(456, timeout=3.0), call(456, timeout=1.0)], any_order=False)
+
+    def test_restart_language_server_no_escalation_when_not_force(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=False):
+                with patch.object(self.supervisor, "_send_signal") as mock_send:
+                    with patch.object(self.supervisor, "_poll_process_exit", return_value=False) as mock_poll:
+                        res = self.supervisor.restart_language_server(force=False)
+                        self.assertFalse(res)
+                        mock_send.assert_called_once_with(456, signal.SIGTERM)
+                        mock_poll.assert_called_once_with(456, timeout=3.0)
+
+    def test_restart_language_server_sigkill_handles_oserror(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=False):
+                with patch.object(self.supervisor, "_send_signal", side_effect=[None, OSError("Process died")]) as mock_send:
+                    with patch.object(self.supervisor, "_poll_process_exit", side_effect=[False, True]) as mock_poll:
+                        res = self.supervisor.restart_language_server(force=True)
+                        self.assertTrue(res)
+                        mock_send.assert_has_calls([call(456, signal.SIGTERM), call(456, signal.SIGKILL)], any_order=False)
+                        mock_poll.assert_has_calls([call(456, timeout=3.0), call(456, timeout=1.0)], any_order=False)
+
+    def test_restart_language_server_force_when_busy(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=True):
+                with patch.object(self.supervisor, "_send_signal") as mock_send:
+                    with patch.object(self.supervisor, "_poll_process_exit", return_value=True) as mock_poll:
+                        res = self.supervisor.restart_language_server(force=True)
+                        self.assertTrue(res)
+                        mock_send.assert_called_once_with(456, signal.SIGTERM)
+                        mock_poll.assert_called_once_with(456, timeout=3.0)
+
+    def test_restart_language_server_force_pid_none(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=None):
+            self.assertFalse(self.supervisor.restart_language_server(force=True))
+
+    def test_restart_language_server_sigterm_process_lookup_error(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=False):
+                with patch.object(self.supervisor, "_send_signal", side_effect=ProcessLookupError("Process disappeared")):
+                    with patch.object(self.supervisor, "_poll_process_exit") as mock_poll:
+                        res = self.supervisor.restart_language_server(force=True)
+                        self.assertTrue(res)
+                        mock_poll.assert_not_called()
+
+    def test_poll_process_exit_permission_error_returns_false(self):
+        with patch("os.kill", side_effect=PermissionError(1, "Operation not permitted")):
+            self.assertFalse(self.supervisor._poll_process_exit(456, timeout=0.1))
+
+
 
 
 class TestLayer1Formatters(unittest.TestCase):

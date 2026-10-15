@@ -114,8 +114,12 @@ class ProcessSupervisor:
             try:
                 os.kill(pid, 0)
                 time.sleep(0.1)
-            except OSError:
+            except ProcessLookupError:
                 return True
+            except OSError as exc:
+                if getattr(exc, "errno", None) == 3:  # errno.ESRCH
+                    return True
+                return False
         return False
 
     def verify_turn_safety(self, force: bool = False, pid: int | None = None) -> None:
@@ -132,15 +136,37 @@ class ProcessSupervisor:
             )
 
     def restart_language_server(self, force: bool = False) -> bool:
-        """Restarts language_server gracefully via SIGTERM so WSL Relay auto-respawns it."""
+        """Restarts language_server gracefully via SIGTERM so WSL Relay auto-respawns it.
+
+        If force=True and the process fails to exit within 3.0s, escalates to SIGKILL
+        and polls for up to 1.0s.
+        """
         pid = self.locate_language_server_pid()
         if pid is None:
             return False
 
         self.verify_turn_safety(force=force, pid=pid)
 
-        self._send_signal(pid, signal.SIGTERM)
-        return self._poll_process_exit(pid, timeout=3.0)
+        try:
+            self._send_signal(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+
+        if self._poll_process_exit(pid, timeout=3.0):
+            return True
+
+        if not force:
+            return False
+
+        try:
+            self._send_signal(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass
+
+        return self._poll_process_exit(pid, timeout=1.0)
+
 
 
 __all__ = ["ProcessSupervisor"]
