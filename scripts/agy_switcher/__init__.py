@@ -48,6 +48,11 @@ _EXPORTS: dict[str, str] = {
     "_parse_timestamp_defensive": "agy_switcher.telemetry",
     "_parse_quota_defensive": "agy_switcher.telemetry",
     "_sanitize_expires_in": "agy_switcher.telemetry",
+    # Layer 2: Vault
+    "AgySwitchEngine": "agy_switcher.vault",
+    "DEFAULT_VAULT_DIR": "agy_switcher.vault",
+    "DEFAULT_GEMINI_DIR": "agy_switcher.vault",
+    "DEFAULT_LEGACY_ROOT": "agy_switcher.vault",
     # Layer 2: Rotation
     "RotationEngine": "agy_switcher.rotation",
     # Layer 2: Doctor
@@ -63,6 +68,8 @@ _EXPORTS: dict[str, str] = {
     "CooldownManager": "agy_switcher.watcher",
     "LogWatcher": "agy_switcher.watcher",
     "DaemonManager": "agy_switcher.watcher",
+    # Layer 3: Hook
+    "handle_pre_invocation_hook": "agy_switcher.hook",
 }
 
 __all__ = list(_EXPORTS.keys())
