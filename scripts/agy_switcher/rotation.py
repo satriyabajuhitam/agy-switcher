@@ -43,13 +43,22 @@ class RotationEngine:
             if isinstance(vault_or_model, Path):
                 resolved_vault = vault_or_model
             elif isinstance(vault_or_model, str):
-                is_path = (
+                is_explicit_path = (
                     "/" in vault_or_model
                     or "\\" in vault_or_model
                     or vault_or_model.startswith((".", "~"))
-                    or os.path.isdir(vault_or_model)
                 )
-                if is_path:
+                is_known_model = False
+                try:
+                    normalize_model_name(vault_or_model)
+                    is_known_model = True
+                except Exception:
+                    is_known_model = False
+
+                if not is_explicit_path and is_known_model:
+                    if resolved_model is None:
+                        resolved_model = vault_or_model
+                elif is_explicit_path or os.path.isdir(vault_or_model):
                     resolved_vault = Path(vault_or_model).expanduser()
                 else:
                     if resolved_model is None:
@@ -313,8 +322,13 @@ class RotationEngine:
                     if not acc_name:
                         continue
                     if cached_data is None:
-                        cached_data = self._load_quota_cache()
-                    q_data = cached_data.get(acc_name, {})
+                        raw_cache = self._load_quota_cache()
+                        if isinstance(raw_cache, dict):
+                            accounts_field = raw_cache.get("accounts")
+                            cached_data = accounts_field if isinstance(accounts_field, dict) else raw_cache
+                        else:
+                            cached_data = {}
+                    q_data = cached_data.get(acc_name, {}) if isinstance(cached_data, dict) else {}
                     items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
                 elif isinstance(acc, dict):
                     acc_name = acc.get("name") or acc.get("account") or acc.get("id")

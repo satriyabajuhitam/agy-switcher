@@ -361,6 +361,86 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
         self.assertEqual(len(res["accounts"]), 2)
         mock_client.save_cache.assert_called_once()
 
+    def test_run_quota_pipeline_preserves_claude_quota(self):
+        """run_quota_pipeline retains Claude quota models and does not mark pure Claude accounts as error."""
+        mock_engine = MagicMock()
+        mock_engine.get_account_tokens.side_effect = lambda name: {
+            "acc_claude": {"access_token": "token_claude"},
+            "acc_gemini": {"access_token": "token_gemini"},
+            "acc_hybrid": {"access_token": "token_hybrid"},
+        }.get(name)
+        mock_client = MagicMock()
+        mock_client.load_cache.return_value = {}
+
+        def mock_fetch(tok, refresh_token=None, on_refresh=None):
+            if tok == "token_claude":
+                return {
+                    "claude": {"quota": 80, "reset_time": 1700001000, "cached": False, "buckets": {}}
+                }
+            elif tok == "token_gemini":
+                return {
+                    "gemini": {"quota": 90, "reset_time": 1700002000, "cached": False, "buckets": {}}
+                }
+            elif tok == "token_hybrid":
+                return {
+                    "gemini": {"quota": 30, "reset_time": 1700003000, "cached": False, "buckets": {}},
+                    "claude": {"quota": 95, "reset_time": 1700003000, "cached": False, "buckets": {}},
+                }
+            return {}
+
+        mock_client.fetch_quota.side_effect = mock_fetch
+
+        data = {"accounts": [{"name": "acc_claude"}, {"name": "acc_gemini"}, {"name": "acc_hybrid"}]}
+        res = run_quota_pipeline(mock_engine, data, client=mock_client)
+
+        # Verify save_cache was called with all valid quotas including Claude
+        self.assertTrue(mock_client.save_cache.called)
+        saved_cache = mock_client.save_cache.call_args[0][0]
+        self.assertIn("acc_claude", saved_cache["accounts"])
+        self.assertIn("acc_gemini", saved_cache["accounts"])
+        self.assertIn("acc_hybrid", saved_cache["accounts"])
+
+        acc_map = {a["name"]: a for a in res["accounts"]}
+        # acc_claude must retain claude quota and NOT be marked Unreachable
+        self.assertIn("claude", acc_map["acc_claude"]["quota"])
+        self.assertEqual(acc_map["acc_claude"]["quota"]["claude"]["quota"], 80)
+        self.assertNotIn("error", acc_map["acc_claude"]["quota"])
+
+        # acc_hybrid must retain both gemini and claude
+        self.assertIn("gemini", acc_map["acc_hybrid"]["quota"])
+        self.assertIn("claude", acc_map["acc_hybrid"]["quota"])
+
+        # Sorting by claude model must place acc_hybrid (95%) before acc_claude (80%)
+        sorted_by_claude = sort_accounts_by_quota(res["accounts"], target_model="claude")
+        claude_order = [a["name"] for a in sorted_by_claude]
+        self.assertEqual(claude_order[0], "acc_hybrid")
+        self.assertEqual(claude_order[1], "acc_claude")
+
+    def test_run_quota_pipeline_claude_cache_fallback(self):
+        """run_quota_pipeline falls back to cached Claude quota when live fetch fails."""
+        mock_engine = MagicMock()
+        mock_engine.get_account_tokens.return_value = {"access_token": "fake_token"}
+        mock_client = MagicMock()
+        mock_client.load_cache.return_value = {
+            "timestamp": 1700000000,
+            "accounts": {
+                "acc_claude": {
+                    "claude": {"quota": 75, "reset_time": 1700001000, "cached": False, "buckets": {}}
+                }
+            },
+        }
+        mock_client.fetch_quota.return_value = None
+
+        data = {"accounts": [{"name": "acc_claude"}]}
+        res = run_quota_pipeline(mock_engine, data, client=mock_client)
+        acc_map = {a["name"]: a for a in res["accounts"]}
+
+        self.assertIn("claude", acc_map["acc_claude"]["quota"])
+        self.assertEqual(acc_map["acc_claude"]["quota"]["claude"]["quota"], 75)
+        self.assertTrue(acc_map["acc_claude"]["quota"]["claude"]["cached"])
+        self.assertNotIn("error", acc_map["acc_claude"]["quota"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

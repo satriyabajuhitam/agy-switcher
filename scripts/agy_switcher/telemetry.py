@@ -865,6 +865,7 @@ def run_quota_pipeline(
     engine: Any,
     data: dict[str, Any] | None,
     client: QuotaClient | None = None,
+    target_model: str = "gemini",
 ) -> dict[str, Any]:
     """Executes the standard quota telemetry pipeline:
 
@@ -894,7 +895,7 @@ def run_quota_pipeline(
     # 2. Extract valid quotas and merge into cache
     valid_quotas: dict[str, Any] = {}
     for name, q in raw_quotas.items():
-        if isinstance(q, dict) and not q.get("error") and q.get("gemini"):
+        if isinstance(q, dict) and not q.get("error") and (q.get("gemini") or q.get("claude")):
             valid_quotas[name] = q
 
     if valid_quotas:
@@ -917,11 +918,17 @@ def run_quota_pipeline(
         acc_name = acc.get("name", "")
         live_q = raw_quotas.get(acc_name)
 
-        if isinstance(live_q, dict) and not live_q.get("error") and live_q.get("gemini"):
-            # Live telemetry succeeded: sanitize to strictly {"gemini": gemini_copy}
-            gemini_copy = dict(live_q["gemini"])
-            gemini_copy["cached"] = False
-            acc["quota"] = {"gemini": gemini_copy}
+        if isinstance(live_q, dict) and not live_q.get("error") and (live_q.get("gemini") or live_q.get("claude")):
+            # Live telemetry succeeded: retain all valid model keys (gemini, claude)
+            new_quota: dict[str, Any] = {}
+            for k in ("gemini", "claude"):
+                if isinstance(live_q.get(k), dict):
+                    m_copy = dict(live_q[k])
+                    m_copy["cached"] = False
+                    new_quota[k] = m_copy
+                elif k in live_q and live_q[k] is not None:
+                    new_quota[k] = live_q[k]
+            acc["quota"] = new_quota
         else:
             # Live fetch failed or error returned: check cache
             cached_acc = cached_accounts.get(acc_name)
@@ -931,24 +938,39 @@ def run_quota_pipeline(
                 and not cached_acc["gemini"].get("error")
                 and "quota" in cached_acc["gemini"]
             )
+            has_valid_claude_cache = (
+                isinstance(cached_acc, dict)
+                and isinstance(cached_acc.get("claude"), dict)
+                and not cached_acc["claude"].get("error")
+                and "quota" in cached_acc["claude"]
+            )
             has_legacy_cache = (
                 isinstance(cached_acc, dict)
                 and "quota" in cached_acc
                 and not cached_acc.get("error")
             )
 
+            fallback_quota: dict[str, Any] = {}
             if has_valid_gemini_cache:
                 gemini_copy = dict(cached_acc["gemini"])
                 gemini_copy["cached"] = True
-                acc["quota"] = {"gemini": gemini_copy}
-            elif has_legacy_cache:
+                fallback_quota["gemini"] = gemini_copy
+            if has_valid_claude_cache:
+                claude_copy = dict(cached_acc["claude"])
+                claude_copy["cached"] = True
+                fallback_quota["claude"] = claude_copy
+
+            if not fallback_quota and has_legacy_cache:
                 gemini_copy = {
                     "quota": cached_acc.get("quota", 0),
                     "reset_time": cached_acc.get("reset_time", 0),
                     "cached": True,
                     "buckets": {},
                 }
-                acc["quota"] = {"gemini": gemini_copy}
+                fallback_quota["gemini"] = gemini_copy
+
+            if fallback_quota:
+                acc["quota"] = fallback_quota
             else:
                 # No cache available: mark as Unreachable
                 acc["quota"] = {
@@ -958,5 +980,6 @@ def run_quota_pipeline(
 
     # 4. Sort accounts deterministically
     result = dict(data)
-    result["accounts"] = sort_accounts_by_quota(accounts)
+    result["accounts"] = sort_accounts_by_quota(accounts, target_model=target_model)
     return result
+

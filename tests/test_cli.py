@@ -199,7 +199,7 @@ class TestCLI(unittest.TestCase):
         self.assertIn("buckets", acc1["quota"]["gemini"])
 
     @patch('agy_switch.QuotaClient')
-    def test_quota_subcommand_json_sanitizes_claude(self, mock_qc_class):
+    def test_quota_subcommand_json_preserves_claude(self, mock_qc_class):
         mock_qc = mock_qc_class.return_value
         mock_qc.fetch_quota.return_value = {
             "gemini": {
@@ -225,8 +225,8 @@ class TestCLI(unittest.TestCase):
         data = json.loads(buf.getvalue())
         for acc in data["accounts"]:
             self.assertIn("gemini", acc["quota"])
-            self.assertNotIn("claude", acc["quota"])
-            self.assertEqual(list(acc["quota"].keys()), ["gemini"])
+            self.assertIn("claude", acc["quota"])
+            self.assertEqual(set(acc["quota"].keys()), {"gemini", "claude"})
 
     def test_list_format_listicle(self):
         buf = io.StringIO()
