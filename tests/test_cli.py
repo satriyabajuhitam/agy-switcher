@@ -11,7 +11,14 @@ from unittest.mock import MagicMock, patch
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
 
-from agy_switch import main, AgySwitchEngine, QuotaClient, RotationEngine, InvalidThresholdError
+from agy_switch import (
+    main,
+    AgySwitchEngine,
+    QuotaClient,
+    RotationEngine,
+    InvalidThresholdError,
+    ActiveTurnRunningError,
+)
 
 class TestCLI(unittest.TestCase):
 
@@ -113,8 +120,84 @@ class TestCLI(unittest.TestCase):
             exit_code = main(["switch", "--auto"], engine=self.engine)
             self.assertEqual(exit_code, 0)
         
-        # Verify rotation
+        # Verify rotation defaults force=True under ADR 0010
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True)
+
+    @patch('agy_switch.RotationEngine')
+    @patch('agy_switch.QuotaClient')
+    def test_switch_auto_rotate_no_restart(self, mock_qc_class, mock_re_class):
+        mock_qc = mock_qc_class.return_value
+        mock_qc.fetch_quota.return_value = {"gemini": {"quota": 10}}
+
+        mock_re = mock_re_class.return_value
+        mock_re.evaluate.return_value = "acc2"
+
+        with patch('sys.stdout'):
+            exit_code = main(["switch", "--auto", "--no-restart"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        # Verify auto-switch with --no-restart passes restart_server=False and force=True
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=False, force=True)
+
+    def test_manual_switch_default_force_false(self):
+        with patch('sys.stdout'):
+            exit_code = main(["switch", "acc2"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        # Verify manual switch preserves force=False by default (turn safety)
         self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=False)
+
+    def test_manual_switch_with_force(self):
+        with patch('sys.stdout'):
+            exit_code = main(["switch", "acc2", "--force"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        # Verify manual switch with --force passes force=True
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True)
+
+    def test_manual_switch_no_restart(self):
+        with patch('sys.stdout'):
+            exit_code = main(["switch", "acc2", "--no-restart"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        # Verify manual switch with --no-restart passes restart_server=False and force=False
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=False, force=False)
+
+    def test_manual_switch_active_turn_error(self):
+        self.engine.switch_tokens.side_effect = ActiveTurnRunningError(
+            "Active turn running on language_server PID 12345"
+        )
+        err_buf = io.StringIO()
+        with patch('sys.stderr', err_buf):
+            exit_code = main(["switch", "acc2"], engine=self.engine)
+            self.assertEqual(exit_code, 2)
+
+        self.assertIn("Warning: Active turn running on language_server PID 12345", err_buf.getvalue())
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=False)
+
+    def test_manual_switch_with_force_and_no_restart(self):
+        with patch('sys.stdout'):
+            exit_code = main(["switch", "acc2", "--force", "--no-restart"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        # Verify manual switch with both --force and --no-restart
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=False, force=True)
+
+    @patch('agy_switch.RotationEngine')
+    @patch('agy_switch.QuotaClient')
+    def test_switch_auto_with_explicit_force(self, mock_qc_class, mock_re_class):
+        mock_qc = mock_qc_class.return_value
+        mock_qc.fetch_quota.return_value = {"gemini": {"quota": 10}}
+
+        mock_re = mock_re_class.return_value
+        mock_re.evaluate.return_value = "acc2"
+
+        with patch('sys.stdout'):
+            exit_code = main(["switch", "--auto", "--force"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        # Verify auto-switch with explicit --force preserves force=True
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True)
 
     @patch('agy_switch.QuotaClient')
     def test_quota_subcommand_table(self, mock_qc_class):

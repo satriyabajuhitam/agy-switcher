@@ -167,7 +167,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         with patch("sys.stdout", buf):
             code = main(["switch", "--auto", "--model", "gemini"], engine=self.engine)
         self.assertEqual(code, 0)
-        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=False)
+        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=True)
 
     @patch("agy_switch.fetch_all_accounts_quota")
     def test_resolution_hierarchy_config_used_when_cli_flag_omitted(self, mock_fetch):
@@ -190,7 +190,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         with patch("sys.stdout", buf):
             code = main(["switch", "--auto"], engine=self.engine)
         self.assertEqual(code, 0)
-        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=False)
+        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=True)
 
     @patch("agy_switch.fetch_all_accounts_quota")
     def test_strict_quota_isolation_all_exhausted(self, mock_fetch):
@@ -268,7 +268,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         with patch("sys.stdout", buf):
             code = main(["switch", "--auto", "--model", "gemini"], engine=self.engine)
         self.assertEqual(code, 0)
-        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=False)
+        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=True)
 
     @patch("agy_switch.fetch_all_accounts_quota")
     def test_model_aware_cooldown_gemini_penalized_disqualified_for_gemini(self, mock_fetch):
@@ -389,7 +389,7 @@ class TestModelSteeringCLI(unittest.TestCase):
             code = main(["switch", "--auto", "--model", "claude"], engine=self.engine)
         self.assertEqual(code, 0)
         # Should select acc2 (85% Claude), not acc3 (which has higher Gemini 95%)
-        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=False)
+        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=True)
 
     @patch("agy_switch.fetch_all_accounts_quota")
     def test_active_account_optimal_for_claude(self, mock_fetch):
@@ -442,7 +442,7 @@ class TestModelSteeringCLI(unittest.TestCase):
         with patch("sys.stdout", buf):
             code = main(["switch", "--auto", "--model", "gemini"], engine=self.engine)
         self.assertEqual(code, 0)
-        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=False)
+        self.engine.switch_tokens.assert_called_with("acc2", restart_server=True, force=True)
 
     def test_rotation_engine_evaluate_default_model_parameter(self):
         """RotationEngine respects instance model_name when target_model is not explicitly passed."""

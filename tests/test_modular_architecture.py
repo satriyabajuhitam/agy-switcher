@@ -617,7 +617,7 @@ class TestCLIDispatcher(unittest.TestCase):
         with patch("sys.stdout"):
             code = main(["switch", "--auto"], engine=self.engine)
         self.assertEqual(code, 0)
-        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=False)
+        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True)
 
 
 if __name__ == "__main__":

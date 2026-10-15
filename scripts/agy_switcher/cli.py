@@ -530,11 +530,16 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             )
             return 1
 
+        is_auto = getattr(args, "auto", False)
+        # switch --auto automatically defaults force=True under ADR 0010; manual switch strictly requires --force
+        force_flag = True if is_auto else getattr(args, "force", False)
+        restart_flag = not getattr(args, "no_restart", False)
+
         try:
             res = engine.switch_tokens(
                 args.account,
-                restart_server=not args.no_restart,
-                force=args.force,
+                restart_server=restart_flag,
+                force=force_flag,
             )
             print(
                 f"[agy-switch] Successfully switched active account to '{res['active']}' ({res.get('email') or 'unknown'})."
@@ -543,7 +548,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             print("  - Updated: ~/.gemini/antigravity-cli/antigravity-oauth-token (Antigravity CLI)")
             if res.get("server_restarted"):
                 print("  - Server : Restarted language_server (new credentials loaded)")
-            elif not args.no_restart:
+            elif restart_flag:
                 print("  - Server : language_server not running or no restart needed")
             return 0
         except ActiveTurnRunningError as e:
