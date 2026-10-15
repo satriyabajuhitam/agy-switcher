@@ -79,7 +79,7 @@ Detail spesifikasi teknis dan analisis dampak sistem terdokumentasi di [`.scratc
 ### Pilar 5: Modularisasi Arsitektur Internal (Zero External Dependencies)
 - **Status**: Selesai (Shipped)
 - **Deskripsi**:
-  - Refaktorisasi berkas monolit `scripts/agy_switch.py` (4.064 baris) dan daemon `scripts/watch.py` (1.609 baris) menjadi sub-paket internal terstruktur di bawah `scripts/agy_switcher/` dengan *Strict 5-Layer DAG* (Layer 0: `exceptions.py`, `models.py`; Layer 1: `supervisor.py`, `formatters.py`, `telemetry.py`; Layer 2: `vault.py`, `rotation.py`, `doctor.py`, `watcher.py`; Layer 3: `hook.py`; Layer 4: `cli.py`, `__init__.py`, `agy_switch.py`, `watch.py`).
+  - Refaktorisasi berkas monolit `scripts/agy_switch.py` (4.064 baris) dan daemon `scripts/watch.py` (1.609 baris) menjadi sub-paket internal terstruktur di bawah `scripts/agy_switcher/` dengan *Strict 5-Layer DAG* (Layer 0: `exceptions.py`, `models.py`, `security.py`; Layer 1: `supervisor.py`, `formatters.py`, `telemetry.py`; Layer 2: `vault.py`, `rotation.py`, `doctor.py`, `watcher.py`, `presence.py`; Layer 3: `hook.py`; Layer 4: `cli.py`, `__init__.py`, `agy_switch.py`, `watch.py`).
   - Mengubah `scripts/agy_switch.py` dan `scripts/watch.py` menjadi *Re-Export Facade Launchers* berbobot ringan untuk menjamin kompatibilitas mundur 100%.
   - Penerapan *Dynamic Module Proxy Bridge* pada `hook.py` dan `cli.py` guna menjamin zero-regression pada seluruh test case eksisting.
   - Penyusunan suite validasi statis AST DAG dan uji isolasi namespace sub-proses pada `tests/test_modular_architecture.py`.

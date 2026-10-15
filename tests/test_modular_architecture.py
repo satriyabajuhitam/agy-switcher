@@ -2,9 +2,9 @@
 
 Validates:
 1. Strict 5-Layer DAG compliance via static AST analysis:
-   - Layer 0: exceptions.py, models.py
+   - Layer 0: exceptions.py, models.py, security.py
    - Layer 1: supervisor.py, formatters.py, telemetry.py
-   - Layer 2: vault.py, rotation.py, doctor.py, watcher.py
+   - Layer 2: vault.py, rotation.py, doctor.py, watcher.py, presence.py
    - Layer 3: hook.py
    - Layer 4: cli.py, __init__.py, agy_switch.py, watch.py
    - No module in Layer N imports from Layer >= N+1 at module level.
@@ -43,6 +43,27 @@ from agy_switcher.vault import AgySwitchEngine
 
 
 # 5-Layer Architectural Hierarchy
+MODULE_LAYERS: dict[str, int] = {
+    # Layer 0: Foundation
+    "agy_switcher.exceptions": 0,
+    "agy_switcher.models": 0,
+    "agy_switcher.security": 0,
+    # Layer 1: Core Services & IO
+    "agy_switcher.supervisor": 1,
+    "agy_switcher.formatters": 1,
+    "agy_switcher.telemetry": 1,
+    # Layer 2: Domain Engines
+    "agy_switcher.vault": 2,
+    "agy_switcher.rotation": 2,
+    "agy_switcher.doctor": 2,
+    "agy_switcher.watcher": 2,
+    "agy_switcher.presence": 2,
+    # Layer 3: Workflow & Orchestration
+    "agy_switcher.hook": 3,
+    # Layer 4: Presentation & Dispatch
+    "agy_switcher.cli": 4,
+}
+
 PACKAGE_LAYER_MAP: dict[str, int] = {
     # Layer 0: Foundation
     "exceptions.py": 0,
@@ -245,6 +266,27 @@ class TestModularArchitectureDAG(unittest.TestCase):
                             f"{file_path.name} imports external non-stdlib dependency from: {node.module}",
                         )
 
+    def test_module_layers_mapping_contains_all_twelve_submodules(self):
+        """Verifies MODULE_LAYERS contains all 12 internal submodules and mappings."""
+        self.assertEqual(MODULE_LAYERS.get("agy_switcher.security"), 0)
+        self.assertEqual(MODULE_LAYERS.get("agy_switcher.presence"), 2)
+        expected_twelve_submodules = [
+            "agy_switcher.exceptions",
+            "agy_switcher.models",
+            "agy_switcher.security",
+            "agy_switcher.supervisor",
+            "agy_switcher.formatters",
+            "agy_switcher.telemetry",
+            "agy_switcher.vault",
+            "agy_switcher.rotation",
+            "agy_switcher.doctor",
+            "agy_switcher.watcher",
+            "agy_switcher.presence",
+            "agy_switcher.hook",
+        ]
+        for submod in expected_twelve_submodules:
+            self.assertIn(submod, MODULE_LAYERS, f"Missing sub-module in MODULE_LAYERS: {submod}")
+
 
 class TestSubprocessNamespaceIsolation(unittest.TestCase):
     """Verifies pure isolated runtime imports via subprocess."""
@@ -360,6 +402,25 @@ class TestSubprocessNamespaceIsolation(unittest.TestCase):
             "assert 'agy_switcher.vault' not in sys.modules; "
             "assert 'agy_switcher.cli' not in sys.modules; "
             "assert 'agy_switcher.doctor' not in sys.modules; "
+            "assert 'agy_switch' not in sys.modules; "
+            "print('OK')",
+        ]
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertIn("OK", res.stdout)
+
+    def test_security_isolated_import(self):
+        """Importing security does not load Layer 1-4 modules or agy_switch into sys.modules."""
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "import agy_switcher.security; "
+            "assert 'agy_switcher.supervisor' not in sys.modules; "
+            "assert 'agy_switcher.telemetry' not in sys.modules; "
+            "assert 'agy_switcher.vault' not in sys.modules; "
+            "assert 'agy_switcher.doctor' not in sys.modules; "
+            "assert 'agy_switcher.cli' not in sys.modules; "
             "assert 'agy_switch' not in sys.modules; "
             "print('OK')",
         ]
