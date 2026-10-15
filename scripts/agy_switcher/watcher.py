@@ -527,7 +527,7 @@ class LogWatcher:
 
         return "gemini"
 
-    def process_line(self, line: str, is_jsonl: bool = False) -> bool:
+    def process_line(self, line: str, is_jsonl: bool = False, file_path: str | None = None) -> bool:
         if not line or not isinstance(line, str):
             return False
 
@@ -543,7 +543,7 @@ class LogWatcher:
         if not is_jsonl:
             if self.is_exhausted_message(line):
                 print(f"[watch] Detected quota exhaustion: {line.strip()}", file=sys.stderr)
-                return self.trigger_switch(line=line)
+                return self._dispatch_exhaustion(line=line, file_path=file_path)
             return False
 
         # Structured JSON-First Event Filtering
@@ -625,9 +625,28 @@ class LogWatcher:
         combined_text = " ".join(error_parts)
         if self.is_exhausted_message(combined_text):
             print(f"[watch] Detected structured JSON quota exhaustion: {combined_text.strip()[:160]}", file=sys.stderr)
-            return self.trigger_switch(line=combined_text)
+            return self._dispatch_exhaustion(line=combined_text, file_path=file_path)
 
         return False
+
+    def _dispatch_exhaustion(
+        self,
+        line: str = "",
+        model_hint: str | None = None,
+        file_path: str | None = None,
+    ) -> bool:
+        """Dispatches exhaustion handling, preserving overrides/mocks on trigger_switch."""
+        if getattr(self.trigger_switch, "__func__", None) is not LogWatcher.trigger_switch:
+            kwargs: dict[str, Any] = {"line": line}
+            if model_hint is not None:
+                kwargs["model_hint"] = model_hint
+            if file_path is not None:
+                kwargs["file_path"] = file_path
+            try:
+                return self.trigger_switch(**kwargs)
+            except TypeError:
+                return self.trigger_switch(line=line)
+        return self.handle_exhaustion(line=line, model_hint=model_hint, file_path=file_path)
 
     def get_cooldowns(self) -> dict:
         return self.cooldown_manager.get_cooldowns()
@@ -635,14 +654,29 @@ class LogWatcher:
     def set_cooldown(self, account_name: str, reset_time: float | None = None, reason: str = "RESOURCE_EXHAUSTED"):
         return self.cooldown_manager.set_cooldown(account_name, reset_time=reset_time, reason=reason)
 
-    def _notify_desktop(self, target_account: str, reason: str = "") -> None:
+    def _notify_desktop(
+        self,
+        target_account: str,
+        old_account: str | None = None,
+        reason: str = "",
+        reloaded: bool = False,
+    ) -> None:
         """Fires an asynchronous, non-blocking desktop notification via notify-send if installed."""
         shutil_mod = _get_shutil()
         notify_bin = shutil_mod.which("notify-send")
         if notify_bin:
             try:
+                if reloaded:
+                    if old_account:
+                        msg = f"🔄 Antigravity switched from '{old_account}' to '{target_account}' & reloaded language_server ({reason})"
+                    else:
+                        msg = f"🔄 Antigravity switched to '{target_account}' & reloaded language_server ({reason})"
+                elif old_account:
+                    msg = f"🔄 Antigravity switched from '{old_account}' to '{target_account}' ({reason})"
+                else:
+                    msg = f"Auto-rotated to '{target_account}' ({reason})"
                 _get_subprocess().Popen(
-                    [notify_bin, "agy-switch", f"Auto-rotated to '{target_account}' ({reason})"],
+                    [notify_bin, "agy-switch", msg],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -651,10 +685,30 @@ class LogWatcher:
 
         vault_dir = getattr(self.engine, "vault_dir", None)
         log_dir = Path(vault_dir) if isinstance(vault_dir, (str, Path)) else DEFAULT_VAULT_DIR
-        ts = datetime.now(timezone.utc).isoformat()
-        append_secure_log_entry(log_dir / "watch.log", f"[{ts}] Switched to '{target_account}' ({reason})\n")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        if old_account and reloaded:
+            log_line = f"[{ts}] [watch] Switched from '{old_account}' to '{target_account}' with force-restart language_server (reason: {reason})\n"
+        elif old_account:
+            log_line = f"[{ts}] [watch] Switched from '{old_account}' to '{target_account}' (reason: {reason})\n"
+        else:
+            log_line = f"[{ts}] Switched to '{target_account}' ({reason})\n"
+        append_secure_log_entry(log_dir / "watch.log", log_line)
 
-    def trigger_switch(self, line: str = "", model_hint: str | None = None) -> bool:
+    def trigger_switch(
+        self,
+        line: str = "",
+        model_hint: str | None = None,
+        file_path: str | None = None,
+    ) -> bool:
+        """Backward-compatible alias forwarding to handle_exhaustion."""
+        return self.handle_exhaustion(line=line, model_hint=model_hint, file_path=file_path)
+
+    def handle_exhaustion(
+        self,
+        line: str = "",
+        model_hint: str | None = None,
+        file_path: str | None = None,
+    ) -> bool:
         # Check damping window
         now = time.time()
         if self.last_switch_time > 0:
@@ -733,15 +787,55 @@ class LogWatcher:
 
         print(f"[watch] Switching from '{active_name}' to '{target_account}' mid-turn...", file=sys.stderr)
         try:
-            self.engine.switch_tokens(target_account, restart_server=False, force=True)
+            res = self.engine.switch_tokens(target_account, restart_server=True, force=True)
+
+            # Check for failure in return value
+            if res is False or res is None:
+                print(f"[watch] Failed to switch accounts to '{target_account}': switch_tokens returned {res}", file=sys.stderr)
+                return False
+            if isinstance(res, dict):
+                if res.get("success") is False:
+                    print(f"[watch] Failed to switch accounts to '{target_account}': {res.get('error', 'unsuccessful')}", file=sys.stderr)
+                    return False
+                if res.get("error") and not res.get("active"):
+                    print(f"[watch] Failed to switch accounts to '{target_account}': {res.get('error')}", file=sys.stderr)
+                    return False
+
             self.last_switch_time = time.time()
             print(f"[watch] Successfully switched to '{target_account}'.", file=sys.stderr)
 
-            # Fire non-blocking desktop notification
-            self._notify_desktop(target_account=target_account, reason=reason)
+            # Advance all active targets in self.file_cursors to EOF defensively and reset stagnant sizes
+            if file_path:
+                file_path_str = str(file_path)
+                if file_path_str not in self.file_cursors:
+                    self.file_cursors[file_path_str] = 0
 
-            # small sleep to avoid rapid re-triggering for the same error
-            _get_time().sleep(0.1)
+            for target_file in list(self.file_cursors.keys()):
+                try:
+                    if os.path.isfile(target_file):
+                        self.file_cursors[target_file] = os.path.getsize(target_file)
+                    else:
+                        self.file_cursors.pop(target_file, None)
+                except (OSError, ValueError):
+                    self.file_cursors.pop(target_file, None)
+
+            self._stagnant_sizes.clear()
+
+            # Observe 1.0s settling delay before notification when language_server is restarted (0.1s otherwise)
+            server_restarted = res.get("server_restarted", False) if isinstance(res, dict) else False
+            if server_restarted:
+                _get_time().sleep(1.0)
+            else:
+                _get_time().sleep(0.1)
+
+            # Fire non-blocking desktop notification
+            self._notify_desktop(
+                target_account=target_account,
+                old_account=active_name,
+                reason="quota 429",
+                reloaded=server_restarted,
+            )
+
             return True
         except Exception as e:
             print(f"[watch] Error switching accounts: {e}", file=sys.stderr)
@@ -855,22 +949,21 @@ class LogWatcher:
                     for raw_line in raw_lines:
                         line_bytes_len = len(raw_line)
                         line_text = raw_line.decode("utf-8", errors="replace")
-                        if self.process_line(line_text, is_jsonl=is_jsonl):
+                        if self.process_line(line_text, is_jsonl=is_jsonl, file_path=target):
                             switches_triggered += 1
                             failover_occurred = True
-                            processed_bytes += line_bytes_len
-                            # Advance cursor precisely to the end of line K to preserve remaining lines
-                            self.file_cursors[target] = cursor + processed_bytes
-                            self._stagnant_sizes.pop(target, None)
                             break
                         processed_bytes += line_bytes_len
 
-                    if not failover_occurred:
-                        self.file_cursors[target] = cursor + (last_nl + 1)
-                        if len(chunk) > last_nl + 1 and (cursor + len(chunk) >= current_size):
-                            self._stagnant_sizes[target] = current_size
-                        else:
-                            self._stagnant_sizes.pop(target, None)
+                    if failover_occurred:
+                        # Do NOT overwrite cursor; handle_exhaustion has already seeked all targets to EOF
+                        break
+
+                    self.file_cursors[target] = cursor + (last_nl + 1)
+                    if len(chunk) > last_nl + 1 and (cursor + len(chunk) >= current_size):
+                        self._stagnant_sizes[target] = current_size
+                    else:
+                        self._stagnant_sizes.pop(target, None)
 
                 except OSError:
                     continue

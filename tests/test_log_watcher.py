@@ -1144,14 +1144,14 @@ class TestLogWatcherProcessing(unittest.TestCase):
     @patch("scripts.watch.time.sleep", return_value=None)
     @patch("scripts.watch.RotationEngine")
     def test_trigger_switch_calls_engine_switch_tokens_turn_safe(self, mock_rot_cls, mock_sleep):
-        """trigger_switch calls engine.switch_tokens with restart_server=False and force=True."""
+        """trigger_switch calls engine.switch_tokens with restart_server=True and force=True under ADR 0010."""
         mock_rot = MagicMock()
         mock_rot.evaluate.return_value = "acc2"
         mock_rot_cls.return_value = mock_rot
 
         res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
         self.assertTrue(res)
-        self.engine_mock.switch_tokens.assert_called_once_with("acc2", restart_server=False, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True)
 
     @patch("scripts.watch.time.sleep", return_value=None)
     @patch("scripts.watch.RotationEngine")
@@ -1244,8 +1244,17 @@ class TestLogWatcherProcessing(unittest.TestCase):
         with open(test_file, "a", encoding="utf-8") as f:
             f.write(error_line)
 
-        # Mock trigger_switch
-        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+        # Mock trigger_switch with ADR 0010 multi-target EOF seeking side effect
+        def _mock_switch(*args, **kwargs):
+            for f in list(self.watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        self.watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
             switches = self.watcher.poll_once()
             self.assertEqual(switches, 1)
             mock_switch.assert_called_once()
@@ -1293,7 +1302,16 @@ class TestLogWatcherProcessing(unittest.TestCase):
         partial_bytes = b'{"status": "ERROR", "content": "RESOURCE_EXHAUSTED'
         test_file.write_bytes(partial_bytes)
 
-        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+        def _mock_switch(*args, **kwargs):
+            for f in list(self.watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        self.watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
             # First tick with incomplete line: must NOT advance cursor and must NOT trigger switch
             switches = self.watcher.poll_once()
             self.assertEqual(switches, 0)
@@ -1336,7 +1354,16 @@ class TestLogWatcherProcessing(unittest.TestCase):
         line2_partial = "error prefix 日本".encode("utf-8")[: -2]  # cut mid-character
         test_file.write_bytes(line1_bytes + line2_partial)
 
-        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+        def _mock_switch(*args, **kwargs):
+            for f in list(self.watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        self.watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
             # Tick 1: Line 1 should be processed cleanly; partial multibyte Line 2 must be held at line 1 boundary
             switches = self.watcher.poll_once()
             self.assertEqual(switches, 0)
@@ -1357,8 +1384,8 @@ class TestLogWatcherProcessing(unittest.TestCase):
                 len(line1_bytes) + full_line2_len,
             )
 
-    def test_poll_once_mid_batch_switch_advances_cursor_to_line_k(self):
-        """When failover triggers on line K of N, cursor advances to end of line K, preserving remaining lines."""
+    def test_poll_once_mid_batch_switch_advances_cursor_to_eof(self):
+        """When failover triggers under ADR 0010, cursor advances to EOF to prevent restart storms."""
         test_file = self.base_dir / "batch_test.log"
         test_file.write_bytes(b"")
 
@@ -1375,19 +1402,27 @@ class TestLogWatcherProcessing(unittest.TestCase):
         line3 = b"line 3: subsequent message that must be preserved\n"
         test_file.write_bytes(line1 + line2 + line3)
 
-        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+        def _mock_switch(*args, **kwargs):
+            for f in list(self.watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        self.watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
             switches = self.watcher.poll_once()
             self.assertEqual(switches, 1)
             mock_switch.assert_called_once()
-            # Cursor MUST advance to end of line 2, NOT end of line 3
-            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(line1) + len(line2))
-
-        # In next tick, reading from cursor processes line 3
-        with patch.object(self.watcher, "process_line") as mock_proc:
-            mock_proc.return_value = False
-            self.watcher.poll_once()
-            mock_proc.assert_called_once_with(line3.decode("utf-8"), is_jsonl=False)
+            # Under ADR 0010, cursor MUST advance to EOF, NOT end of line 2
             self.assertEqual(self.watcher.file_cursors[str(test_file)], len(line1) + len(line2) + len(line3))
+
+        # In next tick, reading from cursor processes 0 lines because cursor is at EOF
+        with patch.object(self.watcher, "process_line") as mock_proc:
+            switches2 = self.watcher.poll_once()
+            self.assertEqual(switches2, 0)
+            mock_proc.assert_not_called()
 
 
 class TestDaemonLifecycle(unittest.TestCase):
