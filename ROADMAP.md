@@ -35,6 +35,11 @@ Dokumen ini melacak rencana pengembangan strategis, fitur masa depan, dan riwaya
   - Subcommand `agy-switch doctor` untuk self-check otomatis 5-layer (permissions, tokens, hooks, daemon, language server) dengan opsi `--fix` dan output JSON murni.
   - Dukungan parameter `--model [gemini|claude]` pada `switch --auto` dan konfigurasi persisten `config default-model`.
   - Perintah `agy-switch rename <old_alias> <new_alias>` dengan transactional rollback guarantee.
+- [x] **Pilar 5: Modularisasi Arsitektur Internal (Zero External Dependencies)**:
+  - Dekomposisi monolit `scripts/agy_switch.py` (4.064 baris) dan `scripts/watch.py` (1.609 baris) menjadi sub-paket internal terstruktur di bawah `scripts/agy_switcher/` dengan *Strict 5-Layer DAG* (Layer 0 s/d Layer 4).
+  - Preservasi antarmuka publik dan transparansi runtime mocking melalui *Dynamic Module Proxy Bridge* pada `hook.py` dan `cli.py`.
+  - Re-Export Facade Launchers kanonikal (`scripts/agy_switch.py` & `scripts/watch.py`) dengan resolusi symlink `os.path.realpath`.
+  - Suite pengujian statis AST DAG dan validasi integritas namespace terisolasi pada `tests/test_modular_architecture.py`.
 
 ---
 
@@ -72,9 +77,10 @@ Detail spesifikasi teknis dan analisis dampak sistem terdokumentasi di [`.scratc
   - Perintah `agy-switch rename <old_alias> <new_alias>`.
 
 ### Pilar 5: Modularisasi Arsitektur Internal (Zero External Dependencies)
-- **Status**: Prioritas 1 (Upcoming / Architecture Settled - ADR 0009)
+- **Status**: Selesai (Shipped)
 - **Deskripsi**:
-  - Refaktorisasi berkas monolit `scripts/agy_switch.py` (4.064 baris) dan daemon `scripts/watch.py` (1.609 baris) menjadi sub-paket internal terstruktur di bawah `scripts/agy_switcher/` dengan *Strict 5-Layer DAG* (Layer 0: `exceptions.py`, `models.py`; Layer 1: `supervisor.py`, `formatters.py`, `telemetry.py`; Layer 2: `vault.py`, `rotation.py`, `watcher.py`; Layer 3: `doctor.py`, `hook.py`; Layer 4: `cli.py`).
+  - Refaktorisasi berkas monolit `scripts/agy_switch.py` (4.064 baris) dan daemon `scripts/watch.py` (1.609 baris) menjadi sub-paket internal terstruktur di bawah `scripts/agy_switcher/` dengan *Strict 5-Layer DAG* (Layer 0: `exceptions.py`, `models.py`; Layer 1: `supervisor.py`, `formatters.py`, `telemetry.py`; Layer 2: `vault.py`, `rotation.py`, `doctor.py`, `watcher.py`; Layer 3: `hook.py`; Layer 4: `cli.py`, `__init__.py`, `agy_switch.py`, `watch.py`).
   - Mengubah `scripts/agy_switch.py` dan `scripts/watch.py` menjadi *Re-Export Facade Launchers* berbobot ringan untuk menjamin kompatibilitas mundur 100%.
-  - Penerapan *Dynamic Module Proxy Bridge* pada `hook.py` guna menjamin zero-regression pada seluruh 505 test case eksisting.
+  - Penerapan *Dynamic Module Proxy Bridge* pada `hook.py` dan `cli.py` guna menjamin zero-regression pada seluruh test case eksisting.
+  - Penyusunan suite validasi statis AST DAG dan uji isolasi namespace sub-proses pada `tests/test_modular_architecture.py`.
 

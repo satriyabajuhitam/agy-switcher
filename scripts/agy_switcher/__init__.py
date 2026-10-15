@@ -54,15 +54,15 @@ _EXPORTS: dict[str, str] = {
     "DEFAULT_VAULT_DIR": "agy_switcher.vault",
     "DEFAULT_GEMINI_DIR": "agy_switcher.vault",
     "DEFAULT_LEGACY_ROOT": "agy_switcher.vault",
+    "extract_email_from_jwt": "agy_switcher.vault",
+    "validate_token_dict": "agy_switcher.vault",
+    "validate_token_file": "agy_switcher.vault",
     # Layer 2: Rotation
     "RotationEngine": "agy_switcher.rotation",
     # Layer 2: Doctor
     "DoctorEngine": "agy_switcher.doctor",
     "run_doctor": "agy_switcher.doctor",
     "auto_heal": "agy_switcher.doctor",
-    "extract_email_from_jwt": "agy_switcher.doctor",
-    "validate_token_dict": "agy_switcher.doctor",
-    "validate_token_file": "agy_switcher.doctor",
     # Layer 2: Watcher
     "_open_secure_log_file": "agy_switcher.watcher",
     "PresenceDetector": "agy_switcher.watcher",

@@ -1,4 +1,4 @@
-"""Unit and architectural tests for Layer 4: CLI Dispatcher, Package Init & Re-Export Launchers.
+"""Unit and architectural tests for Static AST DAG Validation Suite & End-to-End Package Verification.
 
 Validates:
 1. Strict 5-Layer DAG compliance via static AST analysis:
@@ -6,20 +6,21 @@ Validates:
    - Layer 1: supervisor.py, formatters.py, telemetry.py
    - Layer 2: vault.py, rotation.py, doctor.py, watcher.py
    - Layer 3: hook.py
-   - Layer 4: cli.py, __init__.py
+   - Layer 4: cli.py, __init__.py, agy_switch.py, watch.py
    - No module in Layer N imports from Layer >= N+1 at module level.
-   - doctor.py and rotation.py do not import vault.py at module level.
-   - No sub-module in agy_switcher imports agy_switch at module level.
-2. Isolated subprocess namespace imports and PEP 562 lazy-loading.
-3. Re-export facade launcher (scripts/agy_switch.py) symlink safety and completeness.
-4. Re-export shim launcher (scripts/watch.py) symlink safety and delegation.
-5. CLI subcommand parsing, return codes, and Dynamic Module Proxy Bridge.
+   - doctor.py, rotation.py, and watcher.py do not import vault.py at module level.
+   - No sub-module in agy_switcher imports agy_switch or watch at module level.
+2. Pure isolated subprocess namespace imports and PEP 562 lazy-loading.
+3. Re-export facade launchers (scripts/agy_switch.py & scripts/watch.py):
+   - Symlink execution via canonical launcher path.
+   - 100% symbol parity between agy_switch and agy_switcher.
+   - Realpath resolution and exclusion of orphaned helpers.
+4. CLI subcommand parsing, return codes, and Dynamic Module Proxy Bridge.
 """
 
 from __future__ import annotations
 
 import ast
-import inspect
 import io
 import json
 import os
@@ -41,27 +42,33 @@ from agy_switcher.cli import build_parser, main
 from agy_switcher.vault import AgySwitchEngine
 
 
-LAYER_MAP = {
-    # Layer 0
+# 5-Layer Architectural Hierarchy
+PACKAGE_LAYER_MAP: dict[str, int] = {
+    # Layer 0: Foundation
     "exceptions.py": 0,
     "models.py": 0,
-    # Layer 1
+    # Layer 1: Core Services & IO
     "supervisor.py": 1,
     "formatters.py": 1,
     "telemetry.py": 1,
-    # Layer 2
+    # Layer 2: Domain Engines
     "vault.py": 2,
     "rotation.py": 2,
     "doctor.py": 2,
     "watcher.py": 2,
-    # Layer 3
+    # Layer 3: Workflow & Orchestration
     "hook.py": 3,
-    # Layer 4
+    # Layer 4: Presentation & Dispatch
     "cli.py": 4,
     "__init__.py": 4,
 }
 
-MODULE_NAME_TO_LAYER = {
+LAUNCHER_LAYER_MAP: dict[str, int] = {
+    "agy_switch.py": 4,
+    "watch.py": 4,
+}
+
+MODULE_NAME_TO_LAYER: dict[str, int] = {
     "exceptions": 0,
     "models": 0,
     "supervisor": 1,
@@ -81,7 +88,7 @@ class TestModularArchitectureDAG(unittest.TestCase):
 
     def test_strict_5_layer_dag_no_upward_imports(self):
         """Scans AST of every module in agy_switcher to ensure no Layer N imports Layer >= N+1."""
-        for filename, current_layer in LAYER_MAP.items():
+        for filename, current_layer in PACKAGE_LAYER_MAP.items():
             file_path = PACKAGE_DIR / filename
             self.assertTrue(file_path.is_file(), f"Missing expected module: {filename}")
 
@@ -92,8 +99,8 @@ class TestModularArchitectureDAG(unittest.TestCase):
                     for alias in node.names:
                         mod_name = alias.name
                         self.assertFalse(
-                            mod_name == "agy_switch" or mod_name.startswith("agy_switch."),
-                            f"{filename} imports agy_switch at module level!",
+                            mod_name in ("agy_switch", "watch") or mod_name.startswith(("agy_switch.", "watch.")),
+                            f"{filename} imports root launcher '{mod_name}' at module level!",
                         )
                         if mod_name.startswith("agy_switcher."):
                             sub_name = mod_name.split(".")[1]
@@ -107,8 +114,8 @@ class TestModularArchitectureDAG(unittest.TestCase):
                 elif isinstance(node, ast.ImportFrom):
                     mod_name = node.module or ""
                     self.assertFalse(
-                        mod_name == "agy_switch" or mod_name.startswith("agy_switch."),
-                        f"{filename} imports from agy_switch at module level!",
+                        mod_name in ("agy_switch", "watch") or mod_name.startswith(("agy_switch.", "watch.")),
+                        f"{filename} imports from root launcher '{mod_name}' at module level!",
                     )
                     if mod_name.startswith("agy_switcher."):
                         sub_name = mod_name.split(".")[1]
@@ -129,20 +136,51 @@ class TestModularArchitectureDAG(unittest.TestCase):
                                     f"DAG violation in {filename} (Layer {current_layer}): imports {alias.name} (Layer {imported_layer})",
                                 )
 
+    def test_layer_4_launchers_static_dag(self):
+        """Scans root launcher scripts (agy_switch.py, watch.py) to verify Layer 4 status."""
+        for launcher_name, expected_layer in LAUNCHER_LAYER_MAP.items():
+            launcher_path = SCRIPTS_DIR / launcher_name
+            self.assertTrue(launcher_path.is_file(), f"Missing launcher: {launcher_name}")
+
+            tree = ast.parse(launcher_path.read_text(encoding="utf-8"), filename=str(launcher_path))
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name.startswith("agy_switcher."):
+                            sub_name = alias.name.split(".")[1]
+                            imported_layer = MODULE_NAME_TO_LAYER.get(sub_name)
+                            if imported_layer is not None:
+                                self.assertLessEqual(
+                                    imported_layer,
+                                    expected_layer,
+                                    f"Launcher {launcher_name} imports layer {imported_layer} > {expected_layer}",
+                                )
+                elif isinstance(node, ast.ImportFrom):
+                    mod_name = node.module or ""
+                    if mod_name.startswith("agy_switcher."):
+                        sub_name = mod_name.split(".")[1]
+                        imported_layer = MODULE_NAME_TO_LAYER.get(sub_name)
+                        if imported_layer is not None:
+                            self.assertLessEqual(
+                                imported_layer,
+                                expected_layer,
+                                f"Launcher {launcher_name} imports from layer {imported_layer} > {expected_layer}",
+                            )
+
     def test_layer_2_horizontal_independence(self):
-        """DoctorEngine and RotationEngine must NOT import vault.py at module level."""
-        for fn in ["doctor.py", "rotation.py"]:
+        """DoctorEngine, RotationEngine, and Watcher must NOT import vault.py at module level."""
+        for fn in ["doctor.py", "rotation.py", "watcher.py"]:
             file_path = PACKAGE_DIR / fn
             tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
             for node in tree.body:
                 if isinstance(node, ast.Import):
                     for alias in node.names:
-                        self.assertNotIn("vault", alias.name)
+                        self.assertNotIn("vault", alias.name, f"{fn} imports vault at module level!")
                 elif isinstance(node, ast.ImportFrom):
-                    self.assertNotIn("vault", node.module or "")
+                    self.assertNotIn("vault", node.module or "", f"{fn} imports from vault at module level!")
 
     def test_zero_external_pip_dependencies(self):
-        """All modules in agy_switcher must strictly import standard library only."""
+        """All modules in agy_switcher and scripts/ must strictly import standard library only."""
         allowed_stdlib = {
             "__future__",
             "argparse",
@@ -175,9 +213,14 @@ class TestModularArchitectureDAG(unittest.TestCase):
             "unittest",
             "urllib",
             "agy_switcher",
+            "agy_switch",
             "scripts",
         }
-        for file_path in PACKAGE_DIR.glob("*.py"):
+        all_py_files = list(PACKAGE_DIR.glob("*.py")) + [
+            SCRIPTS_DIR / "agy_switch.py",
+            SCRIPTS_DIR / "watch.py",
+        ]
+        for file_path in all_py_files:
             tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
@@ -202,20 +245,74 @@ class TestSubprocessNamespaceIsolation(unittest.TestCase):
     """Verifies pure isolated runtime imports via subprocess."""
 
     def test_telemetry_isolated_import(self):
+        """Importing telemetry does not load vault or agy_switch into sys.modules."""
         cmd = [
             sys.executable,
             "-c",
             "import sys; sys.path.insert(0, 'scripts'); "
             "import agy_switcher.telemetry; "
+            "assert 'agy_switcher.vault' not in sys.modules, 'vault leaked into sys.modules'; "
+            "assert 'agy_switcher.cli' not in sys.modules, 'cli leaked into sys.modules'; "
+            "assert 'agy_switch' not in sys.modules, 'agy_switch leaked into sys.modules'; "
+            "print('OK')",
+        ]
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertIn("OK", res.stdout)
+
+    def test_supervisor_isolated_import(self):
+        """Importing supervisor does not load cli, vault, or agy_switch into sys.modules."""
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "import agy_switcher.supervisor; "
+            "assert 'agy_switcher.cli' not in sys.modules, 'cli leaked into sys.modules'; "
+            "assert 'agy_switcher.vault' not in sys.modules, 'vault leaked into sys.modules'; "
+            "assert 'agy_switch' not in sys.modules, 'agy_switch leaked into sys.modules'; "
+            "print('OK')",
+        ]
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertIn("OK", res.stdout)
+
+    def test_models_and_exceptions_isolated_import(self):
+        """Layer 0 imports do not pull in any Layer 1-4 modules."""
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "import agy_switcher.models; "
+            "import agy_switcher.exceptions; "
+            "assert 'agy_switcher.supervisor' not in sys.modules; "
+            "assert 'agy_switcher.telemetry' not in sys.modules; "
             "assert 'agy_switcher.vault' not in sys.modules; "
+            "assert 'agy_switcher.cli' not in sys.modules; "
             "assert 'agy_switch' not in sys.modules; "
             "print('OK')",
         ]
-        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertIn("OK", res.stdout)
+
+    def test_formatters_isolated_import(self):
+        """Importing formatters does not load vault, doctor, or cli into sys.modules."""
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "import agy_switcher.formatters; "
+            "assert 'agy_switcher.vault' not in sys.modules; "
+            "assert 'agy_switcher.doctor' not in sys.modules; "
+            "assert 'agy_switcher.cli' not in sys.modules; "
+            "print('OK')",
+        ]
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
         self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
         self.assertIn("OK", res.stdout)
 
     def test_cli_isolated_import(self):
+        """Importing agy_switcher.cli does not load the root launcher agy_switch."""
         cmd = [
             sys.executable,
             "-c",
@@ -224,12 +321,12 @@ class TestSubprocessNamespaceIsolation(unittest.TestCase):
             "assert 'agy_switch' not in sys.modules; "
             "print('OK')",
         ]
-        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
         self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
         self.assertIn("OK", res.stdout)
 
     def test_package_pep562_lazy_loading(self):
-        """import agy_switcher does not eagerly import heavy submodules."""
+        """import agy_switcher does not eagerly import heavy submodules until accessed."""
         cmd = [
             sys.executable,
             "-c",
@@ -238,12 +335,13 @@ class TestSubprocessNamespaceIsolation(unittest.TestCase):
             "assert 'agy_switcher.cli' not in sys.modules; "
             "assert 'agy_switcher.doctor' not in sys.modules; "
             "assert 'agy_switcher.watcher' not in sys.modules; "
+            "assert 'agy_switcher.vault' not in sys.modules; "
             "# Accessing attribute triggers lazy load\n"
             "_ = agy_switcher.AgySwitchEngine; "
             "assert 'agy_switcher.vault' in sys.modules; "
             "print('OK')",
         ]
-        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
         self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
         self.assertIn("OK", res.stdout)
 
@@ -270,6 +368,26 @@ class TestReExportLaunchers(unittest.TestCase):
                 f"Symbol '{symbol}' in __all__ not found on agy_switch",
             )
 
+    def test_reexport_surface_parity_with_agy_switcher(self):
+        """Every public symbol in agy_switcher.__all__ must match agy_switch identically."""
+        self.assertTrue(hasattr(agy_switcher, "__all__"))
+        for symbol in agy_switcher.__all__:
+            self.assertTrue(
+                hasattr(agy_switcher, symbol),
+                f"Symbol '{symbol}' defined in __all__ missing from agy_switcher module",
+            )
+            self.assertTrue(
+                hasattr(agy_switch, symbol),
+                f"Symbol '{symbol}' defined in agy_switcher missing from agy_switch launcher",
+            )
+            pkg_obj = getattr(agy_switcher, symbol)
+            launcher_obj = getattr(agy_switch, symbol)
+            self.assertIs(
+                pkg_obj,
+                launcher_obj,
+                f"Symbol identity mismatch for '{symbol}': {pkg_obj} vs {launcher_obj}",
+            )
+
     def test_watch_launcher_uses_realpath_and_exports(self):
         watch_path = SCRIPTS_DIR / "watch.py"
         source = watch_path.read_text(encoding="utf-8")
@@ -281,6 +399,51 @@ class TestReExportLaunchers(unittest.TestCase):
         self.assertTrue(hasattr(watch, "LogWatcher"))
         self.assertTrue(hasattr(watch, "DaemonManager"))
         self.assertTrue(hasattr(watch, "main"))
+
+    def test_canonical_symlink_execution(self):
+        """Verifies executable execution via canonical symlink (ln -s scripts/agy_switch.py)."""
+        target_script = (SCRIPTS_DIR / "agy_switch.py").resolve()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            symlink_path = Path(tmpdir) / "test-launcher"
+            os.symlink(target_script, symlink_path)
+
+            # Test general --help
+            res = subprocess.run(
+                [str(symlink_path), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+            self.assertIn("usage: agy-switch", res.stdout)
+            self.assertIn("{list,quota,status,doctor,switch", res.stdout)
+
+            # Test subcommand --help
+            res_sub = subprocess.run(
+                [str(symlink_path), "status", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(res_sub.returncode, 0, f"Stderr: {res_sub.stderr}")
+            self.assertIn("usage: agy-switch status", res_sub.stdout)
+
+    def test_watch_symlink_execution(self):
+        """Verifies executable execution of watch.py via symlink."""
+        target_script = (SCRIPTS_DIR / "watch.py").resolve()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            symlink_path = Path(tmpdir) / "test-watch-launcher"
+            os.symlink(target_script, symlink_path)
+
+            res = subprocess.run(
+                [str(symlink_path), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+            self.assertIn("usage: watch.py", res.stdout)
+            self.assertIn("--generate-systemd", res.stdout)
 
 
 class TestCLIDispatcher(unittest.TestCase):
