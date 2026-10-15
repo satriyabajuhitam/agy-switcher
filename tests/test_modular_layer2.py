@@ -208,6 +208,180 @@ class TestLayer2DAGCompliance(unittest.TestCase):
         self.assertEqual(res.returncode, 0, f"Subprocess failed: {res.stderr}")
         self.assertIn("ISOLATED_DOCTOR_OK", res.stdout)
 
+    def test_watcher_imports_only_layer0_and_layer1(self):
+        watcher_file = REPO_ROOT / "scripts" / "agy_switcher" / "watcher.py"
+        self.assertTrue(watcher_file.is_file(), "scripts/agy_switcher/watcher.py must exist")
+
+        tree = ast.parse(watcher_file.read_text(encoding="utf-8"))
+        allowed_modules = {
+            "agy_switcher.exceptions",
+            "agy_switcher.models",
+            "agy_switcher.supervisor",
+            "agy_switcher.formatters",
+            "agy_switcher.telemetry",
+        }
+
+        forbidden_layers = {
+            "agy_switcher.vault",
+            "agy_switcher.rotation",
+            "agy_switcher.doctor",
+            "agy_switcher.hook",
+            "agy_switcher.cli",
+            "agy_switch",
+            "watch",
+        }
+
+        def is_forbidden(mod_name: str) -> bool:
+            return mod_name in forbidden_layers or any(mod_name.startswith(f + ".") for f in forbidden_layers)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = alias.name
+                    self.assertFalse(
+                        is_forbidden(name),
+                        f"watcher.py illegally imports forbidden module '{name}'",
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                self.assertFalse(
+                    is_forbidden(mod),
+                    f"watcher.py illegally imports from forbidden module '{mod}'",
+                )
+                if mod.startswith("agy_switcher"):
+                    self.assertIn(
+                        mod,
+                        allowed_modules,
+                        f"watcher.py imports '{mod}' which is not in allowed Layer 0/1 modules",
+                    )
+
+    def test_isolated_watcher_import_does_not_load_vault_or_rotation_or_doctor(self):
+        import subprocess
+        scripts_dir = str(REPO_ROOT / "scripts")
+        cmd = [
+            sys.executable,
+            "-c",
+            f"import sys; sys.path.insert(0, {scripts_dir!r}); "
+            "import agy_switcher.watcher; "
+            "assert 'agy_switcher.vault' not in sys.modules, 'vault leaked into sys.modules'; "
+            "assert 'agy_switcher.rotation' not in sys.modules, 'rotation leaked into sys.modules'; "
+            "assert 'agy_switcher.doctor' not in sys.modules, 'doctor leaked into sys.modules'; "
+            "assert 'agy_switcher.cli' not in sys.modules, 'cli leaked into sys.modules'; "
+            "print('ISOLATED_WATCHER_OK')",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Subprocess failed: {res.stderr}")
+        self.assertIn("ISOLATED_WATCHER_OK", res.stdout)
+
+    def test_daemon_manager_default_watch_script_points_to_canonical_watch_py(self):
+        from agy_switcher.watcher import DaemonManager
+        dm = DaemonManager()
+        self.assertEqual(dm.watch_script.name, "watch.py")
+        self.assertEqual(dm.watch_script.parent.name, "scripts")
+        self.assertTrue(dm.watch_script.is_file(), f"Canonical watch script {dm.watch_script} must exist")
+
+    def test_watch_py_shim_reexports_all_symbols(self):
+        import scripts.watch as watch_mod
+        from agy_switcher.watcher import (
+            LogWatcher as SubLogWatcher,
+            PresenceDetector as SubPresenceDetector,
+            CooldownManager as SubCooldownManager,
+            DaemonManager as SubDaemonManager,
+            _open_secure_log_file as sub_open_secure,
+        )
+        self.assertIs(watch_mod.LogWatcher, SubLogWatcher)
+        self.assertIs(watch_mod.PresenceDetector, SubPresenceDetector)
+        self.assertIs(watch_mod.CooldownManager, SubCooldownManager)
+        self.assertIs(watch_mod.DaemonManager, SubDaemonManager)
+        self.assertIs(watch_mod._open_secure_log_file, sub_open_secure)
+        self.assertTrue(hasattr(watch_mod, "RotationEngine"))
+        self.assertTrue(hasattr(watch_mod, "QuotaClient"))
+        self.assertTrue(hasattr(watch_mod, "AgySwitchEngine"))
+        self.assertTrue(hasattr(watch_mod, "DaemonError"))
+        self.assertTrue(hasattr(watch_mod, "DaemonAlreadyRunningError"))
+        self.assertTrue(hasattr(watch_mod, "time"))
+        self.assertTrue(hasattr(watch_mod, "shutil"))
+        self.assertTrue(hasattr(watch_mod, "subprocess"))
+
+    def test_agy_switcher_exports_watcher_symbols(self):
+        import agy_switcher
+        for sym in (
+            "PresenceDetector",
+            "CooldownManager",
+            "LogWatcher",
+            "DaemonManager",
+            "_open_secure_log_file",
+        ):
+            self.assertTrue(
+                hasattr(agy_switcher, sym),
+                f"agy_switcher package must export '{sym}' via PEP 562 lazy loading",
+            )
+
+    def test_watcher_secure_permissions_and_modes(self):
+        from agy_switcher.watcher import _open_secure_log_file, CooldownManager, DaemonManager
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # 1. _open_secure_log_file mode 0600
+            test_log = tmp_path / "test.log"
+            fd = _open_secure_log_file(test_log)
+            os.close(fd)
+            self.assertTrue(test_log.is_file())
+            self.assertEqual(stat.S_IMODE(test_log.stat().st_mode), 0o600)
+
+            # 2. CooldownManager mode 0600
+            cm = CooldownManager(cache_dir=tmp_path / "cache")
+            cm.set_cooldown("test_acc")
+            cooldown_file = tmp_path / "cache" / "cooldown.json"
+            self.assertTrue(cooldown_file.is_file())
+            self.assertEqual(stat.S_IMODE(cooldown_file.stat().st_mode), 0o600)
+
+            # 3. DaemonManager mode 0600 on watch.pid
+            dm = DaemonManager(vault_dir=tmp_path / "vault")
+            dm._write_pid_file(12345)
+            pid_file = tmp_path / "vault" / "watch.pid"
+            self.assertTrue(pid_file.is_file())
+            self.assertEqual(stat.S_IMODE(pid_file.stat().st_mode), 0o600)
+
+            # 4. _open_secure_log_file creates non-existent parent directory with 0700
+            nested_log = tmp_path / "nested" / "sub" / "daemon.log"
+            fd_nested = _open_secure_log_file(nested_log)
+            os.close(fd_nested)
+            self.assertTrue(nested_log.is_file())
+            self.assertEqual(stat.S_IMODE(nested_log.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(nested_log.parent.stat().st_mode), 0o700)
+
+    def test_watcher_direct_mocking_on_watcher_module(self):
+        """Verify that agy_switcher.watcher allows direct mocking of RotationEngine and QuotaClient."""
+        from unittest.mock import MagicMock, patch
+        import agy_switcher.watcher as watcher_mod
+
+        # 1. Direct patch on agy_switcher.watcher.RotationEngine
+        with patch("agy_switcher.watcher.RotationEngine") as mock_rot_cls:
+            resolved_cls = watcher_mod._get_rotation_engine_class()
+            self.assertIs(resolved_cls, mock_rot_cls)
+
+        # 2. Direct patch on agy_switcher.watcher.QuotaClient
+        with patch("agy_switcher.watcher.QuotaClient") as mock_qc_cls:
+            resolved_qc = watcher_mod._get_quota_client_class()
+            self.assertIs(resolved_qc, mock_qc_cls)
+
+        # 3. Direct patch on agy_switcher.watcher.AgySwitchEngine
+        with patch("agy_switcher.watcher.AgySwitchEngine") as mock_eng_cls:
+            resolved_eng = watcher_mod._get_engine_class()
+            self.assertIs(resolved_eng, mock_eng_cls)
+
+    def test_watcher_cli_invocation_via_python_module(self):
+        """Verify executing python3 -m agy_switcher.watcher --help runs main() and exits cleanly."""
+        import subprocess
+        scripts_dir = str(REPO_ROOT / "scripts")
+        cmd = [sys.executable, "-m", "agy_switcher.watcher", "--help"]
+        res = subprocess.run(cmd, capture_output=True, text=True, cwd=scripts_dir)
+        self.assertEqual(res.returncode, 0, f"Module execution failed: {res.stderr}")
+        self.assertIn("Antigravity Account Switcher Log Watcher", res.stdout)
+        self.assertIn("watch.py", res.stdout)
+
+
 
 class TestRotationEngineLayer2(unittest.TestCase):
     """Detailed unit tests for RotationEngine in agy_switcher.rotation."""

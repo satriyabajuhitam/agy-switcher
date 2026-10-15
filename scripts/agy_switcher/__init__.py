@@ -57,6 +57,12 @@ _EXPORTS: dict[str, str] = {
     "extract_email_from_jwt": "agy_switcher.doctor",
     "validate_token_dict": "agy_switcher.doctor",
     "validate_token_file": "agy_switcher.doctor",
+    # Layer 2: Watcher
+    "_open_secure_log_file": "agy_switcher.watcher",
+    "PresenceDetector": "agy_switcher.watcher",
+    "CooldownManager": "agy_switcher.watcher",
+    "LogWatcher": "agy_switcher.watcher",
+    "DaemonManager": "agy_switcher.watcher",
 }
 
 __all__ = list(_EXPORTS.keys())
