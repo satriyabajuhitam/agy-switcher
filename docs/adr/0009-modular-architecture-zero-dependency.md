@@ -27,15 +27,17 @@ Pada roadmap `agy-switch` (Pilar 5: Modularisasi Arsitektur Internal & Zero Exte
    - Mengubah `scripts/agy_switch.py` menjadi launcher berbobot ringan (`Re-Export Facade Launcher`) yang mengeksekusi `cli.main()` sekaligus mengekspos seluruh simbol publik, fungsi pembantu, dan kelas ke namespace `agy_switch` untuk menjamin kompatibilitas mundur 100%.
    - Mengubah `scripts/watch.py` menjadi executable shim tipis yang me-re-export kelas-kelas watcher dan memanggil `watcher.main()`.
 
-2. **Dekomposisi Granular 10 Modul**:
-   Memecah monolit ke dalam 10 modul dengan batas tanggung jawab tunggal (*Single Responsibility Principle*):
+2. **Dekomposisi Granular 12 Modul**:
+   Memecah monolit ke dalam 12 modul dengan batas tanggung jawab tunggal (*Single Responsibility Principle*):
    - `exceptions.py`: Seluruh tipe exception domain (`AgySwitchError`, `InvalidTokenError`, `AccountNotFoundError`, `ActiveTurnRunningError`, `DaemonError`, `DaemonAlreadyRunningError`).
    - `models.py`: Struktur data murni dan dataclass (`DiagnosticItem`, `DiagnosticReport`, `QuotaStatus`, `EvaluationCandidate`).
+   - `security.py`: Operasi keamanan token primitif, penulisan file dan JSON atomik (`_atomic_write_file`, `_atomic_write_json`), ekstraksi email dari JWT (`extract_email_from_jwt`), dan validasi integritas payload token.
    - `supervisor.py`: Pengawasan proses sistem (`locate_language_server_pid`, `is_server_busy`, restart aman, turn safety guards melalui kelas `ProcessSupervisor`).
    - `telemetry.py`: Klien HTTP CloudCode API (`QuotaClient`), pengambilan kuota paralel/single, parsing defensif token & timestamp, perhitungan bucket countdown, dan manajemen cache disk (`last_known_quota.json`).
    - `rotation.py`: Mesin rotasi cerdas (`RotationEngine`) dengan heuristik `cache_optimized`, `drain_window`, `auto_highest`, penalti cooldown, dan kemudi kuota model (`--model`).
    - `vault.py`: Operasi inti vault kredensial (`AgySwitchEngine`), penyimpanan token atomik ganda (`os.replace`), operasi CRUD akun (`add`, `login`, `remove`, `rename`), konfigurasi persisten, dan migrasi legacy.
-   - `watcher.py`: Log watcher aktif dan manajemen siklus hidup daemon (`PresenceDetector`, `CooldownManager`, `LogWatcher`, `DaemonManager`, generator unit user systemd).
+   - `presence.py`: Pendeteksian sesi aktif Antigravity Desktop (`PresenceDetector`) via `/proc/*/fd` dan `.lock` file, penanganan berkas log aman (`_open_secure_log_file`, `append_secure_log_entry`), serta wrapper penulisan atomik aman.
+   - `watcher.py`: Log watcher aktif dan manajemen siklus hidup daemon (`CooldownManager`, `LogWatcher`, `DaemonManager`, generator unit user systemd).
    - `doctor.py`: Mesin audit kesehatan mandiri 5-lapisan (`DoctorEngine`, `run_doctor`, `auto_heal`).
    - `hook.py`: Penanganan lifecycle hook (`handle_pre_invocation_hook`) dengan evaluasi 3-tingkat (*Tiered Cache-First Polling*).
    - `formatters.py`: Seluruh logika penyajian data antarmuka (Listicle Formatter, tabel Markdown, laporan status, dan diagnostik).
@@ -43,9 +45,9 @@ Pada roadmap `agy-switch` (Pilar 5: Modularisasi Arsitektur Internal & Zero Exte
 
 3. **Strict 5-Layer DAG (Directed Acyclic Graph)**:
    Menerapkan arsitektur dependensi berlapis satu arah yang mencegah terjadinya *circular imports* tanpa trik impor dinamis:
-   - **Layer 0 (Foundation)**: `exceptions.py`, `models.py` (Nol dependensi internal).
+   - **Layer 0 (Foundation)**: `exceptions.py`, `models.py`, `security.py` (Nol dependensi internal).
    - **Layer 1 (Core Services & IO)**: `supervisor.py`, `formatters.py`, `telemetry.py` (Hanya bergantung pada Layer 0).
-   - **Layer 2 (Domain Engines)**: `vault.py`, `rotation.py`, `watcher.py`, `doctor.py` (Bergantung pada Layer 0 dan Layer 1; `doctor.py` beroperasi berbasis path direktori & `supervisor` tanpa impor `vault.py` tingkat modul).
+   - **Layer 2 (Domain Engines)**: `vault.py`, `rotation.py`, `watcher.py`, `doctor.py`, `presence.py` (Bergantung pada Layer 0 dan Layer 1; `doctor.py` beroperasi berbasis path direktori & `supervisor` tanpa impor `vault.py` tingkat modul).
    - **Layer 3 (Workflow & Orchestration)**: `hook.py` (Bergantung pada Layers 0–2).
    - **Layer 4 (Presentation & Dispatch)**: `cli.py`, `__init__.py`, `agy_switch.py`, `watch.py` launcher (Mengorkestrasi seluruh layer).
 

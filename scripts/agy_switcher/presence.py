@@ -12,6 +12,8 @@ from pathlib import Path
 import time
 from typing import Any
 
+from agy_switcher.security import _atomic_write_file
+
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 
 
@@ -73,46 +75,7 @@ def append_secure_log_entry(log_file: Path | str, message: str) -> None:
 
 def _write_atomic_file_secure(target_file: Path | str, payload: bytes | str) -> None:
     """Atomically writes payload to target_file with mode 0600 and ensures mode 0700 parent."""
-    target_path = Path(target_file)
-    parent = target_path.parent
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(parent, 0o700)
-    except OSError:
-        pass
-
-    temp_path = parent / f".{target_path.name}.tmp.{os.getpid()}.{time.time_ns()}"
-    raw_bytes = payload.encode("utf-8") if isinstance(payload, str) else payload
-    fd = None
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(temp_path, flags, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-        except OSError:
-            pass
-        with open(fd, "wb", closefd=True) as f:
-            fd = None
-            f.write(raw_bytes)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_path, target_path)
-        try:
-            os.chmod(target_path, 0o600)
-        except OSError:
-            pass
-    except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-        raise
+    _atomic_write_file(target_file, payload, mode=0o600)
 
 
 class PresenceDetector:

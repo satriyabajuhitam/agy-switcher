@@ -20,14 +20,26 @@ from typing import Any
 from agy_switcher.exceptions import InvalidTokenError
 
 
-def _atomic_write_file(target_path: Path | str, content: str, mode: int = 0o600) -> None:
-    """Writes content to a target path atomically with specified permissions."""
+def _atomic_write_file(target_path: Path | str, content: str | bytes, mode: int = 0o600) -> None:
+    """Writes content (str or bytes) to a target path atomically with specified permissions."""
     target_path = Path(target_path)
     target_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp_fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=f"{target_path.name}.tmp-")
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            f.write(content)
+        os.chmod(target_path.parent, 0o700)
+    except OSError:
+        pass
+    tmp_fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=f".{target_path.name}.tmp.")
+    try:
+        if isinstance(content, bytes):
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
         os.chmod(tmp_file, mode)
         os.replace(tmp_file, target_path)
         tmp_file = None
