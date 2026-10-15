@@ -219,6 +219,7 @@ class TestLayer2DAGCompliance(unittest.TestCase):
             "agy_switcher.supervisor",
             "agy_switcher.formatters",
             "agy_switcher.telemetry",
+            "agy_switcher.presence",
         }
 
         forbidden_layers = {

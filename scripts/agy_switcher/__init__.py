@@ -63,9 +63,9 @@ _EXPORTS: dict[str, str] = {
     "DoctorEngine": "agy_switcher.doctor",
     "run_doctor": "agy_switcher.doctor",
     "auto_heal": "agy_switcher.doctor",
-    # Layer 2: Watcher
-    "_open_secure_log_file": "agy_switcher.watcher",
-    "PresenceDetector": "agy_switcher.watcher",
+    # Layer 2: Watcher & Presence
+    "_open_secure_log_file": "agy_switcher.presence",
+    "PresenceDetector": "agy_switcher.presence",
     "CooldownManager": "agy_switcher.watcher",
     "LogWatcher": "agy_switcher.watcher",
     "DaemonManager": "agy_switcher.watcher",

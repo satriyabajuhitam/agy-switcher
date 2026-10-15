@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import signal
@@ -796,6 +797,66 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
         with patch("time.time", return_value=now):
             res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
             self.assertFalse(res)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    @patch("scripts.watch.RotationEngine")
+    def test_trigger_switch_aborts_when_rotation_engine_evaluates_none(self, mock_rot_cls, mock_sleep):
+        """When rotation engine evaluate returns None, trigger_switch aborts without switching."""
+        now = 1700000000.0
+        self.engine_mock.get_active_name.return_value = "acc1"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},
+            ],
+        }
+
+        mock_rot_instance = MagicMock()
+        mock_rot_instance.evaluate.return_value = None
+        mock_rot_cls.return_value = mock_rot_instance
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            with patch("time.time", return_value=now):
+                res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+
+        self.assertFalse(res)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertIn(
+            "[watch] All other valid accounts are exhausted or in cooldown. Cannot switch.",
+            stderr_buf.getvalue(),
+        )
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    @patch("scripts.watch.RotationEngine")
+    def test_trigger_switch_aborts_when_rotation_engine_returns_active_account(self, mock_rot_cls, mock_sleep):
+        """When rotation engine evaluate returns active_name, trigger_switch aborts without switching."""
+        now = 1700000000.0
+        self.engine_mock.get_active_name.return_value = "acc1"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},
+            ],
+        }
+
+        mock_rot_instance = MagicMock()
+        mock_rot_instance.evaluate.return_value = "acc1"
+        mock_rot_cls.return_value = mock_rot_instance
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            with patch("time.time", return_value=now):
+                res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+
+        self.assertFalse(res)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertIn(
+            "[watch] All other valid accounts are exhausted or in cooldown. Cannot switch.",
+            stderr_buf.getvalue(),
+        )
 
 
 class TestLogWatcherProcessing(unittest.TestCase):

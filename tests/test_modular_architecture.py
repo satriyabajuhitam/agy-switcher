@@ -56,6 +56,7 @@ PACKAGE_LAYER_MAP: dict[str, int] = {
     "rotation.py": 2,
     "doctor.py": 2,
     "watcher.py": 2,
+    "presence.py": 2,
     # Layer 3: Workflow & Orchestration
     "hook.py": 3,
     # Layer 4: Presentation & Dispatch
@@ -78,6 +79,7 @@ MODULE_NAME_TO_LAYER: dict[str, int] = {
     "rotation": 2,
     "doctor": 2,
     "watcher": 2,
+    "presence": 2,
     "hook": 3,
     "cli": 4,
 }
@@ -168,8 +170,8 @@ class TestModularArchitectureDAG(unittest.TestCase):
                             )
 
     def test_layer_2_horizontal_independence(self):
-        """DoctorEngine, RotationEngine, and Watcher must NOT import vault.py at module level."""
-        for fn in ["doctor.py", "rotation.py", "watcher.py"]:
+        """DoctorEngine, RotationEngine, Watcher, and PresenceDetector must NOT import vault.py at module level."""
+        for fn in ["doctor.py", "rotation.py", "watcher.py", "presence.py"]:
             file_path = PACKAGE_DIR / fn
             tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
             for node in tree.body:
@@ -345,9 +347,40 @@ class TestSubprocessNamespaceIsolation(unittest.TestCase):
         self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
         self.assertIn("OK", res.stdout)
 
+    def test_presence_isolated_import(self):
+        """Importing presence does not load vault, cli, doctor, or agy_switch into sys.modules."""
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "import agy_switcher.presence; "
+            "assert 'agy_switcher.vault' not in sys.modules; "
+            "assert 'agy_switcher.cli' not in sys.modules; "
+            "assert 'agy_switcher.doctor' not in sys.modules; "
+            "assert 'agy_switch' not in sys.modules; "
+            "print('OK')",
+        ]
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertIn("OK", res.stdout)
+
 
 class TestReExportLaunchers(unittest.TestCase):
     """Validates contract rules for scripts/agy_switch.py and scripts/watch.py."""
+
+    def test_presence_reexport_parity_and_line_constraint(self):
+        """PresenceDetector and _open_secure_log_file are identically re-exported in watcher.py.
+        watcher.py must remain strictly under 1500 lines.
+        """
+        import agy_switcher.presence as pres_mod
+        import agy_switcher.watcher as watch_mod
+
+        self.assertIs(pres_mod.PresenceDetector, watch_mod.PresenceDetector)
+        self.assertIs(pres_mod._open_secure_log_file, watch_mod._open_secure_log_file)
+
+        watcher_path = PACKAGE_DIR / "watcher.py"
+        lines = watcher_path.read_text(encoding="utf-8").splitlines()
+        self.assertLess(len(lines), 1500, f"watcher.py size {len(lines)} exceeds 1500 lines limit!")
 
     def test_agy_switch_launcher_uses_realpath_not_abspath(self):
         launcher_path = SCRIPTS_DIR / "agy_switch.py"
