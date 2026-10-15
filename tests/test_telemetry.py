@@ -440,6 +440,52 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
         self.assertTrue(acc_map["acc_claude"]["quota"]["claude"]["cached"])
         self.assertNotIn("error", acc_map["acc_claude"]["quota"])
 
+    def test_run_quota_pipeline_partial_live_merges_with_cache(self):
+        """run_quota_pipeline preserves cached Claude when live fetch only returns Gemini."""
+        mock_engine = MagicMock()
+        mock_engine.get_account_tokens.return_value = {"access_token": "token_partial"}
+        mock_client = MagicMock()
+        mock_client.load_cache.return_value = {
+            "timestamp": 1700000000,
+            "accounts": {
+                "acc_partial": {
+                    "claude": {"quota": 65, "reset_time": 1700002000, "cached": False, "buckets": {}}
+                }
+            },
+        }
+        mock_client.fetch_quota.return_value = {
+            "gemini": {"quota": 90, "reset_time": 1700003000, "cached": False, "buckets": {}}
+        }
+
+        data = {"accounts": [{"name": "acc_partial"}]}
+        res = run_quota_pipeline(mock_engine, data, client=mock_client)
+        acc = res["accounts"][0]
+
+        self.assertIn("gemini", acc["quota"])
+        self.assertIn("claude", acc["quota"])
+        self.assertEqual(acc["quota"]["gemini"]["quota"], 90)
+        self.assertFalse(acc["quota"]["gemini"]["cached"])
+        self.assertEqual(acc["quota"]["claude"]["quota"], 65)
+        self.assertTrue(acc["quota"]["claude"]["cached"])
+
+    def test_run_quota_pipeline_unreachable_symmetric_model_schema(self):
+        """run_quota_pipeline provides both gemini and claude keys when account is unreachable and uncached."""
+        mock_engine = MagicMock()
+        mock_engine.get_account_tokens.return_value = {"access_token": "token_err"}
+        mock_client = MagicMock()
+        mock_client.load_cache.return_value = {}
+        mock_client.fetch_quota.return_value = None
+
+        data = {"accounts": [{"name": "acc_down"}]}
+        res = run_quota_pipeline(mock_engine, data, client=mock_client)
+        acc = res["accounts"][0]
+
+        self.assertEqual(acc["quota"]["error"], "Unreachable")
+        self.assertIn("gemini", acc["quota"])
+        self.assertIn("claude", acc["quota"])
+        self.assertIsNone(acc["quota"]["gemini"])
+        self.assertIsNone(acc["quota"]["claude"])
+
 
 if __name__ == "__main__":
     unittest.main()

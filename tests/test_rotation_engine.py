@@ -364,6 +364,61 @@ class TestRotationEngine(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_evaluate_dict_with_accounts_list(self):
+        """RotationEngine.evaluate with standard dict {'active': ..., 'accounts': [...]} evaluates correctly."""
+        engine = RotationEngine(model_name="gemini")
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "quota": {"gemini": {"quota": 10, "reset_time": int(self.base_time.timestamp()) + 3600}}},
+                {"name": "acc2", "quota": {"gemini": {"quota": 90, "reset_time": int(self.base_time.timestamp()) + 3600}}},
+            ],
+        }
+        best = engine.evaluate(data, current_time=self.base_time)
+        self.assertEqual(best, "acc2")
+
+    def test_evaluate_list_of_dicts_without_quota_field_using_cache(self):
+        """RotationEngine.evaluate([{'name': 'acc1'}, {'name': 'acc2'}]) falls back to cached quota."""
+        import tempfile
+        import json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_dir = Path(tmpdir)
+            cache_dir = vault_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "timestamp": int(self.base_time.timestamp()),
+                "accounts": {
+                    "acc1": {"gemini": {"quota": 10, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                    "acc2": {"gemini": {"quota": 90, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                },
+            }
+            (cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+
+            engine = RotationEngine(vault_dir=vault_dir, model_name="gemini")
+            best = engine.evaluate([{"name": "acc1"}, {"name": "acc2"}], active="acc1", current_time=self.base_time)
+            self.assertEqual(best, "acc2")
+
+    def test_evaluate_mixed_list_str_and_dict(self):
+        """RotationEngine.evaluate(['acc1', {'name': 'acc2', ...}]) handles mixed list seamlessly."""
+        import tempfile
+        import json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_dir = Path(tmpdir)
+            cache_dir = vault_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "timestamp": int(self.base_time.timestamp()),
+                "accounts": {
+                    "acc1": {"gemini": {"quota": 10, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                },
+            }
+            (cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+
+            engine = RotationEngine(vault_dir=vault_dir, model_name="gemini")
+            mixed = ["acc1", {"name": "acc2", "quota": {"gemini": {"quota": 95, "reset_time": int(self.base_time.timestamp()) + 3600}}}]
+            best = engine.evaluate(mixed, active="acc1", current_time=self.base_time)
+            self.assertEqual(best, "acc2")
+
 
 if __name__ == "__main__":
     unittest.main()

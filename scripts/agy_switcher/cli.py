@@ -111,6 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format: table (default) or list (listicle)",
     )
     list_parser.add_argument("--quota", action="store_true", help="Fetch and display quota concurrently")
+    list_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Target model family for quota sorting (e.g. gemini, claude)",
+    )
 
     # Command: quota
     quota_parser = subparsers.add_parser(
@@ -122,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["table", "list"],
         default="table",
         help="Output format: table (default) or list (listicle)",
+    )
+    quota_parser.add_argument(
+        "--model",
+        type=str,
+        default="gemini",
+        help="Target model family for quota sorting (e.g. gemini, claude)",
     )
 
     # Command: status
@@ -280,10 +292,23 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         data = engine.list_accounts()
         show_quota = True if args.command == "quota" else getattr(args, "quota", False)
         if show_quota:
+            cli_model = getattr(args, "model", None)
+            if cli_model is not None:
+                try:
+                    target_model = normalize_model_name(cli_model)
+                except AgySwitchError:
+                    print(
+                        f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.",
+                        file=sys.stderr,
+                    )
+                    return 1
+            else:
+                target_model = "gemini"
+
             qc_cls = _get_quota_client_class()
             client = qc_cls(timeout=2.0, engine=engine)
             pipeline_func = _get_run_quota_pipeline()
-            data = pipeline_func(engine, data, client=client)
+            data = pipeline_func(engine, data, client=client, target_model=target_model)
 
         if getattr(args, "json", False):
             print(json.dumps(data, indent=2))

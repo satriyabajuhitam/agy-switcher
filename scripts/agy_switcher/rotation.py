@@ -305,42 +305,73 @@ class RotationEngine:
                 cooldowns = getattr(self.cooldown_manager, "cooldowns")
 
         # Normalize accounts into a list of (account_id, quota_dict)
+        cached_data: dict[str, Any] | None = None
+
+        def _get_cached_map() -> dict[str, Any]:
+            nonlocal cached_data
+            if cached_data is None:
+                raw_cache = self._load_quota_cache()
+                if isinstance(raw_cache, dict):
+                    accounts_field = raw_cache.get("accounts")
+                    cached_data = accounts_field if isinstance(accounts_field, dict) else raw_cache
+                else:
+                    cached_data = {}
+            return cached_data if isinstance(cached_data, dict) else {}
+
         items: list[tuple[str, dict]] = []
         raw_quota_map: dict[str, dict] = {}
+
         if isinstance(accounts, dict):
-            if "accounts" in accounts and isinstance(accounts["accounts"], dict):
-                raw_dict = accounts["accounts"]
+            if current_active is None and isinstance(accounts.get("active"), str):
+                current_active = accounts["active"]
+
+            acc_list_or_map = accounts.get("accounts")
+            if isinstance(acc_list_or_map, list):
+                # Standard vault or quota pipeline structure: {"active": "...", "accounts": [...]}
+                accounts_to_process = acc_list_or_map
+            elif isinstance(acc_list_or_map, dict):
+                # Cache structure: {"timestamp": ..., "accounts": {"acc1": {...}}}
+                accounts_to_process = acc_list_or_map
             else:
-                raw_dict = accounts
-            for acc_id, q_data in raw_dict.items():
-                items.append((acc_id, q_data if isinstance(q_data, dict) else {}))
-        elif isinstance(accounts, list):
-            cached_data: dict[str, Any] | None = None
-            for acc in accounts:
+                accounts_to_process = accounts
+        else:
+            accounts_to_process = accounts
+
+        if isinstance(accounts_to_process, dict):
+            for acc_id, q_data in accounts_to_process.items():
+                if not isinstance(acc_id, str) or not acc_id.strip():
+                    continue
+                # Skip non-account metadata keys if legacy root dict passed
+                if acc_id in ("timestamp", "active", "error") and not isinstance(q_data, dict):
+                    continue
+                acc_name = acc_id.strip()
+                if isinstance(q_data, dict):
+                    has_quota = any(k in q_data for k in ("gemini", "claude", "quota", "groups"))
+                    if not has_quota:
+                        q_data = _get_cached_map().get(acc_name, q_data)
+                else:
+                    q_data = _get_cached_map().get(acc_name, {})
+                items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
+        elif isinstance(accounts_to_process, list):
+            for acc in accounts_to_process:
                 if isinstance(acc, str):
                     acc_name = acc.strip()
                     if not acc_name:
                         continue
-                    if cached_data is None:
-                        raw_cache = self._load_quota_cache()
-                        if isinstance(raw_cache, dict):
-                            accounts_field = raw_cache.get("accounts")
-                            cached_data = accounts_field if isinstance(accounts_field, dict) else raw_cache
-                        else:
-                            cached_data = {}
-                    q_data = cached_data.get(acc_name, {}) if isinstance(cached_data, dict) else {}
+                    q_data = _get_cached_map().get(acc_name, {})
                     items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
                 elif isinstance(acc, dict):
                     acc_name = acc.get("name") or acc.get("account") or acc.get("id")
-                    if not acc_name:
+                    if not acc_name or not isinstance(acc_name, str):
                         continue
+                    acc_name = acc_name.strip()
                     if current_active is None and acc.get("is_active"):
                         current_active = acc_name
-                    if "quota" in acc and isinstance(acc["quota"], dict):
-                        q_data = acc["quota"]
-                    else:
-                        q_data = acc
-                    items.append((acc_name, q_data))
+                    q_data = acc.get("quota") if "quota" in acc and isinstance(acc["quota"], dict) else acc
+                    has_quota = any(k in q_data for k in ("gemini", "claude", "quota", "groups"))
+                    if not has_quota:
+                        q_data = _get_cached_map().get(acc_name, q_data)
+                    items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
 
         if current_active is None:
             current_active = self.active_account_id
