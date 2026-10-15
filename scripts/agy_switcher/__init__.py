@@ -32,6 +32,22 @@ _EXPORTS: dict[str, str] = {
     "format_accounts_table": "agy_switcher.formatters",
     "format_status_report": "agy_switcher.formatters",
     "format_diagnostic_report": "agy_switcher.formatters",
+    # Layer 1: Telemetry
+    "QuotaClient": "agy_switcher.telemetry",
+    "fetch_account_quota": "agy_switcher.telemetry",
+    "fetch_all_accounts_quota": "agy_switcher.telemetry",
+    "sort_accounts_by_quota": "agy_switcher.telemetry",
+    "normalize_model_name": "agy_switcher.telemetry",
+    "run_quota_pipeline": "agy_switcher.telemetry",
+    "AUTH_PHRASES": "agy_switcher.telemetry",
+    "AUTH_ERROR_CODE_PATTERN": "agy_switcher.telemetry",
+    "HTTP_SERVER_ERROR_PATTERN": "agy_switcher.telemetry",
+    "_is_auth_error": "agy_switcher.telemetry",
+    "_is_network_error": "agy_switcher.telemetry",
+    "_is_stale_exhausted_cache": "agy_switcher.telemetry",
+    "_parse_timestamp_defensive": "agy_switcher.telemetry",
+    "_parse_quota_defensive": "agy_switcher.telemetry",
+    "_sanitize_expires_in": "agy_switcher.telemetry",
 }
 
 __all__ = list(_EXPORTS.keys())
