@@ -34,32 +34,29 @@ QuotaClient: Any = None
 AgySwitchEngine: Any = None
 
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
-DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_MAX_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB read bound
+
+# Re-exported from presence.py (Layer 2)
+from agy_switcher.presence import (
+    DEFAULT_GEMINI_DIR,
+    PresenceDetector,
+    _open_secure_log_file,
+    _write_atomic_file_secure,
+    append_secure_log_entry,
+)
 
 
 def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> Any:
     """Resolves symbol from sys.modules if mocked/present; falls back to sub-package default."""
-    watcher_mod = sys.modules.get("agy_switcher.watcher")
-    if watcher_mod and hasattr(watcher_mod, symbol_name):
-        val = getattr(watcher_mod, symbol_name)
-        if val is not None:
-            return val
-
-    for mod_name in ("scripts.watch", "watch", "agy_switch", "scripts.agy_switch"):
+    for mod_name in ("agy_switcher.watcher", "scripts.watch", "watch", "agy_switch", "scripts.agy_switch"):
         mod = sys.modules.get(mod_name)
-        if mod and hasattr(mod, symbol_name):
-            val = getattr(mod, symbol_name)
-            if val is not None:
-                return val
+        if mod and getattr(mod, symbol_name, None) is not None:
+            return getattr(mod, symbol_name)
     return fallback_factory()
 
 
 def _get_rotation_engine_class() -> Any:
-    return _resolve_symbol(
-        "RotationEngine",
-        lambda: __import__("agy_switcher.rotation", fromlist=["RotationEngine"]).RotationEngine,
-    )
+    return _resolve_symbol("RotationEngine", lambda: __import__("agy_switcher.rotation", fromlist=["RotationEngine"]).RotationEngine)
 
 
 def _get_quota_client_class() -> Any:
@@ -68,14 +65,12 @@ def _get_quota_client_class() -> Any:
 
 def _get_engine_class() -> Any:
     def _fallback():
-        try:
-            return __import__("agy_switcher.vault", fromlist=["AgySwitchEngine"]).AgySwitchEngine
-        except ImportError:
+        for m in ("agy_switcher.vault", "agy_switch", "scripts.agy_switch"):
             try:
-                return __import__("agy_switch", fromlist=["AgySwitchEngine"]).AgySwitchEngine
+                return __import__(m, fromlist=["AgySwitchEngine"]).AgySwitchEngine
             except ImportError:
-                return __import__("scripts.agy_switch", fromlist=["AgySwitchEngine"]).AgySwitchEngine
-
+                pass
+        return None
     return _resolve_symbol("AgySwitchEngine", _fallback)
 
 
@@ -89,13 +84,6 @@ def _get_subprocess() -> Any:
 
 def _get_time() -> Any:
     return _resolve_symbol("time", lambda: time)
-
-
-# Re-exported from presence.py (Layer 2)
-from agy_switcher.presence import (
-    PresenceDetector,
-    _open_secure_log_file,
-)
 
 
 class CooldownManager:
@@ -172,52 +160,9 @@ class CooldownManager:
             return None, False
 
     def _atomic_write(self, records: dict) -> None:
-        """
-        Atomically writes dictionary records to cooldown.json with strictly enforced 0600 mode.
-        Ensures temporary files reside in the same directory and are replaced atomically.
-        Cleans up temporary files in case of error.
-        """
-        cache_path = Path(self.cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            os.chmod(cache_path, 0o700)
-        except OSError:
-            pass
-
-        temp_path = cache_path / f".cooldown.json.tmp.{os.getpid()}.{time.time_ns()}"
+        """Atomically writes dictionary records to cooldown.json with strictly enforced 0600 mode."""
         payload = json.dumps(records, indent=2).encode("utf-8")
-        fd = None
-        try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-            fd = os.open(temp_path, flags, 0o600)
-            try:
-                os.fchmod(fd, 0o600)
-            except OSError:
-                pass
-
-            with open(fd, "wb", closefd=True) as f:
-                fd = None
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(temp_path, self.cooldown_file)
-            try:
-                os.chmod(self.cooldown_file, 0o600)
-            except OSError:
-                pass
-        except Exception:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
-            raise
+        _write_atomic_file_secure(self.cooldown_file, payload)
 
     def _parse_and_prune(self, raw_data: dict, now: float) -> tuple[dict[str, dict], bool]:
         """
@@ -695,45 +640,19 @@ class LogWatcher:
         shutil_mod = _get_shutil()
         notify_bin = shutil_mod.which("notify-send")
         if notify_bin:
-            title = "agy-switch"
-            msg = f"Auto-rotated to '{target_account}' ({reason})"
             try:
-                subprocess_mod = _get_subprocess()
-                subprocess_mod.Popen(
-                    [notify_bin, title, msg],
+                _get_subprocess().Popen(
+                    [notify_bin, "agy-switch", f"Auto-rotated to '{target_account}' ({reason})"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
             except Exception:
                 pass
 
-        # Log event to watch.log
         vault_dir = getattr(self.engine, "vault_dir", None)
-        if not isinstance(vault_dir, (str, Path)):
-            vault_dir = Path.home() / ".antigravity-vault"
-        log_file = Path(vault_dir) / "watch.log"
-        try:
-            log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            try:
-                os.chmod(log_file.parent, 0o700)
-            except OSError:
-                pass
-
-            log_fd = _open_secure_log_file(log_file)
-            try:
-                with open(log_fd, "a", encoding="utf-8", closefd=True) as f:
-                    log_fd = None
-                    ts = datetime.now(timezone.utc).isoformat()
-                    f.write(f"[{ts}] Switched to '{target_account}' ({reason})\n")
-                    f.flush()
-            finally:
-                if log_fd is not None:
-                    try:
-                        os.close(log_fd)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
+        log_dir = Path(vault_dir) if isinstance(vault_dir, (str, Path)) else DEFAULT_VAULT_DIR
+        ts = datetime.now(timezone.utc).isoformat()
+        append_secure_log_entry(log_dir / "watch.log", f"[{ts}] Switched to '{target_account}' ({reason})\n")
 
     def trigger_switch(self, line: str = "", model_hint: str | None = None) -> bool:
         # Check damping window
@@ -784,15 +703,16 @@ class LogWatcher:
         cooldowns = self.get_cooldowns()
 
         accounts_data = self.engine.list_accounts()
+        accounts_list = accounts_data.get("accounts") or []
         # Filter out accounts in cooldown in-memory (O(1) lookup avoiding N disk I/O queries)
         valid_accounts = []
-        for acc in accounts_data.get("accounts", []):
-            acc_name = acc["name"]
-            if acc_name == active_name:
+        for acc in accounts_list:
+            acc_name = acc.get("name") if isinstance(acc, dict) else None
+            if not acc_name or acc_name == active_name:
                 continue
             if acc_name in cooldowns:
                 continue
-            if acc["valid"]:
+            if acc.get("valid"):
                 valid_accounts.append(acc)
 
         if not valid_accounts:
@@ -806,7 +726,8 @@ class LogWatcher:
         rot_engine = rot_cls(model_name=resolved_model, active_account_id=active_name)
         target_account = rot_engine.evaluate(valid_accounts, current_active=active_name, target_model=resolved_model)
 
-        if not target_account or target_account == active_name:
+        valid_names = {acc["name"] for acc in valid_accounts}
+        if not target_account or target_account == active_name or target_account not in valid_names:
             print("[watch] All other valid accounts are exhausted or in cooldown. Cannot switch.", file=sys.stderr)
             return False
 
@@ -981,21 +902,12 @@ class DaemonManager:
     graceful SIGTERM termination with 5s SIGKILL escalation, and stale PID pruning.
     """
 
-    SYSTEMD_TEMPLATE = """[Unit]
-Description=Antigravity Account Switcher Log Watcher Daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/agy-switch watch run
-Restart=on-failure
-RestartSec=5s
-StandardOutput=append:%h/.antigravity-vault/watch.log
-StandardError=append:%h/.antigravity-vault/watch.log
-
-[Install]
-WantedBy=default.target
-"""
+    SYSTEMD_TEMPLATE = (
+        "[Unit]\nDescription=Antigravity Account Switcher Log Watcher Daemon\nAfter=network.target\n\n"
+        "[Service]\nType=simple\nExecStart=%h/.local/bin/agy-switch watch run\nRestart=on-failure\nRestartSec=5s\n"
+        "StandardOutput=append:%h/.antigravity-vault/watch.log\nStandardError=append:%h/.antigravity-vault/watch.log\n\n"
+        "[Install]\nWantedBy=default.target\n"
+    )
 
     def __init__(
         self,
@@ -1023,79 +935,31 @@ WantedBy=default.target
 
     def _write_pid_file(self, pid: int) -> None:
         """Atomically writes PID to watch.pid with strictly enforced mode 0600."""
-        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            os.chmod(self.vault_dir, 0o700)
-        except OSError:
-            pass
-
-        temp_path = self.vault_dir / f".watch.pid.tmp.{os.getpid()}.{time.time_ns()}"
-        payload = f"{pid}\n".encode("utf-8")
-        fd = None
-        try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-            fd = os.open(temp_path, flags, 0o600)
-            try:
-                os.fchmod(fd, 0o600)
-            except OSError:
-                pass
-
-            with open(fd, "wb", closefd=True) as f:
-                fd = None
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(temp_path, self.pid_file)
-            try:
-                os.chmod(self.pid_file, 0o600)
-            except OSError:
-                pass
-        except Exception:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
-            raise
+        _write_atomic_file_secure(self.pid_file, f"{pid}\n".encode("utf-8"))
 
     def _is_watch_cmdline(self, pid: int) -> bool:
         """Validates /proc/<pid>/cmdline if accessible to prevent killing arbitrary processes."""
         if not self.proc_dir.is_dir():
             return True
-
         cmdline_file = self.proc_dir / str(pid) / "cmdline"
         if not cmdline_file.is_file():
             return False
-
         try:
             raw = cmdline_file.read_bytes()
         except OSError:
             return False
-
-        if not raw:
-            return False
-
-        raw_args = [a for a in raw.split(b"\x00") if a]
+        raw_args = [a for a in raw.split(b"\x00") if a] if raw else []
         if not raw_args:
             return False
 
         args = [a.decode("utf-8", errors="replace").strip() for a in raw_args]
         argv0 = os.path.basename(args[0]).lower()
-
-        is_python = argv0.startswith("python") or argv0.startswith("pypy")
+        is_python = argv0.startswith(("python", "pypy"))
         is_agyswitch = "agy-switch" in argv0 or "agy_switch" in argv0
-
         if not (is_python or is_agyswitch):
             return False
 
         script_name = self.watch_script.name.lower() if self.watch_script else ""
-
         if is_python:
             target_script = None
             skip_next = False
@@ -1117,30 +981,18 @@ WantedBy=default.target
 
             if not target_script:
                 return False
-
-            if target_script == "-m":
-                full_cmd = " ".join(args).lower()
-                return "watch" in full_cmd and "run" in full_cmd
-
-            matches_script = False
-            if bool(script_name) and target_script == script_name:
-                matches_script = True
-            elif target_script in ("watch.py", "watcher.py", "agy_switch.py"):
-                matches_script = True
-            elif "agy-switch" in target_script or "agy_switch" in target_script:
-                matches_script = True
-
-            if not matches_script:
-                return False
-
             full_cmd = " ".join(args).lower()
-            return "run" in full_cmd or "watch" in full_cmd or bool(script_name and script_name in full_cmd)
+            if target_script == "-m":
+                return "watch" in full_cmd and "run" in full_cmd
+            matches_script = (
+                (bool(script_name) and target_script == script_name)
+                or target_script in ("watch.py", "watcher.py", "agy_switch.py")
+                or "agy-switch" in target_script or "agy_switch" in target_script
+            )
+            return matches_script and ("run" in full_cmd or "watch" in full_cmd or bool(script_name and script_name in full_cmd))
 
-        if is_agyswitch:
-            args_lower = [a.lower() for a in args]
-            return "watch" in args_lower or "run" in args_lower
-
-        return False
+        args_lower = [a.lower() for a in args]
+        return "watch" in args_lower or "run" in args_lower
 
     def is_process_alive(self, pid: int) -> bool:
         """Checks if PID exists, belongs to current user, and represents an active watch process."""
@@ -1350,45 +1202,18 @@ WantedBy=default.target
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="watch.py",
-        description="Antigravity Account Switcher Log Watcher & Daemon",
-    )
-    parser.add_argument(
-        "action",
-        nargs="?",
-        choices=["run", "start", "stop", "status"],
-        default="run",
-        help="Daemon action: run (default foreground), start (background daemon), stop, status",
-    )
-    parser.add_argument(
-        "--generate-systemd",
-        action="store_true",
-        help="Output user systemd service definition",
-    )
-    parser.add_argument(
-        "--install-systemd",
-        action="store_true",
-        help="Install systemd user service unit to ~/.config/systemd/user/agy-switch-watcher.service",
-    )
-    parser.add_argument(
-        "--cooldown",
-        type=int,
-        default=60,
-        help="Default cooldown minutes for exhausted accounts (default: 60)",
-    )
+    parser = argparse.ArgumentParser(prog="watch.py", description="Antigravity Account Switcher Log Watcher & Daemon")
+    parser.add_argument("action", nargs="?", choices=["run", "start", "stop", "status"], default="run", help="Daemon action")
+    parser.add_argument("--generate-systemd", action="store_true", help="Output user systemd service definition")
+    parser.add_argument("--install-systemd", action="store_true", help="Install systemd user service unit")
+    parser.add_argument("--cooldown", type=int, default=60, help="Default cooldown minutes")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    engine_cls = _get_engine_class()
-    engine = engine_cls()
+    engine = _get_engine_class()()
     dm = DaemonManager(vault_dir=engine.vault_dir)
 
     if args.generate_systemd or args.install_systemd:
-        target = (
-            Path.home() / ".config" / "systemd" / "user" / "agy-switch-watcher.service"
-            if args.install_systemd
-            else None
-        )
+        target = Path.home() / ".config" / "systemd" / "user" / "agy-switch-watcher.service" if args.install_systemd else None
         unit = dm.generate_systemd(target_path=target)
         sys.stdout.write(unit)
         sys.stdout.flush()
@@ -1397,9 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "start":
         try:
             pid = dm.start(cooldown=args.cooldown)
-            print(f"[watch] Daemon started in background (PID: {pid}).")
-            print(f"  - Log: {dm.log_file}")
-            print(f"  - PID: {dm.pid_file}")
+            print(f"[watch] Daemon started in background (PID: {pid}).\n  - Log: {dm.log_file}\n  - PID: {dm.pid_file}")
             return 0
         except DaemonAlreadyRunningError as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -1408,39 +1231,33 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error starting daemon: {e}", file=sys.stderr)
             return 1
 
-    elif args.action == "stop":
+    if args.action == "stop":
         try:
             stopped = dm.stop()
-            if stopped:
-                print("[watch] Daemon stopped successfully.")
-            else:
-                print("[watch] Daemon was not running.")
+            print("[watch] Daemon stopped successfully." if stopped else "[watch] Daemon was not running.")
             return 0
         except Exception as e:
             print(f"Error stopping daemon: {e}", file=sys.stderr)
             return 1
 
-    elif args.action == "status":
+    if args.action == "status":
         st = dm.status()
         if st["running"]:
-            print(f"[watch] Daemon is running (PID: {st['pid']}).")
-            print(f"  - Log: {st['log_file']}")
+            print(f"[watch] Daemon is running (PID: {st['pid']}).\n  - Log: {st['log_file']}")
             if st.get("targets"):
                 print("  - Monitored targets:")
                 for t in st["targets"]:
                     print(f"    * {t}")
         else:
-            print("[watch] Daemon is stopped.")
-            print(f"  - Log: {st['log_file']}")
+            print(f"[watch] Daemon is stopped.\n  - Log: {st['log_file']}")
         return 0
 
-    elif args.action == "run":
+    if args.action == "run":
         try:
             signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
         except Exception:
             pass
-        watcher = LogWatcher(engine, cooldown_minutes=args.cooldown)
-        watcher.watch_loop()
+        LogWatcher(engine, cooldown_minutes=args.cooldown).watch_loop()
         return 0
 
     return 0
@@ -1457,6 +1274,7 @@ __all__ = [
     "DEFAULT_GEMINI_DIR",
     "DEFAULT_MAX_CHUNK_BYTES",
     "_open_secure_log_file",
+    "append_secure_log_entry",
     "PresenceDetector",
     "CooldownManager",
     "LogWatcher",

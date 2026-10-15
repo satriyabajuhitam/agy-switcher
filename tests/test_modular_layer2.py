@@ -289,12 +289,14 @@ class TestLayer2DAGCompliance(unittest.TestCase):
             CooldownManager as SubCooldownManager,
             DaemonManager as SubDaemonManager,
             _open_secure_log_file as sub_open_secure,
+            append_secure_log_entry as sub_append_secure,
         )
         self.assertIs(watch_mod.LogWatcher, SubLogWatcher)
         self.assertIs(watch_mod.PresenceDetector, SubPresenceDetector)
         self.assertIs(watch_mod.CooldownManager, SubCooldownManager)
         self.assertIs(watch_mod.DaemonManager, SubDaemonManager)
         self.assertIs(watch_mod._open_secure_log_file, sub_open_secure)
+        self.assertIs(watch_mod.append_secure_log_entry, sub_append_secure)
         self.assertTrue(hasattr(watch_mod, "RotationEngine"))
         self.assertTrue(hasattr(watch_mod, "QuotaClient"))
         self.assertTrue(hasattr(watch_mod, "AgySwitchEngine"))

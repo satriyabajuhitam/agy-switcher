@@ -369,17 +369,20 @@ class TestReExportLaunchers(unittest.TestCase):
     """Validates contract rules for scripts/agy_switch.py and scripts/watch.py."""
 
     def test_presence_reexport_parity_and_line_constraint(self):
-        """PresenceDetector and _open_secure_log_file are identically re-exported in watcher.py.
-        watcher.py must remain strictly under 1500 lines.
+        """PresenceDetector, _open_secure_log_file, and append_secure_log_entry are identically re-exported in watcher.py.
+        watcher.py must remain strictly under 1300 lines (< 1500 lines limit).
         """
         import agy_switcher.presence as pres_mod
         import agy_switcher.watcher as watch_mod
 
         self.assertIs(pres_mod.PresenceDetector, watch_mod.PresenceDetector)
         self.assertIs(pres_mod._open_secure_log_file, watch_mod._open_secure_log_file)
+        self.assertIs(pres_mod.append_secure_log_entry, watch_mod.append_secure_log_entry)
+        self.assertIs(pres_mod.DEFAULT_GEMINI_DIR, watch_mod.DEFAULT_GEMINI_DIR)
 
         watcher_path = PACKAGE_DIR / "watcher.py"
         lines = watcher_path.read_text(encoding="utf-8").splitlines()
+        self.assertLess(len(lines), 1300, f"watcher.py size {len(lines)} exceeds 1300 lines limit!")
         self.assertLess(len(lines), 1500, f"watcher.py size {len(lines)} exceeds 1500 lines limit!")
 
     def test_agy_switch_launcher_uses_realpath_not_abspath(self):

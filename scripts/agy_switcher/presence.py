@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
@@ -42,6 +43,76 @@ def _open_secure_log_file(log_file: Path | str) -> int:
     except OSError:
         pass
     return log_fd
+
+
+def append_secure_log_entry(log_file: Path | str, message: str) -> None:
+    """Safely append a message entry to a log file with 0600 permissions and mode 0700 parent."""
+    path = Path(log_file)
+    try:
+        if path.parent and not path.parent.is_dir():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
+        log_fd = _open_secure_log_file(path)
+        try:
+            with open(log_fd, "a", encoding="utf-8", closefd=True) as f:
+                log_fd = None
+                f.write(message)
+                f.flush()
+        finally:
+            if log_fd is not None:
+                try:
+                    os.close(log_fd)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def _write_atomic_file_secure(target_file: Path | str, payload: bytes | str) -> None:
+    """Atomically writes payload to target_file with mode 0600 and ensures mode 0700 parent."""
+    target_path = Path(target_file)
+    parent = target_path.parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+
+    temp_path = parent / f".{target_path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+    raw_bytes = payload.encode("utf-8") if isinstance(payload, str) else payload
+    fd = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(temp_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with open(fd, "wb", closefd=True) as f:
+            fd = None
+            f.write(raw_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, target_path)
+        try:
+            os.chmod(target_path, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 class PresenceDetector:
@@ -229,6 +300,8 @@ class PresenceDetector:
 
 __all__ = [
     "_open_secure_log_file",
+    "append_secure_log_entry",
+    "_write_atomic_file_secure",
     "PresenceDetector",
     "DEFAULT_GEMINI_DIR",
 ]

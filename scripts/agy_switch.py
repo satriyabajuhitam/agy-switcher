@@ -109,6 +109,7 @@ from agy_switcher.watcher import (
     LogWatcher,
     PresenceDetector,
     _open_secure_log_file,
+    append_secure_log_entry,
 )
 
 # Layer 3: Hook Orchestration
@@ -174,6 +175,7 @@ __all__ = [
     "LogWatcher",
     "DaemonManager",
     "_open_secure_log_file",
+    "append_secure_log_entry",
     # Layer 3
     "handle_pre_invocation_hook",
     # Layer 4
