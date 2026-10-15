@@ -42,6 +42,7 @@ _EXPORTS: dict[str, str] = {
     "AUTH_PHRASES": "agy_switcher.telemetry",
     "AUTH_ERROR_CODE_PATTERN": "agy_switcher.telemetry",
     "HTTP_SERVER_ERROR_PATTERN": "agy_switcher.telemetry",
+    "QUOTA_REGEX": "agy_switcher.telemetry",
     "_is_auth_error": "agy_switcher.telemetry",
     "_is_network_error": "agy_switcher.telemetry",
     "_is_stale_exhausted_cache": "agy_switcher.telemetry",
@@ -70,6 +71,9 @@ _EXPORTS: dict[str, str] = {
     "DaemonManager": "agy_switcher.watcher",
     # Layer 3: Hook
     "handle_pre_invocation_hook": "agy_switcher.hook",
+    # Layer 4: CLI
+    "build_parser": "agy_switcher.cli",
+    "main": "agy_switcher.cli",
 }
 
 __all__ = list(_EXPORTS.keys())

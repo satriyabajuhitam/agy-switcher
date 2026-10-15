@@ -17,12 +17,39 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from agy_switcher.exceptions import AgySwitchError
+
+
+def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> Any:
+    """Resolves symbol from sys.modules['agy_switch'] if mocked/present; falls back to sub-package default."""
+    mod = sys.modules.get("agy_switch")
+    if mod and hasattr(mod, symbol_name):
+        return getattr(mod, symbol_name)
+    return fallback_factory()
+
+
+def _get_datetime() -> Any:
+    mod = sys.modules.get("agy_switch")
+    if mod and hasattr(mod, "datetime"):
+        return getattr(mod, "datetime")
+    return datetime
+
+
+def _get_quota_client_class() -> Any:
+    return _resolve_symbol("QuotaClient", lambda: QuotaClient)
+
+
+def _get_fetch_all_accounts_quota() -> Any:
+    return _resolve_symbol("fetch_all_accounts_quota", lambda: fetch_all_accounts_quota)
+
+
+def _get_fetch_account_quota() -> Any:
+    return _resolve_symbol("fetch_account_quota", lambda: fetch_account_quota)
 
 # Default OAuth Client Credentials for CloudCode
 DEFAULT_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
@@ -31,6 +58,13 @@ DEFAULT_CLIENT_SECRET = "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"
 # Error classification patterns and phrases
 AUTH_ERROR_CODE_PATTERN = re.compile(r"\b(401|403)\b")
 HTTP_SERVER_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
+QUOTA_REGEX = re.compile(
+    r"^(Gemini Models|Claude and GPT models)\s+"
+    r"(Weekly Limit Remaining|Five Hour Limit Remaining)\s+"
+    r"(\d+)%\s*"
+    r"([0-9T:\-Z.]+)?",
+    re.MULTILINE,
+)
 AUTH_PHRASES = (
     "no token",
     "token refresh rejected",
@@ -711,7 +745,7 @@ def fetch_account_quota(
         return "", {"error": "Invalid account name", "error_type": "validation"}
 
     if client is None:
-        client = QuotaClient(timeout=2.0, engine=engine)
+        client = _get_quota_client_class()(timeout=2.0, engine=engine)
 
     tokens = engine.get_account_tokens(acc_name) if hasattr(engine, "get_account_tokens") else None
     if not tokens or not tokens.get("access_token"):
@@ -724,7 +758,8 @@ def fetch_account_quota(
                 return
             raw_exp = new_token_data.get("expires_in", 3600)
             exp_sec = _sanitize_expires_in(raw_exp, default=3600)
-            expiry_iso = (datetime.now(timezone.utc) + timedelta(seconds=exp_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            dt_cls = _get_datetime()
+            expiry_iso = (dt_cls.now(timezone.utc) + timedelta(seconds=exp_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
             if hasattr(engine, "update_account_access_token"):
                 engine.update_account_access_token(acc_name, access_tok, expiry=expiry_iso)
         else:
@@ -772,14 +807,15 @@ def fetch_all_accounts_quota(
 ) -> dict[str, dict[str, Any]]:
     """Concurrently fetches quota for multiple accounts using ThreadPoolExecutor."""
     if client is None:
-        client = QuotaClient(timeout=2.0, engine=engine)
+        client = _get_quota_client_class()(timeout=2.0, engine=engine)
 
     if not accounts:
         return {}
 
+    fetch_one = _get_fetch_account_quota()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(fetch_account_quota, engine, acc, client)
+            executor.submit(fetch_one, engine, acc, client)
             for acc in accounts
         ]
         return dict(f.result() for f in concurrent.futures.as_completed(futures))
@@ -842,7 +878,7 @@ def run_quota_pipeline(
         return {"active": None, "accounts": []}
 
     if client is None:
-        client = QuotaClient(timeout=2.0, engine=engine)
+        client = _get_quota_client_class()(timeout=2.0, engine=engine)
 
     raw_accounts = data.get("accounts", [])
     if not isinstance(raw_accounts, list) or not raw_accounts:
@@ -852,7 +888,8 @@ def run_quota_pipeline(
     accounts = [dict(acc) for acc in raw_accounts if isinstance(acc, dict)]
 
     # 1. Concurrently fetch quotas
-    raw_quotas = fetch_all_accounts_quota(engine, accounts, client=client)
+    fetch_all = _get_fetch_all_accounts_quota()
+    raw_quotas = fetch_all(engine, accounts, client=client)
 
     # 2. Extract valid quotas and merge into cache
     valid_quotas: dict[str, Any] = {}
@@ -861,8 +898,9 @@ def run_quota_pipeline(
             valid_quotas[name] = q
 
     if valid_quotas:
+        dt_cls = _get_datetime()
         client.save_cache({
-            "timestamp": datetime.now(timezone.utc).timestamp(),
+            "timestamp": dt_cls.now(timezone.utc).timestamp(),
             "accounts": valid_quotas,
         }, merge=True)
 
