@@ -48,6 +48,15 @@ _EXPORTS: dict[str, str] = {
     "_parse_timestamp_defensive": "agy_switcher.telemetry",
     "_parse_quota_defensive": "agy_switcher.telemetry",
     "_sanitize_expires_in": "agy_switcher.telemetry",
+    # Layer 2: Rotation
+    "RotationEngine": "agy_switcher.rotation",
+    # Layer 2: Doctor
+    "DoctorEngine": "agy_switcher.doctor",
+    "run_doctor": "agy_switcher.doctor",
+    "auto_heal": "agy_switcher.doctor",
+    "extract_email_from_jwt": "agy_switcher.doctor",
+    "validate_token_dict": "agy_switcher.doctor",
+    "validate_token_file": "agy_switcher.doctor",
 }
 
 __all__ = list(_EXPORTS.keys())

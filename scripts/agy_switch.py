@@ -1625,10 +1625,11 @@ class AgySwitchEngine:
                             is_watch = False
                             has_script = any(
                                 tok.endswith(b"watch.py")
+                                or tok.endswith(b"watcher.py")
                                 or tok.endswith(b"agy_switch.py")
                                 or tok.endswith(b"agy_switch")
                                 or tok.endswith(b"agy-switch")
-                                or tok in (b"watch.py", b"scripts.watch", b"agy_switch", b"agy-switch")
+                                or tok in (b"watch.py", b"watcher.py", b"scripts.watch", b"agy_switcher.watcher", b"agy_switch", b"agy-switch")
                                 for tok in raw_tokens
                             )
                             has_action = any(
