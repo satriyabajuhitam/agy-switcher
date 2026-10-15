@@ -419,14 +419,23 @@ class TestRotationEngineLayer2(unittest.TestCase):
         self.assertEqual(rot.target_group_prefix, "Claude")
         self.assertEqual(rot.target_model_key, "claude")
 
-    def test_cache_optimized_retains_when_above_15_percent(self):
+    def test_cache_optimized_retains_when_above_threshold(self):
         rot = RotationEngine(model_name="gemini", active_account_id="acc1")
         accounts = {
-            "acc1": self._make_quota(gemini_frac=0.16),
+            "acc1": self._make_quota(gemini_frac=0.26),
             "acc2": self._make_quota(gemini_frac=0.99),
         }
         res = rot.evaluate(accounts, current_active="acc1", current_time=self.base_time)
-        self.assertIsNone(res, "Active account with > 15% quota must be retained")
+        self.assertIsNone(res, "Active account with > 25% quota must be retained")
+
+        # Explicit custom threshold test
+        rot_15 = RotationEngine(model_name="gemini", active_account_id="acc1", threshold=0.15)
+        accounts_15 = {
+            "acc1": self._make_quota(gemini_frac=0.16),
+            "acc2": self._make_quota(gemini_frac=0.99),
+        }
+        res_15 = rot_15.evaluate(accounts_15, current_active="acc1", current_time=self.base_time)
+        self.assertIsNone(res_15, "Active account with > 15% quota must be retained when threshold is 0.15")
 
     def test_drain_window_retains_when_reset_imminent(self):
         rot = RotationEngine(model_name="gemini", active_account_id="acc1")

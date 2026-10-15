@@ -520,9 +520,9 @@ class LogWatcher:
                 if g_frac is not None and g_frac <= 0.0 and (c_frac is None or c_frac > 0.0):
                     return "gemini"
                 if c_frac is not None and g_frac is not None:
-                    if c_frac < g_frac and c_frac <= 0.15:
+                    if c_frac < g_frac and c_frac <= 0.25:
                         return "claude"
-                    if g_frac < c_frac and g_frac <= 0.15:
+                    if g_frac < c_frac and g_frac <= 0.25:
                         return "gemini"
 
         return "gemini"

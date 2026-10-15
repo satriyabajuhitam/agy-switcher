@@ -45,6 +45,7 @@ from agy_switcher.exceptions import (
     AgySwitchError,
     DaemonAlreadyRunningError,
     DaemonError,
+    InvalidThresholdError,
     InvalidTokenError,
 )
 from agy_switcher.models import (
