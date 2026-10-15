@@ -604,7 +604,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertIn("acc2", saved_cache["accounts"])
 
     def test_tier_2_single_account_probe_when_quota_intermediate(self):
-        """Intermediate quota (15% <= quota < 25%) triggers Tier 2 single probe even if cache is fresh."""
+        """Intermediate quota (threshold <= quota < tier1_threshold) triggers Tier 2 single probe even if cache is fresh."""
         from agy_switch import handle_pre_invocation_hook
         import io
 
@@ -619,7 +619,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             }))
         self.engine.set_active_name("acc1")
 
-        # Cache created at 1000.0 with 20% quota
+        # Cache created at 1000.0 with 30% quota (intermediate: < 35% tier1 threshold)
         cache_dir = self.vault_dir / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         (cache_dir / "last_known_quota.json").write_text(json.dumps({
@@ -627,7 +627,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             "accounts": {
                 "acc1": {
                     "cached_at": 1000.0,
-                    "gemini": {"quota": 20, "reset_time": 1700000000},
+                    "gemini": {"quota": 30, "reset_time": 1700000000},
                 },
                 "acc2": {
                     "cached_at": 1000.0,
@@ -636,8 +636,8 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             }
         }), encoding="utf-8")
 
-        # Virtual clock at 1050.0 (delta = 50s <= 300s, but quota 20% is intermediate)
-        fresh_quota = {"gemini": {"quota": 22, "reset_time": 1700000000}}
+        # Virtual clock at 1050.0 (delta = 50s <= 300s, but quota 30% is intermediate)
+        fresh_quota = {"gemini": {"quota": 28, "reset_time": 1700000000}}
         with patch("time.time", return_value=1050.0):
             with patch("agy_switch.fetch_account_quota", return_value=("acc1", fresh_quota)) as mock_fetch:
                 with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-3.8-pro"}))):

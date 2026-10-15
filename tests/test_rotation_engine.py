@@ -61,17 +61,17 @@ class TestRotationEngine(unittest.TestCase):
         self.assertEqual(result, "acc2")
 
     def test_cache_optimized_retain(self):
-        # > 15% should retain active account even if another account is higher -> returns None
+        # > 25% should retain active account even if another account is higher -> returns None
         engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
         accounts = [
-            {"name": "acc1", "quota": self._make_quota(gemini_frac=0.16)},
+            {"name": "acc1", "quota": self._make_quota(gemini_frac=0.26)},
             {"name": "acc2", "quota": self._make_quota(gemini_frac=1.0)},
         ]
         result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
         self.assertIsNone(result)
 
     def test_drain_window_retain(self):
-        # < 15% but > 5% and reset in <= 30m -> retain active account -> returns None
+        # < 25% but > 5% and reset in <= 30m -> retain active account -> returns None
         engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
         accounts = [
             {"name": "acc1", "quota": self._make_quota(gemini_frac=0.06, gemini_reset=29)},
@@ -81,12 +81,12 @@ class TestRotationEngine(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_imminent_reset_priority(self):
-        """Standby account nearing reset with healthy quota (>= 15%) is prioritized."""
+        """Standby account nearing reset with healthy quota (>= 25%) is prioritized."""
         engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")
         accounts = [
             {"name": "acc1", "quota": self._make_quota(gemini_frac=0.05, gemini_reset=60)},
             {"name": "acc2", "quota": self._make_quota(gemini_frac=0.50, gemini_reset=120)},
-            {"name": "acc3", "quota": self._make_quota(gemini_frac=0.20, gemini_reset=40)},
+            {"name": "acc3", "quota": self._make_quota(gemini_frac=0.30, gemini_reset=40)},
         ]
         result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
         self.assertEqual(result, "acc3")

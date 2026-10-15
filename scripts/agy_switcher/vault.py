@@ -30,6 +30,7 @@ from agy_switcher.exceptions import (
     AccountNotFoundError,
     ActiveTurnRunningError,
     AgySwitchError,
+    InvalidThresholdError,
     InvalidTokenError,
 )
 from agy_switcher.models import DiagnosticItem, DiagnosticReport
@@ -338,6 +339,41 @@ class AgySwitchEngine:
         normalized = normalize_model_name(model)
         cfg = self.load_config()
         cfg["default_model"] = normalized
+        self.save_config(cfg)
+        return cfg
+
+    def get_quota_threshold(self) -> float:
+        """Returns configured quota threshold fraction, defaulting to 0.25 (25%)."""
+        cfg = self.load_config()
+        raw = cfg.get("quota_threshold")
+        if raw is not None:
+            try:
+                val = float(raw)
+                if val > 1.0:
+                    val = val / 100.0
+                if 0.0 < val <= 1.0:
+                    return val
+            except (ValueError, TypeError):
+                pass
+        return 0.25
+
+    def set_quota_threshold(self, threshold: float | int | str) -> dict[str, Any]:
+        """Persists validated quota threshold (percentage or fraction) to config.json."""
+        try:
+            val = float(threshold)
+        except (ValueError, TypeError):
+            raise InvalidThresholdError(f"Invalid threshold '{threshold}'. Must be a number between 1 and 100.")
+
+        if val > 1.0:
+            fraction = val / 100.0
+        else:
+            fraction = val
+
+        if not (0.0 < fraction <= 1.0):
+            raise InvalidThresholdError(f"Threshold must be between 1% (0.01) and 100% (1.0). Got: {threshold}")
+
+        cfg = self.load_config()
+        cfg["quota_threshold"] = round(fraction, 4)
         self.save_config(cfg)
         return cfg
 

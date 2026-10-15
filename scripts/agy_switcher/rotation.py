@@ -18,6 +18,9 @@ from agy_switcher.models import EvaluationCandidate, QuotaStatus
 from agy_switcher.telemetry import normalize_model_name
 
 
+DEFAULT_QUOTA_THRESHOLD: float = 0.25
+
+
 class RotationEngine:
     """Intelligent multi-account rotation engine supporting quota heuristics and model steering."""
 
@@ -32,6 +35,7 @@ class RotationEngine:
         vault_dir: Path | str | None = None,
         client: Any | None = None,
         target_model: str | None = None,
+        threshold: float | int | None = None,
     ) -> None:
         resolved_vault: Path | None = Path(vault_dir).expanduser() if vault_dir else None
         resolved_client = client
@@ -88,6 +92,27 @@ class RotationEngine:
             self.target_group_prefix = "Claude"
         else:
             self.target_group_prefix = "Gemini"
+
+        if threshold is not None:
+            try:
+                t_val = float(threshold)
+                self.threshold = t_val / 100.0 if t_val > 1.0 else t_val
+            except (ValueError, TypeError):
+                self.threshold = DEFAULT_QUOTA_THRESHOLD
+        elif resolved_vault:
+            cfg_file = resolved_vault / "config.json"
+            cfg_threshold = None
+            if cfg_file.is_file():
+                try:
+                    cfg_data = json.loads(cfg_file.read_text(encoding="utf-8"))
+                    if isinstance(cfg_data, dict) and "quota_threshold" in cfg_data:
+                        raw_t = float(cfg_data["quota_threshold"])
+                        cfg_threshold = raw_t / 100.0 if raw_t > 1.0 else raw_t
+                except Exception:
+                    pass
+            self.threshold = cfg_threshold if cfg_threshold is not None else DEFAULT_QUOTA_THRESHOLD
+        else:
+            self.threshold = DEFAULT_QUOTA_THRESHOLD
 
     def _parse_time(self, t_val: Any) -> datetime:
         """Parses various timestamp representations into a timezone-aware UTC datetime."""
@@ -201,11 +226,11 @@ class RotationEngine:
         """Determines if an account in cooldown is penalized for the target model_key.
 
         An account in cooldown is exempt from penalty for model_key ONLY if:
-        1. It has healthy quota (> 15%) for the target model.
+        1. It has healthy quota (> self.threshold) for the target model.
         2. The cooldown was triggered by exhaustion of the alternate model family.
         3. The cooldown does not explicitly penalize the target model family.
         """
-        if fraction <= 0.15:
+        if fraction <= self.threshold:
             return True
 
         norm_key = "claude" if "claude" in model_key.lower() else "gemini"
@@ -275,10 +300,10 @@ class RotationEngine:
         """Evaluates accounts and returns the optimal account to switch to, or None if current_active is optimal.
 
         Applies heuristics:
-        1. cache_optimized: retain current active if remaining quota > 15%.
+        1. cache_optimized: retain current active if remaining quota > self.threshold.
         2. drain_window: retain current active if remaining quota > 5% and reset in <= 30 minutes.
         3. auto_highest: select standby account with highest quota, prioritizing accounts nearing reset
-           (<= 45m with >= 15% quota), tie-breaking by earliest reset delta.
+           (<= 45m with >= self.threshold quota), tie-breaking by earliest reset delta.
         """
         if current_active is None and active is not None:
             current_active = active
@@ -400,8 +425,8 @@ class RotationEngine:
             )
 
         if not is_active_in_cooldown:
-            # 1. cache_optimized heuristic: retain current active if fraction > 0.15 (> 15%)
-            if active_status is not None and active_status.fraction > 0.15:
+            # 1. cache_optimized heuristic: retain current active if fraction > self.threshold
+            if active_status is not None and active_status.fraction > self.threshold:
                 return None
 
             # 2. drain_window heuristic: retain current active if fraction > 0.05 and reset in <= 30m
@@ -439,12 +464,12 @@ class RotationEngine:
             return None
 
         # Imminent reset priority: accounts nearing reset (reset_delta <= 45m)
-        # with healthy quota (fraction >= 0.15).
-        # Imminent accounts with very low quota (< 15%) do not qualify for imminent priority
+        # with healthy quota (fraction >= self.threshold).
+        # Imminent accounts with very low quota (< self.threshold) do not qualify for imminent priority
         # so they do not starve accounts with higher / 100% quota.
         imminent_candidates = [
             c for c in candidates
-            if 0 <= c.reset_delta <= 45 and c.status.fraction >= 0.15
+            if 0 <= c.reset_delta <= 45 and c.status.fraction >= self.threshold
         ]
 
         if imminent_candidates:

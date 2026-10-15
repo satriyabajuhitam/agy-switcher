@@ -36,6 +36,10 @@ class DaemonAlreadyRunningError(DaemonError):
         super().__init__(msg)
 
 
+class InvalidThresholdError(AgySwitchError):
+    """Raised when an invalid quota threshold value is specified."""
+
+
 __all__ = [
     "AgySwitchError",
     "InvalidTokenError",
@@ -43,4 +47,5 @@ __all__ = [
     "ActiveTurnRunningError",
     "DaemonError",
     "DaemonAlreadyRunningError",
+    "InvalidThresholdError",
 ]

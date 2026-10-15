@@ -100,9 +100,12 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
             RotationEngineCls = _get_rotation_engine_class()
             is_auth_err_fn, is_net_err_fn = _get_error_classifiers()
 
+            threshold = engine.get_quota_threshold() if hasattr(engine, "get_quota_threshold") else 0.25
+            tier1_threshold = min(1.0, threshold + 0.10)
+
             active_name = engine.get_active_name()
             client = QuotaClientCls(timeout=2.0, engine=engine)
-            rot_engine = RotationEngineCls(model_name=model_name, active_account_id=active_name)
+            rot_engine = RotationEngineCls(model_name=model_name, active_account_id=active_name, threshold=threshold)
 
             cached_data = client.load_cache()
             accounts_cache = (
@@ -123,7 +126,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 is_fresh = math.isfinite(cached_at_val) and cached_at_val > 0 and (-5.0 <= (now - cached_at_val) <= 300.0)
                 if is_fresh:
                     status = rot_engine.get_quota_status(active_cache, model_key=model_key)
-                    if status is not None and status.fraction >= 0.25:
+                    if status is not None and status.fraction >= tier1_threshold:
                         # 0ms pass: strictly zero network calls and zero disk writes
                         sys.stdout.write(json.dumps({}) + "\n")
                         sys.stdout.flush()
@@ -151,13 +154,13 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                         # Transient transport failure: attempt fallback to cached quota
                         if isinstance(active_cache, dict):
                             cached_status = rot_engine.get_quota_status(active_cache, model_key=model_key)
-                            if cached_status is not None and cached_status.fraction >= 0.15:
+                            if cached_status is not None and cached_status.fraction >= threshold:
                                 # Retain active account silently without emitting false alarms
                                 print(f"[agy-switch hook] Active account '{active_name}' network error: {probe_error}. Retaining active via cache ({cached_status.remaining_percentage()}%).", file=sys.stderr)
                                 sys.stdout.write(json.dumps({}) + "\n")
                                 sys.stdout.flush()
                                 return 0
-                        # If active cache is missing or low (< 15%), check if any standby account has cached quota
+                        # If active cache is missing or low (< threshold), check if any standby account has cached quota
                         has_standby_cache = any(
                             acc_id != active_name and isinstance(q_data, dict) and rot_engine.has_available_quota(q_data)
                             for acc_id, q_data in accounts_cache.items()
@@ -174,7 +177,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                         if (
                             rot_engine.has_available_quota(active_quota)
                             and active_status is not None
-                            and active_status.fraction >= 0.15
+                            and active_status.fraction >= threshold
                         ):
                             active_entry = dict(active_quota)
                             active_entry["cached_at"] = time.time()

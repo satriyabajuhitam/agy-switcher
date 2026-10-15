@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
 
-from agy_switch import main, AgySwitchEngine, QuotaClient, RotationEngine
+from agy_switch import main, AgySwitchEngine, QuotaClient, RotationEngine, InvalidThresholdError
 
 class TestCLI(unittest.TestCase):
 
@@ -668,6 +668,57 @@ class TestCLI(unittest.TestCase):
         report = format_status_report(status_with_unreachable)
         self.assertIn("Active Account    : acc1 (a@b.com)", report)
         self.assertIn("Language Server   : Running (PID: 1234)", report)
+
+    def test_config_threshold_get_and_set(self):
+        engine = MagicMock(spec=AgySwitchEngine)
+        engine.get_quota_threshold.return_value = 0.25
+
+        # 1. Get threshold via CLI
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            code = main(["config", "threshold"], engine=engine)
+            self.assertEqual(code, 0)
+            self.assertIn("quota threshold is currently 25%.", buf.getvalue())
+
+        # 2. Set threshold via CLI
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            code = main(["config", "threshold", "30"], engine=engine)
+            self.assertEqual(code, 0)
+            self.assertIn("quota threshold set to 30%.", buf.getvalue())
+            engine.set_quota_threshold.assert_called_with(30.0)
+
+        # 3. Invalid threshold via CLI
+        engine.set_quota_threshold.side_effect = InvalidThresholdError("Invalid threshold")
+        err_buf = io.StringIO()
+        with patch('sys.stderr', err_buf):
+            code = main(["config", "threshold", "999"], engine=engine)
+            self.assertEqual(code, 1)
+            self.assertIn("Error setting threshold", err_buf.getvalue())
+
+    def test_engine_threshold_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_dir = Path(tmpdir) / "vault"
+            engine = AgySwitchEngine(vault_dir=vault_dir)
+
+            # Default is 0.25 (25%)
+            self.assertEqual(engine.get_quota_threshold(), 0.25)
+
+            # Valid percentage
+            engine.set_quota_threshold(35)
+            self.assertEqual(engine.get_quota_threshold(), 0.35)
+
+            # Valid fraction
+            engine.set_quota_threshold(0.20)
+            self.assertEqual(engine.get_quota_threshold(), 0.20)
+
+            # Invalid thresholds raise InvalidThresholdError
+            with self.assertRaises(InvalidThresholdError):
+                engine.set_quota_threshold(-1)
+            with self.assertRaises(InvalidThresholdError):
+                engine.set_quota_threshold(150)
+            with self.assertRaises(InvalidThresholdError):
+                engine.set_quota_threshold("not_a_number")
 
 
 if __name__ == '__main__':

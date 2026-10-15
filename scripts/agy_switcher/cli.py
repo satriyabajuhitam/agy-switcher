@@ -217,6 +217,10 @@ def build_parser() -> argparse.ArgumentParser:
     default_model_parser.add_argument(
         "model", nargs="?", help="Default model family (gemini or claude)"
     )
+    threshold_parser = config_subparsers.add_parser(
+        "threshold", help="Configure quota threshold percentage (1-100)"
+    )
+    threshold_parser.add_argument("value", nargs="?", help="Threshold percentage (1-100)")
 
     # Command: hook
     hook_parser = subparsers.add_parser("hook", help="Manage Antigravity lifecycle hooks")
@@ -444,7 +448,8 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 acc["quota"] = valid_quotas.get(acc["name"], {})
 
             re_cls = _get_rotation_engine_class()
-            rot_engine = re_cls(model_name=target_model, active_account_id=active_name)
+            threshold = engine.get_quota_threshold()
+            rot_engine = re_cls(model_name=target_model, active_account_id=active_name, threshold=threshold)
 
             # Quota telemetry presence check for target_model
             accounts_with_telemetry = []
@@ -654,6 +659,22 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                     f"[agy-switch] Unsupported model '{model_arg}'. Allowed models: 'gemini', 'claude'.",
                     file=sys.stderr,
                 )
+                return 1
+        if getattr(args, "config_command", None) == "threshold":
+            val_arg = getattr(args, "value", None)
+            if val_arg is None:
+                current = engine.get_quota_threshold()
+                pct = int(current * 100) if (current * 100).is_integer() else round(current * 100, 1)
+                print(f"[agy-switch] quota threshold is currently {pct}%.")
+                return 0
+            try:
+                val = float(val_arg)
+                engine.set_quota_threshold(val)
+                pct = int(val) if val.is_integer() else val
+                print(f"[agy-switch] quota threshold set to {pct}%.")
+                return 0
+            except Exception as exc:
+                print(f"[agy-switch] Error setting threshold: {exc}", file=sys.stderr)
                 return 1
         cfg = engine.load_config()
         print(json.dumps(cfg, indent=2))
