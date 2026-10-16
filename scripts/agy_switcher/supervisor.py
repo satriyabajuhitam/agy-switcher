@@ -150,8 +150,10 @@ class ProcessSupervisor:
 
         try:
             self._send_signal(pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
+        except ProcessLookupError:
             return True
+        except OSError:
+            pass
 
         if self._poll_process_exit(pid, timeout=3.0):
             return True
