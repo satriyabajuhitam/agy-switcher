@@ -1,0 +1,12 @@
+{
+  "agy-switch-auto-rotate": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 /srv/agy-workspaces/booster/agy-switcher/scripts/agy_switch.py hook-pre-invocation",
+        "timeout": 5
+      }
+    ]
+  }
+}

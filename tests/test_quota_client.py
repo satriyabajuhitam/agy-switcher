@@ -16,11 +16,17 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from agy_switch import (
     AUTH_PHRASES,
+    DEFAULT_CLOUDCODE_ENDPOINT,
+    DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT,
+    DEFAULT_FALLBACK_QUOTA_ENDPOINT,
+    DEFAULT_QUOTA_ENDPOINT,
+    QUOTA_SUMMARY_PATH,
     QuotaClient,
     _is_auth_error,
     _is_network_error,
     fetch_account_quota,
     fetch_all_accounts_quota,
+    resolve_quota_endpoint,
 )
 
 
@@ -1298,6 +1304,215 @@ class TestQuotaClient(unittest.TestCase):
         self.assertTrue(hasattr(mod_client, "parse_quota_response"))
         self.assertTrue(hasattr(mod_client, "save_cache"))
         self.assertTrue(hasattr(mod_client, "load_cache"))
+
+    def test_default_quota_endpoint_constants(self):
+        """Verify default quota endpoints point to daily service with fallback."""
+        self.assertEqual(DEFAULT_CLOUDCODE_ENDPOINT, "https://daily-cloudcode-pa.googleapis.com")
+        self.assertEqual(DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT, "https://cloudcode-pa.googleapis.com")
+        self.assertEqual(QUOTA_SUMMARY_PATH, "/v1internal:retrieveUserQuotaSummary")
+        self.assertEqual(DEFAULT_QUOTA_ENDPOINT, "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
+        self.assertEqual(DEFAULT_FALLBACK_QUOTA_ENDPOINT, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
+
+    def test_resolve_quota_endpoint_precedence(self):
+        """Verify resolve_quota_endpoint precedence: custom > env > supervisor > default."""
+        # 1. Custom endpoint explicit
+        self.assertEqual(
+            resolve_quota_endpoint("https://custom.endpoint.com/v1internal:retrieveUserQuotaSummary"),
+            "https://custom.endpoint.com/v1internal:retrieveUserQuotaSummary",
+        )
+        # 1b. Custom base URL appends path
+        self.assertEqual(
+            resolve_quota_endpoint("https://custom.endpoint.com"),
+            "https://custom.endpoint.com/v1internal:retrieveUserQuotaSummary",
+        )
+        self.assertEqual(
+            resolve_quota_endpoint("https://custom.endpoint.com/"),
+            "https://custom.endpoint.com/v1internal:retrieveUserQuotaSummary",
+        )
+
+        # 2. AGY_CLOUD_CODE_ENDPOINT env var
+        with patch.dict(os.environ, {"AGY_CLOUD_CODE_ENDPOINT": "https://env-agy.endpoint.com"}):
+            self.assertEqual(
+                resolve_quota_endpoint(),
+                "https://env-agy.endpoint.com/v1internal:retrieveUserQuotaSummary",
+            )
+
+        # 2b. CLOUD_CODE_ENDPOINT env var
+        with patch.dict(os.environ, {"CLOUD_CODE_ENDPOINT": "https://env-cc.endpoint.com"}, clear=False):
+            with patch.dict(os.environ, {"AGY_CLOUD_CODE_ENDPOINT": ""}):
+                self.assertEqual(
+                    resolve_quota_endpoint(),
+                    "https://env-cc.endpoint.com/v1internal:retrieveUserQuotaSummary",
+                )
+
+        # 3. Dynamic detection via supervisor
+        mock_sup = MagicMock()
+        mock_sup.get_cloud_code_endpoint.return_value = "https://supervisor-detected.endpoint.com"
+        with patch.dict(os.environ, {"AGY_CLOUD_CODE_ENDPOINT": "", "CLOUD_CODE_ENDPOINT": ""}):
+            self.assertEqual(
+                resolve_quota_endpoint(supervisor=mock_sup),
+                "https://supervisor-detected.endpoint.com/v1internal:retrieveUserQuotaSummary",
+            )
+
+        # 4. Default fallback when no custom, no env, no supervisor
+        mock_empty_sup = MagicMock()
+        mock_empty_sup.get_cloud_code_endpoint.return_value = None
+        with patch.dict(os.environ, {"AGY_CLOUD_CODE_ENDPOINT": "", "CLOUD_CODE_ENDPOINT": ""}):
+            self.assertEqual(
+                resolve_quota_endpoint(supervisor=mock_empty_sup),
+                DEFAULT_QUOTA_ENDPOINT,
+            )
+
+    def test_quota_client_init_endpoints(self):
+        """Verify QuotaClient.__init__ wires primary and fallback endpoints correctly."""
+        # Default client has daily primary and cloudcode fallback
+        qc = QuotaClient(cache_dir=self.cache_dir)
+        self.assertEqual(qc.quota_endpoint, DEFAULT_QUOTA_ENDPOINT)
+        self.assertEqual(qc.fallback_quota_endpoint, DEFAULT_FALLBACK_QUOTA_ENDPOINT)
+
+        # When primary matches fallback, fallback is disabled (None)
+        qc_same = QuotaClient(
+            cache_dir=self.cache_dir,
+            quota_endpoint=DEFAULT_FALLBACK_QUOTA_ENDPOINT,
+            fallback_quota_endpoint=DEFAULT_FALLBACK_QUOTA_ENDPOINT,
+        )
+        self.assertEqual(qc_same.quota_endpoint, DEFAULT_FALLBACK_QUOTA_ENDPOINT)
+        self.assertIsNone(qc_same.fallback_quota_endpoint)
+
+        # Custom explicit endpoints
+        qc_custom = QuotaClient(
+            cache_dir=self.cache_dir,
+            quota_endpoint="https://my-custom.com",
+            fallback_quota_endpoint="https://my-fallback.com",
+        )
+        self.assertEqual(qc_custom.quota_endpoint, "https://my-custom.com/v1internal:retrieveUserQuotaSummary")
+        self.assertEqual(qc_custom.fallback_quota_endpoint, "https://my-fallback.com/v1internal:retrieveUserQuotaSummary")
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_fallback_on_server_error(self, mock_urlopen):
+        """Verify fetch_quota falls back to secondary endpoint on 503 error."""
+        qc = QuotaClient(
+            cache_dir=self.cache_dir,
+            quota_endpoint="https://daily-cloudcode-pa.googleapis.com",
+            fallback_quota_endpoint="https://cloudcode-pa.googleapis.com",
+        )
+        mock_503 = urllib.error.HTTPError(qc.quota_endpoint, 503, "Service Unavailable", {}, None)
+        mock_success = MagicMock()
+        mock_success.read.return_value = json.dumps(self.mock_quota_resp).encode("utf-8")
+        mock_success.__enter__.return_value = mock_success
+
+        mock_urlopen.side_effect = [mock_503, mock_success]
+
+        res = qc.fetch_quota(self.access_token)
+        self.assertEqual(res, self.expected_parsed_resp)
+        self.assertEqual(mock_urlopen.call_count, 2)
+        req1 = mock_urlopen.call_args_list[0][0][0]
+        req2 = mock_urlopen.call_args_list[1][0][0]
+        self.assertEqual(req1.full_url, qc.quota_endpoint)
+        self.assertEqual(req2.full_url, qc.fallback_quota_endpoint)
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_fallback_on_network_error(self, mock_urlopen):
+        """Verify fetch_quota falls back to secondary endpoint on URLError."""
+        qc = QuotaClient(
+            cache_dir=self.cache_dir,
+            quota_endpoint="https://daily-cloudcode-pa.googleapis.com",
+            fallback_quota_endpoint="https://cloudcode-pa.googleapis.com",
+        )
+        mock_net_err = urllib.error.URLError("Connection reset")
+        mock_success = MagicMock()
+        mock_success.read.return_value = json.dumps(self.mock_quota_resp).encode("utf-8")
+        mock_success.__enter__.return_value = mock_success
+
+        mock_urlopen.side_effect = [mock_net_err, mock_success]
+
+        res = qc.fetch_quota(self.access_token)
+        self.assertEqual(res, self.expected_parsed_resp)
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_no_fallback_on_401_unauthorized(self, mock_urlopen):
+        """Verify fetch_quota does NOT attempt fallback endpoint on 401 (auth error)."""
+        qc = QuotaClient(
+            cache_dir=self.cache_dir,
+            quota_endpoint="https://daily-cloudcode-pa.googleapis.com",
+            fallback_quota_endpoint="https://cloudcode-pa.googleapis.com",
+        )
+        mock_401 = urllib.error.HTTPError(qc.quota_endpoint, 401, "Unauthorized", {}, None)
+        mock_urlopen.side_effect = mock_401
+
+        res = qc.fetch_quota(self.access_token)
+        self.assertEqual(res, {})
+        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(qc.last_error_type, "auth")
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_disabled_fallback(self, mock_urlopen):
+        """Verify fetch_quota does not retry when fallback_quota_endpoint is None."""
+        qc = QuotaClient(
+            cache_dir=self.cache_dir,
+            quota_endpoint="https://daily-cloudcode-pa.googleapis.com",
+            fallback_quota_endpoint=None,
+        )
+        mock_500 = urllib.error.HTTPError(qc.quota_endpoint, 500, "Internal Server Error", {}, None)
+        mock_urlopen.side_effect = mock_500
+
+        res = qc.fetch_quota(self.access_token)
+        self.assertEqual(res, {})
+        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(qc.last_error_type, "http")
+
+    def test_resolve_quota_endpoint_trailing_slash_preserves_path(self):
+        """Verify resolve_quota_endpoint does not duplicate path when candidate has trailing slash."""
+        candidate_with_slash = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary/"
+        self.assertEqual(
+            resolve_quota_endpoint(candidate_with_slash),
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        )
+
+        base_with_slash = "https://daily-cloudcode-pa.googleapis.com/"
+        self.assertEqual(
+            resolve_quota_endpoint(base_with_slash),
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        )
+
+    def test_resolve_quota_endpoint_missing_scheme_adds_https(self):
+        """Verify resolve_quota_endpoint prepends https:// if scheme is missing."""
+        self.assertEqual(
+            resolve_quota_endpoint("daily-cloudcode-pa.googleapis.com"),
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        )
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_fallback_on_429_too_many_requests(self, mock_urlopen):
+        """Verify fetch_quota falls back to secondary endpoint on HTTP 429 rate limit."""
+        qc = QuotaClient(
+            cache_dir=self.cache_dir,
+            quota_endpoint="https://daily-cloudcode-pa.googleapis.com",
+            fallback_quota_endpoint="https://cloudcode-pa.googleapis.com",
+        )
+        mock_429 = urllib.error.HTTPError(qc.quota_endpoint, 429, "Too Many Requests", {}, None)
+        mock_success = MagicMock()
+        mock_success.read.return_value = json.dumps(self.mock_quota_resp).encode("utf-8")
+        mock_success.__enter__.return_value = mock_success
+
+        mock_urlopen.side_effect = [mock_429, mock_success]
+
+        res = qc.fetch_quota(self.access_token)
+        self.assertEqual(res, self.expected_parsed_resp)
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_quota_closes_http_error_response(self, mock_urlopen):
+        """Verify fetch_quota calls close() on HTTPError to prevent socket/file descriptor leaks."""
+        qc = QuotaClient(cache_dir=self.cache_dir, fallback_quota_endpoint=None)
+        mock_fp = MagicMock()
+        err = urllib.error.HTTPError(qc.quota_endpoint, 500, "Internal Server Error", {}, mock_fp)
+        mock_urlopen.side_effect = err
+
+        res = qc.fetch_quota(self.access_token)
+        self.assertEqual(res, {})
+        mock_fp.close.assert_called_once()
 
 
 if __name__ == "__main__":
