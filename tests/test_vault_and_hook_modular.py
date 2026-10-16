@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -149,6 +150,57 @@ class TestVaultEngineModular(unittest.TestCase):
         self.assertTrue(self.engine._is_valid_expiry(1700000000))
         self.assertTrue(self.engine._is_valid_expiry("2026-10-15T00:00:00Z"))
 
+    def test_restart_language_server_delegates_to_supervisor(self):
+        """restart_language_server must delegate directly to supervisor.restart_language_server."""
+        with patch.object(self.engine.supervisor, "restart_language_server", return_value=True) as mock_restart:
+            res = self.engine.restart_language_server(force=True)
+            self.assertTrue(res)
+            mock_restart.assert_called_once_with(force=True)
+
+    def test_restart_language_server_bridges_monkeypatched_methods_to_supervisor(self):
+        """restart_language_server bridges instance-level mocks (_send_signal, _poll_process_exit) to supervisor."""
+        killed = []
+        polled = []
+        self.engine.locate_language_server_pid = lambda: 8888
+        self.engine.is_server_busy = lambda pid: False
+        self.engine._send_signal = lambda pid, sig: killed.append((pid, sig))
+        self.engine._poll_process_exit = lambda pid, timeout: polled.append((pid, timeout)) or True
+
+        orig_supervisor_send = self.engine.supervisor._send_signal
+        orig_supervisor_poll = self.engine.supervisor._poll_process_exit
+
+        with patch.object(self.engine.supervisor, "restart_language_server", wraps=self.engine.supervisor.restart_language_server) as spy_restart:
+            res = self.engine.restart_language_server(force=True)
+            self.assertTrue(res)
+            spy_restart.assert_called_once_with(force=True)
+
+        self.assertEqual(killed, [(8888, signal.SIGTERM)])
+        self.assertEqual(polled, [(8888, 3.0)])
+
+        # Verify supervisor instance attributes are restored cleanly
+        self.assertNotIn("_send_signal", self.engine.supervisor.__dict__)
+        self.assertNotIn("_poll_process_exit", self.engine.supervisor.__dict__)
+        self.assertNotIn("locate_language_server_pid", self.engine.supervisor.__dict__)
+        self.assertNotIn("is_server_busy", self.engine.supervisor.__dict__)
+        self.assertEqual(self.engine.supervisor._send_signal, orig_supervisor_send)
+        self.assertEqual(self.engine.supervisor._poll_process_exit, orig_supervisor_poll)
+
+    def test_restart_language_server_restores_supervisor_attributes_on_exception(self):
+        """restart_language_server restores supervisor attributes even if supervisor raises an exception."""
+        self.engine.locate_language_server_pid = lambda: 8888
+        self.engine.is_server_busy = lambda pid: True
+        self.engine._send_signal = lambda pid, sig: None
+        self.engine._poll_process_exit = lambda pid, timeout: True
+
+        with self.assertRaises(ActiveTurnRunningError):
+            self.engine.restart_language_server(force=False)
+
+        # Verify supervisor instance attributes are restored cleanly after exception
+        self.assertNotIn("_send_signal", self.engine.supervisor.__dict__)
+        self.assertNotIn("_poll_process_exit", self.engine.supervisor.__dict__)
+        self.assertNotIn("locate_language_server_pid", self.engine.supervisor.__dict__)
+        self.assertNotIn("is_server_busy", self.engine.supervisor.__dict__)
+
     def test_install_hook_points_to_agy_switch_launcher(self):
         """install_hook must point to scripts/agy_switch.py launcher."""
         hooks_file = self.gemini_dir / "config" / "hooks.json"
@@ -209,6 +261,34 @@ class TestHookLifecycleModular(unittest.TestCase):
     def test_hook_stale_cache_deduplicated_from_telemetry(self):
         """_is_stale_exhausted_cache in hook must be imported directly from telemetry."""
         self.assertIs(_is_stale_exhausted_cache, telemetry_mod._is_stale_exhausted_cache)
+
+    def test_hook_strictly_maintains_restart_server_false_on_rotation(self):
+        """PreInvocation hook must strictly invoke switch_tokens with restart_server=False, force=True."""
+        import agy_switch
+        self.engine.set_auto_switch(True)
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        acc2_dir = self.engine.accounts_dir / "acc2"
+        acc2_dir.mkdir(parents=True, exist_ok=True)
+        (acc2_dir / "token.json").write_text(json.dumps(create_sample_token("acc2@example.com")), encoding="utf-8")
+
+        self.engine.set_active_name("acc1")
+
+        mock_fetch_acc = MagicMock(return_value=("acc1", {"gemini": {"quota": 0}}))
+        mock_fetch_all = MagicMock(return_value={"acc2": {"gemini": {"quota": 80}}})
+
+        with patch.object(agy_switch, "fetch_account_quota", mock_fetch_acc), \
+             patch.object(agy_switch, "fetch_all_accounts_quota", mock_fetch_all), \
+             patch.object(self.engine, "switch_tokens", wraps=self.engine.switch_tokens) as spy_switch:
+            out = io.StringIO()
+            with patch("sys.stdin", io.StringIO('{"modelName": "gemini-3.8-pro"}')), \
+                 patch("sys.stdout", out):
+                ret = handle_pre_invocation_hook(self.engine)
+
+            self.assertEqual(ret, 0)
+            spy_switch.assert_called_once_with("acc2", restart_server=False, force=True)
 
 
 class TestSecurityLayer0(unittest.TestCase):

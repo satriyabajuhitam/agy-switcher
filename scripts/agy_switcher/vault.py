@@ -941,22 +941,29 @@ class AgySwitchEngine:
         return self.supervisor._poll_process_exit(pid, timeout=timeout)
 
     def restart_language_server(self, force: bool = False) -> bool:
-        """Restarts language_server gracefully via SIGTERM so WSL Relay auto-respawns it."""
-        if "_send_signal" in self.__dict__ or "_poll_process_exit" in self.__dict__:
-            pid = self.locate_language_server_pid()
-            if pid is None:
-                return False
+        """Restarts language_server gracefully via SIGTERM so WSL Relay auto-respawns it.
 
-            if self.is_server_busy(pid) and not force:
-                raise ActiveTurnRunningError(
-                    "Antigravity is currently busy processing an agent turn or background task. "
-                    "Use --force to switch and restart anyway."
-                )
-
-            self._send_signal(pid, signal.SIGTERM)
-            return self._poll_process_exit(pid, timeout=3.0)
-
-        return self.supervisor.restart_language_server(force=force)
+        Delegates directly to ProcessSupervisor while transparently bridging any
+        instance-level monkey-patched mocks on this engine instance.
+        """
+        bridge_attrs = ("_send_signal", "_poll_process_exit", "locate_language_server_pid", "is_server_busy")
+        saved = {}
+        had_instance_attr = set()
+        for attr in bridge_attrs:
+            if attr in self.__dict__:
+                if attr in self.supervisor.__dict__:
+                    had_instance_attr.add(attr)
+                    saved[attr] = self.supervisor.__dict__[attr]
+                setattr(self.supervisor, attr, getattr(self, attr))
+        try:
+            return self.supervisor.restart_language_server(force=force)
+        finally:
+            for attr in bridge_attrs:
+                if attr in self.__dict__:
+                    if attr in had_instance_attr:
+                        setattr(self.supervisor, attr, saved[attr])
+                    else:
+                        self.supervisor.__dict__.pop(attr, None)
 
     def get_status(self) -> dict[str, Any]:
         """Returns health and status of the vault and running language_server."""
