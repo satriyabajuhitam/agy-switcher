@@ -670,22 +670,25 @@ class LogWatcher:
         if reloaded:
             _get_time().sleep(1.0)
 
+        clean_reason = ""
+        if reason and isinstance(reason, str):
+            r = reason.strip()
+            while r.startswith("(") and r.endswith(")") and len(r) >= 2:
+                r = r[1:-1].strip()
+            clean_reason = r
+
         shutil_mod = _get_shutil()
         notify_bin = shutil_mod.which("notify-send")
         if notify_bin:
             try:
+
                 if reloaded:
-                    msg = f"🔄 Antigravity switched to {target_account} (reloading language_server...)"
-                    if reason:
-                        msg += f" ({reason})"
-                elif old_account:
-                    msg = f"🔄 Antigravity switched from '{old_account}' to '{target_account}'"
-                    if reason:
-                        msg += f" ({reason})"
+                    msg = f"🔄 Antigravity switched to {target_account} & reloaded language_server"
                 else:
-                    msg = f"Auto-rotated to '{target_account}'"
-                    if reason:
-                        msg += f" ({reason})"
+                    msg = f"🔄 Antigravity switched to {target_account}"
+
+                if clean_reason:
+                    msg += f" ({clean_reason})"
 
                 _get_subprocess().Popen(
                     [notify_bin, "agy-switch", msg],
@@ -698,14 +701,15 @@ class LogWatcher:
         vault_dir = getattr(self.engine, "vault_dir", None)
         log_dir = Path(vault_dir) if isinstance(vault_dir, (str, Path)) else DEFAULT_VAULT_DIR
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        log_reason = clean_reason if clean_reason else reason
         if old_account and reloaded:
-            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' with force-restart language_server (reason: {reason})\n"
+            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' with force-restart language_server (reason: {log_reason})\n"
         elif old_account:
-            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' (reason: {reason})\n"
+            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' (reason: {log_reason})\n"
         elif reloaded:
-            log_line = f"{ts} [watch] Switched to '{target_account}' with force-restart language_server (reason: {reason})\n"
+            log_line = f"{ts} [watch] Switched to '{target_account}' with force-restart language_server (reason: {log_reason})\n"
         else:
-            log_line = f"{ts} Switched to '{target_account}' ({reason})\n"
+            log_line = f"{ts} Switched to '{target_account}' ({log_reason})\n"
         append_secure_log_entry(log_dir / "watch.log", log_line)
 
     def trigger_switch(
@@ -835,14 +839,8 @@ class LogWatcher:
 
             self._stagnant_sizes.clear()
 
-            # Observe 1.0s settling delay before notification when language_server is restarted (0.1s otherwise)
+            # Fire non-blocking desktop notification (encapsulates 1.0s settling delay when reloaded=True)
             server_restarted = res.get("server_restarted", False) if isinstance(res, dict) else False
-            if server_restarted:
-                _get_time().sleep(1.0)
-            else:
-                _get_time().sleep(0.1)
-
-            # Fire non-blocking desktop notification
             self._notify_desktop(
                 target_account=target_account,
                 old_account=active_name,

@@ -1,7 +1,10 @@
 import unittest
 from unittest.mock import MagicMock, patch, mock_open
-import sys
+from pathlib import Path
 import os
+import shutil
+import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -9,8 +12,13 @@ from scripts.watch import LogWatcher
 
 class TestLogWatcher(unittest.TestCase):
     def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
         self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = Path(self.tmpdir)
         self.watcher = LogWatcher(engine=self.engine_mock, log_dirs=["/fake/log/dir"], cooldown_minutes=60)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_regex_matching_resource_exhausted(self):
         line = "Error: RESOURCE_EXHAUSTED (code 429)"
@@ -534,7 +542,7 @@ class TestLogWatcher(unittest.TestCase):
                 mock_notify.assert_not_called()
 
     def test_handle_exhaustion_observes_settling_delay_on_server_restart(self):
-        """Settling delay of 1.0s is observed before desktop notification when server_restarted is True, 0.1s otherwise."""
+        """Settling delay of 1.0s is executed exactly once during handle_exhaustion failover with server reload."""
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -554,29 +562,35 @@ class TestLogWatcher(unittest.TestCase):
 
             with patch("scripts.watch.RotationEngine") as rot_cls_mock, \
                  patch("scripts.watch.time.sleep") as mock_sleep, \
-                 patch.object(self.watcher, "_notify_desktop") as mock_notify:
+                 patch("scripts.watch.shutil.which", return_value="/usr/bin/notify-send"), \
+                 patch("scripts.watch.subprocess.Popen") as mock_popen, \
+                 patch("agy_switcher.watcher.append_secure_log_entry"):
                 rot_mock = MagicMock()
                 rot_mock.evaluate.return_value = 'acc2'
                 rot_cls_mock.return_value = rot_mock
 
-                # Subtest A: server_restarted = True -> sleep(1.0)
+                # Subtest A: server_restarted = True -> sleep(1.0) called exactly once
                 self.engine_mock.switch_tokens.return_value = {
                     "active": "acc2",
                     "server_restarted": True,
                 }
                 res = self.watcher.handle_exhaustion(line="RESOURCE_EXHAUSTED (code 429)", file_path=f1)
                 self.assertTrue(res)
-                mock_sleep.assert_called_with(1.0)
-                mock_notify.assert_called_once_with(
-                    target_account='acc2',
-                    old_account='acc1',
-                    reason='quota 429',
-                    reloaded=True,
-                )
+                mock_sleep.assert_called_once_with(1.0)
+                self.assertEqual(mock_sleep.call_count, 1)
 
-                # Subtest B: server_restarted = False -> sleep(0.1)
+                # Verify clean notification format dispatched via notify-send
+                mock_popen.assert_called_once()
+                call_args = mock_popen.call_args[0][0]
+                self.assertEqual(call_args[0], "/usr/bin/notify-send")
+                self.assertEqual(call_args[1], "agy-switch")
+                self.assertEqual(call_args[2], "🔄 Antigravity switched to acc2 & reloaded language_server (quota 429)")
+                self.assertNotIn("(reloading language_server...)", call_args[2])
+                self.assertNotIn(") (", call_args[2])
+
+                # Subtest B: server_restarted = False -> no settling delay
                 mock_sleep.reset_mock()
-                mock_notify.reset_mock()
+                mock_popen.reset_mock()
                 self.watcher.last_switch_time = 0.0
                 self.engine_mock.switch_tokens.return_value = {
                     "active": "acc2",
@@ -584,13 +598,13 @@ class TestLogWatcher(unittest.TestCase):
                 }
                 res_b = self.watcher.handle_exhaustion(line="RESOURCE_EXHAUSTED (code 429)", file_path=f1)
                 self.assertTrue(res_b)
-                mock_sleep.assert_called_with(0.1)
-                mock_notify.assert_called_once_with(
-                    target_account='acc2',
-                    old_account='acc1',
-                    reason='quota 429',
-                    reloaded=False,
-                )
+                mock_sleep.assert_not_called()
+
+                mock_popen.assert_called_once()
+                call_args_b = mock_popen.call_args[0][0]
+                self.assertEqual(call_args_b[2], "🔄 Antigravity switched to acc2 (quota 429)")
+                self.assertNotIn("& reloaded", call_args_b[2])
+                self.assertNotIn(") (", call_args_b[2])
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_handle_exhaustion_accepts_path_object_file_path(self, mock_sleep):
@@ -628,11 +642,11 @@ class TestLogWatcher(unittest.TestCase):
                 self.assertEqual(len(self.watcher._stagnant_sizes), 0)
 
     def test_notify_desktop_reloaded_true_invokes_settling_delay_and_fires_reload_notification(self):
-        """When reloaded=True, _notify_desktop invokes 1.0s settling delay and sends explicit reload message."""
+        """When reloaded=True, _notify_desktop invokes 1.0s settling delay and sends explicit reload message without double parentheses."""
         with patch("scripts.watch.shutil.which", return_value="/usr/bin/notify-send"), \
              patch("scripts.watch.time.sleep") as mock_sleep, \
              patch("scripts.watch.subprocess.Popen") as mock_popen, \
-             patch("scripts.watch.append_secure_log_entry"):
+             patch("agy_switcher.watcher.append_secure_log_entry"):
 
             self.watcher._notify_desktop(
                 target_account="acc2",
@@ -641,8 +655,8 @@ class TestLogWatcher(unittest.TestCase):
                 reloaded=True,
             )
 
-            # Settling delay of 1.0s MUST be invoked
-            mock_sleep.assert_called_with(1.0)
+            # Settling delay of 1.0s MUST be invoked exactly once
+            mock_sleep.assert_called_once_with(1.0)
 
             # notify-send must be dispatched
             mock_popen.assert_called_once()
@@ -650,16 +664,17 @@ class TestLogWatcher(unittest.TestCase):
             self.assertEqual(call_args[0], "/usr/bin/notify-send")
             # Summary is agy-switch
             self.assertEqual(call_args[1], "agy-switch")
-            # Message receives explicit reload notification and reason
-            self.assertIn("🔄 Antigravity switched to acc2 (reloading language_server...)", call_args[2])
-            self.assertIn("quota 429", call_args[2])
+            # Message receives clean reload notification and reason following ADR 0010
+            self.assertEqual(call_args[2], "🔄 Antigravity switched to acc2 & reloaded language_server (quota 429)")
+            self.assertNotIn("(reloading language_server...)", call_args[2])
+            self.assertNotIn(") (", call_args[2])
 
     def test_notify_desktop_reloaded_false_does_not_invoke_settling_delay(self):
         """When reloaded=False, _notify_desktop does not invoke 1.0s settling delay and sends standard message."""
         with patch("scripts.watch.shutil.which", return_value="/usr/bin/notify-send"), \
              patch("scripts.watch.time.sleep") as mock_sleep, \
              patch("scripts.watch.subprocess.Popen") as mock_popen, \
-             patch("scripts.watch.append_secure_log_entry"):
+             patch("agy_switcher.watcher.append_secure_log_entry"):
 
             self.watcher._notify_desktop(
                 target_account="acc2",
@@ -675,7 +690,32 @@ class TestLogWatcher(unittest.TestCase):
             mock_popen.assert_called_once()
             call_args = mock_popen.call_args[0][0]
             self.assertEqual(call_args[0], "/usr/bin/notify-send")
-            self.assertNotIn("reloading language_server...", " ".join(call_args))
+            self.assertEqual(call_args[2], "🔄 Antigravity switched to acc2 (routine rotation)")
+            self.assertNotIn("reloaded language_server", call_args[2])
+            self.assertNotIn(") (", call_args[2])
+
+    def test_notify_desktop_formatting_edge_cases(self):
+        """Verify clean message formatting without redundant parentheses or empty suffixes across edge cases."""
+        with patch("scripts.watch.shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("scripts.watch.time.sleep", return_value=None), \
+             patch("scripts.watch.subprocess.Popen") as mock_popen, \
+             patch("agy_switcher.watcher.append_secure_log_entry"):
+
+            # Case A: reloaded=True without reason
+            self.watcher._notify_desktop(target_account="acc2", reloaded=True)
+            self.assertEqual(mock_popen.call_args[0][0][2], "🔄 Antigravity switched to acc2 & reloaded language_server")
+
+            # Case B: reloaded=False without reason
+            mock_popen.reset_mock()
+            self.watcher._notify_desktop(target_account="acc2", reloaded=False)
+            self.assertEqual(mock_popen.call_args[0][0][2], "🔄 Antigravity switched to acc2")
+
+            # Case C: reason already wrapped in parentheses
+            mock_popen.reset_mock()
+            self.watcher._notify_desktop(target_account="acc2", reason="(quota 429)", reloaded=True)
+            self.assertEqual(mock_popen.call_args[0][0][2], "🔄 Antigravity switched to acc2 & reloaded language_server (quota 429)")
+            self.assertNotIn(") (", mock_popen.call_args[0][0][2])
+            self.assertNotIn("((", mock_popen.call_args[0][0][2])
 
     def test_notify_desktop_structured_audit_log_reloaded_format_and_mode_0600(self):
         """Structured audit log line is written to watch.log with mode 0600 upon reloaded switch."""
