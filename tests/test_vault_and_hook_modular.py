@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -148,6 +149,57 @@ class TestVaultEngineModular(unittest.TestCase):
         self.assertFalse(self.engine._is_valid_expiry(False))
         self.assertTrue(self.engine._is_valid_expiry(1700000000))
         self.assertTrue(self.engine._is_valid_expiry("2026-10-15T00:00:00Z"))
+
+    def test_restart_language_server_delegates_to_supervisor(self):
+        """restart_language_server must delegate directly to supervisor.restart_language_server."""
+        with patch.object(self.engine.supervisor, "restart_language_server", return_value=True) as mock_restart:
+            res = self.engine.restart_language_server(force=True)
+            self.assertTrue(res)
+            mock_restart.assert_called_once_with(force=True)
+
+    def test_restart_language_server_bridges_monkeypatched_methods_to_supervisor(self):
+        """restart_language_server bridges instance-level mocks (_send_signal, _poll_process_exit) to supervisor."""
+        killed = []
+        polled = []
+        self.engine.locate_language_server_pid = lambda: 8888
+        self.engine.is_server_busy = lambda pid: False
+        self.engine._send_signal = lambda pid, sig: killed.append((pid, sig))
+        self.engine._poll_process_exit = lambda pid, timeout: polled.append((pid, timeout)) or True
+
+        orig_supervisor_send = self.engine.supervisor._send_signal
+        orig_supervisor_poll = self.engine.supervisor._poll_process_exit
+
+        with patch.object(self.engine.supervisor, "restart_language_server", wraps=self.engine.supervisor.restart_language_server) as spy_restart:
+            res = self.engine.restart_language_server(force=True)
+            self.assertTrue(res)
+            spy_restart.assert_called_once_with(force=True)
+
+        self.assertEqual(killed, [(8888, signal.SIGTERM)])
+        self.assertEqual(polled, [(8888, 3.0)])
+
+        # Verify supervisor instance attributes are restored cleanly
+        self.assertNotIn("_send_signal", self.engine.supervisor.__dict__)
+        self.assertNotIn("_poll_process_exit", self.engine.supervisor.__dict__)
+        self.assertNotIn("locate_language_server_pid", self.engine.supervisor.__dict__)
+        self.assertNotIn("is_server_busy", self.engine.supervisor.__dict__)
+        self.assertEqual(self.engine.supervisor._send_signal, orig_supervisor_send)
+        self.assertEqual(self.engine.supervisor._poll_process_exit, orig_supervisor_poll)
+
+    def test_restart_language_server_restores_supervisor_attributes_on_exception(self):
+        """restart_language_server restores supervisor attributes even if supervisor raises an exception."""
+        self.engine.locate_language_server_pid = lambda: 8888
+        self.engine.is_server_busy = lambda pid: True
+        self.engine._send_signal = lambda pid, sig: None
+        self.engine._poll_process_exit = lambda pid, timeout: True
+
+        with self.assertRaises(ActiveTurnRunningError):
+            self.engine.restart_language_server(force=False)
+
+        # Verify supervisor instance attributes are restored cleanly after exception
+        self.assertNotIn("_send_signal", self.engine.supervisor.__dict__)
+        self.assertNotIn("_poll_process_exit", self.engine.supervisor.__dict__)
+        self.assertNotIn("locate_language_server_pid", self.engine.supervisor.__dict__)
+        self.assertNotIn("is_server_busy", self.engine.supervisor.__dict__)
 
     def test_install_hook_points_to_agy_switch_launcher(self):
         """install_hook must point to scripts/agy_switch.py launcher."""
