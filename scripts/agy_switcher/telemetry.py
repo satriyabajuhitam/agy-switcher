@@ -55,6 +55,12 @@ def _get_fetch_account_quota() -> Any:
 DEFAULT_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 DEFAULT_CLIENT_SECRET = "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"
 
+DEFAULT_CLOUDCODE_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com"
+DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT = "https://cloudcode-pa.googleapis.com"
+QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary"
+DEFAULT_QUOTA_ENDPOINT = f"{DEFAULT_CLOUDCODE_ENDPOINT}{QUOTA_SUMMARY_PATH}"
+DEFAULT_FALLBACK_QUOTA_ENDPOINT = f"{DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT}{QUOTA_SUMMARY_PATH}"
+
 # Error classification patterns and phrases
 AUTH_ERROR_CODE_PATTERN = re.compile(r"\b(401|403)\b")
 HTTP_SERVER_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
@@ -308,6 +314,54 @@ def _is_stale_exhausted_cache(
     return is_expired or is_reset_elapsed
 
 
+def resolve_quota_endpoint(
+    custom_endpoint: str | None = None,
+    supervisor: Any | None = None,
+) -> str:
+    """Resolves the CloudCode quota summary endpoint URL.
+
+    Resolution order:
+    1. custom_endpoint if provided.
+    2. Environment variable AGY_CLOUD_CODE_ENDPOINT or CLOUD_CODE_ENDPOINT.
+    3. Dynamic detection from running language_server process via supervisor.
+    4. Default: DEFAULT_QUOTA_ENDPOINT (https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary).
+    """
+    candidate: str | None = None
+
+    if custom_endpoint and isinstance(custom_endpoint, str) and custom_endpoint.strip():
+        candidate = custom_endpoint.strip()
+    elif os.environ.get("AGY_CLOUD_CODE_ENDPOINT", "").strip():
+        candidate = os.environ.get("AGY_CLOUD_CODE_ENDPOINT", "").strip()
+    elif os.environ.get("CLOUD_CODE_ENDPOINT", "").strip():
+        candidate = os.environ.get("CLOUD_CODE_ENDPOINT", "").strip()
+    elif supervisor is not None and hasattr(supervisor, "get_cloud_code_endpoint"):
+        try:
+            detected = supervisor.get_cloud_code_endpoint()
+            if detected:
+                candidate = detected
+        except Exception:
+            pass
+    else:
+        try:
+            from agy_switcher.supervisor import ProcessSupervisor
+            ps = ProcessSupervisor()
+            detected = ps.get_cloud_code_endpoint()
+            if detected:
+                candidate = detected
+        except Exception:
+            pass
+
+    if not candidate:
+        return DEFAULT_QUOTA_ENDPOINT
+
+    cleaned = candidate.strip().rstrip("/")
+    if not (cleaned.startswith("http://") or cleaned.startswith("https://")):
+        cleaned = f"https://{cleaned}"
+    if cleaned.endswith(QUOTA_SUMMARY_PATH):
+        return cleaned
+    return f"{cleaned}{QUOTA_SUMMARY_PATH}"
+
+
 class QuotaClient:
     """Client for fetching and caching quota telemetry from Google CloudCode API."""
 
@@ -318,6 +372,8 @@ class QuotaClient:
         timeout: float = 2.0,
         cache_dir: Path | None = None,
         engine: Any | None = None,
+        quota_endpoint: str | None = None,
+        fallback_quota_endpoint: str | None = DEFAULT_FALLBACK_QUOTA_ENDPOINT,
     ) -> None:
         target_engine = engine if engine is not None else (
             engine_or_client_id if hasattr(engine_or_client_id, "cache_dir") else None
@@ -333,7 +389,17 @@ class QuotaClient:
         self.client_secret = client_secret
         self.timeout = timeout
         self.token_endpoint = "https://oauth2.googleapis.com/token"
-        self.quota_endpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+
+        supervisor = getattr(target_engine, "supervisor", None)
+        self.quota_endpoint = resolve_quota_endpoint(quota_endpoint, supervisor=supervisor)
+        resolved_fallback = (
+            resolve_quota_endpoint(fallback_quota_endpoint)
+            if fallback_quota_endpoint
+            else None
+        )
+        self.fallback_quota_endpoint = (
+            resolved_fallback if resolved_fallback != self.quota_endpoint else None
+        )
         self.cache_file = getattr(target_engine, "cache_file", None) or (self.cache_dir / "last_known_quota.json")
         self._local = threading.local()
 
@@ -487,6 +553,23 @@ class QuotaClient:
 
         return result
 
+    def _execute_quota_request(self, endpoint: str, access_token: str) -> dict[str, Any]:
+        """Sends HTTP POST to a single CloudCode endpoint and parses response."""
+        req = urllib.request.Request(
+            endpoint,
+            data=b'{"project": ""}',
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "Antigravity/2.5.5",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            body = resp.read().decode("utf-8")
+            raw_data = json.loads(body)
+            return self.parse_quota_response(raw_data)
+
     def fetch_quota(
         self,
         access_token: str | dict[str, Any],
@@ -507,45 +590,57 @@ class QuotaClient:
         if not access_token:
             return {}
 
-        req = urllib.request.Request(
-            self.quota_endpoint,
-            data=b'{"project": ""}',
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-                "User-Agent": "Antigravity/2.5.5",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8")
-                raw_data = json.loads(body)
-                return self.parse_quota_response(raw_data)
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and refresh_token:
-                new_token_data = self.refresh_access_token(refresh_token)
-                if new_token_data:
-                    new_tok_str = new_token_data.get("access_token") if isinstance(new_token_data, dict) else str(new_token_data)
-                    if new_tok_str and isinstance(new_tok_str, str) and new_tok_str.strip():
-                        if on_refresh:
-                            try:
-                                on_refresh(new_token_data)
-                            except Exception:
-                                pass
-                        return self.fetch_quota(new_tok_str.strip(), refresh_token=None)
-                self.last_error = "Token refresh rejected"
-                self.last_error_type = "auth"
-            else:
-                self.last_error = f"HTTP Error {e.code}: {e.reason}"
-                self.last_error_type = "auth" if e.code in (401, 403) else "http"
-            print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
-            return {}
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
-            self.last_error = f"Network or Parse Error: {e}"
-            self.last_error_type = "network" if isinstance(e, (urllib.error.URLError, TimeoutError)) else "parse"
-            print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
-            return {}
+        endpoints = [self.quota_endpoint]
+        if self.fallback_quota_endpoint and self.fallback_quota_endpoint != self.quota_endpoint:
+            endpoints.append(self.fallback_quota_endpoint)
+
+        for idx, endpoint in enumerate(endpoints):
+            has_fallback = (len(endpoints) > 1 and idx == 0)
+            try:
+                return self._execute_quota_request(endpoint, access_token)
+            except urllib.error.HTTPError as e:
+                try:
+                    e.close()
+                except Exception:
+                    pass
+                if e.code == 401 and refresh_token:
+                    new_token_data = self.refresh_access_token(refresh_token)
+                    if new_token_data:
+                        new_tok_str = new_token_data.get("access_token") if isinstance(new_token_data, dict) else str(new_token_data)
+                        if new_tok_str and isinstance(new_tok_str, str) and new_tok_str.strip():
+                            if on_refresh:
+                                try:
+                                    on_refresh(new_token_data)
+                                except Exception:
+                                    pass
+                            return self.fetch_quota(new_tok_str.strip(), refresh_token=None)
+                    self.last_error = "Token refresh rejected"
+                    self.last_error_type = "auth"
+                    print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
+                    return {}
+                elif e.code in (401, 403):
+                    self.last_error = f"HTTP Error {e.code}: {e.reason}"
+                    self.last_error_type = "auth"
+                    print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
+                    return {}
+                elif has_fallback and (e.code >= 500 or e.code in (404, 408, 429)):
+                    print(f"[QuotaClient] Primary endpoint HTTP {e.code}. Falling back to {self.fallback_quota_endpoint}", file=sys.stderr)
+                    continue
+                else:
+                    self.last_error = f"HTTP Error {e.code}: {e.reason}"
+                    self.last_error_type = "http"
+                    print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
+                    return {}
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+                if has_fallback:
+                    print(f"[QuotaClient] Primary endpoint error ({e}). Falling back to {self.fallback_quota_endpoint}", file=sys.stderr)
+                    continue
+                self.last_error = f"Network or Parse Error: {e}"
+                self.last_error_type = "network" if isinstance(e, (urllib.error.URLError, TimeoutError)) else "parse"
+                print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
+                return {}
+
+        return {}
 
     def load_cache(self) -> dict[str, Any]:
         """Loads cached quota data from vault cache or legacy fallback."""

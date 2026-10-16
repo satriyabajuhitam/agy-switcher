@@ -366,6 +366,75 @@ class TestProcessSupervisor(unittest.TestCase):
         with patch("os.kill", side_effect=PermissionError(1, "Operation not permitted")):
             self.assertFalse(self.supervisor._poll_process_exit(456, timeout=0.1))
 
+    def test_get_cloud_code_endpoint_from_proc_null_separated(self):
+        pid = self.proc_dir / "777"
+        pid.mkdir()
+        cmd = b"/opt/antigravity/language_server\x00--standalone\x00--cloud_code_endpoint\x00https://daily-cloudcode-pa.googleapis.com\x00"
+        (pid / "cmdline").write_bytes(cmd)
+        endpoint = self.supervisor.get_cloud_code_endpoint(pid=777)
+        self.assertEqual(endpoint, "https://daily-cloudcode-pa.googleapis.com")
+
+    def test_get_cloud_code_endpoint_from_proc_equal_separated(self):
+        pid = self.proc_dir / "778"
+        pid.mkdir()
+        cmd = b"/opt/antigravity/language_server\x00--standalone\x00--cloud_code_endpoint=https://custom-cloudcode.googleapis.com\x00"
+        (pid / "cmdline").write_bytes(cmd)
+        endpoint = self.supervisor.get_cloud_code_endpoint(pid=778)
+        self.assertEqual(endpoint, "https://custom-cloudcode.googleapis.com")
+
+    def test_get_cloud_code_endpoint_from_proc_space_separated(self):
+        pid = self.proc_dir / "779"
+        pid.mkdir()
+        cmd = b"/opt/antigravity/language_server --standalone --cloud_code_endpoint https://daily-cloudcode-pa.googleapis.com"
+        (pid / "cmdline").write_bytes(cmd)
+        endpoint = self.supervisor.get_cloud_code_endpoint(pid=779)
+        self.assertEqual(endpoint, "https://daily-cloudcode-pa.googleapis.com")
+
+    def test_get_cloud_code_endpoint_no_server_running(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=None):
+            self.assertIsNone(self.supervisor.get_cloud_code_endpoint())
+
+    def test_get_cloud_code_endpoint_missing_flag(self):
+        pid = self.proc_dir / "780"
+        pid.mkdir()
+        cmd = b"/opt/antigravity/language_server\x00--standalone\x00--port\x008080\x00"
+        (pid / "cmdline").write_bytes(cmd)
+        self.assertIsNone(self.supervisor.get_cloud_code_endpoint(pid=780))
+
+    def test_get_cloud_code_endpoint_invalid_scheme(self):
+        pid = self.proc_dir / "781"
+        pid.mkdir()
+        cmd = b"/opt/antigravity/language_server\x00--standalone\x00--cloud_code_endpoint\x00ftp://invalid-scheme.com\x00"
+        (pid / "cmdline").write_bytes(cmd)
+        self.assertIsNone(self.supervisor.get_cloud_code_endpoint(pid=781))
+
+    def test_get_cloud_code_endpoint_quoted_and_trailing_slash(self):
+        pid1 = self.proc_dir / "782"
+        pid1.mkdir()
+        cmd1 = b"/opt/antigravity/language_server\x00--standalone\x00--cloud_code_endpoint=\"https://daily-cloudcode-pa.googleapis.com/\"\x00"
+        (pid1 / "cmdline").write_bytes(cmd1)
+        self.assertEqual(
+            self.supervisor.get_cloud_code_endpoint(pid=782),
+            "https://daily-cloudcode-pa.googleapis.com",
+        )
+
+        pid2 = self.proc_dir / "783"
+        pid2.mkdir()
+        cmd2 = b"/opt/antigravity/language_server\x00--standalone\x00--cloud_code_endpoint\x00'https://daily-cloudcode-pa.googleapis.com/'\x00"
+        (pid2 / "cmdline").write_bytes(cmd2)
+        self.assertEqual(
+            self.supervisor.get_cloud_code_endpoint(pid=783),
+            "https://daily-cloudcode-pa.googleapis.com",
+        )
+
+    def test_get_cloud_code_endpoint_ps_fallback(self):
+        # When proc_dir is /proc and cmdline fails, ps fallback is used
+        with patch.object(self.supervisor, "proc_dir", Path("/proc")):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.stdout = "/opt/language_server --standalone --cloud_code_endpoint=\"https://daily-cloudcode-pa.googleapis.com/\""
+                endpoint = self.supervisor.get_cloud_code_endpoint(pid=99999)
+                self.assertEqual(endpoint, "https://daily-cloudcode-pa.googleapis.com")
+
 
 
 

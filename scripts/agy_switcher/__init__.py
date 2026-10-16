@@ -41,6 +41,12 @@ _EXPORTS: dict[str, str] = {
     "format_status_report": "agy_switcher.formatters",
     "format_diagnostic_report": "agy_switcher.formatters",
     # Layer 1: Telemetry
+    "DEFAULT_CLOUDCODE_ENDPOINT": "agy_switcher.telemetry",
+    "DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT": "agy_switcher.telemetry",
+    "QUOTA_SUMMARY_PATH": "agy_switcher.telemetry",
+    "DEFAULT_QUOTA_ENDPOINT": "agy_switcher.telemetry",
+    "DEFAULT_FALLBACK_QUOTA_ENDPOINT": "agy_switcher.telemetry",
+    "resolve_quota_endpoint": "agy_switcher.telemetry",
     "QuotaClient": "agy_switcher.telemetry",
     "fetch_account_quota": "agy_switcher.telemetry",
     "fetch_all_accounts_quota": "agy_switcher.telemetry",

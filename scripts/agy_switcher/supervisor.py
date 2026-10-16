@@ -62,6 +62,56 @@ class ProcessSupervisor:
 
         return None
 
+    def get_cloud_code_endpoint(self, pid: int | None = None) -> str | None:
+        """Extracts --cloud_code_endpoint URL from running language_server process."""
+        target_pid = pid if pid is not None else self.locate_language_server_pid()
+        if target_pid is None:
+            return None
+
+        # 1. Check proc_dir cmdline file
+        cmdline_file = self.proc_dir / str(target_pid) / "cmdline"
+        try:
+            if cmdline_file.is_file():
+                raw = cmdline_file.read_bytes()
+                tokens = [t.decode("utf-8", errors="replace").strip() for t in raw.split(b"\x00") if t]
+                if len(tokens) == 1 and " " in tokens[0]:
+                    tokens = tokens[0].split()
+                for i, token in enumerate(tokens):
+                    if token == "--cloud_code_endpoint" and i + 1 < len(tokens):
+                        val = tokens[i + 1].strip().strip("'\"").rstrip("/")
+                        if val.startswith("http://") or val.startswith("https://"):
+                            return val
+                    elif token.startswith("--cloud_code_endpoint="):
+                        val = token.split("=", 1)[1].strip().strip("'\"").rstrip("/")
+                        if val.startswith("http://") or val.startswith("https://"):
+                            return val
+        except (OSError, ValueError):
+            pass
+
+        # 2. Fallback to ps only if proc_dir is the real /proc
+        if self.proc_dir == Path("/proc"):
+            try:
+                res = subprocess.run(
+                    ["ps", "-p", str(target_pid), "-o", "args="],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                args = res.stdout.strip().split()
+                for i, token in enumerate(args):
+                    if token == "--cloud_code_endpoint" and i + 1 < len(args):
+                        val = args[i + 1].strip().strip("'\"").rstrip("/")
+                        if val.startswith("http://") or val.startswith("https://"):
+                            return val
+                    elif token.startswith("--cloud_code_endpoint="):
+                        val = token.split("=", 1)[1].strip().strip("'\"").rstrip("/")
+                        if val.startswith("http://") or val.startswith("https://"):
+                            return val
+            except Exception:
+                pass
+
+        return None
+
     def is_server_busy(self, pid: int | None = None) -> bool:
         """Checks if language_server has active child processes or presence locks."""
         # 1. Check presence locks in ~/.gemini
