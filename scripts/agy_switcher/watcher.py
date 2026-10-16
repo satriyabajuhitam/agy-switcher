@@ -661,20 +661,32 @@ class LogWatcher:
         reason: str = "",
         reloaded: bool = False,
     ) -> None:
-        """Fires an asynchronous, non-blocking desktop notification via notify-send if installed."""
+        """Fires an asynchronous, non-blocking desktop notification via notify-send if installed.
+
+        Enforces 1.0s settling delay prior to notification dispatch when reloaded=True so WSL Relay
+        has sufficient time to respawn language_server and bind its IPC socket.
+        Appends structured audit entry to ~/.antigravity-vault/watch.log with mode 0600.
+        """
+        if reloaded:
+            _get_time().sleep(1.0)
+
         shutil_mod = _get_shutil()
         notify_bin = shutil_mod.which("notify-send")
         if notify_bin:
             try:
                 if reloaded:
-                    if old_account:
-                        msg = f"🔄 Antigravity switched from '{old_account}' to '{target_account}' & reloaded language_server ({reason})"
-                    else:
-                        msg = f"🔄 Antigravity switched to '{target_account}' & reloaded language_server ({reason})"
+                    msg = f"🔄 Antigravity switched to {target_account} (reloading language_server...)"
+                    if reason:
+                        msg += f" ({reason})"
                 elif old_account:
-                    msg = f"🔄 Antigravity switched from '{old_account}' to '{target_account}' ({reason})"
+                    msg = f"🔄 Antigravity switched from '{old_account}' to '{target_account}'"
+                    if reason:
+                        msg += f" ({reason})"
                 else:
-                    msg = f"Auto-rotated to '{target_account}' ({reason})"
+                    msg = f"Auto-rotated to '{target_account}'"
+                    if reason:
+                        msg += f" ({reason})"
+
                 _get_subprocess().Popen(
                     [notify_bin, "agy-switch", msg],
                     stdout=subprocess.DEVNULL,
@@ -687,11 +699,13 @@ class LogWatcher:
         log_dir = Path(vault_dir) if isinstance(vault_dir, (str, Path)) else DEFAULT_VAULT_DIR
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         if old_account and reloaded:
-            log_line = f"[{ts}] [watch] Switched from '{old_account}' to '{target_account}' with force-restart language_server (reason: {reason})\n"
+            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' with force-restart language_server (reason: {reason})\n"
         elif old_account:
-            log_line = f"[{ts}] [watch] Switched from '{old_account}' to '{target_account}' (reason: {reason})\n"
+            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' (reason: {reason})\n"
+        elif reloaded:
+            log_line = f"{ts} [watch] Switched to '{target_account}' with force-restart language_server (reason: {reason})\n"
         else:
-            log_line = f"[{ts}] Switched to '{target_account}' ({reason})\n"
+            log_line = f"{ts} Switched to '{target_account}' ({reason})\n"
         append_secure_log_entry(log_dir / "watch.log", log_line)
 
     def trigger_switch(

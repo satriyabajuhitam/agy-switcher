@@ -627,6 +627,142 @@ class TestLogWatcher(unittest.TestCase):
                 # Entire stagnant_sizes dictionary cleared
                 self.assertEqual(len(self.watcher._stagnant_sizes), 0)
 
+    def test_notify_desktop_reloaded_true_invokes_settling_delay_and_fires_reload_notification(self):
+        """When reloaded=True, _notify_desktop invokes 1.0s settling delay and sends explicit reload message."""
+        with patch("scripts.watch.shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("scripts.watch.time.sleep") as mock_sleep, \
+             patch("scripts.watch.subprocess.Popen") as mock_popen, \
+             patch("scripts.watch.append_secure_log_entry"):
+
+            self.watcher._notify_desktop(
+                target_account="acc2",
+                old_account="acc1",
+                reason="quota 429",
+                reloaded=True,
+            )
+
+            # Settling delay of 1.0s MUST be invoked
+            mock_sleep.assert_called_with(1.0)
+
+            # notify-send must be dispatched
+            mock_popen.assert_called_once()
+            call_args = mock_popen.call_args[0][0]
+            self.assertEqual(call_args[0], "/usr/bin/notify-send")
+            # Summary is agy-switch
+            self.assertEqual(call_args[1], "agy-switch")
+            # Message receives explicit reload notification and reason
+            self.assertIn("🔄 Antigravity switched to acc2 (reloading language_server...)", call_args[2])
+            self.assertIn("quota 429", call_args[2])
+
+    def test_notify_desktop_reloaded_false_does_not_invoke_settling_delay(self):
+        """When reloaded=False, _notify_desktop does not invoke 1.0s settling delay and sends standard message."""
+        with patch("scripts.watch.shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("scripts.watch.time.sleep") as mock_sleep, \
+             patch("scripts.watch.subprocess.Popen") as mock_popen, \
+             patch("scripts.watch.append_secure_log_entry"):
+
+            self.watcher._notify_desktop(
+                target_account="acc2",
+                old_account="acc1",
+                reason="routine rotation",
+                reloaded=False,
+            )
+
+            # No 1.0s settling delay when not reloaded
+            mock_sleep.assert_not_called()
+
+            # notify-send must be dispatched without reload notification
+            mock_popen.assert_called_once()
+            call_args = mock_popen.call_args[0][0]
+            self.assertEqual(call_args[0], "/usr/bin/notify-send")
+            self.assertNotIn("reloading language_server...", " ".join(call_args))
+
+    def test_notify_desktop_structured_audit_log_reloaded_format_and_mode_0600(self):
+        """Structured audit log line is written to watch.log with mode 0600 upon reloaded switch."""
+        import tempfile
+        from pathlib import Path
+        import re
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_path = Path(tmpdir)
+            self.watcher.engine.vault_dir = vault_path
+
+            with patch("scripts.watch.shutil.which", return_value=None), \
+                 patch("scripts.watch.time.sleep", return_value=None):
+
+                self.watcher._notify_desktop(
+                    target_account="acc2",
+                    old_account="acc1",
+                    reason="quota 429",
+                    reloaded=True,
+                )
+
+            watch_log = vault_path / "watch.log"
+            self.assertTrue(watch_log.is_file())
+            # Enforce 0600 mode
+            self.assertEqual(watch_log.stat().st_mode & 0o777, 0o600)
+
+            content = watch_log.read_text(encoding="utf-8")
+            pattern = (
+                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} "
+                r"\[watch\] Switched from 'acc1' to 'acc2' with force-restart language_server \(reason: quota 429\)\n$"
+            )
+            self.assertRegex(content, pattern)
+
+    def test_notify_desktop_structured_audit_log_not_reloaded_format(self):
+        """Structured audit log line for non-reloaded rotation is appended correctly."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_path = Path(tmpdir)
+            self.watcher.engine.vault_dir = vault_path
+
+            with patch("scripts.watch.shutil.which", return_value=None), \
+                 patch("scripts.watch.time.sleep", return_value=None):
+
+                self.watcher._notify_desktop(
+                    target_account="acc2",
+                    old_account="acc1",
+                    reason="cache rotation",
+                    reloaded=False,
+                )
+
+            watch_log = vault_path / "watch.log"
+            self.assertTrue(watch_log.is_file())
+            content = watch_log.read_text(encoding="utf-8")
+            pattern = (
+                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} "
+                r"\[watch\] Switched from 'acc1' to 'acc2' \(reason: cache rotation\)\n$"
+            )
+            self.assertRegex(content, pattern)
+
+    def test_notify_desktop_handles_missing_notify_send_gracefully(self):
+        """When notify-send binary is missing, _notify_desktop still writes the audit log cleanly."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_path = Path(tmpdir)
+            self.watcher.engine.vault_dir = vault_path
+
+            with patch("scripts.watch.shutil.which", return_value=None), \
+                 patch("scripts.watch.time.sleep", return_value=None), \
+                 patch("scripts.watch.subprocess.Popen") as mock_popen:
+
+                self.watcher._notify_desktop(
+                    target_account="acc2",
+                    old_account="acc1",
+                    reason="quota 429",
+                    reloaded=True,
+                )
+
+                mock_popen.assert_not_called()
+
+            watch_log = vault_path / "watch.log"
+            self.assertTrue(watch_log.is_file())
+            self.assertIn("Switched from 'acc1' to 'acc2' with force-restart language_server", watch_log.read_text(encoding="utf-8"))
+
 
 if __name__ == '__main__':
     unittest.main()
