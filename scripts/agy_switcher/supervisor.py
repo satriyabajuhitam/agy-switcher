@@ -152,6 +152,8 @@ class ProcessSupervisor:
             self._send_signal(pid, signal.SIGTERM)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            return False
         except OSError:
             pass
 
@@ -165,6 +167,8 @@ class ProcessSupervisor:
             self._send_signal(pid, signal.SIGKILL)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            return False
         except OSError:
             pass
 

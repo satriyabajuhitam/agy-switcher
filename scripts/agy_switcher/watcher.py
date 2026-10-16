@@ -663,8 +663,9 @@ class LogWatcher:
     ) -> None:
         """Fires an asynchronous, non-blocking desktop notification via notify-send if installed.
 
-        Enforces 1.0s settling delay prior to notification dispatch when reloaded=True so WSL Relay
-        has sufficient time to respawn language_server and bind its IPC socket.
+        While the subprocess dispatch of notify-send is non-blocking, a synchronous 1.0s process
+        settling delay is enforced on the calling thread when reloaded=True to allow WSL Relay
+        sufficient time to respawn language_server and bind its IPC socket before downstream user prompts.
         Appends structured audit entry to ~/.antigravity-vault/watch.log with mode 0600.
         """
         if reloaded:
@@ -709,7 +710,7 @@ class LogWatcher:
         elif reloaded:
             log_line = f"{ts} [watch] Switched to '{target_account}' with force-restart language_server (reason: {log_reason})\n"
         else:
-            log_line = f"{ts} Switched to '{target_account}' ({log_reason})\n"
+            log_line = f"{ts} [watch] Switched to '{target_account}' ({log_reason})\n"
         append_secure_log_entry(log_dir / "watch.log", log_line)
 
     def trigger_switch(

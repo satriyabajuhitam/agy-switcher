@@ -333,42 +333,34 @@ class TestProcessSupervisor(unittest.TestCase):
                         self.assertTrue(res)
                         mock_poll.assert_not_called()
 
-    def test_restart_language_server_sigterm_permission_error_not_treated_as_success_without_force(self):
+    def test_restart_language_server_sigterm_permission_error_short_circuits_without_force(self):
         with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
             with patch.object(self.supervisor, "is_server_busy", return_value=False):
                 with patch.object(self.supervisor, "_send_signal", side_effect=PermissionError("Operation not permitted")):
-                    with patch.object(self.supervisor, "_poll_process_exit", return_value=False) as mock_poll:
+                    with patch.object(self.supervisor, "_poll_process_exit") as mock_poll:
                         res = self.supervisor.restart_language_server(force=False)
                         self.assertFalse(res)
-                        mock_poll.assert_called_once_with(456, timeout=3.0)
+                        mock_poll.assert_not_called()
 
-    def test_restart_language_server_sigterm_permission_error_not_treated_as_success_with_force(self):
+    def test_restart_language_server_sigterm_permission_error_short_circuits_with_force(self):
         with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
             with patch.object(self.supervisor, "is_server_busy", return_value=False):
-                with patch.object(self.supervisor, "_send_signal", side_effect=PermissionError("Operation not permitted")):
+                with patch.object(self.supervisor, "_send_signal", side_effect=PermissionError("Operation not permitted")) as mock_send:
+                    with patch.object(self.supervisor, "_poll_process_exit") as mock_poll:
+                        res = self.supervisor.restart_language_server(force=True)
+                        self.assertFalse(res)
+                        mock_send.assert_called_once_with(456, signal.SIGTERM)
+                        mock_poll.assert_not_called()
+
+    def test_restart_language_server_sigkill_permission_error_short_circuits(self):
+        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
+            with patch.object(self.supervisor, "is_server_busy", return_value=False):
+                with patch.object(self.supervisor, "_send_signal", side_effect=[None, PermissionError("Operation not permitted")]) as mock_send:
                     with patch.object(self.supervisor, "_poll_process_exit", return_value=False) as mock_poll:
                         res = self.supervisor.restart_language_server(force=True)
                         self.assertFalse(res)
-                        self.assertEqual(mock_poll.call_count, 2)
-
-    def test_restart_language_server_sigterm_permission_error_exits_during_poll(self):
-        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
-            with patch.object(self.supervisor, "is_server_busy", return_value=False):
-                with patch.object(self.supervisor, "_send_signal", side_effect=PermissionError("Operation not permitted")):
-                    with patch.object(self.supervisor, "_poll_process_exit", return_value=True) as mock_poll:
-                        res = self.supervisor.restart_language_server(force=False)
-                        self.assertTrue(res)
-                        mock_poll.assert_called_once_with(456, timeout=3.0)
-
-    def test_restart_language_server_sigterm_permission_error_escalates_to_sigkill(self):
-        with patch.object(self.supervisor, "locate_language_server_pid", return_value=456):
-            with patch.object(self.supervisor, "is_server_busy", return_value=False):
-                with patch.object(self.supervisor, "_send_signal", side_effect=[PermissionError("EPERM"), None]) as mock_send:
-                    with patch.object(self.supervisor, "_poll_process_exit", side_effect=[False, True]) as mock_poll:
-                        res = self.supervisor.restart_language_server(force=True)
-                        self.assertTrue(res)
                         mock_send.assert_has_calls([call(456, signal.SIGTERM), call(456, signal.SIGKILL)])
-                        mock_poll.assert_has_calls([call(456, timeout=3.0), call(456, timeout=1.0)])
+                        mock_poll.assert_called_once_with(456, timeout=3.0)
 
     def test_poll_process_exit_permission_error_returns_false(self):
         with patch("os.kill", side_effect=PermissionError(1, "Operation not permitted")):

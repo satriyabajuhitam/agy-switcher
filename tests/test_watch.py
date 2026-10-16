@@ -777,6 +777,45 @@ class TestLogWatcher(unittest.TestCase):
             )
             self.assertRegex(content, pattern)
 
+    def test_notify_desktop_structured_audit_log_uniform_watch_prefix_all_branches(self):
+        """Structured audit log line uniformly includes [watch] across all branches including fallback."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_path = Path(tmpdir)
+            self.watcher.engine.vault_dir = vault_path
+
+            with patch("scripts.watch.shutil.which", return_value=None), \
+                 patch("scripts.watch.time.sleep", return_value=None):
+
+                # Branch 1: old_account is None, reloaded is False (fallback branch)
+                self.watcher._notify_desktop(
+                    target_account="acc2",
+                    old_account=None,
+                    reason="manual switch",
+                    reloaded=False,
+                )
+
+                # Branch 2: old_account is None, reloaded is True
+                self.watcher._notify_desktop(
+                    target_account="acc3",
+                    old_account=None,
+                    reason="manual reload",
+                    reloaded=True,
+                )
+
+            watch_log = vault_path / "watch.log"
+            self.assertTrue(watch_log.is_file())
+            lines = watch_log.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 2)
+
+            for line in lines:
+                self.assertRegex(line, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[watch\] ")
+
+            self.assertIn("[watch] Switched to 'acc2' (manual switch)", lines[0])
+            self.assertIn("[watch] Switched to 'acc3' with force-restart language_server (reason: manual reload)", lines[1])
+
     def test_notify_desktop_handles_missing_notify_send_gracefully(self):
         """When notify-send binary is missing, _notify_desktop still writes the audit log cleanly."""
         import tempfile
