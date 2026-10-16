@@ -953,8 +953,25 @@ class AgySwitchEngine:
                     "Use --force to switch and restart anyway."
                 )
 
-            self._send_signal(pid, signal.SIGTERM)
-            return self._poll_process_exit(pid, timeout=3.0)
+            try:
+                self._send_signal(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                return True
+
+            if self._poll_process_exit(pid, timeout=3.0):
+                return True
+
+            if not force:
+                return False
+
+            try:
+                self._send_signal(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                pass
+
+            return self._poll_process_exit(pid, timeout=1.0)
 
         return self.supervisor.restart_language_server(force=force)
 

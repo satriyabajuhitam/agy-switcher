@@ -210,6 +210,34 @@ class TestHookLifecycleModular(unittest.TestCase):
         """_is_stale_exhausted_cache in hook must be imported directly from telemetry."""
         self.assertIs(_is_stale_exhausted_cache, telemetry_mod._is_stale_exhausted_cache)
 
+    def test_hook_strictly_maintains_restart_server_false_on_rotation(self):
+        """PreInvocation hook must strictly invoke switch_tokens with restart_server=False, force=True."""
+        import agy_switch
+        self.engine.set_auto_switch(True)
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        acc2_dir = self.engine.accounts_dir / "acc2"
+        acc2_dir.mkdir(parents=True, exist_ok=True)
+        (acc2_dir / "token.json").write_text(json.dumps(create_sample_token("acc2@example.com")), encoding="utf-8")
+
+        self.engine.set_active_name("acc1")
+
+        mock_fetch_acc = MagicMock(return_value=("acc1", {"gemini": {"quota": 0}}))
+        mock_fetch_all = MagicMock(return_value={"acc2": {"gemini": {"quota": 80}}})
+
+        with patch.object(agy_switch, "fetch_account_quota", mock_fetch_acc), \
+             patch.object(agy_switch, "fetch_all_accounts_quota", mock_fetch_all), \
+             patch.object(self.engine, "switch_tokens", wraps=self.engine.switch_tokens) as spy_switch:
+            out = io.StringIO()
+            with patch("sys.stdin", io.StringIO('{"modelName": "gemini-3.8-pro"}')), \
+                 patch("sys.stdout", out):
+                ret = handle_pre_invocation_hook(self.engine)
+
+            self.assertEqual(ret, 0)
+            spy_switch.assert_called_once_with("acc2", restart_server=False, force=True)
+
 
 class TestSecurityLayer0(unittest.TestCase):
     """Unit tests for Layer 0 security.py module and token primitives."""

@@ -957,17 +957,14 @@ class LogWatcher:
                     raw_lines = complete_bytes.splitlines(keepends=True)
 
                     is_jsonl = target.endswith(".jsonl") or target.endswith("transcript.jsonl")
-                    processed_bytes = 0
                     failover_occurred = False
 
                     for raw_line in raw_lines:
-                        line_bytes_len = len(raw_line)
                         line_text = raw_line.decode("utf-8", errors="replace")
                         if self.process_line(line_text, is_jsonl=is_jsonl, file_path=target):
                             switches_triggered += 1
                             failover_occurred = True
                             break
-                        processed_bytes += line_bytes_len
 
                     if failover_occurred:
                         # Do NOT overwrite cursor; handle_exhaustion has already seeked all targets to EOF
