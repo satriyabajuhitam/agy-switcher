@@ -47,8 +47,9 @@ It completely supersedes legacy token managers with an isolated local vault, ato
    - Never alters active credentials during login.
    - Validates JWT tokens, extracts email identity, guards against collisions (`[y/N]`), and saves new accounts in `Standby` status.
 
-5. **Real-Time Quota Overview & Decision Ranking (`quota`)**:
+5. **Real-Time Quota Overview & Dynamic Endpoint Telemetry (`quota`)**:
    - Inspects real-time quotas (Gemini & Claude/GPT 5-Hour and Weekly limits) across all vault accounts via fast direct telemetry (`QuotaClient`) conforming to the Hybrid Quota Schema (ADR 0005).
+   - Dynamically inspects the running `language_server` process to prioritize its active `--cloud_code_endpoint` (`daily-cloudcode-pa.googleapis.com`), accurately reporting rolling 5-hour limits and synchronized weekly capacity with transparent fallback to `cloudcode-pa.googleapis.com`.
    - Deterministic sorting: Highest Gemini Weekly Limit followed by highest Gemini 5-Hour Limit.
    - Computes reset times and countdowns (e.g. `~3 jam 20 menit lagi`).
    - Actionable recommendation banner highlighting the highest-capacity standby account.
@@ -60,7 +61,20 @@ It completely supersedes legacy token managers with an isolated local vault, ato
      - **Tier 2 (Single-Account Probe — ~300ms)**: If cache is expired ($> 300$s) or quota is intermediate ($15\% \le \text{quota} < 25\%$), probes only the active account. If quota $\ge 15\%$, retains the active account and persists telemetry with zero standby probing. Defers disk writes if quota is critical ($< 15\%$) to eliminate double disk I/O.
      - **Tier 3 (Full Standby Probe & Auto-Rotation — $< 15\%$)**: Concurrently probes standby accounts only when active capacity drops below 15% or on authentication failure, rotating seamlessly via `RotationEngine`.
 
-7. **Network Transport Resilience & Zero False Alarms**:
+7. **Unified 5-Layer Self-Healing Diagnostics (`doctor`)**:
+   - Runs comprehensive automated health checks across vault directory permissions (`0700`), credential token modes (`0600`), dual-destination sync integrity, process supervisor status, and telemetry cache validity.
+   - Automated repair mode (`--fix`) auto-corrects filesystem permissions, repairs broken symlinks, re-aligns stale tokens, and prunes corrupted cache entries safely.
+
+8. **Atomic Account Alias Renaming (`rename`)**:
+   - Safely renames accounts with atomic filesystem directory renaming and rollback guarantees.
+   - Automatically migrates active account pointers, telemetry cache keys, and cooldown timers without losing history or leaking tokens.
+
+9. **Continuous Background Watcher Daemon (`watch`)**:
+   - Real-time log-tailing daemon that monitors Antigravity session transcripts and CLI logs for mid-turn quota exhaustion (`RESOURCE_EXHAUSTED` / HTTP 429).
+   - Immediately rotates active tokens and restarts the daemon smoothly when exhaustion strikes.
+   - Native systemd user service support (`--install-systemd`) for persistent 24/7 background protection across all workspaces.
+
+10. **Network Transport Resilience & Zero False Alarms**:
    - Decouples transport errors (timeouts, DNS, socket dropouts, HTTP 5xx) from quota depletion.
    - Graceful fallback to valid cached telemetry; if no cache exists, proceeds silently on the active account without injecting false warnings.
    - Stale 0% cache guard invalidates expired cached zero quotas during outages, preventing false alarms.
@@ -185,15 +199,19 @@ bash install.sh --uninstall
 
 | Command | Arguments / Flags | Description |
 | :--- | :--- | :--- |
-| `agy-switch list` | `[--quota] [--json] [--format table\|list]` | List registered accounts and current active account |
-| `agy-switch status` | None | Show active account, `language_server` PID, and server busy state |
-| `agy-switch quota` | `[--format table\|list] [--json] [--timeout <sec>]` | Inspect real-time quota usage across all accounts |
-| `agy-switch switch <name>` | `[--force] [--no-restart]` | Switch active account and restart daemon safely |
+| `agy-switch list` | `[--quota] [--json] [--format table\|list] [--model <model>]` | List registered accounts and current active account |
+| `agy-switch status` | `[--json]` | Show active account, `language_server` PID, and server busy state |
+| `agy-switch quota` | `[--format table\|list] [--json] [--timeout <sec>] [--model <model>]` | Inspect real-time quota usage across all accounts |
+| `agy-switch switch [<name>]` | `[--auto] [--model <model>] [--force] [--no-restart]` | Switch active account and restart daemon safely (or `--auto` rotate) |
+| `agy-switch doctor` | `[--fix] [--json]` | Run 5-layer self-healing diagnostics on vault, credentials, and processes |
+| `agy-switch rename <old> <new>` | `[--force]` | Atomically rename an account alias across vault, active pointer, and cache |
+| `agy-switch watch [action]` | `[run\|start\|stop\|status] [--install-systemd] [--generate-systemd] [--cooldown <min>]` | Manage background daemon to tail logs and auto-switch on quota exhaustion |
 | `agy-switch login <name>` | `[--force] [--timeout <sec>]` | Interactive Google OAuth login in an isolated sandbox |
 | `agy-switch add <name>` | `--token-file <path>` | Register account from an existing token JSON file |
 | `agy-switch remove <name>` | `[--force]` | Remove an account from vault (`--force` if active) |
-| `agy-switch config` | `[auto-switch <on\|off>]` | View or configure automatic rotation settings |
-| `agy-switch hook` | `[install\|uninstall]` | Manage Antigravity PreInvocation lifecycle hooks |
+| `agy-switch config` | `[auto-switch <on\|off> \| default-model <model> \| threshold <1-100>]` | View or configure automatic rotation and threshold settings |
+| `agy-switch hook` | `[install]` | Register PreInvocation lifecycle hook into `hooks.json` |
+| `agy-switch hook-pre-invocation` | None | Antigravity PreInvocation lifecycle hook handler (invoked by IDE) |
 | `agy-switch migrate` | None | Manually trigger import from legacy `~/.agy-cli-manager` |
 
 ---
@@ -202,17 +220,20 @@ bash install.sh --uninstall
 
 ### 1. Inspect Quotas Across All Accounts
 ```bash
-# Terminal table view
+# Terminal table view (Gemini and Claude limits with rolling countdowns)
 agy-switch quota
 
 # Mobile / chat friendly listicle
 agy-switch quota --format list
 
+# Target specific model family (e.g. claude)
+agy-switch quota --model claude
+
 # Machine-readable JSON
 agy-switch quota --json
 ```
 
-### 2. Switch Active Account
+### 2. Switch Active Account (Manual & Intelligent Auto-Rotation)
 ```bash
 # Graceful switch (blocks if language_server is busy)
 agy-switch switch credible
@@ -222,24 +243,71 @@ agy-switch switch credible --force
 
 # Update token files only without restarting server
 agy-switch switch credible --no-restart
+
+# Intelligent auto-rotation (evaluates quotas and picks optimal account)
+agy-switch switch --auto
+
+# Auto-switch targeting a specific model family
+agy-switch switch --auto --model claude
 ```
 
-### 3. Log In a New Account
+### 3. Run Self-Healing Diagnostics (`doctor`)
+```bash
+# Run 5-layer system diagnostics
+agy-switch doctor
+
+# Automatically repair permissions, token sync, and cache anomalies
+agy-switch doctor --fix
+```
+
+### 4. Safely Rename Account Aliases
+```bash
+# Atomically rename account alias and update active pointer/cache
+agy-switch rename old-alias new-alias
+
+# Force rename if active turn is running
+agy-switch rename old-alias new-alias --force
+```
+
+### 5. Background Log Watcher & Systemd Service (`watch`)
+```bash
+# Start background watcher daemon
+agy-switch watch start
+
+# Check watcher daemon status
+agy-switch watch status
+
+# Stop background watcher daemon
+agy-switch watch stop
+
+# Install and enable 24/7 background systemd user service (recommended)
+agy-switch watch --install-systemd
+systemctl --user daemon-reload
+systemctl --user enable --now agy-switch-watcher.service
+```
+
+### 6. Log In a New Account
 ```bash
 # Launches an isolated browser session to authenticate
 agy-switch login my-new-account
 ```
 
-### 4. Enable Automatic Rotation & Lifecycle Hooks
+### 7. Configure Vault Settings & Lifecycle Hooks
 ```bash
 # Register PreInvocation lifecycle hook
 agy-switch hook install
 
-# Turn on auto-switch rotation
+# Toggle automatic rotation on or off
 agy-switch config auto-switch on
+
+# Set default model family (gemini or claude)
+agy-switch config default-model gemini
+
+# Set quota rotation threshold percentage (e.g. 25%)
+agy-switch config threshold 25
 ```
 
-### 5. PreInvocation Hook Latency & Execution Tiers
+### 8. PreInvocation Hook Latency & Execution Tiers
 
 The `PreInvocation` lifecycle hook evaluates account quota before each agent prompt interaction using adaptive tiered polling:
 
