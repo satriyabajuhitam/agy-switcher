@@ -93,6 +93,20 @@ def _get_engine_class() -> Any:
     )
 
 
+def _get_format_accounts_listicle() -> Any:
+    return _resolve_symbol(
+        "format_accounts_listicle",
+        lambda: format_accounts_listicle,
+    )
+
+
+def _get_format_accounts_table() -> Any:
+    return _resolve_symbol(
+        "format_accounts_table",
+        lambda: format_accounts_table,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Builds and returns the comprehensive argparse CLI parser."""
     parser = argparse.ArgumentParser(
@@ -295,20 +309,19 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
     if args.command in ("quota", "list") or not args.command:
         data = engine.list_accounts()
         show_quota = True if args.command == "quota" else getattr(args, "quota", False)
-        if show_quota:
-            cli_model = getattr(args, "model", None)
-            if cli_model is not None:
-                try:
-                    target_model = normalize_model_name(cli_model)
-                except AgySwitchError:
-                    print(
-                        f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.",
-                        file=sys.stderr,
-                    )
-                    return 1
-            else:
-                target_model = "gemini"
+        target_model = "gemini"
+        cli_model = getattr(args, "model", None)
+        if cli_model is not None:
+            try:
+                target_model = normalize_model_name(cli_model)
+            except AgySwitchError:
+                print(
+                    f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.",
+                    file=sys.stderr,
+                )
+                return 1
 
+        if show_quota:
             qc_cls = _get_quota_client_class()
             client = qc_cls(timeout=2.0, engine=engine)
             pipeline_func = _get_run_quota_pipeline()
@@ -317,9 +330,11 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         if getattr(args, "json", False):
             print(json.dumps(data, indent=2))
         elif getattr(args, "format", "table") == "list":
-            print(format_accounts_listicle(data, show_quota=show_quota))
+            listicle_fn = _get_format_accounts_listicle()
+            print(listicle_fn(data, show_quota=show_quota, target_model=target_model))
         else:
-            print(format_accounts_table(data, show_quota=show_quota))
+            table_fn = _get_format_accounts_table()
+            print(table_fn(data, show_quota=show_quota, target_model=target_model))
         return 0
 
     if args.command == "status":

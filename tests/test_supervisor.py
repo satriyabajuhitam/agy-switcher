@@ -818,6 +818,63 @@ class TestLayer1Formatters(unittest.TestCase):
         self.assertIn(" — Gemini: 80%", listicle_default)
         self.assertNotIn(" — Claude:", listicle_default)
 
+    def test_format_accounts_error_and_malformed(self):
+        """[REQ-3-ERR-001] & [REQ-3-ERR-002]: Errored, missing, or malformed quota payloads render Error / Unreachable."""
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc1",
+                    "email": "acc1@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 80},
+                        "claude": {"error": "HTTP 401: Unauthorized"},
+                    },
+                },
+                {
+                    "name": "acc2",
+                    "email": "acc2@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 70},
+                        "claude": None,
+                    },
+                },
+                {
+                    "name": "acc3",
+                    "email": "acc3@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": "corrupted_string",
+                },
+                {
+                    "name": "acc4",
+                    "email": "acc4@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 60},
+                        "claude": {"quota": "invalid_number"},
+                    },
+                },
+            ],
+        }
+
+        table_claude = format_accounts_table(data, show_quota=True, target_model="claude")
+        self.assertIn("CLAUDE QUOTA", table_claude)
+        lines = [line for line in table_claude.splitlines() if line.startswith("* acc") or line.startswith("  acc")]
+        self.assertEqual(len(lines), 4)
+        for line in lines:
+            self.assertIn("Error / Unreachable", line)
+
+        listicle_claude = format_accounts_listicle(data, show_quota=True, target_model="claude")
+        for line in listicle_claude.splitlines():
+            if "•" in line:
+                self.assertIn("— Claude: Error / Unreachable", line)
+
     def test_format_status_report(self):
         status = {
             "active": "primary",

@@ -140,7 +140,9 @@ def _format_model_quota_summary(
 
     raw_quota = model_data.get("quota")
     parsed_q = _parse_quota_defensive(raw_quota)
-    quota = int(round(parsed_q)) if parsed_q >= 0 else 0
+    if parsed_q < 0:
+        return "Error / Unreachable"
+    quota = int(round(parsed_q))
 
     if is_cached:
         return f"{quota}% (Cached)"
