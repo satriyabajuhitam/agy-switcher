@@ -251,12 +251,12 @@ class TestProcessSupervisor(unittest.TestCase):
         for f in pid4600_fd.iterdir():
             f.unlink()
 
-        # Lock exists on disk but no process holds open fd -> must not mark server busy
+        # Lock exists on disk but no process holds open fd -> must not mark server busy and gets pruned
         self.assertFalse(self.supervisor.is_server_busy())
+        self.assertFalse(active_lock.exists())
+        self.assertFalse(cli_lock.exists())
 
         # [REQ-1-SCN-004]: Active child process under language_server marks server busy
-        active_lock.unlink()
-        cli_lock.unlink()
         child_dir = self.proc_dir / "303"
         child_dir.mkdir(parents=True, exist_ok=True)
         (child_dir / "stat").write_text("303 (subtask) S 202 0 0 0 0")
@@ -345,6 +345,62 @@ class TestProcessSupervisor(unittest.TestCase):
         """[REQ-1-EDGE-001] OSError during proc_dir listing does not crash is_server_busy."""
         with patch.object(Path, "iterdir", side_effect=PermissionError(13, "Permission denied")):
             self.assertFalse(self.supervisor.is_server_busy())
+
+    def test_stale_lock_pruning(self):
+        # [REQ-1-SCN-002]: Orphaned lock file in CLI presence is unlinked and server not busy
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence.mkdir(parents=True, exist_ok=True)
+        orphaned_lock = cli_presence / "orphaned-run.lock"
+        orphaned_lock.touch()
+
+        desktop_presence = self.gemini_dir / "antigravity" / "presence"
+        desktop_presence.mkdir(parents=True, exist_ok=True)
+        notes_file = desktop_presence / "notes.txt"
+        notes_file.write_text("should be kept")
+        hidden_file = desktop_presence / ".DS_Store"
+        hidden_file.touch()
+        hidden_lock = desktop_presence / ".hidden.lock"
+        hidden_lock.touch()
+        subdir_lock = desktop_presence / "nested.lock"
+        subdir_lock.mkdir()
+
+        self.assertTrue(orphaned_lock.exists())
+        self.assertFalse(self.supervisor.is_server_busy())
+        self.assertFalse(orphaned_lock.exists())
+
+        # Non-lock files, hidden files, and directories remain intact
+        self.assertTrue(notes_file.exists())
+        self.assertTrue(hidden_file.exists())
+        self.assertTrue(hidden_lock.exists())
+        self.assertTrue(subdir_lock.exists())
+
+        # [REQ-1-SCN-003]: Coexistence of active and stale locks prunes stale and reports busy
+        stale_lock = desktop_presence / "stale.lock"
+        stale_lock.touch()
+        active_lock = cli_presence / "active.lock"
+        active_lock.touch()
+        pid5100_fd = self.proc_dir / "5100" / "fd"
+        pid5100_fd.mkdir(parents=True, exist_ok=True)
+        (pid5100_fd / "11").symlink_to(active_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertFalse(stale_lock.exists())
+        self.assertTrue(active_lock.exists())
+
+        # [REQ-1-SCN-006]: Consecutive calls are idempotent without raising FileNotFoundError
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(active_lock.exists())
+
+        # [REQ-1-ERR-001]: OSError/PermissionError during unlink is caught and suppressed
+        (pid5100_fd / "11").unlink()
+        active_lock.unlink()
+
+        readonly_lock = desktop_presence / "readonly.lock"
+        readonly_lock.touch()
+
+        with patch("os.unlink", side_effect=PermissionError(13, "Permission denied")):
+            self.assertFalse(self.supervisor.is_server_busy())
+        self.assertTrue(readonly_lock.exists())
 
     def test_verify_turn_safety(self):
         # When server is idle

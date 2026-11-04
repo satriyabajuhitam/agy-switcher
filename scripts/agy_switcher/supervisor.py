@@ -162,6 +162,35 @@ class ProcessSupervisor:
     def is_server_busy(self, pid: int | None = None) -> bool:
         """Checks if language_server has active child processes or presence locks."""
         active_locks = self._get_active_presence_lock_paths()
+
+        presence_dirs = [
+            self.gemini_dir / "antigravity" / "presence",
+            self.gemini_dir / "antigravity-cli" / "presence",
+        ]
+        for p_dir in presence_dirs:
+            if not p_dir.is_dir():
+                continue
+            try:
+                for entry in p_dir.iterdir():
+                    if entry.name.startswith("."):
+                        continue
+                    if not entry.name.endswith(".lock"):
+                        continue
+                    if entry.is_dir() or not entry.is_file():
+                        continue
+                    try:
+                        resolved_entry = entry.resolve()
+                    except OSError:
+                        resolved_entry = entry
+                    if resolved_entry in active_locks or entry in active_locks:
+                        continue
+                    try:
+                        os.unlink(entry)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
         if active_locks:
             return True
 
