@@ -40,6 +40,7 @@ from agy_switcher.formatters import (
     format_diagnostic_report,
     _format_bucket_countdown,
     _format_gemini_quota_summary,
+    _format_model_quota_summary,
 )
 
 
@@ -527,6 +528,30 @@ class TestLayer1Formatters(unittest.TestCase):
         self.assertIn("5h: 90% (in 1h)", summary)
         self.assertIn("wk: 70% (in 1d)", summary)
 
+    def test_format_model_quota_summary(self):
+        self.assertEqual(_format_model_quota_summary(None), "Error / Unreachable")
+        self.assertEqual(_format_model_quota_summary({}, model="claude"), "Error / Unreachable")
+        self.assertEqual(_format_model_quota_summary({"quota": {"error": True}}, model="claude"), "Error / Unreachable")
+        self.assertEqual(_format_model_quota_summary({"quota": {"claude": {"error": True}}}, model="claude"), "Error / Unreachable")
+
+        acc_cached = {"quota": {"claude": {"quota": 60, "cached": True}}}
+        self.assertEqual(_format_model_quota_summary(acc_cached, model="claude"), "60% (Cached)")
+
+        curr = 1700000000.0
+        acc_buckets = {
+            "quota": {
+                "claude": {
+                    "quota": 75,
+                    "buckets": {
+                        "5h": {"quota": 75, "reset_time": curr + 1800},
+                    },
+                }
+            }
+        }
+        summary = _format_model_quota_summary(acc_buckets, model="claude", current_timestamp=curr)
+        self.assertIn("75%", summary)
+        self.assertIn("5h: 75% (in 30m)", summary)
+
     def test_format_accounts_listicle_and_table(self):
         data = {
             "active": "acc1",
@@ -544,6 +569,63 @@ class TestLayer1Formatters(unittest.TestCase):
         self.assertIn("* acc1", table)
         self.assertIn("  acc2", table)
         self.assertIn("Active Account: acc1", table)
+
+    def test_format_accounts_claude_model(self):
+        # [REQ-3-SCN-001] [REQ-3-SCN-002] [REQ-3-SCN-005]
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc1",
+                    "email": "acc1@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 80},
+                        "claude": {"quota": 60},
+                    },
+                },
+                {
+                    "name": "acc2",
+                    "email": "acc2@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 50},
+                        "claude": {"quota": 45, "cached": True},
+                    },
+                },
+            ],
+        }
+
+        # [REQ-3-SCN-001]: Table with target_model="claude"
+        table_claude = format_accounts_table(data, show_quota=True, target_model="claude")
+        self.assertIn("CLAUDE QUOTA", table_claude)
+        self.assertNotIn("GEMINI QUOTA", table_claude)
+        self.assertIn("60%", table_claude)
+        # [REQ-3-SCN-005]: Cached quota badge for Claude
+        self.assertIn("45% (Cached)", table_claude)
+
+        # Default / target_model="gemini"
+        table_gemini = format_accounts_table(data, show_quota=True, target_model="gemini")
+        self.assertIn("GEMINI QUOTA", table_gemini)
+        self.assertNotIn("CLAUDE QUOTA", table_gemini)
+        self.assertIn("80%", table_gemini)
+
+        # [REQ-3-SCN-002]: Listicle with target_model="claude"
+        listicle_claude = format_accounts_listicle(data, show_quota=True, target_model="claude")
+        self.assertIn(" — Claude: 60%", listicle_claude)
+        self.assertIn(" — Claude: 45% (Cached)", listicle_claude)
+        self.assertNotIn(" — Gemini:", listicle_claude)
+
+        # [REQ-3-SCN-004]: Listicle with target_model="gemini" (and default)
+        listicle_gemini = format_accounts_listicle(data, show_quota=True, target_model="gemini")
+        self.assertIn(" — Gemini: 80%", listicle_gemini)
+        self.assertNotIn(" — Claude:", listicle_gemini)
+
+        listicle_default = format_accounts_listicle(data, show_quota=True)
+        self.assertIn(" — Gemini: 80%", listicle_default)
+        self.assertNotIn(" — Claude:", listicle_default)
 
     def test_format_status_report(self):
         status = {
