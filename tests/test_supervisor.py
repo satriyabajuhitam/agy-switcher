@@ -402,6 +402,39 @@ class TestProcessSupervisor(unittest.TestCase):
             self.assertFalse(self.supervisor.is_server_busy())
         self.assertTrue(readonly_lock.exists())
 
+    def test_req_1_scn_003_coexistence_active_and_stale_locks(self):
+        """[REQ-1-SCN-003]: GIVEN a stale lock ~/.gemini/antigravity/presence/stale.lock with no open file descriptor
+        and an active lock ~/.gemini/antigravity-cli/presence/active.lock held open by an active process,
+        WHEN ProcessSupervisor.is_server_busy() is called,
+        THEN stale.lock is unlinked from disk, active.lock is retained, and is_server_busy() returns True.
+        """
+        desktop_presence = self.gemini_dir / "antigravity" / "presence"
+        desktop_presence.mkdir(parents=True, exist_ok=True)
+        stale_lock = desktop_presence / "stale.lock"
+        stale_lock.touch()
+        notes_file = desktop_presence / "notes.txt"
+        notes_file.touch()
+
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence.mkdir(parents=True, exist_ok=True)
+        active_lock = cli_presence / "active.lock"
+        active_lock.touch()
+        cli_stale_lock = cli_presence / "cli_stale.lock"
+        cli_stale_lock.touch()
+
+        pid5100_fd = self.proc_dir / "5100" / "fd"
+        pid5100_fd.mkdir(parents=True, exist_ok=True)
+        (pid5100_fd / "11").symlink_to(active_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertFalse(stale_lock.exists())
+        self.assertFalse(cli_stale_lock.exists())
+        self.assertTrue(active_lock.exists())
+        self.assertTrue(notes_file.exists())
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(active_lock.exists())
+
     def test_verify_turn_safety(self):
         # When server is idle
         self.supervisor.verify_turn_safety(force=False)

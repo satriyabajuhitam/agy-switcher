@@ -1632,6 +1632,59 @@ class TestLogWatcherProcessing(unittest.TestCase):
         targets = watcher.scan_active_targets()
         self.assertEqual(targets.count(str(dup_file)), 1)
 
+    def test_req_2_scn_007_dynamic_session_switch_desktop_to_cli_prunes_stale_cursors(self):
+        """[REQ-2-SCN-007]: GIVEN a running LogWatcher daemon tailing an active Desktop transcript when a user initiates a newer CLI session,
+        WHEN LogWatcher.scan_active_targets() runs on the next tick,
+        THEN it detects the newer CLI transcript via mtime, adjusts watch targets without duplicate file descriptors,
+        and resets stale transcript cursors cleanly.
+        """
+        gemini_dir = self.base_dir / ".gemini_e2e_watcher"
+        desktop_brain = gemini_dir / "antigravity" / "brain" / "desk-sess" / ".system_generated" / "logs"
+        desktop_brain.mkdir(parents=True, exist_ok=True)
+        desktop_transcript = desktop_brain / "transcript.jsonl"
+        desktop_transcript.write_text('{"event": "start_desktop"}\n', encoding="utf-8")
+
+        desktop_presence = gemini_dir / "antigravity" / "presence" / "desk-sess.lock"
+        desktop_presence.parent.mkdir(parents=True, exist_ok=True)
+        desktop_presence.touch()
+        os.utime(desktop_presence, (1000.0, 1000.0))
+
+        cli_log_dir = gemini_dir / "antigravity-cli" / "log"
+        cli_log_dir.mkdir(parents=True, exist_ok=True)
+        cli_agent_log = cli_log_dir / "agent.log"
+        cli_agent_log.write_text("agent ready\n", encoding="utf-8")
+
+        detector = PresenceDetector(gemini_dir=gemini_dir, proc_dir=self.base_dir / "nonexistent_proc")
+        watcher = LogWatcher(engine=MagicMock(), presence_detector=detector)
+
+        targets_tick1 = watcher.scan_active_targets()
+        self.assertIn(str(desktop_transcript), targets_tick1)
+        self.assertEqual(watcher.active_session_id, "desk-sess")
+        self.assertEqual(watcher.active_transcript_path, desktop_transcript)
+
+        watcher.file_cursors[str(desktop_transcript)] = 42
+        watcher.file_cursors[str(cli_agent_log)] = 15
+
+        cli_brain = gemini_dir / "antigravity-cli" / "brain" / "cli-sess" / ".system_generated" / "logs"
+        cli_brain.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_brain / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "start_cli"}\n', encoding="utf-8")
+
+        cli_presence = gemini_dir / "antigravity-cli" / "presence" / "cli-sess.lock"
+        cli_presence.parent.mkdir(parents=True, exist_ok=True)
+        cli_presence.touch()
+        os.utime(cli_presence, (2000.0, 2000.0))
+
+        targets_tick2 = watcher.scan_active_targets()
+
+        self.assertEqual(watcher.active_session_id, "cli-sess")
+        self.assertEqual(watcher.active_transcript_path, cli_transcript)
+        self.assertIn(str(cli_transcript), targets_tick2)
+        self.assertNotIn(str(desktop_transcript), targets_tick2)
+        self.assertEqual(len(targets_tick2), len(set(targets_tick2)))
+        self.assertNotIn(str(desktop_transcript), watcher.file_cursors)
+        self.assertEqual(watcher.file_cursors.get(str(cli_agent_log)), 15)
+
     def test_poll_once_reads_lines_and_handles_truncation(self):
         """poll_once correctly tails file, advances cursor, and resets cursor on truncation."""
         test_file = self.base_dir / "test_session.transcript.jsonl"
