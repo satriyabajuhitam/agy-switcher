@@ -198,9 +198,12 @@ class TestProcessSupervisor(unittest.TestCase):
         # No locks initially
         self.assertFalse(self.supervisor.is_server_busy())
 
-        # With lock file
+        # With active lock held open by running process
         lock_file = presence_dir / "session.lock"
         lock_file.touch()
+        pid_dir = self.proc_dir / "100" / "fd"
+        pid_dir.mkdir(parents=True)
+        (pid_dir / "0").symlink_to(lock_file)
         self.assertTrue(self.supervisor.is_server_busy())
 
     def test_is_server_busy_with_child_process(self):
@@ -215,6 +218,134 @@ class TestProcessSupervisor(unittest.TestCase):
         (child_dir / "stat").write_text("303 (subtask) Z 202 0 0 0 0")
         self.assertFalse(self.supervisor.is_server_busy(pid=202))
 
+    def test_is_server_busy_active_fd(self):
+        # [REQ-1-SCN-001]: Active process in proc_dir holding open fd to presence lock
+        desktop_presence = self.gemini_dir / "antigravity" / "presence"
+        desktop_presence.mkdir(parents=True, exist_ok=True)
+        active_lock = desktop_presence / "active-turn.lock"
+        active_lock.touch()
+
+        pid4500_fd = self.proc_dir / "4500" / "fd"
+        pid4500_fd.mkdir(parents=True, exist_ok=True)
+        (pid4500_fd / "3").symlink_to(active_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(active_lock.exists())
+
+        # Dual-directory presence: CLI lock active fd
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence.mkdir(parents=True, exist_ok=True)
+        cli_lock = cli_presence / "active-cli.lock"
+        cli_lock.touch()
+
+        pid4600_fd = self.proc_dir / "4600" / "fd"
+        pid4600_fd.mkdir(parents=True, exist_ok=True)
+        (pid4600_fd / "7").symlink_to(cli_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(cli_lock.exists())
+
+        # Clean active fds to test stale lock isolation without active fd
+        for f in pid4500_fd.iterdir():
+            f.unlink()
+        for f in pid4600_fd.iterdir():
+            f.unlink()
+
+        # Lock exists on disk but no process holds open fd -> must not mark server busy
+        self.assertFalse(self.supervisor.is_server_busy())
+
+        # [REQ-1-SCN-004]: Active child process under language_server marks server busy
+        active_lock.unlink()
+        cli_lock.unlink()
+        child_dir = self.proc_dir / "303"
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / "stat").write_text("303 (subtask) S 202 0 0 0 0")
+        self.assertTrue(self.supervisor.is_server_busy(pid=202))
+
+        # Reset child process state
+        (child_dir / "stat").write_text("303 (subtask) S 1 0 0 0 0")
+
+        # [REQ-1-EDGE-003]: Deleted symlink target with " (deleted)" suffix is ignored
+        deleted_fd_dir = self.proc_dir / "777" / "fd"
+        deleted_fd_dir.mkdir(parents=True, exist_ok=True)
+        (deleted_fd_dir / "1").symlink_to(str(desktop_presence / "old.lock") + " (deleted)")
+        self.assertFalse(self.supervisor.is_server_busy(pid=202))
+
+        # [REQ-1-EDGE-002]: Non-lock files, directory entries in presence directory are ignored
+        (desktop_presence / "notes.txt").write_text("some notes")
+        (desktop_presence / ".DS_Store").touch()
+        (desktop_presence / "subdir").mkdir(exist_ok=True)
+        self.assertFalse(self.supervisor.is_server_busy())
+
+        # [REQ-1-ERR-002]: Broken or transient symlink does not crash traversal
+        broken_fd_dir = self.proc_dir / "888" / "fd"
+        broken_fd_dir.mkdir(parents=True, exist_ok=True)
+        (broken_fd_dir / "9").symlink_to("/non/existent/path/presence.lock")
+        self.assertFalse(self.supervisor.is_server_busy())
+
+        # [REQ-1-EDGE-001]: Inaccessible proc_dir handled safely without exception
+        inaccessible_supervisor = ProcessSupervisor(
+            gemini_dir=self.gemini_dir,
+            proc_dir=Path("/non/existent/proc/dir"),
+        )
+        self.assertFalse(inaccessible_supervisor.is_server_busy())
+
+    def test_is_server_busy_active_fd_permission_error_on_fd_dir(self):
+        """[REQ-1-ERR-001] PermissionError when reading another user's fd dir is safely suppressed."""
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        active_lock = presence_dir / "active.lock"
+        active_lock.touch()
+
+        # Unreadable PID (e.g. root process in multi-user host)
+        unreadable_fd = self.proc_dir / "10" / "fd"
+        unreadable_fd.mkdir(parents=True, exist_ok=True)
+
+        # Accessible PID holding active lock
+        accessible_fd = self.proc_dir / "20" / "fd"
+        accessible_fd.mkdir(parents=True, exist_ok=True)
+        (accessible_fd / "5").symlink_to(active_lock)
+
+        orig_iterdir = Path.iterdir
+
+        def mock_iterdir(path_obj):
+            if path_obj == unreadable_fd:
+                raise PermissionError(13, "Permission denied")
+            return orig_iterdir(path_obj)
+
+        with patch.object(Path, "iterdir", side_effect=mock_iterdir, autospec=True):
+            self.assertTrue(self.supervisor.is_server_busy())
+
+    def test_is_server_busy_active_fd_transient_process_lookup_error(self):
+        """[REQ-1-ERR-002] ProcessLookupError during readlink due to process exit is suppressed."""
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        active_lock = presence_dir / "active.lock"
+        active_lock.touch()
+
+        fd1 = self.proc_dir / "30" / "fd"
+        fd1.mkdir(parents=True, exist_ok=True)
+        (fd1 / "1").symlink_to("/tmp/transient.lock")
+
+        fd2 = self.proc_dir / "40" / "fd"
+        fd2.mkdir(parents=True, exist_ok=True)
+        (fd2 / "2").symlink_to(active_lock)
+
+        orig_readlink = os.readlink
+
+        def mock_readlink(path_entry):
+            if "30/fd/1" in str(path_entry):
+                raise ProcessLookupError(3, "No such process")
+            return orig_readlink(path_entry)
+
+        with patch("os.readlink", side_effect=mock_readlink):
+            self.assertTrue(self.supervisor.is_server_busy())
+
+    def test_is_server_busy_proc_dir_iterdir_os_error(self):
+        """[REQ-1-EDGE-001] OSError during proc_dir listing does not crash is_server_busy."""
+        with patch.object(Path, "iterdir", side_effect=PermissionError(13, "Permission denied")):
+            self.assertFalse(self.supervisor.is_server_busy())
+
     def test_verify_turn_safety(self):
         # When server is idle
         self.supervisor.verify_turn_safety(force=False)
@@ -222,7 +353,11 @@ class TestProcessSupervisor(unittest.TestCase):
         # When server is busy
         presence_dir = self.gemini_dir / "antigravity" / "presence"
         presence_dir.mkdir(parents=True)
-        (presence_dir / "turn.lock").touch()
+        turn_lock = presence_dir / "turn.lock"
+        turn_lock.touch()
+        pid_dir = self.proc_dir / "123" / "fd"
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "0").symlink_to(turn_lock)
 
         # Mock locate_language_server_pid to return active PID
         with patch.object(self.supervisor, "locate_language_server_pid", return_value=123):

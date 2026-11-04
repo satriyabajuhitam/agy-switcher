@@ -483,7 +483,11 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         # Simulate presence lock in ~/.gemini/antigravity/presence
         presence_dir = self.gemini_dir / "antigravity" / "presence"
         presence_dir.mkdir(parents=True, exist_ok=True)
-        (presence_dir / "turn.lock").write_text("lock", encoding="utf-8")
+        turn_lock = presence_dir / "turn.lock"
+        turn_lock.write_text("lock", encoding="utf-8")
+        fd_dir = self.proc_dir / "101" / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (fd_dir / "10").symlink_to(turn_lock)
 
         report_busy = self.engine.run_diagnostics()
         proc_busy = next(it for it in report_busy.items if it.category == "process")
