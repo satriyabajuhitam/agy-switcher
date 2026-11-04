@@ -562,6 +562,114 @@ class TestPresenceDetector(unittest.TestCase):
         session_id = self.detector.get_active_session_id()
         self.assertEqual(session_id, "valid-regular")
 
+    def test_transcript_targets_cli_exclusive(self):
+        """[REQ-2-SCN-004]: GIVEN an active session ID 'cli-uuid-456' whose transcript exists exclusively
+        at ~/.gemini/antigravity-cli/brain/cli-uuid-456/.system_generated/logs/transcript.jsonl,
+        WHEN PresenceDetector.get_active_transcript_path('cli-uuid-456') is called,
+        THEN it returns the Path pointing to the CLI transcript file.
+        """
+        cli_uuid = "cli-uuid-456"
+        cli_transcript_dir = self.detector.cli_brain_dir / cli_uuid / ".system_generated" / "logs"
+        cli_transcript_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_transcript_dir / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "cli_start"}\n', encoding="utf-8")
+
+        result = self.detector.get_active_transcript_path(cli_uuid)
+        self.assertEqual(result, cli_transcript)
+
+        cli_presence = self.detector.cli_presence_dir / f"{cli_uuid}.lock"
+        cli_presence.parent.mkdir(parents=True, exist_ok=True)
+        cli_presence.touch()
+
+        auto_result = self.detector.get_active_transcript_path()
+        self.assertEqual(auto_result, cli_transcript)
+
+    def test_transcript_targets_concurrent_mtime(self):
+        """[REQ-2-SCN-004]: GIVEN session 'hybrid-sess' exists in both Desktop brain/ (mtime 1500.0)
+        and CLI brain/ (mtime 2500.0), WHEN PresenceDetector.get_active_transcript_path('hybrid-sess') is called,
+        THEN the returned path points to the CLI transcript file with mtime 2500.0.
+        """
+        session_id = "hybrid-sess"
+        desk_dir = self.detector.brain_dir / session_id / ".system_generated" / "logs"
+        desk_dir.mkdir(parents=True, exist_ok=True)
+        desk_transcript = desk_dir / "transcript.jsonl"
+        desk_transcript.write_text('{"event": "desktop"}\n', encoding="utf-8")
+        os.utime(desk_transcript, (1500.0, 1500.0))
+
+        cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_dir / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "cli"}\n', encoding="utf-8")
+        os.utime(cli_transcript, (2500.0, 2500.0))
+
+        result = self.detector.get_active_transcript_path(session_id)
+        self.assertEqual(result, cli_transcript)
+
+        os.utime(desk_transcript, (3500.0, 3500.0))
+        result2 = self.detector.get_active_transcript_path(session_id)
+        self.assertEqual(result2, desk_transcript)
+
+    def test_transcript_targets_deduplication(self):
+        """[REQ-2-SCN-006]: GIVEN an active CLI transcript file exists and multiple .log files exist
+        in ~/.gemini/antigravity-cli/log/, WHEN PresenceDetector.get_watch_targets() is invoked,
+        THEN the returned list contains the CLI transcript path and existing .log paths with zero duplicates.
+        """
+        session_id = "cli-dedup-sess"
+        cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_dir / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "cli_entry"}\n', encoding="utf-8")
+
+        cli_lock = self.detector.cli_presence_dir / f"{session_id}.lock"
+        cli_lock.parent.mkdir(parents=True, exist_ok=True)
+        cli_lock.touch()
+
+        log1 = self.detector.cli_log_dir / "agent.log"
+        log2 = self.detector.cli_log_dir / "runner.log"
+        log1.write_text("agent log", encoding="utf-8")
+        log2.write_text("runner log", encoding="utf-8")
+
+        targets_path = self.detector.get_watch_targets(as_str=False)
+        self.assertEqual(len(targets_path), 3)
+        self.assertEqual(len(targets_path), len(set(targets_path)))
+        self.assertEqual(targets_path[0], cli_transcript)
+        self.assertIn(log1, targets_path)
+        self.assertIn(log2, targets_path)
+
+        targets_str = self.detector.get_watch_targets(as_str=True)
+        self.assertEqual(len(targets_str), 3)
+        self.assertEqual(len(targets_str), len(set(targets_str)))
+        self.assertIn(str(cli_transcript), targets_str)
+        self.assertIn(str(log1), targets_str)
+        self.assertIn(str(log2), targets_str)
+
+    def test_transcript_targets_unreadable_omitted_safely(self):
+        """[REQ-2-ERR-002]: GIVEN an active session ID is discovered,
+        AND the transcript file raises PermissionError or is unlinked when queried with is_file(),
+        WHEN PresenceDetector.get_watch_targets() is called,
+        THEN the unreadable transcript is omitted without raising an unhandled exception.
+        """
+        session_id = "unreadable-sess"
+        cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_dir / "transcript.jsonl"
+        cli_transcript.touch()
+
+        cli_lock = self.detector.cli_presence_dir / f"{session_id}.lock"
+        cli_lock.parent.mkdir(parents=True, exist_ok=True)
+        cli_lock.touch()
+
+        original_is_file = Path.is_file
+
+        def selective_is_file(path_obj):
+            if "transcript.jsonl" in str(path_obj):
+                raise PermissionError("Access denied to transcript")
+            return original_is_file(path_obj)
+
+        with patch.object(Path, "is_file", selective_is_file):
+            targets = self.detector.get_watch_targets()
+            self.assertNotIn(cli_transcript, targets)
+
 
 class TestCooldownManager(unittest.TestCase):
     def setUp(self):
@@ -1478,6 +1586,51 @@ class TestLogWatcherProcessing(unittest.TestCase):
         self.assertEqual(self.watcher.active_session_id, "session-2")
         # Old cursor must be pruned!
         self.assertNotIn(str(transcript_s1), self.watcher.file_cursors)
+
+    def test_scan_active_targets_dual_directory_cli_transcript(self):
+        """[REQ-2-SCN-006]: GIVEN LogWatcher is initialized with a PresenceDetector supporting dual directories,
+        AND an active CLI session has an active transcript,
+        WHEN LogWatcher.scan_active_targets() is invoked,
+        THEN the returned targets list includes the active CLI transcript path.
+        """
+        gemini_dir = self.base_dir / ".gemini_watcher_dual"
+        cli_brain = gemini_dir / "antigravity-cli" / "brain" / "cli-sess-scan" / ".system_generated" / "logs"
+        cli_brain.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_brain / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "start"}\n', encoding="utf-8")
+
+        cli_presence = gemini_dir / "antigravity-cli" / "presence" / "cli-sess-scan.lock"
+        cli_presence.parent.mkdir(parents=True, exist_ok=True)
+        cli_presence.touch()
+
+        detector = PresenceDetector(gemini_dir=gemini_dir, proc_dir=self.base_dir / "nonexistent_proc")
+        watcher = LogWatcher(engine=MagicMock(), presence_detector=detector)
+
+        targets = watcher.scan_active_targets()
+        self.assertIn(str(cli_transcript), targets)
+        self.assertEqual(watcher.active_session_id, "cli-sess-scan")
+        self.assertEqual(watcher.active_transcript_path, cli_transcript)
+
+    def test_scan_active_targets_deduplicates_paths(self):
+        """[REQ-2-SCN-006]: Verify scan_active_targets deduplicates targets even if log_dirs contains overlaps."""
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "dedup-sess"
+        mock_detector.get_active_transcript_path.return_value = Path("/dummy/transcript.jsonl")
+        mock_detector.get_watch_targets.return_value = ["/dummy/transcript.jsonl", "/dummy/agent.log"]
+
+        watcher = LogWatcher(engine=MagicMock(), presence_detector=mock_detector)
+        # Simulate custom log_dir having duplicate
+        custom_dir = self.base_dir / "custom_logs"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        dup_file = custom_dir / "agent.log"
+        dup_file.touch()
+        watcher.log_dirs = [str(custom_dir)]
+
+        # Mock presence_detector.get_watch_targets returning the duplicate path as well
+        mock_detector.get_watch_targets.return_value = [str(dup_file), str(dup_file)]
+
+        targets = watcher.scan_active_targets()
+        self.assertEqual(targets.count(str(dup_file)), 1)
 
     def test_poll_once_reads_lines_and_handles_truncation(self):
         """poll_once correctly tails file, advances cursor, and resets cursor on truncation."""

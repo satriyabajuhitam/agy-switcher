@@ -254,43 +254,104 @@ class PresenceDetector:
     def get_active_transcript_path(self, session_id: str | None = None) -> Path | None:
         """
         Returns Path to brain/<active-id>/.system_generated/logs/transcript.jsonl
-        when the session directory exists, or None.
-        If session_id is provided, bypasses calling get_active_session_id() again.
+        resolved from Desktop brain (~/.gemini/antigravity/brain/<id>) or
+        CLI brain (~/.gemini/antigravity-cli/brain/<id>).
+        If both transcript files exist, returns the file with the newest mtime.
+        If only one exists, returns that file.
+        If neither file exists, checks for existing session directories under Desktop and CLI
+        brain and returns the expected transcript path (preferring newest directory mtime).
+        Returns None if no active session is found or neither session directory exists.
         """
         if session_id is None:
             session_id = self.get_active_session_id()
         if not session_id:
             return None
 
-        session_dir = self.brain_dir / session_id
-        if not session_dir.is_dir():
-            return None
+        desk_session_dir = self.brain_dir / session_id
+        cli_session_dir = self.cli_brain_dir / session_id
 
-        return session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        desk_transcript = desk_session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        cli_transcript = cli_session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+
+        def _is_file(p: Path) -> bool:
+            try:
+                return p.is_file()
+            except OSError:
+                return False
+
+        def _is_dir(p: Path) -> bool:
+            try:
+                return p.is_dir()
+            except OSError:
+                return False
+
+        def _mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        desk_file_exists = _is_file(desk_transcript)
+        cli_file_exists = _is_file(cli_transcript)
+
+        if desk_file_exists and cli_file_exists:
+            return cli_transcript if _mtime(cli_transcript) > _mtime(desk_transcript) else desk_transcript
+        elif desk_file_exists:
+            return desk_transcript
+        elif cli_file_exists:
+            return cli_transcript
+
+        desk_dir_exists = _is_dir(desk_session_dir)
+        cli_dir_exists = _is_dir(cli_session_dir)
+
+        if desk_dir_exists and cli_dir_exists:
+            return cli_transcript if _mtime(cli_session_dir) > _mtime(desk_session_dir) else desk_transcript
+        elif desk_dir_exists:
+            return desk_transcript
+        elif cli_dir_exists:
+            return cli_transcript
+
+        return None
 
     def get_watch_targets(self, as_str: bool = False, session_id: str | None = None) -> list[Path] | list[str]:
         """
         Returns list of active log targets to watch:
         - Active transcript.jsonl if resolved and existing on disk.
         - Existing CLI logs in antigravity-cli/log/*.log.
-        Omits non-existent paths.
+        Omits non-existent paths and deduplicates targets.
         """
         targets: list[Path] = []
         active_transcript = self.get_active_transcript_path(session_id=session_id)
-        if active_transcript is not None and active_transcript.is_file():
-            targets.append(active_transcript)
-
-        if self.cli_log_dir.is_dir():
+        if active_transcript is not None:
             try:
-                for cli_log in sorted(self.cli_log_dir.glob("*.log")):
-                    if cli_log.is_file():
-                        targets.append(cli_log)
+                if active_transcript.is_file():
+                    targets.append(active_transcript)
             except OSError:
                 pass
 
+        try:
+            if self.cli_log_dir.is_dir():
+                for cli_log in sorted(self.cli_log_dir.glob("*.log")):
+                    try:
+                        if cli_log.is_file():
+                            targets.append(cli_log)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        seen: set[str] = set()
+        deduped: list[Path] = []
+        for target in targets:
+            key = str(target)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(target)
+
         if as_str:
-            return [str(p) for p in targets]
-        return targets
+            return [str(p) for p in deduped]
+        return deduped
+
 
 
 __all__ = [
