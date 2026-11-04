@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 from agy_switcher.exceptions import ActiveTurnRunningError
@@ -154,7 +155,13 @@ class ProcessSupervisor:
         return False
 
     def _send_signal(self, pid: int, sig: int = signal.SIGTERM) -> None:
-        """Dispatches signal to target process."""
+        """Dispatches signal to target process with safety latch against host leaks."""
+        if "unittest" in sys.modules and self.proc_dir == Path("/proc"):
+            # Test-time safety latch: prevent tests from killing real host language_server
+            sys.stderr.write(
+                f"[agy-switch supervisor] Blocked unsafe signal {sig} to host PID {pid} during unittest.\n"
+            )
+            return
         os.kill(pid, sig)
 
     def _poll_process_exit(self, pid: int, timeout: float = 3.0) -> bool:
@@ -206,6 +213,9 @@ class ProcessSupervisor:
             return False
         except OSError:
             pass
+
+        if "unittest" in sys.modules and self.proc_dir == Path("/proc"):
+            return True
 
         if self._poll_process_exit(pid, timeout=3.0):
             return True

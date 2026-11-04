@@ -1,5 +1,6 @@
 """Unit tests for ProcessSupervisor, Layer 0 foundation models/exceptions, and Layer 1 formatters."""
 
+import io
 import os
 import signal
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
 import sys
+import warnings
 
 # Add scripts directory to sys.path so agy_switcher can be imported
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -365,6 +367,56 @@ class TestProcessSupervisor(unittest.TestCase):
     def test_poll_process_exit_permission_error_returns_false(self):
         with patch("os.kill", side_effect=PermissionError(1, "Operation not permitted")):
             self.assertFalse(self.supervisor._poll_process_exit(456, timeout=0.1))
+
+    def test_poll_process_exit_req_4_scn_001_process_terminates(self):
+        """[REQ-4-SCN-001] Detects process termination via ProcessLookupError or ESRCH and returns True."""
+        with self.subTest(error="ProcessLookupError"):
+            with patch("os.kill", side_effect=ProcessLookupError):
+                self.assertTrue(self.supervisor._poll_process_exit(100, timeout=1.0))
+
+        with self.subTest(error="ESRCH"):
+            with patch("os.kill", side_effect=OSError(3, "No such process")):
+                self.assertTrue(self.supervisor._poll_process_exit(100, timeout=1.0))
+
+        with self.subTest(behavior="exits_on_second_poll"):
+            with patch("os.kill", side_effect=[None, ProcessLookupError]):
+                with patch("time.sleep") as mock_sleep:
+                    self.assertTrue(self.supervisor._poll_process_exit(100, timeout=1.0))
+                    mock_sleep.assert_called_once_with(0.1)
+
+    def test_poll_process_exit_req_4_scn_002_process_alive_times_out(self):
+        """[REQ-4-SCN-002] Returns False deterministically when process remains alive beyond timeout."""
+        with patch("os.kill", return_value=None):
+            with patch("time.time", side_effect=[0.0, 0.05, 0.15, 0.25]):
+                with patch("time.sleep"):
+                    self.assertFalse(self.supervisor._poll_process_exit(100, timeout=0.2))
+
+    def test_poll_process_exit_dead_code_eliminated(self):
+        """[REQ-4-SCN-001][REQ-4-SCN-002] AST verification that duplicate loop and dead code are pruned."""
+        import ast
+        import inspect
+        import textwrap
+
+        source = textwrap.dedent(inspect.getsource(ProcessSupervisor._poll_process_exit))
+        tree = ast.parse(source)
+        fn_node = tree.body[0]
+        self.assertIsInstance(fn_node, ast.FunctionDef)
+
+        statements = [stmt for stmt in fn_node.body if not isinstance(stmt, ast.Expr)]
+        while_loops = [stmt for stmt in statements if isinstance(stmt, ast.While)]
+        self.assertEqual(len(while_loops), 1, "Expected exactly 1 while loop in _poll_process_exit")
+
+        return_indices = [idx for idx, stmt in enumerate(statements) if isinstance(stmt, ast.Return)]
+        self.assertEqual(len(return_indices), 1, "Expected exactly 1 top-level return in _poll_process_exit")
+        self.assertEqual(return_indices[0], len(statements) - 1, "No statements may follow return statement")
+
+    def test_send_signal_safety_latch_blocks_kill_during_unittest_with_host_proc(self):
+        """When proc_dir is /proc during unit test execution, _send_signal must block signal and warn."""
+        sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir="/proc")
+        with patch("os.kill") as mock_kill, patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+            sup._send_signal(99999, signal.SIGTERM)
+            mock_kill.assert_not_called()
+            self.assertIn("Blocked unsafe signal", mock_err.getvalue())
 
     def test_get_cloud_code_endpoint_from_proc_null_separated(self):
         pid = self.proc_dir / "777"
