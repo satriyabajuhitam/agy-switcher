@@ -1,5 +1,6 @@
 """Unit tests for ProcessSupervisor, Layer 0 foundation models/exceptions, and Layer 1 formatters."""
 
+import io
 import os
 import signal
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
 import sys
+import warnings
 
 # Add scripts directory to sys.path so agy_switcher can be imported
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -38,6 +40,7 @@ from agy_switcher.formatters import (
     format_diagnostic_report,
     _format_bucket_countdown,
     _format_gemini_quota_summary,
+    _format_model_quota_summary,
 )
 
 
@@ -195,9 +198,12 @@ class TestProcessSupervisor(unittest.TestCase):
         # No locks initially
         self.assertFalse(self.supervisor.is_server_busy())
 
-        # With lock file
+        # With active lock held open by running process
         lock_file = presence_dir / "session.lock"
         lock_file.touch()
+        pid_dir = self.proc_dir / "100" / "fd"
+        pid_dir.mkdir(parents=True)
+        (pid_dir / "0").symlink_to(lock_file)
         self.assertTrue(self.supervisor.is_server_busy())
 
     def test_is_server_busy_with_child_process(self):
@@ -212,6 +218,223 @@ class TestProcessSupervisor(unittest.TestCase):
         (child_dir / "stat").write_text("303 (subtask) Z 202 0 0 0 0")
         self.assertFalse(self.supervisor.is_server_busy(pid=202))
 
+    def test_is_server_busy_active_fd(self):
+        # [REQ-1-SCN-001]: Active process in proc_dir holding open fd to presence lock
+        desktop_presence = self.gemini_dir / "antigravity" / "presence"
+        desktop_presence.mkdir(parents=True, exist_ok=True)
+        active_lock = desktop_presence / "active-turn.lock"
+        active_lock.touch()
+
+        pid4500_fd = self.proc_dir / "4500" / "fd"
+        pid4500_fd.mkdir(parents=True, exist_ok=True)
+        (pid4500_fd / "3").symlink_to(active_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(active_lock.exists())
+
+        # Dual-directory presence: CLI lock active fd
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence.mkdir(parents=True, exist_ok=True)
+        cli_lock = cli_presence / "active-cli.lock"
+        cli_lock.touch()
+
+        pid4600_fd = self.proc_dir / "4600" / "fd"
+        pid4600_fd.mkdir(parents=True, exist_ok=True)
+        (pid4600_fd / "7").symlink_to(cli_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(cli_lock.exists())
+
+        # Clean active fds to test stale lock isolation without active fd
+        for f in pid4500_fd.iterdir():
+            f.unlink()
+        for f in pid4600_fd.iterdir():
+            f.unlink()
+
+        # Lock exists on disk but no process holds open fd -> must not mark server busy and gets pruned
+        self.assertFalse(self.supervisor.is_server_busy())
+        self.assertFalse(active_lock.exists())
+        self.assertFalse(cli_lock.exists())
+
+        # [REQ-1-SCN-004]: Active child process under language_server marks server busy
+        child_dir = self.proc_dir / "303"
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / "stat").write_text("303 (subtask) S 202 0 0 0 0")
+        self.assertTrue(self.supervisor.is_server_busy(pid=202))
+
+        # Reset child process state
+        (child_dir / "stat").write_text("303 (subtask) S 1 0 0 0 0")
+
+        # [REQ-1-EDGE-003]: Deleted symlink target with " (deleted)" suffix is ignored
+        deleted_fd_dir = self.proc_dir / "777" / "fd"
+        deleted_fd_dir.mkdir(parents=True, exist_ok=True)
+        (deleted_fd_dir / "1").symlink_to(str(desktop_presence / "old.lock") + " (deleted)")
+        self.assertFalse(self.supervisor.is_server_busy(pid=202))
+
+        # [REQ-1-EDGE-002]: Non-lock files, directory entries in presence directory are ignored
+        (desktop_presence / "notes.txt").write_text("some notes")
+        (desktop_presence / ".DS_Store").touch()
+        (desktop_presence / "subdir").mkdir(exist_ok=True)
+        self.assertFalse(self.supervisor.is_server_busy())
+
+        # [REQ-1-ERR-002]: Broken or transient symlink does not crash traversal
+        broken_fd_dir = self.proc_dir / "888" / "fd"
+        broken_fd_dir.mkdir(parents=True, exist_ok=True)
+        (broken_fd_dir / "9").symlink_to("/non/existent/path/presence.lock")
+        self.assertFalse(self.supervisor.is_server_busy())
+
+        # [REQ-1-EDGE-001]: Inaccessible proc_dir handled safely without exception
+        inaccessible_supervisor = ProcessSupervisor(
+            gemini_dir=self.gemini_dir,
+            proc_dir=Path("/non/existent/proc/dir"),
+        )
+        self.assertFalse(inaccessible_supervisor.is_server_busy())
+
+    def test_is_server_busy_active_fd_permission_error_on_fd_dir(self):
+        """[REQ-1-ERR-001] PermissionError when reading another user's fd dir is safely suppressed."""
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        active_lock = presence_dir / "active.lock"
+        active_lock.touch()
+
+        # Unreadable PID (e.g. root process in multi-user host)
+        unreadable_fd = self.proc_dir / "10" / "fd"
+        unreadable_fd.mkdir(parents=True, exist_ok=True)
+
+        # Accessible PID holding active lock
+        accessible_fd = self.proc_dir / "20" / "fd"
+        accessible_fd.mkdir(parents=True, exist_ok=True)
+        (accessible_fd / "5").symlink_to(active_lock)
+
+        orig_iterdir = Path.iterdir
+
+        def mock_iterdir(path_obj):
+            if path_obj == unreadable_fd:
+                raise PermissionError(13, "Permission denied")
+            return orig_iterdir(path_obj)
+
+        with patch.object(Path, "iterdir", side_effect=mock_iterdir, autospec=True):
+            self.assertTrue(self.supervisor.is_server_busy())
+
+    def test_is_server_busy_active_fd_transient_process_lookup_error(self):
+        """[REQ-1-ERR-002] ProcessLookupError during readlink due to process exit is suppressed."""
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        active_lock = presence_dir / "active.lock"
+        active_lock.touch()
+
+        fd1 = self.proc_dir / "30" / "fd"
+        fd1.mkdir(parents=True, exist_ok=True)
+        (fd1 / "1").symlink_to("/tmp/transient.lock")
+
+        fd2 = self.proc_dir / "40" / "fd"
+        fd2.mkdir(parents=True, exist_ok=True)
+        (fd2 / "2").symlink_to(active_lock)
+
+        orig_readlink = os.readlink
+
+        def mock_readlink(path_entry):
+            if "30/fd/1" in str(path_entry):
+                raise ProcessLookupError(3, "No such process")
+            return orig_readlink(path_entry)
+
+        with patch("os.readlink", side_effect=mock_readlink):
+            self.assertTrue(self.supervisor.is_server_busy())
+
+    def test_is_server_busy_proc_dir_iterdir_os_error(self):
+        """[REQ-1-EDGE-001] OSError during proc_dir listing does not crash is_server_busy."""
+        with patch.object(Path, "iterdir", side_effect=PermissionError(13, "Permission denied")):
+            self.assertFalse(self.supervisor.is_server_busy())
+
+    def test_stale_lock_pruning(self):
+        # [REQ-1-SCN-002]: Orphaned lock file in CLI presence is unlinked and server not busy
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence.mkdir(parents=True, exist_ok=True)
+        orphaned_lock = cli_presence / "orphaned-run.lock"
+        orphaned_lock.touch()
+
+        desktop_presence = self.gemini_dir / "antigravity" / "presence"
+        desktop_presence.mkdir(parents=True, exist_ok=True)
+        notes_file = desktop_presence / "notes.txt"
+        notes_file.write_text("should be kept")
+        hidden_file = desktop_presence / ".DS_Store"
+        hidden_file.touch()
+        hidden_lock = desktop_presence / ".hidden.lock"
+        hidden_lock.touch()
+        subdir_lock = desktop_presence / "nested.lock"
+        subdir_lock.mkdir()
+
+        self.assertTrue(orphaned_lock.exists())
+        self.assertFalse(self.supervisor.is_server_busy())
+        self.assertFalse(orphaned_lock.exists())
+
+        # Non-lock files, hidden files, and directories remain intact
+        self.assertTrue(notes_file.exists())
+        self.assertTrue(hidden_file.exists())
+        self.assertTrue(hidden_lock.exists())
+        self.assertTrue(subdir_lock.exists())
+
+        # [REQ-1-SCN-003]: Coexistence of active and stale locks prunes stale and reports busy
+        stale_lock = desktop_presence / "stale.lock"
+        stale_lock.touch()
+        active_lock = cli_presence / "active.lock"
+        active_lock.touch()
+        pid5100_fd = self.proc_dir / "5100" / "fd"
+        pid5100_fd.mkdir(parents=True, exist_ok=True)
+        (pid5100_fd / "11").symlink_to(active_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertFalse(stale_lock.exists())
+        self.assertTrue(active_lock.exists())
+
+        # [REQ-1-SCN-006]: Consecutive calls are idempotent without raising FileNotFoundError
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(active_lock.exists())
+
+        # [REQ-1-ERR-001]: OSError/PermissionError during unlink is caught and suppressed
+        (pid5100_fd / "11").unlink()
+        active_lock.unlink()
+
+        readonly_lock = desktop_presence / "readonly.lock"
+        readonly_lock.touch()
+
+        with patch("os.unlink", side_effect=PermissionError(13, "Permission denied")):
+            self.assertFalse(self.supervisor.is_server_busy())
+        self.assertTrue(readonly_lock.exists())
+
+    def test_req_1_scn_003_coexistence_active_and_stale_locks(self):
+        """[REQ-1-SCN-003]: GIVEN a stale lock ~/.gemini/antigravity/presence/stale.lock with no open file descriptor
+        and an active lock ~/.gemini/antigravity-cli/presence/active.lock held open by an active process,
+        WHEN ProcessSupervisor.is_server_busy() is called,
+        THEN stale.lock is unlinked from disk, active.lock is retained, and is_server_busy() returns True.
+        """
+        desktop_presence = self.gemini_dir / "antigravity" / "presence"
+        desktop_presence.mkdir(parents=True, exist_ok=True)
+        stale_lock = desktop_presence / "stale.lock"
+        stale_lock.touch()
+        notes_file = desktop_presence / "notes.txt"
+        notes_file.touch()
+
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence.mkdir(parents=True, exist_ok=True)
+        active_lock = cli_presence / "active.lock"
+        active_lock.touch()
+        cli_stale_lock = cli_presence / "cli_stale.lock"
+        cli_stale_lock.touch()
+
+        pid5100_fd = self.proc_dir / "5100" / "fd"
+        pid5100_fd.mkdir(parents=True, exist_ok=True)
+        (pid5100_fd / "11").symlink_to(active_lock)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertFalse(stale_lock.exists())
+        self.assertFalse(cli_stale_lock.exists())
+        self.assertTrue(active_lock.exists())
+        self.assertTrue(notes_file.exists())
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertTrue(active_lock.exists())
+
     def test_verify_turn_safety(self):
         # When server is idle
         self.supervisor.verify_turn_safety(force=False)
@@ -219,7 +442,11 @@ class TestProcessSupervisor(unittest.TestCase):
         # When server is busy
         presence_dir = self.gemini_dir / "antigravity" / "presence"
         presence_dir.mkdir(parents=True)
-        (presence_dir / "turn.lock").touch()
+        turn_lock = presence_dir / "turn.lock"
+        turn_lock.touch()
+        pid_dir = self.proc_dir / "123" / "fd"
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "0").symlink_to(turn_lock)
 
         # Mock locate_language_server_pid to return active PID
         with patch.object(self.supervisor, "locate_language_server_pid", return_value=123):
@@ -366,6 +593,55 @@ class TestProcessSupervisor(unittest.TestCase):
         with patch("os.kill", side_effect=PermissionError(1, "Operation not permitted")):
             self.assertFalse(self.supervisor._poll_process_exit(456, timeout=0.1))
 
+    def test_poll_process_exit_req_4_scn_001_process_terminates(self):
+        """[REQ-4-SCN-001] Detects process termination via ProcessLookupError or ESRCH and returns True."""
+        with self.subTest(error="ProcessLookupError"):
+            with patch("os.kill", side_effect=ProcessLookupError):
+                self.assertTrue(self.supervisor._poll_process_exit(100, timeout=1.0))
+
+        with self.subTest(error="ESRCH"):
+            with patch("os.kill", side_effect=OSError(3, "No such process")):
+                self.assertTrue(self.supervisor._poll_process_exit(100, timeout=1.0))
+
+        with self.subTest(behavior="exits_on_second_poll"):
+            with patch("os.kill", side_effect=[None, ProcessLookupError]):
+                with patch("time.sleep") as mock_sleep:
+                    self.assertTrue(self.supervisor._poll_process_exit(100, timeout=1.0))
+                    mock_sleep.assert_called_once_with(0.1)
+
+    def test_poll_process_exit_req_4_scn_002_process_alive_times_out(self):
+        """[REQ-4-SCN-002] Returns False deterministically when process remains alive beyond timeout."""
+        with patch("os.kill", return_value=None):
+            with patch("time.time", side_effect=[0.0, 0.05, 0.15, 0.25]):
+                with patch("time.sleep"):
+                    self.assertFalse(self.supervisor._poll_process_exit(100, timeout=0.2))
+
+    def test_poll_process_exit_dead_code_eliminated(self):
+        """[REQ-4-SCN-001][REQ-4-SCN-002] AST verification that duplicate loop and dead code are pruned."""
+        import ast
+        import inspect
+        import textwrap
+
+        source = textwrap.dedent(inspect.getsource(ProcessSupervisor._poll_process_exit))
+        tree = ast.parse(source)
+        fn_node = tree.body[0]
+        self.assertIsInstance(fn_node, ast.FunctionDef)
+
+        statements = [stmt for stmt in fn_node.body if not isinstance(stmt, ast.Expr)]
+        while_loops = [stmt for stmt in statements if isinstance(stmt, ast.While)]
+        self.assertEqual(len(while_loops), 1, "Expected exactly 1 while loop in _poll_process_exit")
+
+        return_indices = [idx for idx, stmt in enumerate(statements) if isinstance(stmt, ast.Return)]
+        self.assertEqual(len(return_indices), 1, "Expected exactly 1 top-level return in _poll_process_exit")
+        self.assertEqual(return_indices[0], len(statements) - 1, "No statements may follow return statement")
+
+    def test_send_signal_dispatches_via_os_kill(self):
+        """_send_signal dispatches signal to target process via os.kill."""
+        sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        with patch("os.kill") as mock_kill:
+            sup._send_signal(99999, signal.SIGTERM)
+            mock_kill.assert_called_once_with(99999, signal.SIGTERM)
+
     def test_get_cloud_code_endpoint_from_proc_null_separated(self):
         pid = self.proc_dir / "777"
         pid.mkdir()
@@ -475,6 +751,30 @@ class TestLayer1Formatters(unittest.TestCase):
         self.assertIn("5h: 90% (in 1h)", summary)
         self.assertIn("wk: 70% (in 1d)", summary)
 
+    def test_format_model_quota_summary(self):
+        self.assertEqual(_format_model_quota_summary(None), "Error / Unreachable")
+        self.assertEqual(_format_model_quota_summary({}, model="claude"), "Error / Unreachable")
+        self.assertEqual(_format_model_quota_summary({"quota": {"error": True}}, model="claude"), "Error / Unreachable")
+        self.assertEqual(_format_model_quota_summary({"quota": {"claude": {"error": True}}}, model="claude"), "Error / Unreachable")
+
+        acc_cached = {"quota": {"claude": {"quota": 60, "cached": True}}}
+        self.assertEqual(_format_model_quota_summary(acc_cached, model="claude"), "60% (Cached)")
+
+        curr = 1700000000.0
+        acc_buckets = {
+            "quota": {
+                "claude": {
+                    "quota": 75,
+                    "buckets": {
+                        "5h": {"quota": 75, "reset_time": curr + 1800},
+                    },
+                }
+            }
+        }
+        summary = _format_model_quota_summary(acc_buckets, model="claude", current_timestamp=curr)
+        self.assertIn("75%", summary)
+        self.assertIn("5h: 75% (in 30m)", summary)
+
     def test_format_accounts_listicle_and_table(self):
         data = {
             "active": "acc1",
@@ -492,6 +792,120 @@ class TestLayer1Formatters(unittest.TestCase):
         self.assertIn("* acc1", table)
         self.assertIn("  acc2", table)
         self.assertIn("Active Account: acc1", table)
+
+    def test_format_accounts_claude_model(self):
+        # [REQ-3-SCN-001] [REQ-3-SCN-002] [REQ-3-SCN-005]
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc1",
+                    "email": "acc1@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 80},
+                        "claude": {"quota": 60},
+                    },
+                },
+                {
+                    "name": "acc2",
+                    "email": "acc2@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 50},
+                        "claude": {"quota": 45, "cached": True},
+                    },
+                },
+            ],
+        }
+
+        # [REQ-3-SCN-001]: Table with target_model="claude"
+        table_claude = format_accounts_table(data, show_quota=True, target_model="claude")
+        self.assertIn("CLAUDE QUOTA", table_claude)
+        self.assertNotIn("GEMINI QUOTA", table_claude)
+        self.assertIn("60%", table_claude)
+        # [REQ-3-SCN-005]: Cached quota badge for Claude
+        self.assertIn("45% (Cached)", table_claude)
+
+        # Default / target_model="gemini"
+        table_gemini = format_accounts_table(data, show_quota=True, target_model="gemini")
+        self.assertIn("GEMINI QUOTA", table_gemini)
+        self.assertNotIn("CLAUDE QUOTA", table_gemini)
+        self.assertIn("80%", table_gemini)
+
+        # [REQ-3-SCN-002]: Listicle with target_model="claude"
+        listicle_claude = format_accounts_listicle(data, show_quota=True, target_model="claude")
+        self.assertIn(" — Claude: 60%", listicle_claude)
+        self.assertIn(" — Claude: 45% (Cached)", listicle_claude)
+        self.assertNotIn(" — Gemini:", listicle_claude)
+
+        # [REQ-3-SCN-004]: Listicle with target_model="gemini" (and default)
+        listicle_gemini = format_accounts_listicle(data, show_quota=True, target_model="gemini")
+        self.assertIn(" — Gemini: 80%", listicle_gemini)
+        self.assertNotIn(" — Claude:", listicle_gemini)
+
+        listicle_default = format_accounts_listicle(data, show_quota=True)
+        self.assertIn(" — Gemini: 80%", listicle_default)
+        self.assertNotIn(" — Claude:", listicle_default)
+
+    def test_format_accounts_error_and_malformed(self):
+        """[REQ-3-ERR-001] & [REQ-3-ERR-002]: Errored, missing, or malformed quota payloads render Error / Unreachable."""
+        data = {
+            "active": "acc1",
+            "accounts": [
+                {
+                    "name": "acc1",
+                    "email": "acc1@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 80},
+                        "claude": {"error": "HTTP 401: Unauthorized"},
+                    },
+                },
+                {
+                    "name": "acc2",
+                    "email": "acc2@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 70},
+                        "claude": None,
+                    },
+                },
+                {
+                    "name": "acc3",
+                    "email": "acc3@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": "corrupted_string",
+                },
+                {
+                    "name": "acc4",
+                    "email": "acc4@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "quota": {
+                        "gemini": {"quota": 60},
+                        "claude": {"quota": "invalid_number"},
+                    },
+                },
+            ],
+        }
+
+        table_claude = format_accounts_table(data, show_quota=True, target_model="claude")
+        self.assertIn("CLAUDE QUOTA", table_claude)
+        lines = [line for line in table_claude.splitlines() if line.startswith("* acc") or line.startswith("  acc")]
+        self.assertEqual(len(lines), 4)
+        for line in lines:
+            self.assertIn("Error / Unreachable", line)
+
+        listicle_claude = format_accounts_listicle(data, show_quota=True, target_model="claude")
+        for line in listicle_claude.splitlines():
+            if "•" in line:
+                self.assertIn("— Claude: Error / Unreachable", line)
 
     def test_format_status_report(self):
         status = {

@@ -74,6 +74,7 @@ from agy_switcher.formatters import (
     format_status_report,
     _format_bucket_countdown,
     _format_gemini_quota_summary,
+    _format_model_quota_summary,
 )
 from agy_switcher.telemetry import (
     AUTH_ERROR_CODE_PATTERN,
@@ -151,6 +152,7 @@ __all__ = [
     "format_diagnostic_report",
     "_format_bucket_countdown",
     "_format_gemini_quota_summary",
+    "_format_model_quota_summary",
     "DEFAULT_CLOUDCODE_ENDPOINT",
     "DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT",
     "QUOTA_SUMMARY_PATH",

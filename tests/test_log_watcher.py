@@ -306,6 +306,370 @@ class TestPresenceDetector(unittest.TestCase):
         session_id = self.detector.get_active_session_id()
         self.assertEqual(session_id, uuid)
 
+    def test_dual_directory_init_attributes(self):
+        self.assertEqual(
+            self.detector.cli_presence_dir,
+            self.gemini_dir / "antigravity-cli" / "presence",
+        )
+        self.assertEqual(
+            self.detector.cli_brain_dir,
+            self.gemini_dir / "antigravity-cli" / "brain",
+        )
+        self.assertEqual(
+            self.detector.cli_log_dir,
+            self.gemini_dir / "antigravity-cli" / "log",
+        )
+
+    def test_dual_directory_tier1_cli_proc_fd(self):
+        """[REQ-2-SCN-001]: GIVEN an Antigravity CLI process holds an open fd to cli presence lock,
+        WHEN get_active_session_id() is called, THEN it returns the cli session ID via Tier 1.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+        cli_session = "cli-session-123"
+        lock_file = cli_presence_dir / f"{cli_session}.lock"
+        lock_file.touch()
+
+        self._create_mock_proc_process(
+            pid=4001,
+            cmdline=b"antigravity-cli\x00",
+            fd_targets=[lock_file],
+        )
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, cli_session)
+
+    def test_dual_directory_tier1_multiple_processes_newest_mtime(self):
+        """[REQ-2-SCN-001/002]: GIVEN Desktop process with old lock and CLI process with new lock,
+        WHEN get_active_session_id() is called, THEN Tier 1 selects the newer CLI session ID.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        desk_lock = self.presence_dir / "desk-session.lock"
+        cli_lock = cli_presence_dir / "cli-session.lock"
+
+        desk_lock.touch()
+        os.utime(desk_lock, (1000.0, 1000.0))
+
+        cli_lock.touch()
+        os.utime(cli_lock, (2000.0, 2000.0))
+
+        self._create_mock_proc_process(
+            pid=4001,
+            cmdline=b"language_server\x00",
+            fd_targets=[desk_lock],
+        )
+        self._create_mock_proc_process(
+            pid=4002,
+            cmdline=b"antigravity-cli\x00",
+            fd_targets=[cli_lock],
+        )
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "cli-session")
+
+    def test_dual_directory_tier1_multiple_processes_deterministic_tie_breaking(self):
+        """[REQ-2-EDGE-002]: GIVEN concurrent processes holding locks with identical mtime,
+        WHEN get_active_session_id() is called, THEN tie is resolved via lexical stem ordering.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        desk_lock = self.presence_dir / "session-desk.lock"
+        cli_lock = cli_presence_dir / "session-cli.lock"
+
+        desk_lock.touch()
+        os.utime(desk_lock, (1000.0, 1000.0))
+
+        cli_lock.touch()
+        os.utime(cli_lock, (1000.0, 1000.0))
+
+        self._create_mock_proc_process(
+            pid=4001,
+            cmdline=b"language_server\x00",
+            fd_targets=[desk_lock],
+        )
+        self._create_mock_proc_process(
+            pid=4002,
+            cmdline=b"antigravity-cli\x00",
+            fd_targets=[cli_lock],
+        )
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "session-cli")
+
+    def test_dual_directory_tier1_directory_and_non_absolute_symlink_ignored(self):
+        """[REQ-2-EDGE-003]: GIVEN process holds fds to directory.lock and non-absolute targets,
+        WHEN get_active_session_id() is called, THEN invalid targets are skipped in Tier 1.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        dir_lock = cli_presence_dir / "dir-session.lock"
+        dir_lock.mkdir()
+
+        valid_lock = cli_presence_dir / "valid-session.lock"
+        valid_lock.touch()
+
+        pid_dir = self.proc_dir / "4005"
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "cmdline").write_bytes(b"antigravity\x00")
+        fd_dir = pid_dir / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+
+        os.symlink(str(dir_lock), str(fd_dir / "1"))
+        os.symlink("relative.lock", str(fd_dir / "2"))
+        os.symlink(str(valid_lock), str(fd_dir / "3"))
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "valid-session")
+
+    def test_dual_directory_tier1_inaccessible_proc_falls_back_to_tier2(self):
+        """[REQ-2-ERR-001]: GIVEN proc_dir raises PermissionError on iterdir,
+        WHEN get_active_session_id() is called, THEN it safely falls back to Tier 2 newest mtime.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        desk_lock = self.presence_dir / "desk-session.lock"
+        cli_lock = cli_presence_dir / "cli-session.lock"
+
+        desk_lock.touch()
+        os.utime(desk_lock, (1000.0, 1000.0))
+
+        cli_lock.touch()
+        os.utime(cli_lock, (2000.0, 2000.0))
+
+        original_iterdir = Path.iterdir
+
+        def selective_iterdir(path_obj):
+            if path_obj == self.proc_dir:
+                raise PermissionError("Access denied to proc")
+            return original_iterdir(path_obj)
+
+        with patch.object(Path, "iterdir", selective_iterdir):
+            session_id = self.detector.get_active_session_id()
+            self.assertEqual(session_id, "cli-session")
+
+    def test_dual_directory_tier2_newest_mtime(self):
+        """[REQ-2-SCN-002]: GIVEN Desktop lock with mtime 1000 and CLI lock with mtime 2000,
+        WHEN get_active_session_id() evaluates presence locks, THEN it selects cli-session.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        desk_lock = self.presence_dir / "desk-session.lock"
+        cli_lock = cli_presence_dir / "cli-session.lock"
+
+        desk_lock.touch()
+        os.utime(desk_lock, (1000.0, 1000.0))
+
+        cli_lock.touch()
+        os.utime(cli_lock, (2000.0, 2000.0))
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "cli-session")
+
+    def test_dual_directory_deterministic_tie_breaking(self):
+        """[REQ-2-EDGE-002]: GIVEN Desktop lock session-desk.lock and CLI lock session-cli.lock
+        with identical mtime 1000.0, WHEN get_active_session_id() is called,
+        THEN tie is resolved deterministically via lexical ordering on session stem.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        desk_lock = self.presence_dir / "session-desk.lock"
+        cli_lock = cli_presence_dir / "session-cli.lock"
+
+        desk_lock.touch()
+        os.utime(desk_lock, (1000.0, 1000.0))
+
+        cli_lock.touch()
+        os.utime(cli_lock, (1000.0, 1000.0))
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "session-cli")
+
+    def test_dual_directory_permission_error_fallback(self):
+        """[REQ-2-ERR-001]: GIVEN cli_presence_dir raises PermissionError on listing,
+        WHEN get_active_session_id() is called, THEN it safely falls back to Desktop lock.
+        """
+        desk_lock = self.presence_dir / "fallback-desk.lock"
+        desk_lock.touch()
+
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        original_iterdir = Path.iterdir
+
+        def selective_iterdir(path_obj):
+            if "antigravity-cli" in str(path_obj):
+                raise PermissionError("Access denied to CLI presence")
+            return original_iterdir(path_obj)
+
+        with patch.object(Path, "iterdir", selective_iterdir):
+            session_id = self.detector.get_active_session_id()
+            self.assertEqual(session_id, "fallback-desk")
+
+    def test_dual_directory_malformed_lock_names(self):
+        """[REQ-2-EDGE-003]: GIVEN a presence directory contains .lock (empty stem) or non-lock,
+        WHEN get_active_session_id() is called, THEN empty stems are filtered out.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        (cli_presence_dir / ".lock").touch()
+        (cli_presence_dir / "valid-cli.lock").touch()
+        (self.presence_dir / "notes.txt").touch()
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "valid-cli")
+
+    def test_dual_directory_relative_traversal_symlink_filtered(self):
+        """[REQ-2-EDGE-003]: GIVEN a presence directory contains a relative traversal symlink,
+        WHEN get_active_session_id() is called, THEN the traversal symlink is rejected.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        external_file = self.gemini_dir / "external.txt"
+        external_file.touch()
+        os.utime(external_file, (3000.0, 3000.0))
+
+        traversal_symlink = cli_presence_dir / "traversal-attack.lock"
+        traversal_symlink.symlink_to("../../external.txt")
+
+        valid_lock = cli_presence_dir / "valid-session.lock"
+        valid_lock.touch()
+        os.utime(valid_lock, (1000.0, 1000.0))
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "valid-session")
+
+    def test_dual_directory_dot_prefixed_stems_filtered(self):
+        """[REQ-2-EDGE-003]: GIVEN presence directory contains dot-prefixed stems,
+        WHEN get_active_session_id() is called, THEN hidden and dot-prefixed stems are ignored.
+        """
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+
+        (cli_presence_dir / ".hidden.lock").touch()
+        (cli_presence_dir / "..traversal.lock").touch()
+        valid_lock = cli_presence_dir / "valid-regular.lock"
+        valid_lock.touch()
+
+        session_id = self.detector.get_active_session_id()
+        self.assertEqual(session_id, "valid-regular")
+
+    def test_transcript_targets_cli_exclusive(self):
+        """[REQ-2-SCN-004]: GIVEN an active session ID 'cli-uuid-456' whose transcript exists exclusively
+        at ~/.gemini/antigravity-cli/brain/cli-uuid-456/.system_generated/logs/transcript.jsonl,
+        WHEN PresenceDetector.get_active_transcript_path('cli-uuid-456') is called,
+        THEN it returns the Path pointing to the CLI transcript file.
+        """
+        cli_uuid = "cli-uuid-456"
+        cli_transcript_dir = self.detector.cli_brain_dir / cli_uuid / ".system_generated" / "logs"
+        cli_transcript_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_transcript_dir / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "cli_start"}\n', encoding="utf-8")
+
+        result = self.detector.get_active_transcript_path(cli_uuid)
+        self.assertEqual(result, cli_transcript)
+
+        cli_presence = self.detector.cli_presence_dir / f"{cli_uuid}.lock"
+        cli_presence.parent.mkdir(parents=True, exist_ok=True)
+        cli_presence.touch()
+
+        auto_result = self.detector.get_active_transcript_path()
+        self.assertEqual(auto_result, cli_transcript)
+
+    def test_transcript_targets_concurrent_mtime(self):
+        """[REQ-2-SCN-004]: GIVEN session 'hybrid-sess' exists in both Desktop brain/ (mtime 1500.0)
+        and CLI brain/ (mtime 2500.0), WHEN PresenceDetector.get_active_transcript_path('hybrid-sess') is called,
+        THEN the returned path points to the CLI transcript file with mtime 2500.0.
+        """
+        session_id = "hybrid-sess"
+        desk_dir = self.detector.brain_dir / session_id / ".system_generated" / "logs"
+        desk_dir.mkdir(parents=True, exist_ok=True)
+        desk_transcript = desk_dir / "transcript.jsonl"
+        desk_transcript.write_text('{"event": "desktop"}\n', encoding="utf-8")
+        os.utime(desk_transcript, (1500.0, 1500.0))
+
+        cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_dir / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "cli"}\n', encoding="utf-8")
+        os.utime(cli_transcript, (2500.0, 2500.0))
+
+        result = self.detector.get_active_transcript_path(session_id)
+        self.assertEqual(result, cli_transcript)
+
+        os.utime(desk_transcript, (3500.0, 3500.0))
+        result2 = self.detector.get_active_transcript_path(session_id)
+        self.assertEqual(result2, desk_transcript)
+
+    def test_transcript_targets_deduplication(self):
+        """[REQ-2-SCN-006]: GIVEN an active CLI transcript file exists and multiple .log files exist
+        in ~/.gemini/antigravity-cli/log/, WHEN PresenceDetector.get_watch_targets() is invoked,
+        THEN the returned list contains the CLI transcript path and existing .log paths with zero duplicates.
+        """
+        session_id = "cli-dedup-sess"
+        cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_dir / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "cli_entry"}\n', encoding="utf-8")
+
+        cli_lock = self.detector.cli_presence_dir / f"{session_id}.lock"
+        cli_lock.parent.mkdir(parents=True, exist_ok=True)
+        cli_lock.touch()
+
+        log1 = self.detector.cli_log_dir / "agent.log"
+        log2 = self.detector.cli_log_dir / "runner.log"
+        log1.write_text("agent log", encoding="utf-8")
+        log2.write_text("runner log", encoding="utf-8")
+
+        targets_path = self.detector.get_watch_targets(as_str=False)
+        self.assertEqual(len(targets_path), 3)
+        self.assertEqual(len(targets_path), len(set(targets_path)))
+        self.assertEqual(targets_path[0], cli_transcript)
+        self.assertIn(log1, targets_path)
+        self.assertIn(log2, targets_path)
+
+        targets_str = self.detector.get_watch_targets(as_str=True)
+        self.assertEqual(len(targets_str), 3)
+        self.assertEqual(len(targets_str), len(set(targets_str)))
+        self.assertIn(str(cli_transcript), targets_str)
+        self.assertIn(str(log1), targets_str)
+        self.assertIn(str(log2), targets_str)
+
+    def test_transcript_targets_unreadable_omitted_safely(self):
+        """[REQ-2-ERR-002]: GIVEN an active session ID is discovered,
+        AND the transcript file raises PermissionError or is unlinked when queried with is_file(),
+        WHEN PresenceDetector.get_watch_targets() is called,
+        THEN the unreadable transcript is omitted without raising an unhandled exception.
+        """
+        session_id = "unreadable-sess"
+        cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_dir / "transcript.jsonl"
+        cli_transcript.touch()
+
+        cli_lock = self.detector.cli_presence_dir / f"{session_id}.lock"
+        cli_lock.parent.mkdir(parents=True, exist_ok=True)
+        cli_lock.touch()
+
+        original_is_file = Path.is_file
+
+        def selective_is_file(path_obj):
+            if "transcript.jsonl" in str(path_obj):
+                raise PermissionError("Access denied to transcript")
+            return original_is_file(path_obj)
+
+        with patch.object(Path, "is_file", selective_is_file):
+            targets = self.detector.get_watch_targets()
+            self.assertNotIn(cli_transcript, targets)
+
 
 class TestCooldownManager(unittest.TestCase):
     def setUp(self):
@@ -1222,6 +1586,104 @@ class TestLogWatcherProcessing(unittest.TestCase):
         self.assertEqual(self.watcher.active_session_id, "session-2")
         # Old cursor must be pruned!
         self.assertNotIn(str(transcript_s1), self.watcher.file_cursors)
+
+    def test_scan_active_targets_dual_directory_cli_transcript(self):
+        """[REQ-2-SCN-006]: GIVEN LogWatcher is initialized with a PresenceDetector supporting dual directories,
+        AND an active CLI session has an active transcript,
+        WHEN LogWatcher.scan_active_targets() is invoked,
+        THEN the returned targets list includes the active CLI transcript path.
+        """
+        gemini_dir = self.base_dir / ".gemini_watcher_dual"
+        cli_brain = gemini_dir / "antigravity-cli" / "brain" / "cli-sess-scan" / ".system_generated" / "logs"
+        cli_brain.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_brain / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "start"}\n', encoding="utf-8")
+
+        cli_presence = gemini_dir / "antigravity-cli" / "presence" / "cli-sess-scan.lock"
+        cli_presence.parent.mkdir(parents=True, exist_ok=True)
+        cli_presence.touch()
+
+        detector = PresenceDetector(gemini_dir=gemini_dir, proc_dir=self.base_dir / "nonexistent_proc")
+        watcher = LogWatcher(engine=MagicMock(), presence_detector=detector)
+
+        targets = watcher.scan_active_targets()
+        self.assertIn(str(cli_transcript), targets)
+        self.assertEqual(watcher.active_session_id, "cli-sess-scan")
+        self.assertEqual(watcher.active_transcript_path, cli_transcript)
+
+    def test_scan_active_targets_deduplicates_paths(self):
+        """[REQ-2-SCN-006]: Verify scan_active_targets deduplicates targets even if log_dirs contains overlaps."""
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "dedup-sess"
+        mock_detector.get_active_transcript_path.return_value = Path("/dummy/transcript.jsonl")
+        mock_detector.get_watch_targets.return_value = ["/dummy/transcript.jsonl", "/dummy/agent.log"]
+
+        watcher = LogWatcher(engine=MagicMock(), presence_detector=mock_detector)
+        # Simulate custom log_dir having duplicate
+        custom_dir = self.base_dir / "custom_logs"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        dup_file = custom_dir / "agent.log"
+        dup_file.touch()
+        watcher.log_dirs = [str(custom_dir)]
+
+        # Mock presence_detector.get_watch_targets returning the duplicate path as well
+        mock_detector.get_watch_targets.return_value = [str(dup_file), str(dup_file)]
+
+        targets = watcher.scan_active_targets()
+        self.assertEqual(targets.count(str(dup_file)), 1)
+
+    def test_req_2_scn_007_dynamic_session_switch_desktop_to_cli_prunes_stale_cursors(self):
+        """[REQ-2-SCN-007]: GIVEN a running LogWatcher daemon tailing an active Desktop transcript when a user initiates a newer CLI session,
+        WHEN LogWatcher.scan_active_targets() runs on the next tick,
+        THEN it detects the newer CLI transcript via mtime, adjusts watch targets without duplicate file descriptors,
+        and resets stale transcript cursors cleanly.
+        """
+        gemini_dir = self.base_dir / ".gemini_e2e_watcher"
+        desktop_brain = gemini_dir / "antigravity" / "brain" / "desk-sess" / ".system_generated" / "logs"
+        desktop_brain.mkdir(parents=True, exist_ok=True)
+        desktop_transcript = desktop_brain / "transcript.jsonl"
+        desktop_transcript.write_text('{"event": "start_desktop"}\n', encoding="utf-8")
+
+        desktop_presence = gemini_dir / "antigravity" / "presence" / "desk-sess.lock"
+        desktop_presence.parent.mkdir(parents=True, exist_ok=True)
+        desktop_presence.touch()
+        os.utime(desktop_presence, (1000.0, 1000.0))
+
+        cli_log_dir = gemini_dir / "antigravity-cli" / "log"
+        cli_log_dir.mkdir(parents=True, exist_ok=True)
+        cli_agent_log = cli_log_dir / "agent.log"
+        cli_agent_log.write_text("agent ready\n", encoding="utf-8")
+
+        detector = PresenceDetector(gemini_dir=gemini_dir, proc_dir=self.base_dir / "nonexistent_proc")
+        watcher = LogWatcher(engine=MagicMock(), presence_detector=detector)
+
+        targets_tick1 = watcher.scan_active_targets()
+        self.assertIn(str(desktop_transcript), targets_tick1)
+        self.assertEqual(watcher.active_session_id, "desk-sess")
+        self.assertEqual(watcher.active_transcript_path, desktop_transcript)
+
+        watcher.file_cursors[str(desktop_transcript)] = 42
+        watcher.file_cursors[str(cli_agent_log)] = 15
+
+        cli_brain = gemini_dir / "antigravity-cli" / "brain" / "cli-sess" / ".system_generated" / "logs"
+        cli_brain.mkdir(parents=True, exist_ok=True)
+        cli_transcript = cli_brain / "transcript.jsonl"
+        cli_transcript.write_text('{"event": "start_cli"}\n', encoding="utf-8")
+
+        cli_presence = gemini_dir / "antigravity-cli" / "presence" / "cli-sess.lock"
+        cli_presence.parent.mkdir(parents=True, exist_ok=True)
+        cli_presence.touch()
+        os.utime(cli_presence, (2000.0, 2000.0))
+
+        targets_tick2 = watcher.scan_active_targets()
+
+        self.assertEqual(watcher.active_session_id, "cli-sess")
+        self.assertEqual(watcher.active_transcript_path, cli_transcript)
+        self.assertIn(str(cli_transcript), targets_tick2)
+        self.assertNotIn(str(desktop_transcript), targets_tick2)
+        self.assertEqual(len(targets_tick2), len(set(targets_tick2)))
+        self.assertNotIn(str(desktop_transcript), watcher.file_cursors)
+        self.assertEqual(watcher.file_cursors.get(str(cli_agent_log)), 15)
 
     def test_poll_once_reads_lines_and_handles_truncation(self):
         """poll_once correctly tails file, advances cursor, and resets cursor on truncation."""

@@ -857,13 +857,12 @@ class LogWatcher:
     def scan_active_targets(self) -> list[str]:
         """
         Returns list of file paths to tail:
-        1. Current active Desktop transcript (if active session discovered).
+        1. Current active transcript across Desktop and CLI environments (if active session discovered).
         2. CLI logs from ~/.gemini/antigravity-cli/log/*.log.
-        Handles dynamic active session switching and cursor reset/cleanup.
+        Handles dynamic active session switching, cursor cleanup, and target deduplication.
         """
         current_session_id = self.presence_detector.get_active_session_id()
         if current_session_id != self.active_session_id:
-            # Active session changed: clean up previous transcript cursor
             if self.active_transcript_path:
                 prev_path_str = str(self.active_transcript_path)
                 if prev_path_str in self.file_cursors:
@@ -871,8 +870,9 @@ class LogWatcher:
                 self._stagnant_sizes.pop(prev_path_str, None)
             self.active_session_id = current_session_id
             self.active_transcript_path = self.presence_detector.get_active_transcript_path(session_id=current_session_id)
+        elif self.active_transcript_path is None and current_session_id is not None:
+            self.active_transcript_path = self.presence_detector.get_active_transcript_path(session_id=current_session_id)
 
-        # Clean up any stale jsonl transcript cursors not matching active transcript
         active_transcript_str = str(self.active_transcript_path) if self.active_transcript_path else None
         for path_key in list(self.file_cursors.keys()):
             if path_key.endswith(".jsonl") and path_key != active_transcript_str:
@@ -881,7 +881,6 @@ class LogWatcher:
 
         targets = list(self.presence_detector.get_watch_targets(as_str=True, session_id=current_session_id))
 
-        # Check custom log_dirs if provided
         if getattr(self, "log_dirs", None):
             for log_dir in self.log_dirs:
                 if not os.path.isdir(log_dir):
@@ -889,10 +888,15 @@ class LogWatcher:
                 if hasattr(self.presence_detector, "cli_log_dir") and os.path.abspath(log_dir) == os.path.abspath(str(self.presence_detector.cli_log_dir)):
                     continue
                 for f in glob.glob(os.path.join(log_dir, "*.log")):
-                    if f not in targets:
-                        targets.append(f)
+                    targets.append(f)
 
-        return targets
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for t in targets:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        return deduped
 
     def scan_new_files(self) -> list[str]:
         return self.scan_active_targets()

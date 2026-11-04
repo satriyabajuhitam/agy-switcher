@@ -221,10 +221,13 @@ class TestHookLifecycleModular(unittest.TestCase):
         self.vault_dir = self.base_path / ".antigravity-vault"
         self.gemini_dir = self.base_path / ".gemini"
         self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.proc_dir = self.base_path / "proc"
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
         self.engine = AgySwitchEngine(
             vault_dir=self.vault_dir,
             gemini_dir=self.gemini_dir,
             legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
         )
 
     def tearDown(self):
@@ -289,6 +292,26 @@ class TestHookLifecycleModular(unittest.TestCase):
 
             self.assertEqual(ret, 0)
             spy_switch.assert_called_once_with("acc2", restart_server=False, force=True)
+
+    def test_hook_source_code_never_contains_restart_server_true(self):
+        """Enforces ADR 0010 Bagian 3 invariant: hook.py must never restart language_server."""
+        import ast
+        hook_path = REPO_ROOT / "scripts" / "agy_switcher" / "hook.py"
+        source = hook_path.read_text(encoding="utf-8")
+
+        # 1. Textual check
+        self.assertNotIn("restart_server=True", source, "ADR 0010: PreInvocation hook must never pass restart_server=True")
+
+        # 2. AST check: inspect all calls to switch_tokens
+        tree = ast.parse(source, filename=str(hook_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func_name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if func_name == "switch_tokens":
+                    for kw in node.keywords:
+                        if kw.arg == "restart_server":
+                            if isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                                self.fail("Found switch_tokens(..., restart_server=True) in hook.py! Violates ADR 0010.")
 
 
 class TestSecurityLayer0(unittest.TestCase):

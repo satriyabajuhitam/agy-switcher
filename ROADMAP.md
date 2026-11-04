@@ -84,3 +84,138 @@ Detail spesifikasi teknis dan analisis dampak sistem terdokumentasi di [`.scratc
   - Penerapan *Dynamic Module Proxy Bridge* pada `hook.py` dan `cli.py` guna menjamin zero-regression pada seluruh test case eksisting.
   - Penyusunan suite validasi statis AST DAG dan uji isolasi namespace sub-proses pada `tests/test_modular_architecture.py`.
 
+---
+
+## 3. Peta Jalan Ekosistem Triad Personal Assistant 24/7 (OpenClaw-Style)
+
+Rencana pengembangan strategis untuk mengoperasikan `agy-switcher` bersamaan dengan `agy-telemote` (Telegram gateway & concurrency runner) dan `agy-memory` (durable context, FTS5 & persona) guna mewujudkan asisten pribadi otonom 24/7 berbasis ekosistem Antigravity CLI.
+
+Detail arsitektur, data flow, dan analisis kegagalan terdokumentasi di [`.scratch/triad-personal-assistant/spec.md`](.scratch/triad-personal-assistant/spec.md).
+
+```
+                      ┌────────────────────────────────────────┐
+                      │         TELEGRAM USER / GROUP          │
+                      └───────────────────┬────────────────────┘
+                                          │
+                                          ▼
+                      ┌────────────────────────────────────────┐
+                      │              agy-telemote              │
+                      │  - Forum Topics & Concurrency Queue    │
+                      │  - TurnRunner (Subprocess per Turn)    │
+                      └──────────────┬──────────────────┬──────┘
+                                     │                  │
+                1. Context Directives│                  │ 2. Failover & In-Process SDK
+                & Memory Hooks       │                  │    (Auto-Rotate on 429)
+                                     ▼                  ▼
+    ┌──────────────────────────────────┐              ┌──────────────────────────────────┐
+    │            agy-memory            │              │           agy-switcher           │
+    │  - Persona Isolation (SOUL.md)   │              │  - Multi-Account OAuth Vault     │
+    │  - Durable Facts & SQLite FTS5   │◀─────────────│  - Fast Telemetry & Cooldown     │
+    │  - Failure Reflection            │  Panic Event │  - Dual Sync Desktop + CLI       │
+    └──────────────────────────────────┘              └──────────────────────────────────┘
+                                     │                  │
+                                     ▼                  ▼
+                      ┌────────────────────────────────────────┐
+                      │         Google Antigravity CLI         │
+                      │   `agy -p "..." --conversation <id>`   │
+                      └────────────────────────────────────────┘
+```
+
+> [!IMPORTANT]
+> **Invarian Arsitektur: Standalone Independence & Graceful Degradation (Zero Hard Coupling)**
+> Ketiga komponen (`agy-switcher`, `agy-telemote`, `agy-memory`) **wajib dapat diinstal, dikonfigurasi, dan berjalan secara 100% independen tanpa saling mewajibkan keberadaan satu sama lain**:
+> 1. **Zero Hard Pip Dependencies**: Tidak ada modul yang saling mencantumkan satu sama lain di blok `dependencies` pada `pyproject.toml`. Masing-masing tetap mempertahankan prinsip *Zero External Dependencies* (hanya Python 3.10+ stdlib).
+> 2. **Soft Import & Dynamic Capability Probing**: Sinergi antar-modul dilakukan melalui *safe soft-import* (`try: import agy_switcher.api except ImportError: None`) atau pengecekan ketersediaan perintah CLI saat runtime.
+> 3. **Graceful Fallback Behaviour**:
+>    - **`agy-telemote` tanpa `agy-switcher`**: Bot tetap berfungsi penuh menjalankan sesi `agy`. Jika kuota habis (429), bot mengembalikan pesan error standar Antigravity ke pengguna tanpa crash. Perintah `/quota` dan `/switch` menampilkan pesan ramah bahwa `agy-switcher` belum terpasang.
+>    - **`agy-switcher` tanpa `agy-telemote` / `agy-memory`**: Bekerja 100% sebagai CLI vault manager, Desktop/CLI token switcher, daemon watcher, dan PreInvocation hook.
+>    - **`agy-memory` tanpa `agy-switcher` / `agy-telemote`**: Bekerja 100% mengelola persona `SOUL.md`, SQLite FTS5, dan PreInvocation hook tanpa memedulikan akun mana yang sedang aktif.
+
+---
+
+### Siklus 1: Fondasi Stabilitas Headless & Bugfixing Kritis
+* **Fokus**: Menghilangkan false positive dan bug blocking pada headless VPS / server CLI.
+* **Status**: Direncanakan (Planned)
+* **Tiket Pekerjaan**:
+  - [ ] **[P0-1] Perbaikan Stale Lock Trap pada `ProcessSupervisor.is_server_busy`**:
+    - Validasi keaktifan lock melalui kepemilikan file descriptor PID aktif di `/proc` (bukan sekadar `iterdir()`).
+    - Otomatis bersihkan lock basi yang tidak memiliki proses hidup terkait di `scripts/agy_switcher/supervisor.py`.
+  - [ ] **[P0-2] Dual-Directory Presence & Brain CLI Scan**:
+    - Tambahkan pemindaian `~/.gemini/antigravity-cli/presence` dan `~/.gemini/antigravity-cli/brain` di `presence.py` dan `watcher.py` agar transkrip sesi CLI terpantau.
+  - [ ] **[P0-3] Perbaikan Formatter Model Claude**:
+    - Teruskan parameter `target_model` dari `cli.py` ke `format_accounts_table` dan `format_accounts_listicle` di `formatters.py`.
+    - Tampilkan header dinamis `CLAUDE QUOTA` vs `GEMINI QUOTA`.
+  - [ ] **[P0-4] Pembersihan Unreachable Dead Code**:
+    - Hapus duplikat perulangan tak terjangkau setelah `return False` di `scripts/agy_switcher/supervisor.py#L181-L194`.
+* **Kriteria Selesai (DoD)**:
+  - Rotasi `agy-switch switch <alias>` tidak lagi diblokir oleh lock file yatim pada server headless.
+  - `agy-switch quota --model claude` mencetak tabel kuota Claude yang akurat.
+  - Suite unit test hijau: `python3 -m unittest discover tests/`.
+
+---
+
+### Siklus 2: Paketasi Modul & In-Process SDK Interface
+* **Fokus**: Menjadikan `agy-switcher` sebagai library Python standar yang dapat diinstal (`pip install -e .`) dan diimpor langsung oleh `agy-telemote`.
+* **Status**: Direncanakan (Planned)
+* **Tiket Pekerjaan**:
+  - [ ] **[P1-1] Standardisasi Packaging Python (`pyproject.toml`)**:
+    - Konfigurasi `pyproject.toml` berbasis standard-library setuptools tanpa external dependencies.
+    - Pendaftaran console script CLI `agy-switch = "agy_switcher.cli:main"`.
+  - [ ] **[P1-2] In-Process SDK Facade (`scripts/agy_switcher/api.py`)**:
+    - Sediakan antarmuka publik Python murni type-hinted:
+      - `get_active_account() -> AccountInfo`
+      - `auto_rotate_on_exhaustion(model="gemini") -> RotationResult`
+      - `switch_account(name: str) -> bool`
+      - `get_fleet_quota_summary(model="all") -> dict[str, Any]`
+  - [ ] **[P1-3] Alur Otentikasi Remote VPS (`login --headless`)**:
+    - Tangkap URL otentikasi Google dari `stderr` saat memanggil `agy -p "auth check"` tanpa TUI curses.
+    - Terima kode otentikasi via stdin/argumen dan simpan token langsung ke vault.
+  - [ ] **[P2-4] Utilitas Migrasi Vault (`export` & `import`)**:
+    - Perintah `agy-switch vault export --bundle <file.tar.gz>` dan `agy-switch vault import <file.tar.gz>`.
+* **Kriteria Selesai (DoD)**:
+  - `pip install -e /srv/agy-workspaces/booster/agy-switcher` sukses tanpa error build.
+  - `python3 -c "import agy_switcher.api as api; print(api.get_active_account())"` berjalan tanpa subprocess.
+
+---
+
+### Siklus 3: Integrasi Triad & Self-Healing Failover Engine
+* **Fokus**: Menghubungkan failover otomatis di `agy-telemote` dan pencatatan refleksi kegagalan di `agy-memory`.
+* **Status**: Direncanakan (Planned)
+* **Tiket Pekerjaan**:
+  - [ ] **Mid-Turn Failover Retry Loop pada `TurnRunner` (`agy-telemote`)**:
+    - Tangkap status error `RESOURCE_EXHAUSTED` (429) pada eksekusi `agy`.
+    - Lakukan *safe soft-import* ke `agy_switcher.api`; jika tidak terpasang, teruskan pesan kuota habis ke pengguna tanpa crash.
+    - Jika `agy_switcher` tersedia, panggil `auto_rotate_on_exhaustion()` dan ulangi eksekusi `agy -p ... --conversation <conv_id>` secara transparan tanpa kehilangan konteks.
+  - [ ] **[P2-3] Perintah Kontrol Telegram di `agy-telemote`**:
+    - Handler `/quota`: Menampilkan kapasitas armada akun aktif dan standby jika `agy-switcher` terpasang; jika tidak, tampilkan panduan aktivasi opsional.
+    - Handler `/switch`: Mengganti akun aktif via Telegram inline keyboard buttons secara aman.
+    - Pembaruan `/status`: Menyertakan info akun dan kapasitas aktif di blok ringkasan sesi (opsional jika switcher aktif).
+  - [ ] **Penyambungan Panic Event ke `agy-memory` (Opsional)**:
+    - Kirim failure report ke `agy-memory` hanya jika `agy-memory` terpasang pada sistem; jika tidak, cukup catat ke log lokal `agy-switcher`.
+  - [ ] **[P3-2] Webhook / Telegram Alert pada Watcher Daemon**:
+    - Dukungan notifikasi via callback/bot Telegram saat daemon mendeteksi rotasi otomatis di background.
+* **Kriteria Selesai (DoD)**:
+  - Error 429 pada panggilan asisten Telegram memicu rotasi token dan melanjutkan tugas secara transparan (*zero turn drop*) saat `agy-switcher` terpasang.
+  - `agy-telemote` tetap dapat dinyalakan dan digunakan normal 100% tanpa kehadiran `agy-switcher` maupun `agy-memory`.
+  - Interaksi `/quota` dan `/switch` berjalan interaktif di Telegram.
+
+---
+
+### Siklus 4: Automasi Ekosistem, Matriks Kuota & Otonomi MCP
+* **Fokus**: Memaksimalkan kenyamanan administrasi, komparasi multi-model, dan kapabilitas self-reflection AI via MCP.
+* **Status**: Direncanakan (Planned)
+* **Tiket Pekerjaan**:
+  - [ ] **[P2-1] Otomatisasi Lifecycle Hook & Dynamic Paths**:
+    - Otomatisasi registrasi hook di `install.sh` dan sediakan `uninstall_hook` di `vault.py`.
+    - Terapkan dynamic path dan subshell multi-PATH guard: `PATH="$HOME/.gemini/antigravity/bin:$HOME/.local/bin:$PATH"`.
+  - [ ] **[P2-2] Dual-Model Quota Matrix View (`--matrix` / `--all-models`)**:
+    - Tampilkan matriks kapasitas Gemini dan Claude secara berdampingan dalam satu tabel CLI.
+  - [ ] **[P3-1] Native Stdlib MCP Server (`mcpServers.agy-switch`)**:
+    - Bangun MCP server berbasis standard-library JSON-RPC (`scripts/agy_switcher/mcp_server.py`).
+    - Daftarkan tools: `agy_check_quota`, `agy_list_accounts`, `agy_switch_account`.
+* **Kriteria Selesai (DoD)**:
+  - Instalasi via `bash install.sh --local` langsung mengaktifkan auto-rotasi out-of-the-box.
+  - Tampilan `agy-switch quota --matrix` mencakup kedua keluarga model.
+  - Agen Antigravity dapat memeriksa kuotanya sendiri via pemanggilan tool MCP.
+
+

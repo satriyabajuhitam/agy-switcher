@@ -349,6 +349,128 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(exit_code, 1)
         self.assertIn("Unsupported model 'unsupported'", buf.getvalue())
 
+    @patch('agy_switch.QuotaClient')
+    def test_quota_model_forwarding(self, mock_qc_class):
+        """[REQ-3-SCN-005] and [REQ-3-ERR-001]: CLI forwards target_model to formatters and handles errors."""
+        mock_qc = mock_qc_class.return_value
+        mock_qc.fetch_quota.return_value = {
+            "gemini": {"quota": 80, "reset_time": 1791201600, "cached": False, "buckets": {}},
+            "claude": {"quota": 45, "reset_time": 1791201600, "cached": False, "buckets": {}},
+        }
+        mock_qc.load_cache.return_value = {}
+
+        buf_table = io.StringIO()
+        with patch('sys.stdout', buf_table):
+            exit_code = main(["quota", "--model", "claude"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        output_table = buf_table.getvalue()
+        self.assertIn("CLAUDE QUOTA", output_table)
+        self.assertNotIn("GEMINI QUOTA", output_table)
+        self.assertIn("45%", output_table)
+
+        buf_listicle = io.StringIO()
+        with patch('sys.stdout', buf_listicle):
+            exit_code = main(["quota", "--model", "claude", "--format", "list"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        output_listicle = buf_listicle.getvalue()
+        self.assertIn("— Claude: 45%", output_listicle)
+        self.assertNotIn("— Gemini:", output_listicle)
+
+        buf_gemini = io.StringIO()
+        with patch('sys.stdout', buf_gemini):
+            exit_code = main(["quota", "--model", "gemini"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        output_gemini = buf_gemini.getvalue()
+        self.assertIn("GEMINI QUOTA", output_gemini)
+        self.assertNotIn("CLAUDE QUOTA", output_gemini)
+        self.assertIn("80%", output_gemini)
+
+        self.engine.get_account_tokens.side_effect = lambda name: {
+            "acc1": {"access_token": "tok1"},
+            "acc2": {"access_token": "tok2"},
+        }.get(name)
+        mock_qc.fetch_quota.side_effect = lambda tok, refresh_token=None, on_refresh=None: {
+            "tok1": {
+                "gemini": {"quota": 80, "reset_time": 1791201600, "cached": False, "buckets": {}},
+                "claude": {"error": "HTTP 401: Unauthorized"},
+            },
+            "tok2": {
+                "gemini": {"quota": 70, "reset_time": 1791201600, "cached": False, "buckets": {}},
+                "claude": None,
+            },
+        }.get(tok, {})
+
+        buf_err = io.StringIO()
+        with patch('sys.stdout', buf_err):
+            exit_code = main(["quota", "--model", "claude"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+
+        output_err = buf_err.getvalue()
+        self.assertIn("CLAUDE QUOTA", output_err)
+        self.assertIn("Error / Unreachable", output_err)
+
+    @patch('agy_switch.QuotaClient')
+    def test_list_command_model_forwarding(self, mock_qc_class):
+        """agy-switch list forwards target_model with --quota and validates --model."""
+        mock_qc = mock_qc_class.return_value
+        mock_qc.fetch_quota.return_value = {
+            "gemini": {"quota": 80, "reset_time": 1791201600, "cached": False, "buckets": {}},
+            "claude": {"quota": 65, "reset_time": 1791201600, "cached": False, "buckets": {}},
+        }
+        mock_qc.load_cache.return_value = {}
+
+        buf_table = io.StringIO()
+        with patch('sys.stdout', buf_table):
+            exit_code = main(["list", "--quota", "--model", "claude"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+        self.assertIn("CLAUDE QUOTA", buf_table.getvalue())
+        self.assertIn("65%", buf_table.getvalue())
+
+        buf_listicle = io.StringIO()
+        with patch('sys.stdout', buf_listicle):
+            exit_code = main(["list", "--quota", "--model", "claude", "--format", "list"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+        self.assertIn("— Claude: 65%", buf_listicle.getvalue())
+
+        buf_no_quota = io.StringIO()
+        with patch('sys.stdout', buf_no_quota):
+            exit_code = main(["list", "--model", "claude"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+        self.assertNotIn("CLAUDE QUOTA", buf_no_quota.getvalue())
+        self.assertIn("Active", buf_no_quota.getvalue())
+
+        buf_err = io.StringIO()
+        with patch('sys.stderr', buf_err):
+            exit_code = main(["list", "--model", "unsupported"], engine=self.engine)
+            self.assertEqual(exit_code, 1)
+        self.assertIn("Unsupported model 'unsupported'", buf_err.getvalue())
+
+    @patch('agy_switch.QuotaClient')
+    def test_quota_model_slug_normalization(self, mock_qc_class):
+        """agy-switch quota normalizes model slugs and case variants."""
+        mock_qc = mock_qc_class.return_value
+        mock_qc.fetch_quota.return_value = {
+            "gemini": {"quota": 80, "reset_time": 1791201600, "cached": False, "buckets": {}},
+            "claude": {"quota": 55, "reset_time": 1791201600, "cached": False, "buckets": {}},
+        }
+        mock_qc.load_cache.return_value = {}
+
+        buf_slug = io.StringIO()
+        with patch('sys.stdout', buf_slug):
+            exit_code = main(["quota", "--model", "claude-3-5-sonnet"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+        self.assertIn("CLAUDE QUOTA", buf_slug.getvalue())
+        self.assertIn("55%", buf_slug.getvalue())
+
+        buf_case = io.StringIO()
+        with patch('sys.stdout', buf_case):
+            exit_code = main(["quota", "--model", "CLAUDE"], engine=self.engine)
+            self.assertEqual(exit_code, 0)
+        self.assertIn("CLAUDE QUOTA", buf_case.getvalue())
+
     def test_list_format_listicle(self):
         buf = io.StringIO()
         with patch('sys.stdout', buf):

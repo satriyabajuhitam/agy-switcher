@@ -79,7 +79,7 @@ def _write_atomic_file_secure(target_file: Path | str, payload: bytes | str) -> 
 
 
 class PresenceDetector:
-    """Discovers active Antigravity Desktop conversation session without historical session scans."""
+    """Discovers active Antigravity session across Desktop and CLI environments."""
 
     def __init__(
         self,
@@ -89,19 +89,22 @@ class PresenceDetector:
         self.gemini_dir = Path(gemini_dir).expanduser() if gemini_dir else DEFAULT_GEMINI_DIR
         self.presence_dir = self.gemini_dir / "antigravity" / "presence"
         self.brain_dir = self.gemini_dir / "antigravity" / "brain"
+        self.cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        self.cli_brain_dir = self.gemini_dir / "antigravity-cli" / "brain"
         self.cli_log_dir = self.gemini_dir / "antigravity-cli" / "log"
         self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
 
     def _discover_from_proc(self) -> str | None:
         """
-        Tier 1: Scans proc_dir/<pid>/fd/* of running language_server processes
-        to find file descriptors referencing presence/<uuid>.lock.
+        Tier 1: Scans proc_dir/<pid>/fd/* of running language_server or antigravity processes
+        to find file descriptors referencing presence/*.lock across Desktop and CLI presence directories.
         Returns the active session ID (or newest if multiple), or None if not found or inaccessible.
         """
         if not self.proc_dir.is_dir():
             return None
 
-        candidates: list[tuple[float, str]] = []
+        candidates: list[tuple[float, str, str]] = []
+        presence_dirs = [self.presence_dir, self.cli_presence_dir]
 
         try:
             for pid_entry in self.proc_dir.iterdir():
@@ -114,7 +117,7 @@ class PresenceDetector:
                 except OSError:
                     continue
 
-                if b"language_server" not in cmdline:
+                if b"language_server" not in cmdline and b"antigravity" not in cmdline:
                     continue
 
                 fd_dir = pid_entry / "fd"
@@ -128,6 +131,9 @@ class PresenceDetector:
                         except OSError:
                             continue
 
+                        if not target.startswith("/"):
+                            continue
+
                         if target.endswith(" (deleted)"):
                             target = target[:-10]
 
@@ -135,32 +141,47 @@ class PresenceDetector:
                         if target_path.suffix != ".lock":
                             continue
 
-                        try:
-                            target_parent_resolved = target_path.parent.resolve()
-                            presence_resolved = self.presence_dir.resolve()
-                            is_in_presence = (
-                                target_parent_resolved == presence_resolved
-                                or str(target_path.parent) == str(self.presence_dir)
-                            )
-                        except OSError:
-                            is_in_presence = str(target_path.parent) == str(self.presence_dir)
-
-                        if not is_in_presence:
-                            continue
-
                         session_id = target_path.stem
-                        if not session_id:
+                        if not session_id or session_id.startswith("."):
                             continue
+
+                        matched_dir: Path | None = None
+                        for p_dir in presence_dirs:
+                            try:
+                                if (
+                                    target_path.parent.resolve() == p_dir.resolve()
+                                    or str(target_path.parent) == str(p_dir)
+                                ):
+                                    matched_dir = p_dir
+                                    break
+                            except OSError:
+                                if str(target_path.parent) == str(p_dir):
+                                    matched_dir = p_dir
+                                    break
+
+                        if matched_dir is None:
+                            continue
+
+                        real_lock_file = matched_dir / target_path.name
+                        try:
+                            if real_lock_file.is_dir():
+                                continue
+                            if (
+                                real_lock_file.is_symlink()
+                                and real_lock_file.resolve().parent != matched_dir.resolve()
+                            ):
+                                continue
+                        except OSError:
+                            pass
 
                         mtime = 0.0
                         try:
-                            real_lock_file = self.presence_dir / target_path.name
                             if real_lock_file.is_file():
                                 mtime = real_lock_file.stat().st_mtime
                         except OSError:
                             pass
 
-                        candidates.append((mtime, session_id))
+                        candidates.append((mtime, session_id, str(matched_dir / target_path.name)))
                 except OSError:
                     continue
         except OSError:
@@ -169,42 +190,53 @@ class PresenceDetector:
         if not candidates:
             return None
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
         return candidates[0][1]
 
     def _discover_from_presence_locks(self) -> str | None:
         """
-        Tier 2: Falls back to inspecting presence/*.lock and selects the file
-        with the newest mtime.
+        Tier 2: Falls back to inspecting presence/*.lock across both presence_dir
+        and cli_presence_dir, selecting the candidate with the newest mtime.
         """
-        if not self.presence_dir.is_dir():
-            return None
+        candidates: list[tuple[float, str, str]] = []
+        presence_dirs = [self.presence_dir, self.cli_presence_dir]
 
-        candidates: list[tuple[float, str]] = []
-        try:
-            for lock_file in self.presence_dir.iterdir():
-                if not lock_file.is_file() or lock_file.suffix != ".lock":
+        for p_dir in presence_dirs:
+            try:
+                if not p_dir.is_dir():
                     continue
-                try:
-                    mtime = lock_file.stat().st_mtime
-                    candidates.append((mtime, lock_file.stem))
-                except OSError:
-                    continue
-        except OSError:
-            return None
+                for lock_file in p_dir.iterdir():
+                    try:
+                        if not lock_file.is_file() or lock_file.suffix != ".lock":
+                            continue
+                        session_id = lock_file.stem
+                        if not session_id or session_id.startswith("."):
+                            continue
+                        if lock_file.is_symlink():
+                            try:
+                                if lock_file.resolve().parent != p_dir.resolve():
+                                    continue
+                            except OSError:
+                                continue
+                        mtime = lock_file.stat().st_mtime
+                        candidates.append((mtime, session_id, str(lock_file)))
+                    except OSError:
+                        continue
+            except OSError:
+                continue
 
         if not candidates:
             return None
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
         return candidates[0][1]
 
     def get_active_session_id(self) -> str | None:
         """
-        Discovers the active Antigravity Desktop conversation ID.
-        Tier 1: Scans /proc/*/fd for language_server file descriptors pointing to presence/*.lock.
-        Tier 2: Falls back to newest .lock file mtime in presence_dir.
-        Returns UUID string or None if no active session found.
+        Discovers the active Antigravity session ID across Desktop and CLI environments.
+        Tier 1: Scans /proc/*/fd for process file descriptors pointing to presence/*.lock.
+        Tier 2: Falls back to newest .lock file mtime across presence directories.
+        Returns UUID or session identifier string, or None if no active session found.
         """
         try:
             session_id = self._discover_from_proc()
@@ -222,43 +254,104 @@ class PresenceDetector:
     def get_active_transcript_path(self, session_id: str | None = None) -> Path | None:
         """
         Returns Path to brain/<active-id>/.system_generated/logs/transcript.jsonl
-        when the session directory exists, or None.
-        If session_id is provided, bypasses calling get_active_session_id() again.
+        resolved from Desktop brain (~/.gemini/antigravity/brain/<id>) or
+        CLI brain (~/.gemini/antigravity-cli/brain/<id>).
+        If both transcript files exist, returns the file with the newest mtime.
+        If only one exists, returns that file.
+        If neither file exists, checks for existing session directories under Desktop and CLI
+        brain and returns the expected transcript path (preferring newest directory mtime).
+        Returns None if no active session is found or neither session directory exists.
         """
         if session_id is None:
             session_id = self.get_active_session_id()
         if not session_id:
             return None
 
-        session_dir = self.brain_dir / session_id
-        if not session_dir.is_dir():
-            return None
+        desk_session_dir = self.brain_dir / session_id
+        cli_session_dir = self.cli_brain_dir / session_id
 
-        return session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        desk_transcript = desk_session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        cli_transcript = cli_session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+
+        def _is_file(p: Path) -> bool:
+            try:
+                return p.is_file()
+            except OSError:
+                return False
+
+        def _is_dir(p: Path) -> bool:
+            try:
+                return p.is_dir()
+            except OSError:
+                return False
+
+        def _mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        desk_file_exists = _is_file(desk_transcript)
+        cli_file_exists = _is_file(cli_transcript)
+
+        if desk_file_exists and cli_file_exists:
+            return cli_transcript if _mtime(cli_transcript) > _mtime(desk_transcript) else desk_transcript
+        elif desk_file_exists:
+            return desk_transcript
+        elif cli_file_exists:
+            return cli_transcript
+
+        desk_dir_exists = _is_dir(desk_session_dir)
+        cli_dir_exists = _is_dir(cli_session_dir)
+
+        if desk_dir_exists and cli_dir_exists:
+            return cli_transcript if _mtime(cli_session_dir) > _mtime(desk_session_dir) else desk_transcript
+        elif desk_dir_exists:
+            return desk_transcript
+        elif cli_dir_exists:
+            return cli_transcript
+
+        return None
 
     def get_watch_targets(self, as_str: bool = False, session_id: str | None = None) -> list[Path] | list[str]:
         """
         Returns list of active log targets to watch:
         - Active transcript.jsonl if resolved and existing on disk.
         - Existing CLI logs in antigravity-cli/log/*.log.
-        Omits non-existent paths.
+        Omits non-existent paths and deduplicates targets.
         """
         targets: list[Path] = []
         active_transcript = self.get_active_transcript_path(session_id=session_id)
-        if active_transcript is not None and active_transcript.is_file():
-            targets.append(active_transcript)
-
-        if self.cli_log_dir.is_dir():
+        if active_transcript is not None:
             try:
-                for cli_log in sorted(self.cli_log_dir.glob("*.log")):
-                    if cli_log.is_file():
-                        targets.append(cli_log)
+                if active_transcript.is_file():
+                    targets.append(active_transcript)
             except OSError:
                 pass
 
+        try:
+            if self.cli_log_dir.is_dir():
+                for cli_log in sorted(self.cli_log_dir.glob("*.log")):
+                    try:
+                        if cli_log.is_file():
+                            targets.append(cli_log)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        seen: set[str] = set()
+        deduped: list[Path] = []
+        for target in targets:
+            key = str(target)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(target)
+
         if as_str:
-            return [str(p) for p in targets]
-        return targets
+            return [str(p) for p in deduped]
+        return deduped
+
 
 
 __all__ = [

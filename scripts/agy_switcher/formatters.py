@@ -105,35 +105,49 @@ def _format_bucket_countdown(reset_ts: Any, current_timestamp: float | None = No
     return f" (in {cd})"
 
 
-def _format_gemini_quota_summary(acc: dict[str, Any], current_timestamp: float | None = None) -> str:
-    """Extracts and formats Gemini quota summary for display across table and listicle views."""
+def _normalize_target_model(target_model: str | None) -> str:
+    """Normalizes target model identifier to lowercase standard string."""
+    if not isinstance(target_model, str) or not target_model.strip():
+        return "gemini"
+    return target_model.strip().lower()
+
+
+def _format_model_quota_summary(
+    acc: dict[str, Any],
+    model: str = "gemini",
+    current_timestamp: float | None = None,
+) -> str:
+    """Extracts and formats model quota summary for display across table and listicle views."""
     if not isinstance(acc, dict):
         return "Error / Unreachable"
 
+    model_key = _normalize_target_model(model)
     q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
-    gemini_data = q_root.get("gemini") if isinstance(q_root.get("gemini"), dict) else None
+    model_data = q_root.get(model_key) if isinstance(q_root.get(model_key), dict) else None
 
-    if q_root.get("error") or gemini_data is None or (isinstance(gemini_data, dict) and gemini_data.get("error")):
+    if q_root.get("error") or model_data is None or (isinstance(model_data, dict) and model_data.get("error")):
         return "Error / Unreachable"
 
-    if not isinstance(gemini_data, dict):
+    if not isinstance(model_data, dict):
         return "Error / Unreachable"
 
-    raw_cached = gemini_data.get("cached")
+    raw_cached = model_data.get("cached")
     is_cached = (
         raw_cached.strip().lower() in ("true", "1")
         if isinstance(raw_cached, str)
         else bool(raw_cached)
     )
 
-    raw_quota = gemini_data.get("quota")
+    raw_quota = model_data.get("quota")
     parsed_q = _parse_quota_defensive(raw_quota)
-    quota = int(round(parsed_q)) if parsed_q >= 0 else 0
+    if parsed_q < 0:
+        return "Error / Unreachable"
+    quota = int(round(parsed_q))
 
     if is_cached:
         return f"{quota}% (Cached)"
 
-    buckets = gemini_data.get("buckets") if isinstance(gemini_data.get("buckets"), dict) else {}
+    buckets = model_data.get("buckets") if isinstance(model_data.get("buckets"), dict) else {}
     b_5h = buckets.get("5h") if isinstance(buckets.get("5h"), dict) else {}
     b_wk = buckets.get("weekly") if isinstance(buckets.get("weekly"), dict) else (buckets.get("wk") if isinstance(buckets.get("wk"), dict) else {})
 
@@ -156,10 +170,16 @@ def _format_gemini_quota_summary(acc: dict[str, Any], current_timestamp: float |
     return f"{quota}%"
 
 
+def _format_gemini_quota_summary(acc: dict[str, Any], current_timestamp: float | None = None) -> str:
+    """Extracts and formats Gemini quota summary for display across table and listicle views."""
+    return _format_model_quota_summary(acc, model="gemini", current_timestamp=current_timestamp)
+
+
 def format_accounts_listicle(
     result: dict[str, Any] | None,
     show_quota: bool = True,
     current_timestamp: float | None = None,
+    target_model: str = "gemini",
 ) -> str:
     """Formats accounts list as a compact, single-line bulleted listicle for LLMs and narrow terminals."""
     if not isinstance(result, dict):
@@ -168,6 +188,9 @@ def format_accounts_listicle(
     accounts = result.get("accounts", [])
     if not isinstance(accounts, list) or not accounts:
         return "No accounts registered in vault (~/.antigravity-vault/accounts)."
+
+    model_clean = _normalize_target_model(target_model)
+    model_label = model_clean.capitalize()
 
     lines: list[str] = []
     for acc in accounts:
@@ -179,8 +202,8 @@ def format_accounts_listicle(
         prefix = f"{marker} {name} ({email_str})"
 
         if show_quota:
-            quota_summary = _format_gemini_quota_summary(acc, current_timestamp=current_timestamp)
-            lines.append(f"{prefix} — Gemini: {quota_summary}")
+            quota_summary = _format_model_quota_summary(acc, model=model_clean, current_timestamp=current_timestamp)
+            lines.append(f"{prefix} — {model_label}: {quota_summary}")
         else:
             status = "Active" if acc.get("is_active") else "Standby"
             if not acc.get("valid", True):
@@ -200,8 +223,9 @@ def format_accounts_table(
     result: dict[str, Any] | None,
     show_quota: bool = False,
     current_timestamp: float | None = None,
+    target_model: str = "gemini",
 ) -> str:
-    """Formats accounts list as a clean, human-readable terminal table focusing exclusively on Gemini."""
+    """Formats accounts list as a clean, human-readable terminal table."""
     if not isinstance(result, dict):
         return "No accounts registered in vault (~/.antigravity-vault/accounts)."
 
@@ -209,9 +233,10 @@ def format_accounts_table(
     if not isinstance(accounts, list) or not accounts:
         return "No accounts registered in vault (~/.antigravity-vault/accounts)."
 
+    model_clean = _normalize_target_model(target_model)
     header = f"{'':2} {'ACCOUNT':<20} {'EMAIL':<30} {'STATUS':<15}"
     if show_quota:
-        header += " GEMINI QUOTA"
+        header += f" {model_clean.upper()} QUOTA"
 
     lines = [
         "Antigravity Accounts (~/.antigravity-vault):",
@@ -231,7 +256,7 @@ def format_accounts_table(
         line = f"{marker}{str(acc.get('name') or ''):<20} {email_str:<30} {status:<15}"
 
         if show_quota:
-            quota_summary = _format_gemini_quota_summary(acc, current_timestamp=current_timestamp)
+            quota_summary = _format_model_quota_summary(acc, model=model_clean, current_timestamp=current_timestamp)
             line += f" {quota_summary}"
 
         lines.append(line)
@@ -332,6 +357,7 @@ __all__ = [
     "format_diagnostic_report",
     "_format_bucket_countdown",
     "_format_gemini_quota_summary",
+    "_format_model_quota_summary",
     "_parse_timestamp_defensive",
     "_parse_quota_defensive",
 ]

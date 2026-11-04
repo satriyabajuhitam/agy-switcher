@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 from agy_switcher.exceptions import ActiveTurnRunningError
@@ -112,23 +113,86 @@ class ProcessSupervisor:
 
         return None
 
+    def _get_active_presence_lock_paths(self) -> set[Path]:
+        """Scans proc_dir/*/fd/* for open file descriptors pointing to presence locks."""
+        active_locks: set[Path] = set()
+        proc_path = self.proc_dir
+        if not proc_path.is_dir():
+            return active_locks
+
+        presence_dirs = {
+            (self.gemini_dir / "antigravity" / "presence").resolve(),
+            (self.gemini_dir / "antigravity-cli" / "presence").resolve(),
+        }
+
+        try:
+            for pid_dir in proc_path.iterdir():
+                if not pid_dir.name.isdigit():
+                    continue
+                fd_dir = pid_dir / "fd"
+                try:
+                    if not fd_dir.is_dir():
+                        continue
+                    for fd_entry in fd_dir.iterdir():
+                        try:
+                            raw_target = os.readlink(fd_entry)
+                            if raw_target.endswith(" (deleted)"):
+                                continue
+                            target_path = Path(raw_target)
+                            if not target_path.is_absolute():
+                                target_path = (fd_dir / target_path)
+
+                            resolved_parent = target_path.parent.resolve()
+                            if resolved_parent not in presence_dirs:
+                                continue
+
+                            if target_path.suffix == ".lock" and target_path.is_file():
+                                active_locks.add(target_path.resolve())
+                                active_locks.add(target_path)
+                        except (OSError, ValueError):
+                            continue
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            pass
+
+        return active_locks
+
     def is_server_busy(self, pid: int | None = None) -> bool:
         """Checks if language_server has active child processes or presence locks."""
-        # 1. Check presence locks in ~/.gemini
+        active_locks = self._get_active_presence_lock_paths()
+
         presence_dirs = [
             self.gemini_dir / "antigravity" / "presence",
             self.gemini_dir / "antigravity-cli" / "presence",
         ]
         for p_dir in presence_dirs:
-            if p_dir.is_dir():
-                try:
-                    lock_files = [f for f in p_dir.iterdir() if f.is_file() and f.suffix == ".lock"]
-                    if lock_files:
-                        return True
-                except OSError:
-                    pass
+            if not p_dir.is_dir():
+                continue
+            try:
+                for entry in p_dir.iterdir():
+                    if entry.name.startswith("."):
+                        continue
+                    if not entry.name.endswith(".lock"):
+                        continue
+                    if entry.is_dir() or not entry.is_file():
+                        continue
+                    try:
+                        resolved_entry = entry.resolve()
+                    except OSError:
+                        resolved_entry = entry
+                    if resolved_entry in active_locks or entry in active_locks:
+                        continue
+                    try:
+                        os.unlink(entry)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
 
-        # 2. Check child processes of pid if provided
+        if active_locks:
+            return True
+
         if pid is not None:
             proc_path = self.proc_dir
             if proc_path.is_dir():
