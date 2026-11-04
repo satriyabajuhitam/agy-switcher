@@ -28,10 +28,13 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.vault_dir = self.base_path / ".antigravity-vault"
         self.gemini_dir = self.base_path / ".gemini"
         self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.proc_dir = self.base_path / "proc"
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
         self.engine = AgySwitchEngine(
             vault_dir=self.vault_dir,
             gemini_dir=self.gemini_dir,
             legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
         )
 
     def tearDown(self):

@@ -142,7 +142,6 @@ class ProcessSupervisor:
                             if not target_path.is_absolute():
                                 target_path = (fd_dir / target_path)
 
-                            # Validate parent directory is within known presence directories
                             resolved_parent = target_path.parent.resolve()
                             if resolved_parent not in presence_dirs:
                                 continue
@@ -219,13 +218,7 @@ class ProcessSupervisor:
         return False
 
     def _send_signal(self, pid: int, sig: int = signal.SIGTERM) -> None:
-        """Dispatches signal to target process with safety latch against host leaks."""
-        if "unittest" in sys.modules and self.proc_dir == Path("/proc"):
-            # Test-time safety latch: prevent tests from killing real host language_server
-            sys.stderr.write(
-                f"[agy-switch supervisor] Blocked unsafe signal {sig} to host PID {pid} during unittest.\n"
-            )
-            return
+        """Dispatches signal to target process."""
         os.kill(pid, sig)
 
     def _poll_process_exit(self, pid: int, timeout: float = 3.0) -> bool:
@@ -277,9 +270,6 @@ class ProcessSupervisor:
             return False
         except OSError:
             pass
-
-        if "unittest" in sys.modules and self.proc_dir == Path("/proc"):
-            return True
 
         if self._poll_process_exit(pid, timeout=3.0):
             return True

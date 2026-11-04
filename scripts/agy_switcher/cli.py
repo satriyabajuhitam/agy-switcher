@@ -93,14 +93,14 @@ def _get_engine_class() -> Any:
     )
 
 
-def _get_format_accounts_listicle() -> Any:
+def _get_format_accounts_listicle() -> Callable[..., str]:
     return _resolve_symbol(
         "format_accounts_listicle",
         lambda: format_accounts_listicle,
     )
 
 
-def _get_format_accounts_table() -> Any:
+def _get_format_accounts_table() -> Callable[..., str]:
     return _resolve_symbol(
         "format_accounts_table",
         lambda: format_accounts_table,

@@ -7,10 +7,21 @@ import stat
 import subprocess
 import tempfile
 import time
+import sys
 import unittest
+import unittest.loader
 from unittest.mock import MagicMock, patch
 from pathlib import Path
-import sys
+
+# Allow boolean expressions and substrings in unittest -k patterns
+_orig_fnmatchcase = unittest.loader.fnmatchcase
+def _smart_fnmatchcase(name: str, pat: str) -> bool:
+    if " or " in pat:
+        return any(_smart_fnmatchcase(name, p.strip()) for p in pat.split(" or "))
+    if _orig_fnmatchcase(name, pat):
+        return True
+    return pat in name or _orig_fnmatchcase(name, f"*{pat}*")
+unittest.loader.fnmatchcase = _smart_fnmatchcase
 
 # Add scripts directory to sys.path so agy_switch can be imported
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -327,9 +338,13 @@ class TestProcessManagementAndSafety(unittest.TestCase):
         self.vault_dir = self.base_path / ".antigravity-vault"
         self.gemini_dir = self.base_path / ".gemini"
 
+        self.proc_dir = self.base_path / "proc"
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
         self.engine = AgySwitchEngine(
             vault_dir=self.vault_dir,
             gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
         )
 
         # Seed account in vault
@@ -341,11 +356,15 @@ class TestProcessManagementAndSafety(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_is_server_busy_detects_presence_locks(self):
-        """Presence lock files in gemini directory indicate an active agent session."""
+        """Presence lock files held by active process indicate an active agent session."""
         lock_dir = self.gemini_dir / "antigravity" / "presence"
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_file = lock_dir / "active_turn.lock"
         lock_file.write_text("lock")
+
+        pid_dir = self.proc_dir / "12345" / "fd"
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "3").symlink_to(lock_file)
 
         self.assertTrue(self.engine.is_server_busy(pid=12345))
 

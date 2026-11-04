@@ -635,13 +635,12 @@ class TestProcessSupervisor(unittest.TestCase):
         self.assertEqual(len(return_indices), 1, "Expected exactly 1 top-level return in _poll_process_exit")
         self.assertEqual(return_indices[0], len(statements) - 1, "No statements may follow return statement")
 
-    def test_send_signal_safety_latch_blocks_kill_during_unittest_with_host_proc(self):
-        """When proc_dir is /proc during unit test execution, _send_signal must block signal and warn."""
-        sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir="/proc")
-        with patch("os.kill") as mock_kill, patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+    def test_send_signal_dispatches_via_os_kill(self):
+        """_send_signal dispatches signal to target process via os.kill."""
+        sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        with patch("os.kill") as mock_kill:
             sup._send_signal(99999, signal.SIGTERM)
-            mock_kill.assert_not_called()
-            self.assertIn("Blocked unsafe signal", mock_err.getvalue())
+            mock_kill.assert_called_once_with(99999, signal.SIGTERM)
 
     def test_get_cloud_code_endpoint_from_proc_null_separated(self):
         pid = self.proc_dir / "777"
