@@ -52,7 +52,11 @@ Run via `run_command`:
 Report the output directly as plain conversational text.
 
 > [!IMPORTANT]
-> **NO MARKDOWN TABLES IN CHAT**: Never render quota reports as Markdown tables in conversational chat—tables wrap destructively on mobile screens. Always use plain lists for clean numbered listicles.
+> **NO MARKDOWN TABLES IN CHAT**: Never render quota reports as Markdown tables in conversational chat—tables wrap destructively on mobile screens.
+> Render quota reports as a clean bulleted list where EVERY line starts with `- `, account names are styled with backticks (``` `<name>` ```) for syntax highlighting/color, and emails are omitted:
+> `- `<name>` — 5h: <quota_5h>% (in <reset_5h>) | wk: <quota_wk>% (in <reset_wk>)`
+> For the active account, highlight it:
+> `- **[ACTIVE]** `<name>` — 5h: <quota_5h>% (in <reset_5h>) | wk: <quota_wk>% (in <reset_wk>)`
 
 ### Procedure C: When User asks to switch accounts
 Run:

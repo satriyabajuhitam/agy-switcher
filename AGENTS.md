@@ -1,7 +1,7 @@
 # agy-switch Workspace Agent Information
 
 ## System Identity
-This workspace hosts `agy-switch` (Antigravity Multi-Account Switcher & Vault Manager), paired with `agy-memory` as its persistent workspace memory operating system.
+This workspace hosts `agy-switch` (Antigravity Multi-Account Switcher & Vault Manager).
 
 ## Commands
 - **Run tests**: `python3 -m unittest discover tests/`
@@ -12,8 +12,7 @@ This workspace hosts `agy-switch` (Antigravity Multi-Account Switcher & Vault Ma
 2. **Dual-Destination Atomic Swaps**: Token updates must be emitted atomically (`os.replace`) to Desktop and CLI token files.
 3. **Turn Safety & Process Supervisor**: Never restart or interrupt `language_server` during an active agent turn without checking process status.
 4. **Absolute Credential Protection**: Never expose, log, or commit OAuth tokens from `~/.antigravity-vault/`.
-5. **Persistent Memory**: Use `memory_search`, `memory_add`, and `memory_audit` MCP tools. Workspace identity files live in `.agents/identity/`.
-6. **Branching & Git Workflow**: All feature development and modifications must occur on the `dev` branch. Direct commits or pushes to `main` are strictly forbidden; `main` is reserved only for tested, stable releases via merge.
+5. **Branching & Git Workflow**: All feature development and modifications must occur on the `dev` branch. Direct commits or pushes to `main` are strictly forbidden; `main` is reserved only for tested, stable releases via merge.
 
 ## Agent skills
 
@@ -32,7 +31,6 @@ The suite is hardened with Antigravity-native capabilities across all engineerin
 - **Subagent Workspace Isolation & Model Tiering**:
   - `Workspace: "branch"` isolates destructive bug reproductions (`diagnosing-bugs`) and experimental throwaway spikes (`prototype`) into clean worktree branches, protecting the main working tree.
 - **Single-Source Storage (`.scratch/`)**: Key design outputs, specifications, design plans, and tickets must be written EXCLUSIVELY to persistent repo storage (`.scratch/<feature-slug>/`). Do NOT emit or create artifacts in `<appDataDir>/brain/`. Keep all project work unified and versioned under `.scratch/`.
-- **Persistent Memory Integration**: Explicit memory recall and storage protocols (`memory_search`, `memory_add`, `memory_audit`).
 - **Zero-Dependency Execution**: Standard library and POSIX compliant.
 
 ### Issue tracker
