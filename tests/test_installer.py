@@ -17,7 +17,7 @@ def get_current_branch():
         check=True,
     )
     branch = res.stdout.strip()
-    return "dev" if branch == "HEAD" else branch
+    return "main" if branch == "HEAD" else branch
 
 
 class TestInstallerScript(unittest.TestCase):
@@ -299,13 +299,13 @@ class TestInstallerScript(unittest.TestCase):
         res = self.run_piped_bootstrap(
             extra_env={
                 "AGY_SWITCH_REPO_URL": "file:///nonexistent/repo.git",
-                "AGY_SWITCH_BRANCH": "dev",
+                "AGY_SWITCH_BRANCH": "main",
             }
         )
         self.assertNotEqual(res.returncode, 0)
         self.assertFalse(target_dir.exists(), "Failed clone must clean up target directory")
 
-    def test_piped_bootstrap_defaults_to_dev_branch_when_branch_env_unset(self):
+    def test_piped_bootstrap_defaults_to_main_branch_when_branch_env_unset(self):
         res = self.run_piped_bootstrap(extra_env={"AGY_SWITCH_BRANCH": None})
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
         default_target_repo = Path(self.temp_home.name) / "agy-switcher"
@@ -315,7 +315,7 @@ class TestInstallerScript(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertEqual(branch_res.stdout.strip(), "dev")
+        self.assertEqual(branch_res.stdout.strip(), "main")
 
     def test_piped_bootstrap_into_preexisting_empty_directory(self):
         default_target_repo = Path(self.temp_home.name) / "agy-switcher"
@@ -792,7 +792,7 @@ exec "{real_git}" "$@"
                 res = self.run_piped_bootstrap(
                     extra_env={
                         "AGY_SWITCH_REPO_URL": "file:///nonexistent/repo.git",
-                        "AGY_SWITCH_BRANCH": "dev",
+                        "AGY_SWITCH_BRANCH": "main",
                         "AGY_SWITCH_HOME": f"{self.temp_home.name}{slash_suffix}",
                     }
                 )
@@ -825,7 +825,7 @@ exec "{real_git}" "$@"
         subprocess.run(["git", "init", str(upstream)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(upstream), "config", "user.name", "test"], check=True)
         subprocess.run(["git", "-C", str(upstream), "config", "user.email", "test@test.com"], check=True)
-        subprocess.run(["git", "-C", str(upstream), "checkout", "-b", "dev"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(upstream), "checkout", "-b", "main"], check=True, capture_output=True)
         (upstream / "scripts").mkdir()
         (upstream / "scripts" / "agy_switch.py").write_text("#!/usr/bin/env python3\n")
         (upstream / "scripts" / "agy_switch.py").chmod(0o755)
@@ -839,7 +839,7 @@ exec "{real_git}" "$@"
             args=["--all"],
             extra_env={
                 "AGY_SWITCH_REPO_URL": f"file://{upstream.resolve()}",
-                "AGY_SWITCH_BRANCH": "dev",
+                "AGY_SWITCH_BRANCH": "main",
             },
         )
         self.assertEqual(res.returncode, 0, f"Stdout: {res.stdout}\nStderr: {res.stderr}")
@@ -890,13 +890,13 @@ exec "{real_git}" "$@"
         self.assertEqual(current_url, orig_url, "Existing remote.origin.url must not be mutated")
 
     def test_piped_bootstrap_sync_fetches_strictly_target_branch(self):
-        # Create an upstream repo with dev and feature-secret branch
+        # Create an upstream repo with main and feature-secret branch
         upstream = Path(self.temp_workspace.name) / "upstream_repo"
         upstream.mkdir()
         subprocess.run(["git", "init", str(upstream)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(upstream), "config", "user.name", "test"], check=True)
         subprocess.run(["git", "-C", str(upstream), "config", "user.email", "test@test.com"], check=True)
-        subprocess.run(["git", "-C", str(upstream), "checkout", "-b", "dev"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(upstream), "checkout", "-b", "main"], check=True, capture_output=True)
         
         # Populate with dummy booster files
         (upstream / "scripts").mkdir()
@@ -914,7 +914,7 @@ exec "{real_git}" "$@"
         res1 = self.run_piped_bootstrap(
             extra_env={
                 "AGY_SWITCH_REPO_URL": f"file://{upstream.resolve()}",
-                "AGY_SWITCH_BRANCH": "dev",
+                "AGY_SWITCH_BRANCH": "main",
             }
         )
         self.assertEqual(res1.returncode, 0, f"Stderr: {res1.stderr}")

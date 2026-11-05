@@ -91,11 +91,11 @@ It completely supersedes legacy token managers with an isolated local vault, ato
 For fresh VPS instances, Linux hosts, and terminal environments, install directly using the remote bootstrap one-liner:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/main/install.sh | bash
 ```
 
 **What the bootstrap one-liner does automatically:**
-- **Clones into `~/agy-switcher`**: Clones the repository into `$HOME/agy-switcher` tracking the active `dev` branch.
+- **Clones into `~/agy-switcher`**: Clones the repository into `$HOME/agy-switcher` tracking the active `main` branch.
 - **Installs Global Plugin**: Registers the booster plugin globally in `~/.gemini/config/plugins/agy-switch` so all workspaces and AI agent sessions have immediate access.
 - **Configures CLI Launcher**: Symlinks `~/.local/bin/agy-switch` directly to `scripts/agy_switch.py`.
 - **Vault Protection**: Leaves existing credentials in `~/.antigravity-vault/` untouched; strict `0700` directory and `0600` file permissions are enforced by `agy-switch` at runtime.
@@ -106,7 +106,7 @@ To pass flags (such as `--help` or `--copy`) directly through the remote pipelin
 
 ```bash
 # View usage help without cloning
-curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | bash -s -- --help
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/main/install.sh | bash -s -- --help
 ```
 
 #### Optional Environment Variable Overrides
@@ -114,13 +114,13 @@ You can customize the destination directory, git branch, or repository URL by se
 
 ```bash
 # Example: Custom directory and branch
-curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/install.sh | AGY_SWITCH_HOME="$HOME/tools/agy-switcher" AGY_SWITCH_BRANCH="dev" bash
+curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/main/install.sh | AGY_SWITCH_HOME="$HOME/tools/agy-switcher" AGY_SWITCH_BRANCH="main" bash
 ```
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
 | `AGY_SWITCH_HOME` | `$HOME/agy-switcher` | Destination directory for the cloned repository |
-| `AGY_SWITCH_BRANCH` | `dev` | Git branch to clone and synchronize |
+| `AGY_SWITCH_BRANCH` | `main` | Git branch to clone and synchronize |
 | `AGY_SWITCH_REPO_URL` | `https://github.com/satriyabajuhitam/agy-switcher.git` | Upstream Git repository URL |
 
 ---
@@ -130,8 +130,8 @@ curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/dev/i
 If you prefer to clone manually or are already inside a cloned repository:
 
 ```bash
-# Clone the repository (active dev branch)
-git clone -b dev https://github.com/satriyabajuhitam/agy-switcher.git
+# Clone the repository (active main branch)
+git clone -b main https://github.com/satriyabajuhitam/agy-switcher.git
 cd agy-switcher
 
 # Interactive Menu (Recommended for manual installation)

@@ -12,7 +12,7 @@ This workspace hosts `agy-switch` (Antigravity Multi-Account Switcher & Vault Ma
 2. **Dual-Destination Atomic Swaps**: Token updates must be emitted atomically (`os.replace`) to Desktop and CLI token files.
 3. **Turn Safety & Process Supervisor**: Never restart or interrupt `language_server` during an active agent turn without checking process status.
 4. **Absolute Credential Protection**: Never expose, log, or commit OAuth tokens from `~/.antigravity-vault/`.
-5. **Branching & Git Workflow**: All feature development and modifications must occur on the `dev` branch. Direct commits or pushes to `main` are strictly forbidden; `main` is reserved only for tested, stable releases via merge.
+5. **Branching & Git Workflow**: The repository follows Trunk-Based Development with main as the primary long-lived branch and distribution default. Feature development and hotfixes occur via short-lived feature branches or verified direct commits to main, with full test suite passing required before push.
 
 ## Agent skills
 

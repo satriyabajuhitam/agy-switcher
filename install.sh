@@ -20,7 +20,7 @@ Options:
 
 Environment Variables (Remote Bootstrap):
   AGY_SWITCH_HOME       Destination directory (default: \$HOME/agy-switcher)
-  AGY_SWITCH_BRANCH     Git branch to clone (default: dev)
+  AGY_SWITCH_BRANCH     Git branch to clone (default: main)
   AGY_SWITCH_REPO_URL   Upstream repository URL (default: https://github.com/satriyabajuhitam/agy-switcher.git)
 
 Interactive Mode:
@@ -67,7 +67,7 @@ if [ "$IS_BOOTSTRAP" -eq 1 ]; then
         TARGET_DIR="${TARGET_DIR%/}"
     done
     REPO_URL="${AGY_SWITCH_REPO_URL:-https://github.com/satriyabajuhitam/agy-switcher.git}"
-    BRANCH="${AGY_SWITCH_BRANCH:-dev}"
+    BRANCH="${AGY_SWITCH_BRANCH:-main}"
 
     safe_cleanup_target() {
         local target="${TARGET_DIR}"
