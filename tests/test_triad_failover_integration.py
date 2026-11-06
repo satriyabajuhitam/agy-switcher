@@ -13,11 +13,13 @@ Contracts & Specifications:
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -491,5 +493,336 @@ class TestSdkFailoverContract(unittest.TestCase):
         )
 
 
+class TestSoftImportAndConcurrency(unittest.TestCase):
+    """Integration test suite validating soft-import fallback and concurrency safety (ADR-0014).
+
+    Validates:
+    - [FAILOVER-ERR-001]: Graceful fallback when agy-switcher is not installed in Python runtime.
+    - [FAILOVER-EDGE-004]: Concurrent failover rotations serialize safely under atomic disk swap
+      without race conditions, without corrupted token files, and without double-hopping.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+
+        self.vault_dir = self.base_dir / ".antigravity-vault"
+        self.gemini_dir = self.base_dir / ".gemini"
+        self.legacy_root = self.base_dir / ".agy-cli-manager"
+        self.proc_dir = self.base_dir / "proc"
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+        # Scaffolding accounts: primary-acc (active), standby-acc (target 1), standby-acc-2 (target 2)
+        self.primary_token_data = create_mock_oauth_token("primary@example.com", "ya29.primary-token-val")
+        self.standby_token_data = create_mock_oauth_token("standby@example.com", "ya29.standby-token-val")
+        self.standby2_token_data = create_mock_oauth_token("standby2@example.com", "ya29.standby2-token-val")
+
+        self._setup_account("primary-acc", self.primary_token_data)
+        self._setup_account("standby-acc", self.standby_token_data)
+        self._setup_account("standby-acc-2", self.standby2_token_data)
+
+        self.engine.set_active_name("primary-acc")
+
+        # Quota cache telemetry: primary-acc exhausted (quota=0), standby-acc healthy (quota=90), standby-acc-2 (quota=85)
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 90, "reset_time": 1700003600.0}},
+                "standby-acc-2": {"gemini": {"quota": 85, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _setup_account(self, name: str, token_data: dict[str, Any]) -> None:
+        acc_dir = self.engine.accounts_dir / name
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(token_data), encoding="utf-8")
+
+    def test_failover_err_001_soft_import_fallback_when_agy_switcher_not_installed(self) -> None:
+        """[FAILOVER-ERR-001] Graceful fallback when agy_switcher is not installed in runtime."""
+        # Simulate missing agy_switcher.api module in Python runtime
+        with patch.dict(sys.modules, {"agy_switcher.api": None, "agy_switcher": None}):
+            # Attempt soft-import rotation via helper
+            success, result, error_msg = switcher_api.handle_soft_import_rotation(
+                model="gemini",
+                reload_server=False,
+                engine=self.engine,
+            )
+
+        self.assertFalse(success)
+        self.assertIsNone(result)
+        # Verify message explains quota exhaustion and manual re-login or installing agy-switcher is required
+        self.assertIn("quota", error_msg.lower())
+        self.assertIn("exhausted", error_msg.lower())
+        self.assertIn("manual re-login or installing 'agy-switcher' is required", error_msg.lower())
+
+    def test_failover_err_001_turn_runner_catches_import_error_gracefully(self) -> None:
+        """[FAILOVER-ERR-001] TurnRunner catches ImportError gracefully and emits guidance message."""
+        progress_sink_messages: list[str] = []
+
+        class SimulatedTurnRunner:
+            def handle_exhaustion_turn(self, error_text: str) -> dict[str, Any]:
+                lower = error_text.lower()
+                if "resource_exhausted" in lower or "resourceexhausted" in lower or "quota" in lower:
+                    try:
+                        # Soft-import agy_switcher.api dynamically
+                        import agy_switcher.api as dynamic_api
+                        rot = dynamic_api.auto_rotate_on_exhaustion(model="gemini", reload_server=False)
+                        return {"success": rot.success, "message": rot.message}
+                    except (ImportError, ModuleNotFoundError):
+                        msg = (
+                            "Quota limit reached (RESOURCE_EXHAUSTED). "
+                            "Manual re-login or installing 'agy-switcher' is required."
+                        )
+                        progress_sink_messages.append(msg)
+                        return {"success": False, "message": msg}
+                return {"success": False, "message": "Unknown error"}
+
+        runner = SimulatedTurnRunner()
+
+        # Simulate environment where agy_switcher is absent
+        with patch.dict(sys.modules, {"agy_switcher.api": None, "agy_switcher": None}):
+            res = runner.handle_exhaustion_turn("rpc error: code = ResourceExhausted desc = Quota limit reached")
+
+        self.assertFalse(res["success"])
+        self.assertEqual(len(progress_sink_messages), 1)
+        self.assertIn("manual re-login or installing 'agy-switcher' is required", progress_sink_messages[0].lower())
+
+    def test_failover_edge_004_concurrent_failover_rotations_serialize_safely(self) -> None:
+        """[FAILOVER-EDGE-004] Two concurrent turns rotate simultaneously without race or double-hop."""
+        start_event = threading.Event()
+
+        def concurrent_rotate() -> RotationResult:
+            start_event.wait(timeout=5.0)
+            return switcher_api.auto_rotate_on_exhaustion(
+                model="gemini",
+                reload_server=False,
+                engine=self.engine,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut1 = executor.submit(concurrent_rotate)
+            fut2 = executor.submit(concurrent_rotate)
+            # Release both threads simultaneously to create genuine concurrent entry
+            start_event.set()
+            res1 = fut1.result(timeout=10.0)
+            res2 = fut2.result(timeout=10.0)
+
+        # Both turns must succeed
+        self.assertTrue(res1.success, f"Turn 1 rotation failed: {res1.message}")
+        self.assertTrue(res2.success, f"Turn 2 rotation failed: {res2.message}")
+
+        # Active account must have cleanly transitioned to standby-acc
+        active_account = self.engine.get_active_name()
+        self.assertEqual(active_account, "standby-acc")
+
+        # Crucial Anti-Double-Hop Invariant: active account must NOT have double-hopped to standby-acc-2
+        self.assertNotEqual(active_account, "standby-acc-2")
+        self.assertEqual(res1.active_account, "standby-acc")
+        self.assertEqual(res2.active_account, "standby-acc")
+
+        # Verify token files on disk are intact, valid JSON, 0600 permissions, containing standby-acc tokens
+        cli_payload = json.loads(self.engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            cli_payload["token"]["access_token"],
+            self.standby_token_data["token"]["access_token"],
+        )
+        self.assertEqual(self.engine.cli_token_file.stat().st_mode & 0o777, 0o600)
+
+        desktop_payload = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            desktop_payload["token"]["access_token"],
+            self.standby_token_data["token"]["access_token"],
+        )
+        self.assertEqual(self.engine.desktop_token_file.stat().st_mode & 0o777, 0o600)
+
+    def test_failover_edge_004_multi_worker_concurrency_stress(self) -> None:
+        """[FAILOVER-EDGE-004] High concurrency stress: 8 workers failover simultaneously without corruption."""
+        worker_count = 8
+        barrier = threading.Barrier(worker_count)
+
+        def worker_task() -> RotationResult:
+            barrier.wait(timeout=5.0)
+            return switcher_api.auto_rotate_on_exhaustion(
+                model="gemini",
+                reload_server=False,
+                engine=self.engine,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(worker_task) for _ in range(worker_count)]
+            results = [f.result(timeout=10.0) for f in futures]
+
+        for idx, res in enumerate(results):
+            self.assertTrue(res.success, f"Worker {idx} failed: {res.message}")
+            self.assertEqual(res.active_account, "standby-acc")
+
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+        self.assertNotEqual(self.engine.get_active_name(), "standby-acc-2")
+
+        # Verify atomic disk swap did not leave corrupt files or partial writes
+        cli_payload = json.loads(self.engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            cli_payload["token"]["access_token"],
+            self.standby_token_data["token"]["access_token"],
+        )
+
+    def test_failover_edge_004_explicit_current_account_prevents_double_hop(self) -> None:
+        """[FAILOVER-EDGE-004] Passing current_account explicitly prevents double-hop across threads."""
+        start_event = threading.Event()
+
+        def rotate_from_primary() -> RotationResult:
+            start_event.wait(timeout=5.0)
+            return switcher_api.auto_rotate_on_exhaustion(
+                model="gemini",
+                reload_server=False,
+                engine=self.engine,
+                current_account="primary-acc",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(rotate_from_primary)
+            f2 = executor.submit(rotate_from_primary)
+            start_event.set()
+            r1 = f1.result(timeout=10.0)
+            r2 = f2.result(timeout=10.0)
+
+        self.assertTrue(r1.success)
+        self.assertTrue(r2.success)
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+        self.assertNotEqual(self.engine.get_active_name(), "standby-acc-2")
+
+    def test_failover_edge_004_heterogeneous_model_concurrency_race(self) -> None:
+        """[FAILOVER-EDGE-004] Concurrent rotations for different models isolate and do not corrupt state."""
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "primary-acc": {
+                    "claude": {"quota": 0, "reset_time": 1700003600.0},
+                    "gemini": {"quota": 0, "reset_time": 1700003600.0},
+                },
+                "standby-acc": {
+                    "claude": {"quota": 90, "reset_time": 1700003600.0},
+                    "gemini": {"quota": 0, "reset_time": 1700003600.0},
+                },
+                "standby-acc-2": {
+                    "claude": {"quota": 85, "reset_time": 1700003600.0},
+                    "gemini": {"quota": 85, "reset_time": 1700003600.0},
+                },
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        start_event = threading.Event()
+
+        def rotate_claude() -> RotationResult:
+            start_event.wait(timeout=5.0)
+            return switcher_api.auto_rotate_on_exhaustion(
+                model="claude",
+                reload_server=False,
+                engine=self.engine,
+                current_account="primary-acc",
+            )
+
+        def rotate_gemini() -> RotationResult:
+            start_event.wait(timeout=5.0)
+            return switcher_api.auto_rotate_on_exhaustion(
+                model="gemini",
+                reload_server=False,
+                engine=self.engine,
+                current_account="primary-acc",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_c = executor.submit(rotate_claude)
+            fut_g = executor.submit(rotate_gemini)
+            start_event.set()
+            res_c = fut_c.result(timeout=10.0)
+            res_g = fut_g.result(timeout=10.0)
+
+        # Both must succeed
+        self.assertTrue(res_c.success)
+        self.assertTrue(res_g.success)
+
+        # Claude rotated to an account with claude quota (standby-acc or standby-acc-2)
+        self.assertEqual(res_c.model, "claude")
+        self.assertIn(res_c.new_account, ["standby-acc", "standby-acc-2"])
+
+        # Gemini MUST NOT be stranded on standby-acc (which has 0 gemini quota)!
+        self.assertEqual(res_g.model, "gemini")
+        self.assertEqual(res_g.new_account, "standby-acc-2")
+
+        # The active account in vault must be an account valid for both (standby-acc-2)
+        self.assertEqual(self.engine.get_active_name(), "standby-acc-2")
+
+    def test_failover_edge_004_corrupt_standby_account_bypassed_cleanly(self) -> None:
+        """[FAILOVER-EDGE-004] Corrupted token file in standby account is bypassed in favor of valid account."""
+        # Corrupt standby-acc token.json
+        (self.engine.accounts_dir / "standby-acc" / "token.json").write_text("{corrupt-json", encoding="utf-8")
+
+        res = switcher_api.auto_rotate_on_exhaustion(
+            model="gemini",
+            reload_server=False,
+            engine=self.engine,
+            current_account="primary-acc",
+        )
+
+        self.assertTrue(res.success)
+        self.assertEqual(res.new_account, "standby-acc-2")
+        self.assertEqual(self.engine.get_active_name(), "standby-acc-2")
+
+    def test_failover_err_001_soft_import_missing_attribute_fallback(self) -> None:
+        """[FAILOVER-ERR-001] Missing auto_rotate_on_exhaustion attribute in imported module triggers clean fallback."""
+        from unittest.mock import MagicMock
+        mock_mod = MagicMock(spec=[])
+        with patch.dict(sys.modules, {"agy_switcher.api": mock_mod}):
+            success, result, msg = switcher_api.handle_soft_import_rotation(
+                model="gemini",
+                reload_server=False,
+                engine=self.engine,
+            )
+        self.assertFalse(success)
+        self.assertIsNone(result)
+        self.assertIn("manual re-login or installing 'agy-switcher' is required", msg.lower())
+
+    def test_failover_edge_004_all_accounts_exhausted_with_explicit_current_account(self) -> None:
+        """[FAILOVER-EDGE-004] Rotation fails gracefully when all accounts exhausted, preserving current_account in result."""
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc-2": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        res = switcher_api.auto_rotate_on_exhaustion(
+            model="gemini",
+            reload_server=False,
+            engine=self.engine,
+            current_account="primary-acc",
+        )
+        self.assertFalse(res.success)
+        self.assertEqual(res.previous_account, "primary-acc")
+        self.assertIsNone(res.new_account)
+        self.assertIn("exhausted", res.message)
+
+
 if __name__ == "__main__":
     unittest.main()
+

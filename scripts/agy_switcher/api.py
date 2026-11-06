@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Any
 
@@ -23,6 +24,14 @@ from agy_switcher.rotation import RotationEngine
 from agy_switcher.security import extract_email_from_jwt
 from agy_switcher.telemetry import normalize_model_name
 from agy_switcher.vault import AgySwitchEngine
+
+_ROTATION_LOCK = threading.RLock()
+_LAST_ROTATION_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {}
+
+FALLBACK_MISSING_SWITCHER_MESSAGE = (
+    "Quota limit reached (RESOURCE_EXHAUSTED). "
+    "Manual re-login or installing 'agy-switcher' is required."
+)
 
 
 def get_active_account(engine: AgySwitchEngine | None = None) -> AccountInfo:
@@ -80,10 +89,44 @@ def get_active_account(engine: AgySwitchEngine | None = None) -> AccountInfo:
         )
 
 
+def handle_soft_import_rotation(
+    model: str = "gemini",
+    reload_server: bool = False,
+    engine: AgySwitchEngine | None = None,
+    current_account: str | None = None,
+) -> tuple[bool, RotationResult | None, str]:
+    """Gracefully executes rotation via soft-import, handling missing agy-switcher without crashes.
+
+    Encapsulates dynamic import of agy_switcher.api. If agy_switcher is absent from the
+    runtime environment (ImportError / ModuleNotFoundError), catches the error cleanly
+    and returns actionable fallback guidance.
+
+    Returns:
+        tuple[bool, RotationResult | None, str]: (success, rotation_result, message)
+    """
+    try:
+        import importlib
+        switcher_api = importlib.import_module("agy_switcher.api")
+        if not hasattr(switcher_api, "auto_rotate_on_exhaustion"):
+            return (False, None, FALLBACK_MISSING_SWITCHER_MESSAGE)
+        res = switcher_api.auto_rotate_on_exhaustion(
+            model=model,
+            reload_server=reload_server,
+            engine=engine,
+            current_account=current_account,
+        )
+        return (res.success, res, res.message)
+    except (ImportError, ModuleNotFoundError):
+        return (False, None, FALLBACK_MISSING_SWITCHER_MESSAGE)
+    except Exception as exc:
+        return (False, None, f"Rotation error: {exc}")
+
+
 def auto_rotate_on_exhaustion(
     model: str = "gemini",
     reload_server: bool = False,
     engine: AgySwitchEngine | None = None,
+    current_account: str | None = None,
 ) -> RotationResult:
     """Rotates to the optimal account with remaining quota for target model using Disk-Only Swap."""
     try:
@@ -100,126 +143,241 @@ def auto_rotate_on_exhaustion(
             active_account=None,
         )
 
-    if engine is None:
+    with _ROTATION_LOCK:
+        if engine is None:
+            try:
+                engine = AgySwitchEngine()
+            except Exception as exc:
+                return RotationResult(
+                    success=False,
+                    previous_account=None,
+                    new_account=None,
+                    model=model,
+                    message=f"Failed to initialize vault engine: {exc}",
+                    quota_remaining=None,
+                    reloaded_server=False,
+                    active_account=None,
+                )
+
         try:
-            engine = AgySwitchEngine()
+            vault_key = str(engine.vault_dir.resolve())
+        except Exception:
+            vault_key = str(id(engine))
+
+        reg_key = (vault_key, model_key)
+
+        try:
+            active_account = engine.get_active_name()
+            if active_account:
+                active_account = active_account.strip()
+            if not active_account:
+                active_account = None
+        except Exception:
+            active_account = None
+
+        now = time.time()
+        # Clean up stale registry entries older than 60 seconds
+        for k in list(_LAST_ROTATION_REGISTRY.keys()):
+            if now - float(_LAST_ROTATION_REGISTRY[k].get("timestamp", 0.0)) > 60.0:
+                _LAST_ROTATION_REGISTRY.pop(k, None)
+
+        last_rot = _LAST_ROTATION_REGISTRY.get(reg_key)
+
+        # Anti-double-hopping check:
+        # If a recent rotation for this vault and model succeeded within a short debounce window (2.0s)
+        # and the vault's active account matches the newly rotated account:
+        if (
+            last_rot is not None
+            and (now - float(last_rot.get("timestamp", 0.0)) < 2.0)
+            and last_rot.get("model") == model_key
+            and isinstance(last_rot.get("result"), RotationResult)
+            and last_rot["result"].success
+            and active_account == last_rot.get("new_account")
+        ):
+            if current_account is None or current_account == last_rot.get("previous_account"):
+                return last_rot["result"]
+
+        # Explicit current_account guard: if the caller's turn ran on current_account, but the active
+        # account has already transitioned away:
+        if current_account and active_account and active_account != current_account:
+            # Case A: A recent rotation for this specific model already rotated to active_account
+            if (
+                last_rot is not None
+                and last_rot.get("model") == model_key
+                and last_rot.get("new_account") == active_account
+                and isinstance(last_rot.get("result"), RotationResult)
+                and last_rot["result"].success
+            ):
+                if last_rot.get("previous_account") == current_account:
+                    return last_rot["result"]
+                res = last_rot["result"]
+                return RotationResult(
+                    success=True,
+                    previous_account=current_account,
+                    new_account=active_account,
+                    model=model,
+                    message=f"Account already rotated from '{current_account}' to '{active_account}' for model '{model}'.",
+                    quota_remaining=res.quota_remaining,
+                    reloaded_server=False,
+                    active_account=active_account,
+                )
+
+            # Case B: active_account was changed (e.g. by another model rotation).
+            # Inspect whether active_account actually has available quota for this target model.
+            rot_engine_probe = RotationEngine(
+                vault_dir=engine.vault_dir,
+                active_account_id=active_account,
+                target_model=model_key,
+            )
+            probe_cache = rot_engine_probe._load_quota_cache()
+            probe_accounts_map = (
+                probe_cache.get("accounts", {})
+                if isinstance(probe_cache, dict) and isinstance(probe_cache.get("accounts"), dict)
+                else (probe_cache if isinstance(probe_cache, dict) else {})
+            )
+            active_acc_quota = probe_accounts_map.get(active_account, {}) if isinstance(probe_accounts_map, dict) else {}
+            active_status = rot_engine_probe.get_quota_status(active_acc_quota, model_key=model_key)
+            active_quota_rem = active_status.fraction if active_status is not None else None
+
+            # If active_account has available quota (> 0.0) for target model, retain it safely
+            if active_quota_rem is not None and active_quota_rem > 0:
+                return RotationResult(
+                    success=True,
+                    previous_account=current_account,
+                    new_account=active_account,
+                    model=model,
+                    message=f"Account already transitioned from '{current_account}' to '{active_account}'.",
+                    quota_remaining=active_quota_rem,
+                    reloaded_server=False,
+                    active_account=active_account,
+                )
+            # If active_account is also exhausted for model_key, fall through to rotate to a healthy account!
+
+        previous_account = active_account
+
+        try:
+            accounts_data = engine.list_accounts()
+        except Exception:
+            accounts_data = {"active": previous_account, "accounts": []}
+
+        accounts_list = accounts_data.get("accounts") or []
+        valid_accounts = [acc for acc in accounts_list if isinstance(acc, dict) and acc.get("valid", True)]
+
+        try:
+            cooldowns = dict(engine.get_cooldowns())
+        except Exception:
+            cooldowns = {}
+
+        if current_account:
+            cooldowns[current_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
+        if active_account:
+            if active_account != current_account:
+                cooldowns[active_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
+        elif previous_account:
+            cooldowns[previous_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
+
+        rot_engine = RotationEngine(
+            vault_dir=engine.vault_dir,
+            active_account_id=previous_account,
+            target_model=model_key,
+        )
+        try:
+            target_account = rot_engine.evaluate(
+                valid_accounts,
+                current_active=previous_account,
+                target_model=model_key,
+                cooldowns=cooldowns,
+            )
         except Exception as exc:
             return RotationResult(
                 success=False,
-                previous_account=None,
+                previous_account=current_account or previous_account,
                 new_account=None,
                 model=model,
-                message=f"Failed to initialize vault engine: {exc}",
-                quota_remaining=None,
-                reloaded_server=False,
-                active_account=None,
-            )
-
-    try:
-        previous_account = engine.get_active_name()
-        if previous_account:
-            previous_account = previous_account.strip()
-        if not previous_account:
-            previous_account = None
-    except Exception:
-        previous_account = None
-
-    try:
-        accounts_data = engine.list_accounts()
-    except Exception:
-        accounts_data = {"active": previous_account, "accounts": []}
-
-    accounts_list = accounts_data.get("accounts") or []
-    valid_accounts = [acc for acc in accounts_list if isinstance(acc, dict) and acc.get("valid", True)]
-
-    try:
-        cooldowns = dict(engine.get_cooldowns())
-    except Exception:
-        cooldowns = {}
-
-    if previous_account:
-        cooldowns[previous_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
-
-    rot_engine = RotationEngine(
-        vault_dir=engine.vault_dir,
-        active_account_id=previous_account,
-        target_model=model_key,
-    )
-    target_account = rot_engine.evaluate(
-        valid_accounts,
-        current_active=previous_account,
-        target_model=model_key,
-        cooldowns=cooldowns,
-    )
-
-    if not target_account or target_account == previous_account:
-        return RotationResult(
-            success=False,
-            previous_account=previous_account,
-            new_account=None,
-            model=model,
-            message=f"All accounts exhausted for model '{model}'.",
-            quota_remaining=None,
-            reloaded_server=False,
-            active_account=None,
-        )
-
-    if reload_server:
-        pid = engine.locate_language_server_pid()
-        if engine.is_server_busy(pid):
-            return RotationResult(
-                success=False,
-                previous_account=previous_account,
-                new_account=None,
-                model=model,
-                message=(
-                    "Antigravity is currently busy processing an agent turn or background task. "
-                    "Cannot reload language server during active turn."
-                ),
+                message=f"Rotation evaluation failed: {exc}",
                 quota_remaining=None,
                 reloaded_server=False,
                 active_account=previous_account,
             )
 
-    try:
-        switch_res = engine.switch_tokens(target_account, restart_server=reload_server, force=False)
-        server_reloaded = bool(switch_res.get("server_restarted", False)) if reload_server else False
-    except Exception as exc:
-        return RotationResult(
-            success=False,
-            previous_account=previous_account,
-            new_account=None,
+        if not target_account or target_account == previous_account:
+            return RotationResult(
+                success=False,
+                previous_account=current_account or previous_account,
+                new_account=None,
+                model=model,
+                message=f"All accounts exhausted for model '{model}'.",
+                quota_remaining=None,
+                reloaded_server=False,
+                active_account=None,
+            )
+
+        if reload_server:
+            pid = engine.locate_language_server_pid()
+            if engine.is_server_busy(pid):
+                return RotationResult(
+                    success=False,
+                    previous_account=current_account or previous_account,
+                    new_account=None,
+                    model=model,
+                    message=(
+                        "Antigravity is currently busy processing an agent turn or background task. "
+                        "Cannot reload language server during active turn."
+                    ),
+                    quota_remaining=None,
+                    reloaded_server=False,
+                    active_account=previous_account,
+                )
+
+        try:
+            switch_res = engine.switch_tokens(target_account, restart_server=reload_server, force=False)
+            server_reloaded = bool(switch_res.get("server_restarted", False)) if reload_server else False
+        except Exception as exc:
+            return RotationResult(
+                success=False,
+                previous_account=current_account or previous_account,
+                new_account=None,
+                model=model,
+                message=f"Failed to switch account to '{target_account}': {exc}",
+                quota_remaining=None,
+                reloaded_server=False,
+                active_account=previous_account,
+            )
+
+        target_quota_cache = rot_engine._load_quota_cache()
+        if isinstance(target_quota_cache, dict):
+            target_accounts_map = (
+                target_quota_cache.get("accounts", {})
+                if isinstance(target_quota_cache.get("accounts"), dict)
+                else target_quota_cache
+            )
+        else:
+            target_accounts_map = {}
+
+        target_acc_quota = target_accounts_map.get(target_account, {}) if isinstance(target_accounts_map, dict) else {}
+        target_status = rot_engine.get_quota_status(target_acc_quota, model_key=model_key)
+        quota_rem = target_status.fraction if target_status is not None else None
+
+        rotation_res = RotationResult(
+            success=True,
+            previous_account=current_account or previous_account,
+            new_account=target_account,
             model=model,
-            message=f"Failed to switch account to '{target_account}': {exc}",
-            quota_remaining=None,
-            reloaded_server=False,
-            active_account=previous_account,
+            message=f"Successfully rotated to '{target_account}' for model '{model}'.",
+            quota_remaining=quota_rem,
+            reloaded_server=server_reloaded,
+            active_account=target_account,
         )
 
-    target_quota_cache = rot_engine._load_quota_cache()
-    if isinstance(target_quota_cache, dict):
-        target_accounts_map = (
-            target_quota_cache.get("accounts", {})
-            if isinstance(target_quota_cache.get("accounts"), dict)
-            else target_quota_cache
-        )
-    else:
-        target_accounts_map = {}
+        _LAST_ROTATION_REGISTRY[reg_key] = {
+            "timestamp": now,
+            "model": model_key,
+            "previous_account": current_account or previous_account,
+            "new_account": target_account,
+            "result": rotation_res,
+        }
 
-    target_acc_quota = target_accounts_map.get(target_account, {}) if isinstance(target_accounts_map, dict) else {}
-    target_status = rot_engine.get_quota_status(target_acc_quota, model_key=model_key)
-    quota_rem = target_status.fraction if target_status is not None else None
-
-    return RotationResult(
-        success=True,
-        previous_account=previous_account,
-        new_account=target_account,
-        model=model,
-        message=f"Successfully rotated to '{target_account}' for model '{model}'.",
-        quota_remaining=quota_rem,
-        reloaded_server=server_reloaded,
-        active_account=target_account,
-    )
+        return rotation_res
 
 
 def switch_account(
@@ -481,6 +639,8 @@ __all__ = [
     "auto_rotate_on_exhaustion",
     "switch_account",
     "get_fleet_quota_summary",
+    "handle_soft_import_rotation",
+    "FALLBACK_MISSING_SWITCHER_MESSAGE",
     "AccountInfo",
     "RotationResult",
     "FleetQuotaSummary",
