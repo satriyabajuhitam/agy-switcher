@@ -221,6 +221,7 @@ class TestModularArchitectureDAG(unittest.TestCase):
             "datetime",
             "functools",
             "glob",
+            "gzip",
             "hashlib",
             "importlib",
             "io",
