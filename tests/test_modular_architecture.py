@@ -273,23 +273,25 @@ class TestModularArchitectureDAG(unittest.TestCase):
                             f"{file_path.name} imports external non-stdlib dependency from: {node.module}",
                         )
 
-        # [REQ-1-ERR-002] Verify pyproject.toml declares zero external dependencies if present
+        # [REQ-1-ERR-002] Verify pyproject.toml declares zero external dependencies
         pyproject_path = REPO_ROOT / "pyproject.toml"
-        if pyproject_path.exists():
-            import tomllib
-            data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
-            deps = data.get("project", {}).get("dependencies", [])
-            self.assertEqual(
-                deps,
-                [],
-                f"Prohibited external pip dependency declared in pyproject.toml: {deps}",
-            )
+        self.assertTrue(pyproject_path.is_file(), "pyproject.toml must exist at repo root")
+        import tomllib
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        deps = data.get("project", {}).get("dependencies", [])
+        self.assertEqual(
+            deps,
+            [],
+            f"Prohibited external pip dependency declared in pyproject.toml: {deps}",
+        )
 
-    def test_module_layers_mapping_contains_all_twelve_submodules(self):
-        """Verifies MODULE_LAYERS contains all 12 internal submodules and mappings."""
+    def test_module_layers_mapping_contains_all_submodules(self):
+        """Verifies MODULE_LAYERS contains all internal submodules and mappings."""
         self.assertEqual(MODULE_LAYERS.get("agy_switcher.security"), 0)
         self.assertEqual(MODULE_LAYERS.get("agy_switcher.presence"), 2)
-        expected_twelve_submodules = [
+        self.assertEqual(MODULE_LAYERS.get("agy_switcher.api"), 4)
+        self.assertEqual(MODULE_LAYERS.get("agy_switcher.cli"), 4)
+        expected_submodules = [
             "agy_switcher.exceptions",
             "agy_switcher.models",
             "agy_switcher.security",
@@ -302,9 +304,111 @@ class TestModularArchitectureDAG(unittest.TestCase):
             "agy_switcher.watcher",
             "agy_switcher.presence",
             "agy_switcher.hook",
+            "agy_switcher.cli",
+            "agy_switcher.api",
         ]
-        for submod in expected_twelve_submodules:
+        for submod in expected_submodules:
             self.assertIn(submod, MODULE_LAYERS, f"Missing sub-module in MODULE_LAYERS: {submod}")
+
+    def test_api_facade_layer_4_dag_and_imports(self):
+        """[REQ-1-ERR-002] Register api.py at Layer 4 of 5-Layer DAG (zero upward imports, strictly imports Layers 0, 1, 2)."""
+        # 1. Verify Layer 4 registrations
+        self.assertEqual(MODULE_LAYERS.get("agy_switcher.api"), 4)
+        self.assertEqual(PACKAGE_LAYER_MAP.get("api.py"), 4)
+        self.assertEqual(MODULE_NAME_TO_LAYER.get("api"), 4)
+
+        # 2. AST analysis of api.py
+        api_path = PACKAGE_DIR / "api.py"
+        self.assertTrue(api_path.is_file(), "scripts/agy_switcher/api.py must exist")
+        tree = ast.parse(api_path.read_text(encoding="utf-8"), filename=str(api_path))
+
+        imported_internal_submodules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(
+                        alias.name in ("agy_switch", "watch") or alias.name.startswith(("agy_switch.", "watch.")),
+                        f"api.py imports root launcher '{alias.name}' at module level!",
+                    )
+                    if alias.name.startswith("agy_switcher."):
+                        imported_internal_submodules.add(alias.name.split(".")[1])
+            elif isinstance(node, ast.ImportFrom):
+                mod_name = node.module or ""
+                self.assertFalse(
+                    mod_name in ("agy_switch", "watch") or mod_name.startswith(("agy_switch.", "watch.")),
+                    f"api.py imports from root launcher '{mod_name}' at module level!",
+                )
+                if mod_name.startswith("agy_switcher."):
+                    imported_internal_submodules.add(mod_name.split(".")[1])
+                elif mod_name == "agy_switcher":
+                    for alias in node.names:
+                        imported_internal_submodules.add(alias.name)
+
+        # 3. Assert zero upward imports and strictly imports Layers 0, 1, 2 (no Layer 3 or Layer 4)
+        self.assertTrue(len(imported_internal_submodules) > 0, "api.py should import internal submodules")
+        for submod in imported_internal_submodules:
+            layer = MODULE_NAME_TO_LAYER.get(submod)
+            self.assertIsNotNone(layer, f"Unregistered sub-module imported by api.py: {submod}")
+            self.assertIn(
+                layer,
+                (0, 1, 2),
+                f"DAG violation: api.py (Layer 4) imports {submod} (Layer {layer}), but strictly requires Layers 0, 1, 2",
+            )
+            self.assertNotIn(submod, ("cli", "hook", "watch", "agy_switch"))
+
+    def test_vault_standard_library_imports(self):
+        """[REQ-1-ERR-002] vault.py imports standard library modules including tarfile and hashlib."""
+        vault_path = PACKAGE_DIR / "vault.py"
+        self.assertTrue(vault_path.is_file(), "scripts/agy_switcher/vault.py must exist")
+        tree = ast.parse(vault_path.read_text(encoding="utf-8"), filename=str(vault_path))
+
+        imported_modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_modules.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    imported_modules.add(node.module.split(".")[0])
+
+        self.assertIn("tarfile", imported_modules, "vault.py must import stdlib tarfile for bundle migration")
+        self.assertIn("hashlib", imported_modules, "vault.py must import stdlib hashlib for sha256 checksums")
+
+    def test_pyproject_and_install_sh_compatibility(self):
+        """[REQ-1-ERR-002, REQ-1-SCN-005] Assert pyproject.toml has zero external dependencies and install.sh compatibility."""
+        pyproject_path = REPO_ROOT / "pyproject.toml"
+        self.assertTrue(pyproject_path.is_file(), "pyproject.toml must exist at repo root")
+
+        import tomllib
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+
+        deps = data.get("project", {}).get("dependencies", [])
+        self.assertEqual(deps, [], f"pyproject.toml declared prohibited external dependencies: {deps}")
+        optional_deps = data.get("project", {}).get("optional-dependencies", {})
+        for extra, extra_deps in optional_deps.items():
+            self.assertEqual(extra_deps, [], f"optional dependency group '{extra}' must not declare external packages")
+
+        scripts = data.get("project", {}).get("scripts", {})
+        self.assertEqual(scripts.get("agy-switch"), "agy_switcher.cli:main")
+
+        install_script = REPO_ROOT / "install.sh"
+        self.assertTrue(install_script.is_file(), "install.sh must exist at repository root")
+        self.assertTrue(os.access(install_script, os.X_OK), "install.sh must be executable")
+
+        res = subprocess.run(
+            ["bash", str(install_script), "--help"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(res.returncode, 0, f"install.sh --help failed with stderr: {res.stderr}")
+        self.assertIn("Usage:", res.stdout)
+        self.assertIn("install.sh", res.stdout)
+
+        launcher_path = SCRIPTS_DIR / "agy_switch.py"
+        self.assertTrue(launcher_path.is_file(), "scripts/agy_switch.py must exist")
+        self.assertTrue(os.access(launcher_path, os.X_OK), "scripts/agy_switch.py must be executable")
 
 
 class TestSubprocessNamespaceIsolation(unittest.TestCase):
@@ -441,6 +545,23 @@ class TestSubprocessNamespaceIsolation(unittest.TestCase):
             "assert 'agy_switcher.doctor' not in sys.modules; "
             "assert 'agy_switcher.cli' not in sys.modules; "
             "assert 'agy_switch' not in sys.modules; "
+            "print('OK')",
+        ]
+        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, f"Stderr: {res.stderr}")
+        self.assertIn("OK", res.stdout)
+
+    def test_api_isolated_import(self):
+        """Importing api does not load cli, hook, agy_switch, or watch into sys.modules."""
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "import agy_switcher.api; "
+            "assert 'agy_switcher.cli' not in sys.modules, 'cli leaked into sys.modules'; "
+            "assert 'agy_switcher.hook' not in sys.modules, 'hook leaked into sys.modules'; "
+            "assert 'agy_switch' not in sys.modules, 'agy_switch leaked into sys.modules'; "
+            "assert 'watch' not in sys.modules, 'watch leaked into sys.modules'; "
             "print('OK')",
         ]
         res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10)
@@ -608,6 +729,7 @@ class TestCLIDispatcher(unittest.TestCase):
             "hook",
             "hook-pre-invocation",
             "watch",
+            "vault",
             "internal-probe",
         ]
         for cmd in expected_commands:
