@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 _LAYER_TO_CATEGORY: dict[int, str] = {
@@ -144,9 +145,79 @@ class EvaluationCandidate:
     reset_delta: float
 
 
+@dataclass
+class AccountInfo:
+    """Represents public metadata and status for a registered vault account."""
+
+    name: str
+    email: str | None = None
+    is_active: bool = False
+    token_path: Path | str | None = None
+    status: str = "standby"  # "active", "standby", "exhausted", "corrupt", "none"
+
+    def to_dict(self) -> dict[str, Any]:
+        str_token_path = str(self.token_path).strip() if self.token_path is not None else None
+        if str_token_path in ("", "."):
+            str_token_path = None
+        return {
+            "name": self.name,
+            "email": self.email,
+            "is_active": self.is_active,
+            "token_path": str_token_path,
+            "status": self.status,
+        }
+
+
+@dataclass
+class RotationResult:
+    """Represents the outcome of an automated or programmatic account rotation."""
+
+    success: bool
+    previous_account: str | None
+    new_account: str | None
+    model: str
+    message: str
+    quota_remaining: float | None = None
+    reloaded_server: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "previous_account": self.previous_account,
+            "new_account": self.new_account,
+            "model": self.model,
+            "message": self.message,
+            "quota_remaining": self.quota_remaining,
+            "reloaded_server": self.reloaded_server,
+        }
+
+
+@dataclass
+class FleetQuotaSummary:
+    """Represents aggregated fleet-wide quota status across all accounts."""
+
+    total_accounts: int
+    active_account: str | None
+    accounts: dict[str, dict[str, Any]]
+    model: str
+    timestamp: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_accounts": self.total_accounts,
+            "active_account": self.active_account,
+            "accounts": dict(self.accounts),
+            "model": self.model,
+            "timestamp": self.timestamp,
+        }
+
+
 __all__ = [
     "DiagnosticItem",
     "DiagnosticReport",
     "QuotaStatus",
     "EvaluationCandidate",
+    "AccountInfo",
+    "RotationResult",
+    "FleetQuotaSummary",
 ]

@@ -62,6 +62,7 @@ MODULE_LAYERS: dict[str, int] = {
     "agy_switcher.hook": 3,
     # Layer 4: Presentation & Dispatch
     "agy_switcher.cli": 4,
+    "agy_switcher.api": 4,
 }
 
 PACKAGE_LAYER_MAP: dict[str, int] = {
@@ -83,6 +84,7 @@ PACKAGE_LAYER_MAP: dict[str, int] = {
     "hook.py": 3,
     # Layer 4: Presentation & Dispatch
     "cli.py": 4,
+    "api.py": 4,
     "__init__.py": 4,
 }
 
@@ -105,6 +107,7 @@ MODULE_NAME_TO_LAYER: dict[str, int] = {
     "presence": 2,
     "hook": 3,
     "cli": 4,
+    "api": 4,
 }
 
 
