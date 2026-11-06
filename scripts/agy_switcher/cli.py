@@ -35,6 +35,7 @@ from agy_switcher.models import DiagnosticItem, DiagnosticReport, QuotaStatus
 from agy_switcher.telemetry import (
     DEFAULT_CLIENT_ID,
     QuotaClient,
+    build_oauth_url,
     fetch_all_accounts_quota,
     normalize_model_name,
     run_quota_pipeline,
@@ -311,43 +312,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _account_exists(engine: Any, alias: str) -> bool:
+def _account_exists(engine: AgySwitchEngine, alias: str) -> bool:
     """Checks whether an account alias already exists in the vault."""
-    if hasattr(engine, "has_account") and callable(engine.has_account):
-        res = engine.has_account(alias)
-        if isinstance(res, bool):
-            return res
-    if hasattr(engine, "vault") and hasattr(engine.vault, "has_account") and callable(engine.vault.has_account):
-        res = engine.vault.has_account(alias)
-        if isinstance(res, bool):
-            return res
-    if hasattr(engine, "accounts_dir") and isinstance(getattr(engine, "accounts_dir", None), Path):
-        return (engine.accounts_dir / alias).is_dir()
-    if hasattr(engine, "list_accounts") and callable(engine.list_accounts):
-        try:
-            accounts_data = engine.list_accounts()
-            if isinstance(accounts_data, dict):
-                for acc in accounts_data.get("accounts", []):
-                    if isinstance(acc, dict) and acc.get("name") == alias:
-                        return True
-                    elif isinstance(acc, str) and acc == alias:
-                        return True
-        except Exception:
-            pass
-    return False
+    return bool(engine.has_account(alias))
 
 
 def _get_default_oauth_url() -> str:
     """Constructs default Google OAuth authorization URL for headless login."""
-    params = urllib.parse.urlencode({
-        "client_id": DEFAULT_CLIENT_ID,
-        "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-        "response_type": "code",
-        "scope": "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform",
-        "access_type": "offline",
-        "prompt": "consent",
-    })
-    return f"https://accounts.google.com/o/oauth2/auth?{params}"
+    return build_oauth_url(DEFAULT_CLIENT_ID)
 
 
 def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:

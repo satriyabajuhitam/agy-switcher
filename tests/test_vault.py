@@ -275,6 +275,42 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertIn("timed out", msg)
         self.assertFalse((self.vault_dir / "accounts" / "remote_acc").exists())
 
+    def test_login_headless_prompt_fn_and_named_params(self) -> None:
+        """Verifies prompt_fn invocation and name/code named parameter fallback."""
+        def mock_popen(args: list[str], **kwargs: object) -> MockSubprocess:
+            env = kwargs.get("env")
+            assert isinstance(env, dict)
+            temp_home = Path(env["HOME"])
+            return MockSubprocess(temp_home=temp_home, should_succeed=True)
+
+        prompt_called = []
+        def custom_prompt(msg: str) -> str:
+            prompt_called.append(msg)
+            return "4/0AWgav-prompt-code"
+
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", side_effect=mock_popen):
+            success, msg = self.engine.login_headless(
+                alias="prompt_acc",
+                prompt_fn=custom_prompt,
+            )
+            self.assertTrue(success, f"login_headless failed: {msg}")
+            self.assertEqual(prompt_called, ["Enter authorization code: "])
+
+            success2, msg2 = self.engine.login_headless(
+                name="named_acc",
+                code="4/0AWgav-named-code",
+            )
+            self.assertTrue(success2, f"login_headless with name/code failed: {msg2}")
+
+    def test_get_oauth_url_and_vault_structure(self) -> None:
+        """Verifies get_oauth_url contains DEFAULT_CLIENT_ID and engine does not retain redundant self.vault."""
+        from agy_switcher.telemetry import DEFAULT_CLIENT_ID
+        oauth_url = self.engine.get_oauth_url()
+        self.assertIn(DEFAULT_CLIENT_ID, oauth_url)
+        self.assertIn("accounts.google.com/o/oauth2/auth", oauth_url)
+        self.assertFalse(hasattr(self.engine, "vault"))
+
 
 if __name__ == "__main__":
     unittest.main()

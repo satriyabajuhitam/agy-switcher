@@ -28,7 +28,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Any
+from typing import Any, Callable
 import urllib.parse
 
 from agy_switcher.exceptions import (
@@ -48,7 +48,9 @@ from agy_switcher.security import (
 )
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.telemetry import (
+    DEFAULT_CLIENT_ID,
     _parse_timestamp_defensive,
+    build_oauth_url,
     normalize_model_name,
 )
 from agy_switcher.doctor import DoctorEngine
@@ -86,7 +88,6 @@ class AgySwitchEngine:
 
         self.supervisor = ProcessSupervisor(gemini_dir=self._gemini_dir, proc_dir=self._proc_dir)
         self.doctor = DoctorEngine(engine=self)
-        self.vault = self
 
         self.init_vault()
 
@@ -848,7 +849,7 @@ class AgySwitchEngine:
         agy_binary: str | None = None,
         timeout: int = 600,
         force: bool = False,
-        prompt_fn: Any | None = None,
+        prompt_fn: Callable[[str], str] | None = None,
     ) -> dict[str, Any]:
         """Authenticates a new account via isolated agy CLI sandbox and saves to vault as Standby."""
         clean_name = name.strip()
@@ -937,15 +938,16 @@ class AgySwitchEngine:
         force: bool = False,
         agy_binary: str | None = None,
         timeout: float = 600.0,
-        prompt_fn: Any | None = None,
-        **kwargs: Any,
+        prompt_fn: Callable[[str], str] | None = None,
+        name: str | None = None,
+        code: str | None = None,
     ) -> tuple[bool, str]:
         """Performs headless OAuth token exchange, saving credentials to vault with 0600 mode.
 
         Supports non-interactive code injection and interactive stdin/prompt fallback.
         Returns tuple[bool, str] representing (success, message).
         """
-        raw_alias = alias or kwargs.get("name") or ""
+        raw_alias = alias or name or ""
         try:
             clean_alias = self.validate_account_alias(raw_alias)
         except AgySwitchError as exc:
@@ -953,7 +955,7 @@ class AgySwitchEngine:
         except Exception as exc:
             return False, f"Invalid account alias: {exc}"
 
-        raw_code = auth_code if auth_code is not None else kwargs.get("code")
+        raw_code = auth_code if auth_code is not None else code
         if raw_code is None:
             if prompt_fn is not None:
                 try:
@@ -1091,15 +1093,7 @@ class AgySwitchEngine:
 
     def get_oauth_url(self) -> str:
         """Returns the Google OAuth 2.0 authorization URL for headless login."""
-        params = urllib.parse.urlencode({
-            "client_id": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-            "response_type": "code",
-            "scope": "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform",
-            "access_type": "offline",
-            "prompt": "consent",
-        })
-        return f"https://accounts.google.com/o/oauth2/auth?{params}"
+        return build_oauth_url(DEFAULT_CLIENT_ID)
 
     def locate_language_server_pid(self) -> int | None:
         """Finds running language_server PID by scanning /proc or pgrep."""
@@ -1471,7 +1465,6 @@ class AgySwitchEngine:
         try:
             self.accounts_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
 
-            # Write regular account files (excluding root active and config.json)
             for rel_name, content in verified_payloads.items():
                 if rel_name in ("active", "config.json"):
                     continue
@@ -1490,7 +1483,6 @@ class AgySwitchEngine:
                 target_path.write_bytes(content)
                 os.chmod(target_path, 0o600)
 
-            # Ensure all imported account directories have 0700 permissions
             for acc_name in imported_account_names:
                 acc_dir = self.accounts_dir / acc_name
                 if not acc_dir.exists():
@@ -1498,13 +1490,11 @@ class AgySwitchEngine:
                     created_dirs.append(acc_dir)
                 os.chmod(acc_dir, 0o700)
 
-            # If merge is False, clear existing accounts not in bundle
             if not merge and self.accounts_dir.is_dir():
                 for existing_acc in sorted(self.accounts_dir.iterdir()):
                     if existing_acc.is_dir() and existing_acc.name not in imported_account_names:
                         shutil.rmtree(existing_acc)
 
-            # Restore active account pointer
             bundle_active = manifest_data.get("active_account")
             if not bundle_active and "active" in verified_payloads:
                 bundle_active = verified_payloads["active"].decode("utf-8").strip()
@@ -1525,7 +1515,6 @@ class AgySwitchEngine:
                     overwritten_files[self.active_file] = self.active_file.read_bytes()
                 self.set_active_name(bundle_active)
 
-            # Restore config.json if present
             if "config.json" in verified_payloads:
                 if force or not merge or not self.config_file.is_file():
                     if self.config_file.is_file():

@@ -1392,6 +1392,23 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(ret, 0)
             self.assertTrue(nested_bundle.is_file())
 
+    def test_account_exists_and_oauth_helpers(self):
+        """Verifies _account_exists delegates directly to engine.has_account and _get_default_oauth_url uses centralized builder."""
+        from agy_switcher.cli import _account_exists, _get_default_oauth_url
+        from agy_switcher.telemetry import DEFAULT_CLIENT_ID
+
+        mock_engine = MagicMock(spec=AgySwitchEngine)
+        mock_engine.has_account.return_value = True
+        self.assertTrue(_account_exists(mock_engine, "active_user"))
+        mock_engine.has_account.assert_called_once_with("active_user")
+
+        mock_engine.has_account.return_value = False
+        self.assertFalse(_account_exists(mock_engine, "nonexistent"))
+
+        url = _get_default_oauth_url()
+        self.assertIn(DEFAULT_CLIENT_ID, url)
+        self.assertIn("accounts.google.com/o/oauth2/auth", url)
+
 
 if __name__ == '__main__':
     unittest.main()
