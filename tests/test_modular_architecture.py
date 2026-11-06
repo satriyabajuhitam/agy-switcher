@@ -235,6 +235,7 @@ class TestModularArchitectureDAG(unittest.TestCase):
             "tempfile",
             "threading",
             "time",
+            "tomllib",
             "typing",
             "unittest",
             "urllib",
@@ -265,6 +266,18 @@ class TestModularArchitectureDAG(unittest.TestCase):
                             allowed_stdlib,
                             f"{file_path.name} imports external non-stdlib dependency from: {node.module}",
                         )
+
+        # [REQ-1-ERR-002] Verify pyproject.toml declares zero external dependencies if present
+        pyproject_path = REPO_ROOT / "pyproject.toml"
+        if pyproject_path.exists():
+            import tomllib
+            data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+            deps = data.get("project", {}).get("dependencies", [])
+            self.assertEqual(
+                deps,
+                [],
+                f"Prohibited external pip dependency declared in pyproject.toml: {deps}",
+            )
 
     def test_module_layers_mapping_contains_all_twelve_submodules(self):
         """Verifies MODULE_LAYERS contains all 12 internal submodules and mappings."""
