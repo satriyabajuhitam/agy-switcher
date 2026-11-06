@@ -91,6 +91,7 @@ _EXPORTS: dict[str, str] = {
     "get_active_account": "agy_switcher.api",
     "auto_rotate_on_exhaustion": "agy_switcher.api",
     "switch_account": "agy_switcher.api",
+    "get_fleet_quota_summary": "agy_switcher.api",
     "build_parser": "agy_switcher.cli",
     "main": "agy_switcher.cli",
 }

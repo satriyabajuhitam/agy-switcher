@@ -664,6 +664,295 @@ class TestSDKFacade(unittest.TestCase):
             self.assertTrue(res)
             self.assertEqual(self.engine.get_active_name(), "no_srv_acc")
 
+    def test_get_fleet_quota_summary_populated(self) -> None:
+        """[REQ-2-SCN-008] get_fleet_quota_summary returns populated FleetQuotaSummary with cached telemetry."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        acc2_dir = self.engine.accounts_dir / "acc2"
+        acc2_dir.mkdir(parents=True, exist_ok=True)
+        (acc2_dir / "token.json").write_text(json.dumps(create_sample_token("acc2@example.com")), encoding="utf-8")
+
+        self.engine.set_active_name("acc1")
+
+        cache_ts = 1700000000.0
+        cache_data = {
+            "timestamp": cache_ts,
+            "accounts": {
+                "acc1": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 80, "reset_time": 1700003600},
+                    "claude": {"quota": 60, "reset_time": 1700003600},
+                },
+                "acc2": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 45, "reset_time": 1700003600},
+                    "claude": {"quota": 90, "reset_time": 1700003600},
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(model="all", engine=self.engine)
+
+        self.assertIsInstance(summary, FleetQuotaSummary)
+        self.assertEqual(summary.total_accounts, 2)
+        self.assertEqual(summary.active_account, "acc1")
+        self.assertEqual(summary.model, "all")
+        self.assertEqual(summary.timestamp, cache_ts)
+        self.assertIn("acc1", summary.accounts)
+        self.assertIn("acc2", summary.accounts)
+        self.assertEqual(summary.accounts["acc1"]["gemini"]["quota"], 80)
+        self.assertEqual(summary.accounts["acc2"]["claude"]["quota"], 90)
+
+    def test_get_fleet_quota_summary_model_filtering(self) -> None:
+        """[REQ-2-SCN-008] get_fleet_quota_summary with model='gemini' extracts gemini quota details."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        self.engine.set_active_name("acc1")
+
+        cache_ts = 1700000500.0
+        cache_data = {
+            "timestamp": cache_ts,
+            "accounts": {
+                "acc1": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 75, "reset_time": 1700003600},
+                    "claude": {"quota": 20, "reset_time": 1700003600},
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+
+        self.assertIsInstance(summary, FleetQuotaSummary)
+        self.assertEqual(summary.total_accounts, 1)
+        self.assertEqual(summary.active_account, "acc1")
+        self.assertEqual(summary.model, "gemini")
+        self.assertEqual(summary.timestamp, cache_ts)
+        self.assertIn("acc1", summary.accounts)
+        # Verify both direct quota key and gemini container key are populated
+        self.assertEqual(summary.accounts["acc1"]["quota"], 75)
+        self.assertEqual(summary.accounts["acc1"]["gemini"]["quota"], 75)
+
+    def test_get_fleet_quota_summary_network_outage_fallback(self) -> None:
+        """[REQ-2-EDGE-002] Telemetry network outage falls back to cached quota with timestamp preserved."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        self.engine.set_active_name("acc1")
+
+        cache_ts = 1699999999.0
+        cache_data = {
+            "timestamp": cache_ts,
+            "accounts": {
+                "acc1": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 65, "reset_time": 1700003600},
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        import email.message
+        import urllib.error
+        hdrs = email.message.Message()
+        with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("https://daily-cloudcode-pa.googleapis.com", 503, "Service Unavailable", hdrs, None)):
+            summary = api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+
+        self.assertIsInstance(summary, FleetQuotaSummary)
+        self.assertEqual(summary.total_accounts, 1)
+        self.assertEqual(summary.active_account, "acc1")
+        self.assertEqual(summary.timestamp, cache_ts)
+        self.assertEqual(summary.accounts["acc1"]["quota"], 65)
+
+    def test_get_fleet_quota_summary_empty_vault_and_missing_cache(self) -> None:
+        """get_fleet_quota_summary handles empty vault and missing cache file cleanly."""
+        summary = api.get_fleet_quota_summary(engine=self.engine)
+        self.assertIsInstance(summary, FleetQuotaSummary)
+        self.assertEqual(summary.total_accounts, 0)
+        self.assertIsNone(summary.active_account)
+        self.assertEqual(summary.accounts, {})
+        self.assertEqual(summary.model, "all")
+        self.assertGreater(summary.timestamp, 0.0)
+
+    def test_get_fleet_quota_summary_corrupted_cache(self) -> None:
+        """get_fleet_quota_summary handles corrupted JSON cache without crashing."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+        self.engine.set_active_name("acc1")
+
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text("CORRUPTED NOT JSON {{{", encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(engine=self.engine)
+        self.assertIsInstance(summary, FleetQuotaSummary)
+        self.assertEqual(summary.total_accounts, 1)
+        self.assertEqual(summary.active_account, "acc1")
+        self.assertEqual(summary.accounts, {"acc1": {}})
+        self.assertGreater(summary.timestamp, 0.0)
+
+    def test_get_fleet_quota_summary_dangling_active_pointer(self) -> None:
+        """Dangling active pointer file resolved safely to active_account=None."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        self.engine.active_file.write_text("deleted_acc\n", encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(engine=self.engine)
+        self.assertIsNone(summary.active_account)
+        self.assertEqual(summary.total_accounts, 1)
+
+    def test_get_fleet_quota_summary_path_traversal_active_pointer(self) -> None:
+        """Path traversal string in active file safely rejected to active_account=None."""
+        self.engine.active_file.write_text("../../etc\n", encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(engine=self.engine)
+        self.assertIsNone(summary.active_account)
+
+    def test_get_fleet_quota_summary_model_filtering_excludes_other_models(self) -> None:
+        """Model filtering for claude does not leak gemini quota when claude is absent."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1700000000.0,
+                    "gemini": {"quota": 80, "reset_time": 1700003600},
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(model="claude", engine=self.engine)
+        self.assertIn("acc1", summary.accounts)
+        self.assertNotIn("gemini", summary.accounts["acc1"])
+        self.assertNotIn("quota", summary.accounts["acc1"])
+        self.assertEqual(summary.model, "claude")
+
+    def test_get_fleet_quota_summary_per_account_cache_fallback(self) -> None:
+        """Per-account directory last_known_quota.json is used when central cache is missing entry."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        per_acc_cache = acc1_dir / "last_known_quota.json"
+        per_acc_cache.write_text(
+            json.dumps({"gemini": {"quota": 95, "reset_time": 1700003600}}),
+            encoding="utf-8",
+        )
+
+        summary = api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+        self.assertIn("acc1", summary.accounts)
+        self.assertEqual(summary.accounts["acc1"]["gemini"]["quota"], 95)
+
+    def test_get_fleet_quota_summary_cloudcode_raw_groups(self) -> None:
+        """CloudCode raw groups schema parsed properly during model-filtered fleet summary."""
+        acc1_dir = self.engine.accounts_dir / "acc1"
+        acc1_dir.mkdir(parents=True, exist_ok=True)
+        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
+
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "acc1": {
+                    "cached_at": 1700000000.0,
+                    "groups": [
+                        {
+                            "displayName": "Gemini 1.5 Pro",
+                            "buckets": [
+                                {
+                                    "remainingFraction": 0.65,
+                                    "resetTime": "2026-11-06T12:00:00Z",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+        self.assertIn("acc1", summary.accounts)
+        self.assertEqual(summary.accounts["acc1"]["quota"], 65)
+
+    def test_get_fleet_quota_summary_empty_or_none_model_defaults_all(self) -> None:
+        """None or whitespace model defaults cleanly to 'all'."""
+        summary1 = api.get_fleet_quota_summary(model=None, engine=self.engine)  # type: ignore[arg-type]
+        self.assertEqual(summary1.model, "all")
+
+        summary2 = api.get_fleet_quota_summary(model="   ", engine=self.engine)
+        self.assertEqual(summary2.model, "all")
+
+    def test_get_fleet_quota_summary_nan_or_inf_timestamp_resilience(self) -> None:
+        """NaN or infinite cache timestamp gracefully falls back to current POSIX time."""
+        import math
+        cache_data = {"timestamp": float("nan"), "accounts": {}}
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        summary = api.get_fleet_quota_summary(engine=self.engine)
+        self.assertTrue(math.isfinite(summary.timestamp))
+        self.assertGreater(summary.timestamp, 0.0)
+
+    def test_top_level_package_exports_and_parity(self) -> None:
+        """[REQ-2-SCN-007] Top-level agy_switcher package and agy_switch launcher re-export all api symbols with 100% parity."""
+        import agy_switcher
+
+        expected_symbols = [
+            "get_active_account",
+            "auto_rotate_on_exhaustion",
+            "switch_account",
+            "get_fleet_quota_summary",
+            "AccountInfo",
+            "RotationResult",
+            "FleetQuotaSummary",
+        ]
+
+        # Verify api module has all symbols
+        for sym in expected_symbols:
+            self.assertTrue(hasattr(api, sym), f"api module missing symbol: {sym}")
+            self.assertIn(sym, api.__all__, f"api.__all__ missing symbol: {sym}")
+
+        # Verify agy_switcher package re-exports
+        self.assertIs(agy_switcher.AccountInfo, AccountInfo)
+        self.assertIs(agy_switcher.RotationResult, RotationResult)
+        self.assertIs(agy_switcher.FleetQuotaSummary, FleetQuotaSummary)
+        self.assertIs(agy_switcher.get_active_account, api.get_active_account)
+        self.assertIs(agy_switcher.auto_rotate_on_exhaustion, api.auto_rotate_on_exhaustion)
+        self.assertIs(agy_switcher.switch_account, api.switch_account)
+        self.assertIs(agy_switcher.get_fleet_quota_summary, api.get_fleet_quota_summary)
+        for sym in expected_symbols:
+            self.assertIn(sym, agy_switcher.__all__, f"agy_switcher.__all__ missing symbol: {sym}")
+
+        # Verify agy_switch launcher re-exports
+        import agy_switch
+        self.assertIs(agy_switch.AccountInfo, AccountInfo)
+        self.assertIs(agy_switch.RotationResult, RotationResult)
+        self.assertIs(agy_switch.FleetQuotaSummary, FleetQuotaSummary)
+        self.assertIs(agy_switch.get_active_account, api.get_active_account)
+        self.assertIs(agy_switch.auto_rotate_on_exhaustion, api.auto_rotate_on_exhaustion)
+        self.assertIs(agy_switch.switch_account, api.switch_account)
+        self.assertIs(agy_switch.get_fleet_quota_summary, api.get_fleet_quota_summary)
+        for sym in expected_symbols:
+            self.assertIn(sym, agy_switch.__all__, f"agy_switch.__all__ missing symbol: {sym}")
+
 
 class TestSDKModels(unittest.TestCase):
     """Tests for SDK dataclasses in agy_switcher.models."""
@@ -753,22 +1042,8 @@ class TestSDKModels(unittest.TestCase):
         info_str = AccountInfo(name="acc", token_path="/var/token.json")
         self.assertEqual(info_str.to_dict()["token_path"], "/var/token.json")
 
-    def test_top_level_package_exports_and_parity(self) -> None:
-        """Top-level agy_switcher package re-exports models and api facade correctly."""
-        import agy_switcher
-
-        self.assertIs(agy_switcher.AccountInfo, AccountInfo)
-        self.assertIs(agy_switcher.RotationResult, RotationResult)
-        self.assertIs(agy_switcher.FleetQuotaSummary, FleetQuotaSummary)
-        self.assertIs(agy_switcher.get_active_account, api.get_active_account)
-        self.assertIs(agy_switcher.auto_rotate_on_exhaustion, api.auto_rotate_on_exhaustion)
-        self.assertIs(agy_switcher.switch_account, api.switch_account)
-
-        import agy_switch
-        self.assertIs(agy_switch.get_active_account, api.get_active_account)
-        self.assertIs(agy_switch.auto_rotate_on_exhaustion, api.auto_rotate_on_exhaustion)
-        self.assertIs(agy_switch.switch_account, api.switch_account)
-
 
 if __name__ == "__main__":
     unittest.main()
+
+

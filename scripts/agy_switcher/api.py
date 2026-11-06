@@ -12,7 +12,9 @@ and Layer 2 (vault, rotation).
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
+import time
 from typing import Any
 
 from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError
@@ -290,11 +292,197 @@ def switch_account(
     return True
 
 
+def get_fleet_quota_summary(
+    model: str = "all",
+    engine: AgySwitchEngine | None = None,
+    refresh: bool = False,
+) -> FleetQuotaSummary:
+    """Returns aggregated quota telemetry for all registered vault accounts.
+
+    Queries cached quota telemetry without blocking and handles offline state gracefully.
+    Preserves cache timestamp from last_known_quota.json.
+
+    Args:
+        model: Model family to filter ("all", "gemini", "claude"). Defaults to "all".
+        engine: Optional AgySwitchEngine instance for dependency injection.
+        refresh: If True, attempts to trigger background quota fetch before reading cache.
+
+    Returns:
+        FleetQuotaSummary dataclass containing fleet capacity and quota distributions.
+    """
+    resolved_model = model.strip() if (isinstance(model, str) and model.strip()) else "all"
+
+    if engine is None:
+        try:
+            engine = AgySwitchEngine()
+        except Exception:
+            return FleetQuotaSummary(
+                total_accounts=0,
+                active_account=None,
+                accounts={},
+                model=resolved_model,
+                timestamp=time.time(),
+            )
+
+    active_name: str | None = None
+    try:
+        raw_active = engine.get_active_name()
+        if raw_active and isinstance(raw_active, str) and raw_active.strip():
+            clean_active = raw_active.strip()
+            if not ("/" in clean_active or "\\" in clean_active or ".." in clean_active or clean_active in (".", "..")):
+                acc_dir = engine.accounts_dir / clean_active
+                if (
+                    acc_dir.is_dir()
+                    and not acc_dir.is_symlink()
+                    and acc_dir.resolve().parent == engine.accounts_dir.resolve()
+                ):
+                    active_name = clean_active
+    except Exception:
+        active_name = None
+
+    registered_names: list[str] = []
+    try:
+        accounts_data = engine.list_accounts()
+        for acc in accounts_data.get("accounts", []):
+            if isinstance(acc, dict) and "name" in acc:
+                name_str = str(acc["name"]).strip()
+                if name_str and name_str not in registered_names:
+                    registered_names.append(name_str)
+    except Exception:
+        registered_names = []
+
+    if refresh:
+        try:
+            from agy_switcher.telemetry import run_quota_pipeline
+            target_m = resolved_model if resolved_model != "all" else "gemini"
+            run_quota_pipeline(engine=engine, data=engine.list_accounts(), target_model=target_m)
+        except Exception:
+            pass
+
+    cache_data: dict[str, Any] = {}
+    cache_file = getattr(engine, "cache_file", None)
+    if not cache_file and hasattr(engine, "vault_dir"):
+        cache_file = engine.vault_dir / "cache" / "last_known_quota.json"
+
+    if cache_file and isinstance(cache_file, Path) and cache_file.is_file():
+        try:
+            raw_content = cache_file.read_text(encoding="utf-8")
+            parsed = json.loads(raw_content)
+            if isinstance(parsed, dict):
+                cache_data = parsed
+        except Exception:
+            cache_data = {}
+
+    if not cache_data:
+        try:
+            from agy_switcher.telemetry import QuotaClient
+            client = QuotaClient(engine=engine)
+            loaded = client.load_cache()
+            if isinstance(loaded, dict):
+                cache_data = loaded
+        except Exception:
+            pass
+
+    raw_ts = cache_data.get("timestamp") if isinstance(cache_data, dict) else None
+    timestamp: float
+    if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
+        timestamp = float(raw_ts) if (math.isfinite(raw_ts) and raw_ts > 0) else time.time()
+    else:
+        try:
+            parsed_ts = float(raw_ts) if raw_ts is not None else 0.0
+            timestamp = parsed_ts if (math.isfinite(parsed_ts) and parsed_ts > 0) else time.time()
+        except (ValueError, TypeError):
+            timestamp = time.time()
+
+    if isinstance(cache_data.get("accounts"), dict):
+        cached_accounts_map = cache_data["accounts"]
+    else:
+        cached_accounts_map = {
+            k: v for k, v in cache_data.items()
+            if k not in ("timestamp", "cached_at") and isinstance(v, dict)
+        }
+
+    all_names = list(registered_names)
+    for k in cached_accounts_map.keys():
+        if isinstance(k, str) and k.strip() and k not in all_names:
+            all_names.append(k)
+    total_accounts = len(all_names)
+
+    norm_model = resolved_model.strip().lower()
+    if norm_model == "all":
+        target_model_key = None
+    else:
+        try:
+            target_model_key = normalize_model_name(norm_model)
+        except Exception:
+            target_model_key = norm_model
+
+    fleet_accounts: dict[str, dict[str, Any]] = {}
+    for acc_name in all_names:
+        cached_entry = cached_accounts_map.get(acc_name)
+        if not isinstance(cached_entry, dict) or not cached_entry:
+            # Check per-account directory cache fallback
+            try:
+                per_acc_cache = engine.accounts_dir / acc_name / "last_known_quota.json"
+                if per_acc_cache.is_file():
+                    loaded_per_acc = json.loads(per_acc_cache.read_text(encoding="utf-8"))
+                    if isinstance(loaded_per_acc, dict):
+                        cached_entry = loaded_per_acc
+            except Exception:
+                pass
+
+        if not isinstance(cached_entry, dict):
+            fleet_accounts[acc_name] = {}
+            continue
+
+        if target_model_key is None:
+            fleet_accounts[acc_name] = dict(cached_entry)
+        else:
+            acc_dict: dict[str, Any] = {}
+            if target_model_key in cached_entry and isinstance(cached_entry[target_model_key], dict):
+                model_payload = dict(cached_entry[target_model_key])
+                acc_dict.update(model_payload)
+                acc_dict[target_model_key] = model_payload
+            elif "quota" in cached_entry and not isinstance(cached_entry["quota"], dict) and target_model_key == "gemini":
+                acc_dict = dict(cached_entry)
+                acc_dict["gemini"] = dict(cached_entry)
+            elif "groups" in cached_entry and isinstance(cached_entry["groups"], list):
+                try:
+                    rot = RotationEngine(vault_dir=engine.vault_dir, target_model=target_model_key)
+                    st = rot.get_quota_status(cached_entry, model_key=target_model_key)
+                    if st is not None:
+                        payload = {
+                            "quota": st.remaining_percentage(),
+                            "reset_time": st.reset_time.timestamp(),
+                        }
+                        acc_dict.update(payload)
+                        acc_dict[target_model_key] = payload
+                except Exception:
+                    pass
+            else:
+                acc_dict = {}
+
+            if "cached_at" in cached_entry and "cached_at" not in acc_dict:
+                acc_dict["cached_at"] = cached_entry["cached_at"]
+
+            fleet_accounts[acc_name] = acc_dict
+
+    return FleetQuotaSummary(
+        total_accounts=total_accounts,
+        active_account=active_name,
+        accounts=fleet_accounts,
+        model=resolved_model,
+        timestamp=timestamp,
+    )
+
+
 __all__ = [
     "get_active_account",
     "auto_rotate_on_exhaustion",
     "switch_account",
+    "get_fleet_quota_summary",
     "AccountInfo",
     "RotationResult",
     "FleetQuotaSummary",
 ]
+
