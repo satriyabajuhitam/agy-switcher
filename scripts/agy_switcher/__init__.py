@@ -89,6 +89,8 @@ _EXPORTS: dict[str, str] = {
     "handle_pre_invocation_hook": "agy_switcher.hook",
     # Layer 4: Facade & CLI
     "get_active_account": "agy_switcher.api",
+    "auto_rotate_on_exhaustion": "agy_switcher.api",
+    "switch_account": "agy_switcher.api",
     "build_parser": "agy_switcher.cli",
     "main": "agy_switcher.cli",
 }

@@ -132,7 +132,7 @@ from agy_switcher.watcher import (
 from agy_switcher.hook import handle_pre_invocation_hook
 
 # Layer 4: Presentation, Facade & CLI Dispatch
-from agy_switcher.api import get_active_account
+from agy_switcher.api import auto_rotate_on_exhaustion, get_active_account, switch_account
 from agy_switcher.cli import build_parser, main
 
 __all__ = [
@@ -209,6 +209,8 @@ __all__ = [
     "handle_pre_invocation_hook",
     # Layer 4
     "get_active_account",
+    "auto_rotate_on_exhaustion",
+    "switch_account",
     "build_parser",
     "main",
     # Standard library re-exports for backward-compatibility with tests

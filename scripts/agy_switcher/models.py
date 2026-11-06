@@ -173,12 +173,19 @@ class RotationResult:
     """Represents the outcome of an automated or programmatic account rotation."""
 
     success: bool
-    previous_account: str | None
-    new_account: str | None
-    model: str
-    message: str
+    previous_account: str | None = None
+    new_account: str | None = None
+    model: str = ""
+    message: str = ""
     quota_remaining: float | None = None
     reloaded_server: bool = False
+    active_account: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.active_account is None and self.new_account is not None:
+            self.active_account = self.new_account
+        elif self.new_account is None and self.active_account is not None and self.success:
+            self.new_account = self.active_account
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -189,6 +196,7 @@ class RotationResult:
             "message": self.message,
             "quota_remaining": self.quota_remaining,
             "reloaded_server": self.reloaded_server,
+            "active_account": self.active_account,
         }
 
 
