@@ -138,7 +138,7 @@ from agy_switcher.api import (
     get_fleet_quota_summary,
     switch_account,
 )
-from agy_switcher.cli import build_parser, main
+from agy_switcher.cli import build_parser, handle_vault, main
 
 __all__ = [
     # Layer 0
@@ -218,6 +218,7 @@ __all__ = [
     "switch_account",
     "get_fleet_quota_summary",
     "build_parser",
+    "handle_vault",
     "main",
     # Standard library re-exports for backward-compatibility with tests
     "argparse",

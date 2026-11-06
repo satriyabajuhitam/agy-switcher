@@ -286,6 +286,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default cooldown minutes for exhausted accounts (default: 60)",
     )
 
+    # Command: vault
+    vault_parser = subparsers.add_parser("vault", help="Export and import cryptographic vault archives")
+    vault_parser.set_defaults(_subparser=vault_parser)
+    vault_subparsers = vault_parser.add_subparsers(dest="vault_command")
+
+    export_parser = vault_subparsers.add_parser("export", help="Export vault archive to bundle tar.gz")
+    export_parser.add_argument("bundle", nargs="?", default=None, help="Destination path for vault bundle (.tar.gz)")
+    export_parser.add_argument("--bundle", dest="bundle_flag", default=None, help="Destination path for vault bundle (.tar.gz)")
+    export_parser.add_argument("--force", action="store_true", help="Overwrite existing destination bundle file")
+
+    import_parser = vault_subparsers.add_parser("import", help="Import vault archive from bundle tar.gz")
+    import_parser.add_argument("bundle", nargs="?", default=None, help="Source path of vault bundle (.tar.gz)")
+    import_parser.add_argument("--bundle", dest="bundle_flag", default=None, help="Source path of vault bundle (.tar.gz)")
+    import_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force overwrite of existing active account pointer and existing files",
+    )
+
     # Command: internal-probe
     subparsers.add_parser("internal-probe", help=argparse.SUPPRESS)
 
@@ -434,6 +453,77 @@ def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
         return 0
     except AgySwitchError as e:
         print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def _format_cli_error(msg: str) -> str:
+    clean_msg = str(msg).strip()
+    while clean_msg.startswith("Error:") or clean_msg.startswith("[agy-switch]"):
+        if clean_msg.startswith("Error:"):
+            clean_msg = clean_msg[len("Error:"):].strip()
+        elif clean_msg.startswith("[agy-switch]"):
+            clean_msg = clean_msg[len("[agy-switch]"):].strip()
+    return f"Error: [agy-switch] {clean_msg}"
+
+
+def handle_vault(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
+    """Dispatches vault subcommands (export, import) with integrity handling."""
+    action = getattr(args, "vault_command", None)
+    if not action:
+        subparser = getattr(args, "_subparser", None)
+        if subparser is not None:
+            subparser.print_help()
+        return 0
+
+    if action not in ("export", "import"):
+        print(
+            f"Error: [agy-switch] Unknown vault subcommand: '{action}'. Allowed subcommands: export, import.",
+            file=sys.stderr,
+        )
+        return 1
+
+    pos_bundle = getattr(args, "bundle", None)
+    flag_bundle = getattr(args, "bundle_flag", None)
+    if pos_bundle and flag_bundle and pos_bundle != flag_bundle:
+        print(
+            f"Error: [agy-switch] Conflicting bundle paths provided: '{pos_bundle}' and '{flag_bundle}'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    bundle_path = flag_bundle or pos_bundle
+    if not bundle_path or not str(bundle_path).strip():
+        print("Error: [agy-switch] Bundle path must be provided via positional argument or --bundle.", file=sys.stderr)
+        return 1
+
+    bundle_str = str(bundle_path).strip()
+    target = Path(bundle_str).expanduser()
+    if target.is_dir():
+        print(
+            _format_cli_error(f"Bundle path is a directory, not a bundle archive file: {bundle_str}"),
+            file=sys.stderr,
+        )
+        return 1
+
+    force = getattr(args, "force", False)
+
+    try:
+        if action == "export":
+            success, msg = engine.export_vault_bundle(bundle_str, force=force)
+        else:
+            success, msg = engine.import_vault_bundle(bundle_str, force=force)
+
+        if success:
+            print(f"[agy-switch] {msg}")
+            return 0
+
+        print(_format_cli_error(msg), file=sys.stderr)
+        return 1
+    except AgySwitchError as exc:
+        print(_format_cli_error(str(exc)), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(_format_cli_error(str(exc)), file=sys.stderr)
         return 1
 
 
@@ -748,6 +838,13 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
 
     if args.command == "login":
         return handle_login(args, engine)
+
+    if args.command == "vault":
+        vault_fn = _resolve_symbol(
+            "handle_vault",
+            lambda: handle_vault,
+        )
+        return vault_fn(args, engine)
 
     if args.command == "remove":
         try:
