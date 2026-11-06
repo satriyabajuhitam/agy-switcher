@@ -35,3 +35,16 @@ _Avoid_: Terminal OAuth, manual login, non-GUI login
 **Vault Bundle**:
 A compressed archive encapsulating multi-account vault states with restricted POSIX permissions and cryptographic checksum verification for transport.
 _Avoid_: Account export, backup archive, vault package
+
+**Mid-Turn Failover**:
+An automatic credential rotation and subprocess re-execution cycle triggered mid-turn when an inferencing engine reports quota exhaustion (HTTP 429 / RESOURCE_EXHAUSTED), preserving the active conversation context transparently.
+_Avoid_: Turn retry, hot swap, prompt retry
+
+**Fleet Exhaustion**:
+An operational state where all accounts registered within the multi-account vault have exhausted their model quota or remain in active cooldown.
+_Avoid_: All down, zero quota, total burnout
+
+**Panic Event**:
+A high-severity lifecycle signal emitted upon Fleet Exhaustion to record structured failure reflections into persistent memory (`agy-memory`) and notify human operators with estimated reset times.
+_Avoid_: Crash dump, fatal alert, alarm trigger
+
