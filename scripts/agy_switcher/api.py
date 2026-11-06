@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any
@@ -525,10 +526,18 @@ def get_fleet_quota_summary(
     if cache_file and isinstance(cache_file, Path) and cache_file.is_file():
         try:
             raw_content = cache_file.read_text(encoding="utf-8")
-            parsed = json.loads(raw_content)
-            if isinstance(parsed, dict):
-                cache_data = parsed
-        except Exception:
+            if not raw_content.strip():
+                print(f"[agy_switcher.api] Warning: Quota cache file {cache_file} is empty", file=sys.stderr)
+                cache_data = {}
+            else:
+                parsed = json.loads(raw_content)
+                if isinstance(parsed, dict):
+                    cache_data = parsed
+                else:
+                    print(f"[agy_switcher.api] Warning: Quota cache file {cache_file} does not contain a JSON object", file=sys.stderr)
+                    cache_data = {}
+        except Exception as exc:
+            print(f"[agy_switcher.api] Warning: Failed to parse quota cache file {cache_file} (corrupt JSON): {exc}", file=sys.stderr)
             cache_data = {}
 
     if not cache_data:
