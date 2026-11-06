@@ -53,6 +53,9 @@ from agy_switcher.models import (
     DiagnosticReport,
     EvaluationCandidate,
     QuotaStatus,
+    AccountInfo,
+    RotationResult,
+    FleetQuotaSummary,
 )
 from agy_switcher.security import (
     _atomic_write_file,
@@ -128,8 +131,14 @@ from agy_switcher.watcher import (
 # Layer 3: Hook Orchestration
 from agy_switcher.hook import handle_pre_invocation_hook
 
-# Layer 4: CLI Presentation & Dispatch
-from agy_switcher.cli import build_parser, main
+# Layer 4: Presentation, Facade & CLI Dispatch
+from agy_switcher.api import (
+    auto_rotate_on_exhaustion,
+    get_active_account,
+    get_fleet_quota_summary,
+    switch_account,
+)
+from agy_switcher.cli import build_parser, handle_vault, main
 
 __all__ = [
     # Layer 0
@@ -143,6 +152,9 @@ __all__ = [
     "DiagnosticReport",
     "QuotaStatus",
     "EvaluationCandidate",
+    "AccountInfo",
+    "RotationResult",
+    "FleetQuotaSummary",
     # Layer 1
     "ProcessSupervisor",
     "format_countdown",
@@ -201,7 +213,12 @@ __all__ = [
     # Layer 3
     "handle_pre_invocation_hook",
     # Layer 4
+    "get_active_account",
+    "auto_rotate_on_exhaustion",
+    "switch_account",
+    "get_fleet_quota_summary",
     "build_parser",
+    "handle_vault",
     "main",
     # Standard library re-exports for backward-compatibility with tests
     "argparse",

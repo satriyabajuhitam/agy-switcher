@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 from typing import Any, Callable
+import urllib.parse
 
 from agy_switcher.exceptions import (
     AccountNotFoundError,
@@ -32,7 +33,9 @@ from agy_switcher.formatters import (
 )
 from agy_switcher.models import DiagnosticItem, DiagnosticReport, QuotaStatus
 from agy_switcher.telemetry import (
+    DEFAULT_CLIENT_ID,
     QuotaClient,
+    build_oauth_url,
     fetch_all_accounts_quota,
     normalize_model_name,
     run_quota_pipeline,
@@ -217,6 +220,16 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing account without confirmation prompt"
     )
+    login_parser.add_argument(
+        "--headless", action="store_true", help="Headless OAuth 2.0 credential acquisition flow"
+    )
+    login_parser.add_argument(
+        "--auth-code",
+        dest="auth_code",
+        type=str,
+        default=None,
+        help="OAuth 2.0 authorization code (skips stdin prompt in headless mode)",
+    )
 
     # Command: config
     config_parser = subparsers.add_parser("config", help="Manage vault configuration")
@@ -274,10 +287,216 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default cooldown minutes for exhausted accounts (default: 60)",
     )
 
+    # Command: vault
+    vault_parser = subparsers.add_parser("vault", help="Export and import cryptographic vault archives")
+    vault_parser.set_defaults(_subparser=vault_parser)
+    vault_subparsers = vault_parser.add_subparsers(dest="vault_command")
+
+    export_parser = vault_subparsers.add_parser("export", help="Export vault archive to bundle tar.gz")
+    export_parser.add_argument("bundle", nargs="?", default=None, help="Destination path for vault bundle (.tar.gz)")
+    export_parser.add_argument("--bundle", dest="bundle_flag", default=None, help="Destination path for vault bundle (.tar.gz)")
+    export_parser.add_argument("--force", action="store_true", help="Overwrite existing destination bundle file")
+
+    import_parser = vault_subparsers.add_parser("import", help="Import vault archive from bundle tar.gz")
+    import_parser.add_argument("bundle", nargs="?", default=None, help="Source path of vault bundle (.tar.gz)")
+    import_parser.add_argument("--bundle", dest="bundle_flag", default=None, help="Source path of vault bundle (.tar.gz)")
+    import_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force overwrite of existing active account pointer and existing files",
+    )
+
     # Command: internal-probe
     subparsers.add_parser("internal-probe", help=argparse.SUPPRESS)
 
     return parser
+
+
+def _account_exists(engine: AgySwitchEngine, alias: str) -> bool:
+    """Checks whether an account alias already exists in the vault."""
+    return bool(engine.has_account(alias))
+
+
+def _get_default_oauth_url() -> str:
+    """Constructs default Google OAuth authorization URL for headless login."""
+    return build_oauth_url(DEFAULT_CLIENT_ID)
+
+
+def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
+    """Dispatches login command, supporting interactive headless and browser-based modes."""
+    alias = getattr(args, "name", "")
+    force = getattr(args, "force", False)
+
+    if getattr(args, "headless", False):
+        if hasattr(engine, "validate_account_alias") and callable(engine.validate_account_alias):
+            try:
+                res_alias = engine.validate_account_alias(alias)
+                if isinstance(res_alias, str):
+                    alias = res_alias
+            except AgySwitchError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+        if not force and _account_exists(engine, alias):
+            try:
+                confirm = input(f"Account '{alias}' already exists. Overwrite? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
+                return 1
+
+            if confirm not in ("y", "yes"):
+                print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
+                return 1
+            force = True
+
+        auth_code = getattr(args, "auth_code", None)
+        if not auth_code:
+            oauth_url = None
+            if hasattr(engine, "get_oauth_url") and callable(engine.get_oauth_url):
+                try:
+                    res_url = engine.get_oauth_url()
+                    if isinstance(res_url, str) and res_url:
+                        oauth_url = res_url
+                except Exception:
+                    pass
+
+            if not oauth_url:
+                oauth_url = _get_default_oauth_url()
+
+            print(f"Please visit this URL to authorize this application: {oauth_url}")
+            try:
+                auth_code = input("Enter authorization code: ").strip()
+            except EOFError:
+                print("Error: No authorization code provided and stdin closed.", file=sys.stderr)
+                return 1
+            except KeyboardInterrupt:
+                print("Error: Login process interrupted by user.", file=sys.stderr)
+                return 1
+
+            if not auth_code:
+                print("Error: Authorization code must be a non-empty string.", file=sys.stderr)
+                return 1
+
+        agy_binary = getattr(args, "agy_binary", None)
+        timeout = getattr(args, "timeout", 600)
+
+        try:
+            success, msg = engine.login_headless(
+                alias=alias,
+                auth_code=auth_code,
+                force=force,
+                agy_binary=agy_binary,
+                timeout=timeout,
+            )
+        except AgySwitchError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        if success:
+            print(f"[agy-switch] Account '{alias}' successfully logged in and saved to vault.")
+            print(f"  - Status: Standby (Run 'agy-switch switch {alias}' to activate)")
+            if hasattr(engine, "accounts_dir") and engine.accounts_dir:
+                print(f"  - Vault : {engine.accounts_dir / alias / 'token.json'}")
+            return 0
+        else:
+            err_msg = str(msg)
+            if err_msg.startswith("Error:"):
+                print(err_msg, file=sys.stderr)
+            else:
+                print(f"Error: {err_msg}", file=sys.stderr)
+            return 1
+
+    try:
+        res = engine.login_account(
+            alias,
+            agy_binary=args.agy_binary,
+            timeout=args.timeout,
+            force=force,
+        )
+        email_info = f" ({res['email']})" if res.get("email") else ""
+        print(
+            f"[agy-switch] Account '{res['name']}'{email_info} successfully logged in and saved to vault."
+        )
+        print(f"  - Status: Standby (Run 'agy-switch switch {res['name']}' to activate)")
+        print(f"  - Vault : {engine.accounts_dir / res['name'] / 'token.json'}")
+        return 0
+    except AgySwitchError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def _format_cli_error(msg: str) -> str:
+    clean_msg = str(msg).strip()
+    while clean_msg.startswith("Error:") or clean_msg.startswith("[agy-switch]"):
+        if clean_msg.startswith("Error:"):
+            clean_msg = clean_msg[len("Error:"):].strip()
+        elif clean_msg.startswith("[agy-switch]"):
+            clean_msg = clean_msg[len("[agy-switch]"):].strip()
+    return f"Error: [agy-switch] {clean_msg}"
+
+
+def handle_vault(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
+    """Dispatches vault subcommands (export, import) with integrity handling."""
+    action = getattr(args, "vault_command", None)
+    if not action:
+        subparser = getattr(args, "_subparser", None)
+        if subparser is not None:
+            subparser.print_help()
+        return 0
+
+    if action not in ("export", "import"):
+        print(
+            f"Error: [agy-switch] Unknown vault subcommand: '{action}'. Allowed subcommands: export, import.",
+            file=sys.stderr,
+        )
+        return 1
+
+    pos_bundle = getattr(args, "bundle", None)
+    flag_bundle = getattr(args, "bundle_flag", None)
+    if pos_bundle and flag_bundle and pos_bundle != flag_bundle:
+        print(
+            f"Error: [agy-switch] Conflicting bundle paths provided: '{pos_bundle}' and '{flag_bundle}'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    bundle_path = flag_bundle or pos_bundle
+    if not bundle_path or not str(bundle_path).strip():
+        print("Error: [agy-switch] Bundle path must be provided via positional argument or --bundle.", file=sys.stderr)
+        return 1
+
+    bundle_str = str(bundle_path).strip()
+    target = Path(bundle_str).expanduser()
+    if target.is_dir():
+        print(
+            _format_cli_error(f"Bundle path is a directory, not a bundle archive file: {bundle_str}"),
+            file=sys.stderr,
+        )
+        return 1
+
+    force = getattr(args, "force", False)
+
+    try:
+        if action == "export":
+            success, msg = engine.export_vault_bundle(bundle_str, force=force)
+        else:
+            success, msg = engine.import_vault_bundle(bundle_str, force=force)
+
+        if success:
+            print(f"[agy-switch] {msg}")
+            return 0
+
+        print(_format_cli_error(msg), file=sys.stderr)
+        return 1
+    except AgySwitchError as exc:
+        print(_format_cli_error(str(exc)), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(_format_cli_error(str(exc)), file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -> int:
@@ -410,7 +629,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         else:
             print(format_diagnostic_report(report))
 
-        return report.exit_code
+        return int(report.exit_code) if report.exit_code is not None else 0
 
     if args.command == "internal-probe":
         accounts_data = engine.list_accounts().get("accounts", [])
@@ -590,23 +809,14 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             return 1
 
     if args.command == "login":
-        try:
-            res = engine.login_account(
-                args.name,
-                agy_binary=args.agy_binary,
-                timeout=args.timeout,
-                force=args.force,
-            )
-            email_info = f" ({res['email']})" if res.get("email") else ""
-            print(
-                f"[agy-switch] Account '{res['name']}'{email_info} successfully logged in and saved to vault."
-            )
-            print(f"  - Status: Standby (Run 'agy-switch switch {res['name']}' to activate)")
-            print(f"  - Vault : {engine.accounts_dir / res['name'] / 'token.json'}")
-            return 0
-        except AgySwitchError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+        return handle_login(args, engine)
+
+    if args.command == "vault":
+        vault_fn = _resolve_symbol(
+            "handle_vault",
+            lambda: handle_vault,
+        )
+        return vault_fn(args, engine)
 
     if args.command == "remove":
         try:

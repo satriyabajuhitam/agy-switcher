@@ -925,6 +925,490 @@ class TestCLI(unittest.TestCase):
             with self.assertRaises(InvalidThresholdError):
                 engine.set_quota_threshold("not_a_number")
 
+    def test_login_headless_interactive_prompt_success(self):
+        """[REQ-3-SCN-001] Interactive login displays OAuth URL, reads code from stdin, delegates to engine."""
+        self.engine.has_account.return_value = False
+        self.engine.accounts_dir = Path("/mock/vault/accounts")
+        self.engine.get_oauth_url.return_value = "https://accounts.google.com/o/oauth2/auth?client_id=test"
+        self.engine.login_headless.return_value = (True, "Account 'myacc' successfully logged in")
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+             patch("builtins.input", return_value="4/1AY0e-valid-code") as mock_input:
+            ret = main(["login", "myacc", "--headless"], engine=self.engine)
+
+        self.assertEqual(ret, 0)
+        mock_input.assert_called_once_with("Enter authorization code: ")
+        self.engine.login_headless.assert_called_once_with(
+            alias="myacc",
+            auth_code="4/1AY0e-valid-code",
+            force=False,
+            agy_binary=None,
+            timeout=600,
+        )
+        self.assertIn("https://accounts.google.com/o/oauth2/auth", stdout_buf.getvalue())
+        self.assertIn("Account 'myacc' successfully logged in and saved to vault.", stdout_buf.getvalue())
+
+    def test_login_headless_non_interactive_auth_code_flag(self):
+        """[REQ-3-SCN-002] Non-interactive login with --auth-code skips stdin prompt."""
+        self.engine.has_account.return_value = False
+        self.engine.accounts_dir = Path("/mock/vault/accounts")
+        self.engine.login_headless.return_value = (True, "Account 'bot-acc' successfully logged in")
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("builtins.input") as mock_input:
+            ret = main(["login", "bot-acc", "--headless", "--auth-code", "4/1AY0e-auto-code"], engine=self.engine)
+
+        self.assertEqual(ret, 0)
+        mock_input.assert_not_called()
+        self.engine.login_headless.assert_called_once_with(
+            alias="bot-acc",
+            auth_code="4/1AY0e-auto-code",
+            force=False,
+            agy_binary=None,
+            timeout=600,
+        )
+        self.assertIn("Account 'bot-acc' successfully logged in and saved to vault.", stdout_buf.getvalue())
+
+    def test_login_headless_collision_abort_when_declined(self):
+        """[REQ-3-EDGE-001] Declining overwrite on existing account aborts safely."""
+        self.engine.has_account.return_value = True
+        self.engine.login_headless = MagicMock()
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf), patch("builtins.input", return_value="n"):
+            ret = main(["login", "existing_acc", "--headless"], engine=self.engine)
+
+        self.assertEqual(ret, 1)
+        self.engine.login_headless.assert_not_called()
+        self.assertIn("Error: Account 'existing_acc' already exists in vault. Overwrite aborted.", stderr_buf.getvalue())
+
+    def test_login_headless_collision_abort_on_eof(self):
+        """[REQ-3-EDGE-001] EOF during overwrite confirmation prompt aborts safely."""
+        self.engine.has_account.return_value = True
+        self.engine.login_headless = MagicMock()
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf), patch("builtins.input", side_effect=EOFError):
+            ret = main(["login", "existing_acc", "--headless"], engine=self.engine)
+
+        self.assertEqual(ret, 1)
+        self.engine.login_headless.assert_not_called()
+        self.assertIn("Error: Account 'existing_acc' already exists in vault. Overwrite aborted.", stderr_buf.getvalue())
+
+    def test_login_headless_collision_confirmed_overwrites(self):
+        """[REQ-3-EDGE-001] Confirming overwrite passes force=True to login_headless."""
+        self.engine.has_account.return_value = True
+        self.engine.accounts_dir = Path("/mock/vault/accounts")
+        self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("builtins.input", return_value="y") as mock_input:
+            ret = main(
+                ["login", "existing_acc", "--headless", "--auth-code", "valid-code"],
+                engine=self.engine,
+            )
+
+        self.assertEqual(ret, 0)
+        mock_input.assert_called_once_with("Account 'existing_acc' already exists. Overwrite? [y/N]: ")
+        self.engine.login_headless.assert_called_once_with(
+            alias="existing_acc",
+            auth_code="valid-code",
+            force=True,
+            agy_binary=None,
+            timeout=600,
+        )
+
+    def test_login_headless_force_bypasses_prompt(self):
+        """[REQ-3-EDGE-002] Providing --force bypasses overwrite confirmation prompt."""
+        self.engine.has_account.return_value = True
+        self.engine.accounts_dir = Path("/mock/vault/accounts")
+        self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("builtins.input") as mock_input:
+            ret = main(
+                ["login", "existing_acc", "--headless", "--force", "--auth-code", "valid-code"],
+                engine=self.engine,
+            )
+
+        self.assertEqual(ret, 0)
+        mock_input.assert_not_called()
+        self.engine.login_headless.assert_called_once_with(
+            alias="existing_acc",
+            auth_code="valid-code",
+            force=True,
+            agy_binary=None,
+            timeout=600,
+        )
+
+    def test_login_headless_stdin_closed_eof(self):
+        """[REQ-3-EDGE-003] EOF on authorization code prompt prints clean error and exits with 1."""
+        self.engine.has_account.return_value = False
+        self.engine.login_headless = MagicMock()
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+             patch("builtins.input", side_effect=EOFError):
+            ret = main(["login", "myacc", "--headless"], engine=self.engine)
+
+        self.assertEqual(ret, 1)
+        self.engine.login_headless.assert_not_called()
+        self.assertIn("Error: No authorization code provided and stdin closed.", stderr_buf.getvalue())
+
+    def test_login_headless_exchange_failure_stderr(self):
+        """[REQ-3-ERR-001] Exchange failure from engine writes error to stderr and exits with 1."""
+        self.engine.has_account.return_value = False
+        self.engine.login_headless.return_value = (
+            False,
+            "OAuth token exchange failed: invalid or expired authorization code.",
+        )
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(
+                ["login", "bad-acc", "--headless", "--auth-code", "invalid-expired-code"],
+                engine=self.engine,
+            )
+
+        self.assertEqual(ret, 1)
+        self.assertIn(
+            "Error: OAuth token exchange failed: invalid or expired authorization code.",
+            stderr_buf.getvalue(),
+        )
+
+    def test_login_headless_invalid_alias_path_traversal(self):
+        """[REQ-3-ERR-003] Invalid alias syntax with path traversal rejects before subprocess execution."""
+        from agy_switcher.exceptions import AgySwitchError
+        self.engine.validate_account_alias.side_effect = AgySwitchError(
+            "Account alias contains invalid path traversal element: '../bad'"
+        )
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(["login", "../bad", "--headless"], engine=self.engine)
+
+        self.assertEqual(ret, 1)
+        self.assertIn("Error: Account alias contains invalid path traversal element: '../bad'", stderr_buf.getvalue())
+
+    def test_login_standard_browser_dispatch(self):
+        """Standard login without --headless preserves backward compatibility with login_account."""
+        self.engine.login_account.return_value = {
+            "name": "browseracc",
+            "email": "browser@example.com",
+            "status": "standby",
+        }
+        self.engine.accounts_dir = Path("/mock/vault/accounts")
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            ret = main(["login", "browseracc"], engine=self.engine)
+
+        self.assertEqual(ret, 0)
+        self.engine.login_account.assert_called_once_with(
+            "browseracc",
+            agy_binary=None,
+            timeout=600,
+            force=False,
+        )
+        self.assertIn("Account 'browseracc' (browser@example.com) successfully logged in", stdout_buf.getvalue())
+
+
+    def test_vault_export_and_import_routing(self):
+        """Subcommand routing: Add vault parser with export and import subcommands."""
+        self.engine.export_vault_bundle.return_value = (True, "Successfully exported vault bundle (1 account) to /tmp/bundle.tar.gz")
+        self.engine.import_vault_bundle.return_value = (True, "Successfully imported vault bundle (1 account) from /tmp/bundle.tar.gz")
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            ret = main(["vault", "export", "/tmp/bundle.tar.gz"], engine=self.engine)
+        self.assertEqual(ret, 0)
+        self.engine.export_vault_bundle.assert_called_with("/tmp/bundle.tar.gz", force=False)
+        self.assertIn("Successfully exported vault bundle", stdout_buf.getvalue())
+
+        self.engine.export_vault_bundle.reset_mock()
+        with patch("sys.stdout", io.StringIO()):
+            ret = main(["vault", "export", "--bundle", "/tmp/bundle2.tar.gz", "--force"], engine=self.engine)
+        self.assertEqual(ret, 0)
+        self.engine.export_vault_bundle.assert_called_with("/tmp/bundle2.tar.gz", force=True)
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            ret = main(["vault", "import", "/tmp/bundle.tar.gz"], engine=self.engine)
+        self.assertEqual(ret, 0)
+        self.engine.import_vault_bundle.assert_called_with("/tmp/bundle.tar.gz", force=False)
+        self.assertIn("Successfully imported vault bundle", stdout_buf.getvalue())
+
+        self.engine.import_vault_bundle.reset_mock()
+        with patch("sys.stdout", io.StringIO()):
+            ret = main(["vault", "import", "--bundle", "/tmp/bundle2.tar.gz", "--force"], engine=self.engine)
+        self.assertEqual(ret, 0)
+        self.engine.import_vault_bundle.assert_called_with("/tmp/bundle2.tar.gz", force=True)
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(["vault", "export"], engine=self.engine)
+        self.assertEqual(ret, 1)
+        self.assertIn("bundle path must be provided", stderr_buf.getvalue().lower())
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(["vault", "import"], engine=self.engine)
+        self.assertEqual(ret, 1)
+        self.assertIn("bundle path must be provided", stderr_buf.getvalue().lower())
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            ret = main(["vault"], engine=self.engine)
+        self.assertEqual(ret, 0)
+
+        self.engine.export_vault_bundle.return_value = (False, "Bundle already exists at /tmp/bundle.tar.gz. Use --force to overwrite.")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(["vault", "export", "/tmp/bundle.tar.gz"], engine=self.engine)
+        self.assertEqual(ret, 1)
+        self.assertIn("already exists", stderr_buf.getvalue())
+
+    def test_vault_export_and_import_edge_cases(self):
+        """Validates conflicting flags, whitespace paths, and directory arguments."""
+        self.engine.export_vault_bundle.return_value = (True, "Exported")
+        self.engine.import_vault_bundle.return_value = (True, "Imported")
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(["vault", "export", "/tmp/a.tar.gz", "--bundle", "/tmp/b.tar.gz"], engine=self.engine)
+        self.assertEqual(ret, 1)
+        self.assertIn("conflicting bundle paths", stderr_buf.getvalue().lower())
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(["vault", "import", "/tmp/a.tar.gz", "--bundle", "/tmp/b.tar.gz"], engine=self.engine)
+        self.assertEqual(ret, 1)
+        self.assertIn("conflicting bundle paths", stderr_buf.getvalue().lower())
+
+        with patch("sys.stdout", io.StringIO()):
+            ret = main(["vault", "export", "/tmp/same.tar.gz", "--bundle", "/tmp/same.tar.gz"], engine=self.engine)
+        self.assertEqual(ret, 0)
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = main(["vault", "export", "   "], engine=self.engine)
+        self.assertEqual(ret, 1)
+        self.assertIn("bundle path must be provided", stderr_buf.getvalue().lower())
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                ret = main(["vault", "export", tmp_dir], engine=self.engine)
+            self.assertEqual(ret, 1)
+            self.assertIn("is a directory", stderr_buf.getvalue().lower())
+
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                ret = main(["vault", "import", tmp_dir], engine=self.engine)
+            self.assertEqual(ret, 1)
+            self.assertIn("is a directory", stderr_buf.getvalue().lower())
+
+    def test_vault_unknown_subcommand(self):
+        """Tests that unrecognized vault subcommands return non-zero exit and helpful error."""
+        import argparse
+        from agy_switcher.cli import handle_vault
+
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            ret = handle_vault(argparse.Namespace(vault_command="bogus"), self.engine)
+        self.assertEqual(ret, 1)
+        self.assertIn("unknown vault subcommand: 'bogus'", stderr_buf.getvalue().lower())
+
+    def test_format_cli_error_normalization(self):
+        """Tests that _format_cli_error normalizes redundant prefixes idempotently."""
+        from agy_switcher.cli import _format_cli_error
+
+        self.assertEqual(_format_cli_error("Something failed"), "Error: [agy-switch] Something failed")
+        self.assertEqual(_format_cli_error("Error: Something failed"), "Error: [agy-switch] Something failed")
+        self.assertEqual(_format_cli_error("[agy-switch] Something failed"), "Error: [agy-switch] Something failed")
+        self.assertEqual(_format_cli_error("Error: [agy-switch] Something failed"), "Error: [agy-switch] Something failed")
+        self.assertEqual(_format_cli_error("[agy-switch] Error: Something failed"), "Error: [agy-switch] Something failed")
+
+    def test_vault_export_and_import_req_4_err_001_corrupt_checksum(self):
+        """[REQ-4-ERR-001] GIVEN a corrupt vault bundle archive with mismatched SHA-256 checksums,
+        WHEN agy-switch vault import corrupt.tar.gz is executed,
+        THEN the CLI exits with non-zero code and displays a checksum mismatch error without importing corrupt tokens.
+        """
+        import hashlib
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            vault_dir = tmp_path / ".antigravity-vault"
+            gemini_dir = tmp_path / ".gemini"
+            legacy_root = tmp_path / ".agy-cli-manager"
+            vault_dir.mkdir(mode=0o700)
+            gemini_dir.mkdir(mode=0o700)
+            legacy_root.mkdir(mode=0o700)
+
+            real_engine = AgySwitchEngine(
+                vault_dir=vault_dir,
+                gemini_dir=gemini_dir,
+                legacy_root=legacy_root,
+            )
+
+            corrupt_bundle = tmp_path / "corrupt.tar.gz"
+            genuine_content = b'{"token": "valid"}'
+            corrupt_content = b'{"token": "TAMPERED"}'
+            manifest_data = {
+                "version": 1,
+                "created_at": "2026-11-06T00:00:00Z",
+                "active_account": "acc1",
+                "files": {
+                    "accounts/acc1/token.json": hashlib.sha256(genuine_content).hexdigest()
+                }
+            }
+            manifest_bytes = json.dumps(manifest_data).encode("utf-8")
+
+            with tarfile.open(corrupt_bundle, "w:gz") as tar:
+                m_info = tarfile.TarInfo(name="manifest.json")
+                m_info.type = tarfile.REGTYPE
+                m_info.size = len(manifest_bytes)
+                m_info.mode = 0o600
+                tar.addfile(m_info, io.BytesIO(manifest_bytes))
+
+                c_info = tarfile.TarInfo(name="accounts/acc1/token.json")
+                c_info.type = tarfile.REGTYPE
+                c_info.size = len(corrupt_content)
+                c_info.mode = 0o600
+                tar.addfile(c_info, io.BytesIO(corrupt_content))
+
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                exit_code = main(["vault", "import", str(corrupt_bundle)], engine=real_engine)
+
+            self.assertNotEqual(exit_code, 0)
+            self.assertIn("checksum mismatch", stderr_buf.getvalue().lower())
+            corrupt_token_dest = vault_dir / "accounts" / "acc1" / "token.json"
+            self.assertFalse(corrupt_token_dest.exists(), "Corrupt token must not be written to accounts")
+
+    def test_vault_export_and_import_req_4_edge_003_restored_permissions(self):
+        """[REQ-4-EDGE-003] GIVEN successful execution of agy-switch vault import backup.tar.gz,
+        WHEN vault accounts are inspected,
+        THEN all restored token files are verified to have strict POSIX 0600 permissions.
+        """
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            src_vault = tmp_path / "src_vault"
+            src_gemini = tmp_path / "src_gemini"
+            src_vault.mkdir(mode=0o700)
+            src_gemini.mkdir(mode=0o700)
+
+            src_engine = AgySwitchEngine(
+                vault_dir=src_vault,
+                gemini_dir=src_gemini,
+                legacy_root=tmp_path / "src_legacy",
+            )
+            acc_dir = src_vault / "accounts" / "backup_acc"
+            acc_dir.mkdir(parents=True, mode=0o700)
+            token_path = acc_dir / "token.json"
+            token_path.write_text(json.dumps({"token": "secret"}), encoding="utf-8")
+            os.chmod(token_path, 0o600)
+            src_engine.set_active_name("backup_acc")
+
+            backup_bundle = tmp_path / "backup.tar.gz"
+
+            with patch("sys.stdout", io.StringIO()):
+                ret = main(["vault", "export", str(backup_bundle)], engine=src_engine)
+            self.assertEqual(ret, 0)
+            self.assertTrue(backup_bundle.is_file())
+
+            dest_vault = tmp_path / "dest_vault"
+            dest_gemini = tmp_path / "dest_gemini"
+            dest_vault.mkdir(mode=0o700)
+            dest_gemini.mkdir(mode=0o700)
+
+            dest_engine = AgySwitchEngine(
+                vault_dir=dest_vault,
+                gemini_dir=dest_gemini,
+                legacy_root=tmp_path / "dest_legacy",
+            )
+
+            stdout_buf = io.StringIO()
+            with patch("sys.stdout", stdout_buf):
+                ret = main(["vault", "import", str(backup_bundle)], engine=dest_engine)
+            self.assertEqual(ret, 0)
+
+            restored_token = dest_vault / "accounts" / "backup_acc" / "token.json"
+            self.assertTrue(restored_token.is_file(), "Restored token file must exist")
+            file_mode = stat.S_IMODE(os.stat(restored_token).st_mode)
+            self.assertEqual(file_mode, 0o600, f"Token file must have 0600 permissions, got {oct(file_mode)}")
+
+            restored_acc_dir = dest_vault / "accounts" / "backup_acc"
+            dir_mode = stat.S_IMODE(os.stat(restored_acc_dir).st_mode)
+            self.assertEqual(dir_mode, 0o700, f"Account dir must have 0700 permissions, got {oct(dir_mode)}")
+
+    def test_vault_real_engine_lifecycle_and_edge_cases(self):
+        """Tests nonexistent import bundle, export conflict without force, and nested dir export."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            vault_dir = tmp_path / "vault"
+            gemini_dir = tmp_path / "gemini"
+            vault_dir.mkdir(mode=0o700)
+            gemini_dir.mkdir(mode=0o700)
+
+            engine = AgySwitchEngine(
+                vault_dir=vault_dir,
+                gemini_dir=gemini_dir,
+                legacy_root=tmp_path / "legacy",
+            )
+            acc_dir = vault_dir / "accounts" / "testacc"
+            acc_dir.mkdir(parents=True, mode=0o700)
+            (acc_dir / "token.json").write_text(json.dumps({"token": "xyz"}), encoding="utf-8")
+            engine.set_active_name("testacc")
+
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                ret = main(["vault", "import", str(tmp_path / "nonexistent.tar.gz")], engine=engine)
+            self.assertEqual(ret, 1)
+            self.assertIn("not found", stderr_buf.getvalue().lower())
+
+            existing_bundle = tmp_path / "existing.tar.gz"
+            existing_bundle.write_bytes(b"dummy")
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                ret = main(["vault", "export", str(existing_bundle)], engine=engine)
+            self.assertEqual(ret, 1)
+            self.assertIn("already exists", stderr_buf.getvalue().lower())
+
+            with patch("sys.stdout", io.StringIO()):
+                ret = main(["vault", "export", str(existing_bundle), "--force"], engine=engine)
+            self.assertEqual(ret, 0)
+
+            nested_bundle = tmp_path / "nested" / "sub" / "bundle.tar.gz"
+            self.assertFalse(nested_bundle.parent.exists())
+            with patch("sys.stdout", io.StringIO()):
+                ret = main(["vault", "export", str(nested_bundle)], engine=engine)
+            self.assertEqual(ret, 0)
+            self.assertTrue(nested_bundle.is_file())
+
+    def test_account_exists_and_oauth_helpers(self):
+        """Verifies _account_exists delegates directly to engine.has_account and _get_default_oauth_url uses centralized builder."""
+        from agy_switcher.cli import _account_exists, _get_default_oauth_url
+        from agy_switcher.telemetry import DEFAULT_CLIENT_ID
+
+        mock_engine = MagicMock(spec=AgySwitchEngine)
+        mock_engine.has_account.return_value = True
+        self.assertTrue(_account_exists(mock_engine, "active_user"))
+        mock_engine.has_account.assert_called_once_with("active_user")
+
+        mock_engine.has_account.return_value = False
+        self.assertFalse(_account_exists(mock_engine, "nonexistent"))
+
+        url = _get_default_oauth_url()
+        self.assertIn(DEFAULT_CLIENT_ID, url)
+        self.assertIn("accounts.google.com/o/oauth2/auth", url)
+
 
 if __name__ == '__main__':
     unittest.main()

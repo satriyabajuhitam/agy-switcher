@@ -12,6 +12,8 @@ Does not import Layer 3 (hook) or Layer 4 (cli).
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
 import math
 import os
@@ -20,11 +22,14 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
-from typing import Any
+from typing import Any, Callable
+import urllib.parse
 
 from agy_switcher.exceptions import (
     AccountNotFoundError,
@@ -43,7 +48,9 @@ from agy_switcher.security import (
 )
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.telemetry import (
+    DEFAULT_CLIENT_ID,
     _parse_timestamp_defensive,
+    build_oauth_url,
     normalize_model_name,
 )
 from agy_switcher.doctor import DoctorEngine
@@ -601,12 +608,12 @@ class AgySwitchEngine:
             raise AgySwitchError("Account alias cannot be empty.")
         if len(clean) > 64:
             raise AgySwitchError(f"Account alias too long ({len(clean)} > 64 chars): '{clean}'")
+        if ".." in clean or "/" in clean or "\\" in clean or clean in (".", ".."):
+            raise AgySwitchError(f"Account alias contains invalid path traversal element: '{clean}'")
         if not re.match(r"^[a-zA-Z0-9._-]+$", clean):
             raise AgySwitchError(
                 f"Invalid account alias '{clean}'. Allowed characters: letters, digits, '.', '_', '-'"
             )
-        if ".." in clean or clean in (".", ".."):
-            raise AgySwitchError(f"Account alias contains invalid path traversal element: '{clean}'")
         return clean
 
     def _validate_preflight_writes(self) -> None:
@@ -842,7 +849,7 @@ class AgySwitchEngine:
         agy_binary: str | None = None,
         timeout: int = 600,
         force: bool = False,
-        prompt_fn: Any | None = None,
+        prompt_fn: Callable[[str], str] | None = None,
     ) -> dict[str, Any]:
         """Authenticates a new account via isolated agy CLI sandbox and saves to vault as Standby."""
         clean_name = name.strip()
@@ -923,6 +930,170 @@ class AgySwitchEngine:
                 "email": email,
                 "status": "standby",
             }
+
+    def login_headless(
+        self,
+        alias: str = "",
+        auth_code: str | None = None,
+        force: bool = False,
+        agy_binary: str | None = None,
+        timeout: float = 600.0,
+        prompt_fn: Callable[[str], str] | None = None,
+        name: str | None = None,
+        code: str | None = None,
+    ) -> tuple[bool, str]:
+        """Performs headless OAuth token exchange, saving credentials to vault with 0600 mode.
+
+        Supports non-interactive code injection and interactive stdin/prompt fallback.
+        Returns tuple[bool, str] representing (success, message).
+        """
+        raw_alias = alias or name or ""
+        try:
+            clean_alias = self.validate_account_alias(raw_alias)
+        except AgySwitchError as exc:
+            return False, str(exc)
+        except Exception as exc:
+            return False, f"Invalid account alias: {exc}"
+
+        raw_code = auth_code if auth_code is not None else code
+        if raw_code is None:
+            if prompt_fn is not None:
+                try:
+                    raw_code = prompt_fn("Enter authorization code: ")
+                except Exception as exc:
+                    return False, f"Failed to prompt for authorization code: {exc}"
+            else:
+                try:
+                    raw_code = input("Enter authorization code: ")
+                except (EOFError, OSError):
+                    return False, "Failed to read authorization code from stdin."
+
+        if not isinstance(raw_code, str) or not raw_code.strip():
+            return False, "Authorization code must be a non-empty string."
+
+        clean_code = raw_code.strip()
+        if len(clean_code) > 1024 or any(ord(c) < 32 for c in clean_code):
+            return False, "Invalid authorization code format."
+
+        acc_dir = self.accounts_dir / clean_alias
+        if acc_dir.is_dir() and not force:
+            return False, f"Account '{clean_alias}' already exists in vault. Overwrite aborted."
+
+        try:
+            resolved_binary = self.resolve_agy_binary(agy_binary)
+        except Exception as exc:
+            return False, str(exc)
+
+        with tempfile.TemporaryDirectory(prefix="agy-login-headless-") as temp_dir_str:
+            temp_home = Path(temp_dir_str)
+            gemini_login_dir = temp_home / ".gemini"
+            gemini_login_dir.mkdir(parents=True, exist_ok=True)
+
+            env = os.environ.copy()
+            env["HOME"] = str(temp_home)
+            env["PATH"] = f"{Path.home()}/.local/bin:{env.get('PATH', '/bin:/usr/bin:/usr/local/bin')}"
+
+            try:
+                proc = subprocess.Popen(
+                    [resolved_binary],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=str(temp_home),
+                    env=env,
+                )
+            except Exception as exc:
+                return False, f"Failed to spawn agy login process: {exc}"
+
+            stdout_bytes = b""
+            stderr_bytes = b""
+            try:
+                if hasattr(proc, "communicate"):
+                    stdout_bytes, stderr_bytes = proc.communicate(
+                        input=(clean_code + "\n").encode("utf-8"),
+                        timeout=timeout,
+                    )
+                else:
+                    if hasattr(proc, "stdin") and proc.stdin:
+                        try:
+                            proc.stdin.write((clean_code + "\n").encode("utf-8"))
+                            proc.stdin.flush()
+                        except Exception:
+                            pass
+                    start_time = time.time()
+                    while proc.poll() is None:
+                        if time.time() - start_time > timeout:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=3)
+                            except Exception:
+                                proc.kill()
+                            return False, f"Login timed out after {timeout} seconds."
+                        time.sleep(0.05)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+                return False, f"Login timed out after {timeout} seconds."
+            except Exception as exc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return False, f"Process execution error: {exc}"
+
+            returncode = (
+                proc.returncode
+                if hasattr(proc, "returncode") and proc.returncode is not None
+                else proc.poll()
+            )
+            if returncode is not None and returncode != 0:
+                err_msg = stderr_bytes.decode("utf-8", errors="replace").strip() if stderr_bytes else ""
+                return False, f"OAuth token exchange failed: {err_msg or 'invalid or expired authorization code.'}"
+
+            token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+            if not token_file.is_file():
+                jetski_token = temp_home / ".gemini" / "jetski-standalone-oauth-token"
+                if jetski_token.is_file():
+                    token_file = jetski_token
+                else:
+                    return False, "OAuth token exchange failed: invalid or expired authorization code."
+
+            try:
+                token_data = self.validate_token_file(token_file)
+            except Exception as exc:
+                return False, f"OAuth token exchange failed: invalid token data ({exc})"
+
+            try:
+                acc_dir.mkdir(parents=True, exist_ok=True)
+                token_path = acc_dir / "token.json"
+                self._atomic_write_json(token_path, token_data)
+                try:
+                    os.chmod(token_path, 0o600)
+                except OSError:
+                    pass
+            except Exception as exc:
+                if not force:
+                    shutil.rmtree(acc_dir, ignore_errors=True)
+                return False, f"Failed to save credentials: {exc}"
+
+            return True, f"Account '{clean_alias}' successfully logged in"
+
+    def has_account(self, name: str) -> bool:
+        """Checks if account alias exists in vault accounts directory."""
+        if not name:
+            return False
+        try:
+            clean = self.validate_account_alias(name)
+            return (self.accounts_dir / clean).is_dir()
+        except Exception:
+            return (self.accounts_dir / name).is_dir()
+
+    def get_oauth_url(self) -> str:
+        """Returns the Google OAuth 2.0 authorization URL for headless login."""
+        return build_oauth_url(DEFAULT_CLIENT_ID)
 
     def locate_language_server_pid(self) -> int | None:
         """Finds running language_server PID by scanning /proc or pgrep."""
@@ -1013,6 +1184,371 @@ class AgySwitchEngine:
     def auto_heal(self, report: DiagnosticReport) -> list[str]:
         """Canonical alias for fix_diagnostics."""
         return self.fix_diagnostics(report)
+
+    def export_vault_bundle(
+        self,
+        bundle_path: str | Path,
+        force: bool = False,
+    ) -> tuple[bool, str]:
+        """Packages registered accounts, active pointer, config, and SHA-256 manifest into a 0600 tar.gz bundle.
+
+        Args:
+            bundle_path: Destination path for the .tar.gz bundle archive.
+            force: If True, overwrite existing bundle file; if False, reject existing files.
+
+        Returns:
+            Tuple of (success: bool, message: str).
+        """
+        target = Path(bundle_path).expanduser()
+        if target.exists() and not force:
+            return (False, f"Bundle already exists at {bundle_path}. Use --force to overwrite.")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        active_account = self.get_active_name()
+
+        files_map: dict[str, str] = {}
+        files_data: list[tuple[str, bytes]] = []
+
+        if self.active_file.is_file():
+            active_bytes = self.active_file.read_bytes()
+            files_map["active"] = hashlib.sha256(active_bytes).hexdigest()
+            files_data.append(("active", active_bytes))
+
+        if self.config_file.is_file():
+            config_bytes = self.config_file.read_bytes()
+            files_map["config.json"] = hashlib.sha256(config_bytes).hexdigest()
+            files_data.append(("config.json", config_bytes))
+
+        account_names: set[str] = set()
+        if self.accounts_dir.is_dir():
+            for acc_path in sorted(self.accounts_dir.iterdir()):
+                if not acc_path.is_dir() or acc_path.name.startswith("."):
+                    continue
+                acc_name = acc_path.name
+                token_file = acc_path / "token.json"
+                if token_file.is_file():
+                    account_names.add(acc_name)
+                    for file_path in sorted(acc_path.iterdir()):
+                        if not file_path.is_file() or file_path.name.startswith("."):
+                            continue
+                        file_bytes = file_path.read_bytes()
+                        rel_name = f"accounts/{acc_name}/{file_path.name}"
+                        files_map[rel_name] = hashlib.sha256(file_bytes).hexdigest()
+                        files_data.append((rel_name, file_bytes))
+
+        account_count = len(account_names)
+
+        manifest_data = {
+            "version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "active_account": active_account,
+            "files": files_map,
+        }
+        manifest_bytes = json.dumps(manifest_data, indent=2).encode("utf-8")
+
+        temp_bundle = tempfile.NamedTemporaryFile(
+            dir=target.parent,
+            prefix=f".tmp-bundle-{os.getpid()}-",
+            suffix=".tar.gz",
+            delete=False,
+        )
+        temp_path = Path(temp_bundle.name)
+        temp_bundle.close()
+
+        try:
+            os.chmod(temp_path, 0o600)
+            now_ts = int(time.time())
+
+            with tarfile.open(temp_path, mode="w:gz") as tar:
+                m_info = tarfile.TarInfo(name="manifest.json")
+                m_info.type = tarfile.REGTYPE
+                m_info.size = len(manifest_bytes)
+                m_info.mode = 0o600
+                m_info.mtime = now_ts
+                m_info.uid = 0
+                m_info.gid = 0
+                tar.addfile(m_info, io.BytesIO(manifest_bytes))
+
+                if self.accounts_dir.is_dir() and account_names:
+                    dir_info = tarfile.TarInfo(name="accounts")
+                    dir_info.type = tarfile.DIRTYPE
+                    dir_info.mode = 0o700
+                    dir_info.mtime = now_ts
+                    dir_info.uid = 0
+                    dir_info.gid = 0
+                    tar.addfile(dir_info)
+
+                    for acc_name in sorted(account_names):
+                        acc_dir_info = tarfile.TarInfo(name=f"accounts/{acc_name}")
+                        acc_dir_info.type = tarfile.DIRTYPE
+                        acc_dir_info.mode = 0o700
+                        acc_dir_info.mtime = now_ts
+                        acc_dir_info.uid = 0
+                        acc_dir_info.gid = 0
+                        tar.addfile(acc_dir_info)
+
+                for rel_name, data_bytes in files_data:
+                    f_info = tarfile.TarInfo(name=rel_name)
+                    f_info.type = tarfile.REGTYPE
+                    f_info.size = len(data_bytes)
+                    f_info.mode = 0o600
+                    f_info.mtime = now_ts
+                    f_info.uid = 0
+                    f_info.gid = 0
+                    tar.addfile(f_info, io.BytesIO(data_bytes))
+
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, target)
+            os.chmod(target, 0o600)
+        except Exception:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise
+
+        msg = f"Successfully exported vault bundle ({account_count} account{'s' if account_count != 1 else ''}) to {target}"
+        return (True, msg)
+
+    def import_vault_bundle(
+        self,
+        bundle_path: str | Path,
+        merge: bool = True,
+        force: bool = False,
+    ) -> tuple[bool, str]:
+        """Verifies SHA-256 integrity manifest and unpacks accounts into vault with 0600 permissions.
+
+        Enforces strict Zip Slip path traversal defenses, symlink/hardlink rejection,
+        manifest checksum verification, and atomic all-or-nothing extraction.
+
+        Args:
+            bundle_path: Path to the .tar.gz bundle archive.
+            merge: If True, merge imported accounts into existing vault; if False, clear existing accounts.
+            force: If True, overwrite existing active account pointer and existing files.
+
+        Returns:
+            Tuple of (success: bool, message: str).
+
+        Raises:
+            AgySwitchError: On security violation, corrupt archive, missing manifest, or checksum mismatch.
+        """
+        target = Path(bundle_path).expanduser()
+        if not target.exists():
+            raise AgySwitchError(f"Vault bundle not found: {bundle_path}")
+        if not target.is_file():
+            raise AgySwitchError("Invalid vault bundle: file is not a valid gzip-compressed tar archive.")
+
+        try:
+            with tarfile.open(target, mode="r:gz") as tar:
+                members = tar.getmembers()
+
+                # Step 1: Preflight inspection of all archive members
+                for m in members:
+                    # Check symlinks and hardlinks
+                    if m.issym() or m.islnk() or m.type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                        raise AgySwitchError(
+                            f"Security violation: archive member is a symbolic or hard link: '{m.name}'"
+                        )
+
+                    # Check directory traversal / Zip Slip
+                    raw_name = m.name
+                    norm_name = os.path.normpath(raw_name)
+                    if (
+                        raw_name.startswith("/")
+                        or os.path.isabs(raw_name)
+                        or norm_name.startswith("..")
+                        or any(part == ".." for part in Path(raw_name).parts)
+                    ):
+                        raise AgySwitchError(
+                            f"Security violation: archive member contains illegal path traversal: '{raw_name}'"
+                        )
+
+                    # Check resolved path under vault_dir does not escape vault_dir
+                    resolved_target = (self.vault_dir / norm_name).resolve()
+                    try:
+                        resolved_target.relative_to(self.vault_dir.resolve())
+                    except ValueError:
+                        raise AgySwitchError(
+                            f"Security violation: archive member contains illegal path traversal: '{raw_name}'"
+                        )
+
+                # Step 2: Locate and parse manifest.json
+                manifest_member = None
+                for m in members:
+                    if os.path.normpath(m.name) == "manifest.json":
+                        manifest_member = m
+                        break
+
+                if manifest_member is None or not manifest_member.isreg():
+                    raise AgySwitchError("Invalid vault bundle: missing or malformed manifest.json.")
+
+                mf = tar.extractfile(manifest_member)
+                if mf is None:
+                    raise AgySwitchError("Invalid vault bundle: missing or malformed manifest.json.")
+
+                try:
+                    manifest_bytes = mf.read()
+                    manifest_data = json.loads(manifest_bytes.decode("utf-8"))
+                    if not isinstance(manifest_data, dict):
+                        raise AgySwitchError("Invalid vault bundle: missing or malformed manifest.json.")
+                    if "files" not in manifest_data or not isinstance(manifest_data["files"], dict):
+                        raise AgySwitchError("Invalid vault bundle: missing or malformed manifest.json.")
+                except AgySwitchError:
+                    raise
+                except Exception as e:
+                    raise AgySwitchError("Invalid vault bundle: missing or malformed manifest.json.") from e
+
+                # Step 3: Checksum verification of all archive files against manifest
+                files_checksums: dict[str, str] = manifest_data["files"]
+                verified_payloads: dict[str, bytes] = {}
+
+                archive_files: dict[str, tarfile.TarInfo] = {}
+                for m in members:
+                    if m.isreg():
+                        norm = os.path.normpath(m.name)
+                        if norm == "manifest.json":
+                            continue
+                        archive_files[norm] = m
+
+                for rel_name, m in archive_files.items():
+                    if rel_name not in files_checksums:
+                        raise AgySwitchError(
+                            f"Vault bundle integrity verification failed: checksum mismatch for '{rel_name}'"
+                        )
+                    f_extract = tar.extractfile(m)
+                    if f_extract is None:
+                        raise AgySwitchError(
+                            f"Vault bundle integrity verification failed: checksum mismatch for '{rel_name}'"
+                        )
+                    content = f_extract.read()
+                    actual_digest = hashlib.sha256(content).hexdigest()
+                    if actual_digest != files_checksums[rel_name]:
+                        raise AgySwitchError(
+                            f"Vault bundle integrity verification failed: checksum mismatch for '{rel_name}'"
+                        )
+                    verified_payloads[rel_name] = content
+
+                for declared_name in files_checksums:
+                    if declared_name not in verified_payloads:
+                        raise AgySwitchError(
+                            f"Vault bundle integrity verification failed: checksum mismatch for '{declared_name}'"
+                        )
+
+        except AgySwitchError:
+            raise
+        except (tarfile.ReadError, EOFError, tarfile.CompressionError, OSError) as e:
+            raise AgySwitchError("Invalid vault bundle: file is not a valid gzip-compressed tar archive.") from e
+
+        # Step 4: Extract verified payloads into vault with strict permissions and rollback protection
+        imported_account_names: set[str] = set()
+        for rel_name in verified_payloads:
+            parts = Path(rel_name).parts
+            if len(parts) >= 3 and parts[0] == "accounts":
+                acc_name = parts[1]
+                if acc_name and not acc_name.startswith("."):
+                    imported_account_names.add(acc_name)
+
+        for m in members:
+            if m.isdir():
+                parts = Path(os.path.normpath(m.name)).parts
+                if len(parts) == 2 and parts[0] == "accounts":
+                    acc_name = parts[1]
+                    if acc_name and not acc_name.startswith("."):
+                        imported_account_names.add(acc_name)
+
+        created_dirs: list[Path] = []
+        created_files: list[Path] = []
+        overwritten_files: dict[Path, bytes] = {}
+
+        try:
+            self.accounts_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+            for rel_name, content in verified_payloads.items():
+                if rel_name in ("active", "config.json"):
+                    continue
+                target_path = self.vault_dir / rel_name
+                parent_dir = target_path.parent
+                if not parent_dir.exists():
+                    parent_dir.mkdir(parents=True, mode=0o700)
+                    created_dirs.append(parent_dir)
+                os.chmod(parent_dir, 0o700)
+
+                if target_path.exists():
+                    overwritten_files[target_path] = target_path.read_bytes()
+                else:
+                    created_files.append(target_path)
+
+                target_path.write_bytes(content)
+                os.chmod(target_path, 0o600)
+
+            for acc_name in imported_account_names:
+                acc_dir = self.accounts_dir / acc_name
+                if not acc_dir.exists():
+                    acc_dir.mkdir(parents=True, mode=0o700)
+                    created_dirs.append(acc_dir)
+                os.chmod(acc_dir, 0o700)
+
+            if not merge and self.accounts_dir.is_dir():
+                for existing_acc in sorted(self.accounts_dir.iterdir()):
+                    if existing_acc.is_dir() and existing_acc.name not in imported_account_names:
+                        shutil.rmtree(existing_acc)
+
+            bundle_active = manifest_data.get("active_account")
+            if not bundle_active and "active" in verified_payloads:
+                bundle_active = verified_payloads["active"].decode("utf-8").strip()
+
+            current_active = self.get_active_name()
+            should_update_active = False
+
+            if bundle_active:
+                if force:
+                    should_update_active = True
+                elif not merge:
+                    should_update_active = True
+                elif current_active is None:
+                    should_update_active = True
+
+            if should_update_active and bundle_active:
+                if self.active_file.is_file():
+                    overwritten_files[self.active_file] = self.active_file.read_bytes()
+                self.set_active_name(bundle_active)
+
+            if "config.json" in verified_payloads:
+                if force or not merge or not self.config_file.is_file():
+                    if self.config_file.is_file():
+                        overwritten_files[self.config_file] = self.config_file.read_bytes()
+                    self._atomic_write_file(
+                        self.config_file,
+                        verified_payloads["config.json"].decode("utf-8"),
+                        mode=0o600,
+                    )
+
+        except (PermissionError, OSError) as e:
+            # Atomic rollback on write failure
+            for path, orig_data in overwritten_files.items():
+                try:
+                    path.write_bytes(orig_data)
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            for path in reversed(created_files):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            for path in reversed(created_dirs):
+                try:
+                    if path.is_dir() and not any(path.iterdir()):
+                        path.rmdir()
+                except OSError:
+                    pass
+            raise AgySwitchError(f"Target vault directory write permission failure: {e}") from e
+
+        account_count = len(imported_account_names)
+        msg = f"Successfully imported vault bundle ({account_count} account{'s' if account_count != 1 else ''}) from {target}"
+        return (True, msg)
 
 
 __all__ = [
