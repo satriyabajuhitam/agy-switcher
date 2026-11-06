@@ -823,6 +823,232 @@ class TestSoftImportAndConcurrency(unittest.TestCase):
         self.assertIn("exhausted", res.message)
 
 
+
+class TestMultiModelTelemetry(unittest.TestCase):
+    """Integration test suite validating multi-model telemetry and missing timestamp handling (ADR-0014).
+
+    Validates:
+    - [PANIC-EDGE-001]: GIVEN both 'gemini' and 'claude' model quotas are exhausted across all accounts,
+      WHEN get_fleet_quota_summary(model="all") is queried during a Panic Event,
+      THEN the summary calculates reset countdowns independently for both families
+      and displays the relevant reset time for the currently requested turn model.
+    - [PANIC-EDGE-002]: GIVEN CloudCode quota API returns 0% quota without providing a specific reset
+      countdown timestamp, WHEN the Fleet Exhaustion message is synthesized,
+      THEN the formatter indicates that quota is exhausted and will refresh on the standard rolling
+      window schedule, and does not display 'None' or negative countdown durations.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+
+        self.vault_dir = self.base_dir / ".antigravity-vault"
+        self.gemini_dir = self.base_dir / ".gemini"
+        self.legacy_root = self.base_dir / ".agy-cli-manager"
+        self.proc_dir = self.base_dir / "proc"
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+        self.acc1_token = create_mock_oauth_token("acc1@example.com", "ya29.acc1-token")
+        self.acc2_token = create_mock_oauth_token("acc2@example.com", "ya29.acc2-token")
+        self._setup_account("acc1", self.acc1_token)
+        self._setup_account("acc2", self.acc2_token)
+        self.engine.set_active_name("acc1")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _setup_account(self, name: str, token_data: dict[str, Any]) -> None:
+        acc_dir = self.engine.accounts_dir / name
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(token_data), encoding="utf-8")
+
+    def test_panic_edge_001_multi_model_concurrent_exhaustion_independent_resets(self) -> None:
+        """[PANIC-EDGE-001] Multiple model families exhausted concurrently in fleet summary.
+
+        GIVEN both 'gemini' and 'claude' model quotas are exhausted across all accounts,
+        WHEN get_fleet_quota_summary(model="all") is queried during a Panic Event,
+        THEN the summary calculates reset countdowns independently for both families
+        AND displays the relevant reset time for the currently requested turn model.
+        """
+        curr_ts = 1730902200.0  # reference timestamp
+        gemini_reset = curr_ts + 1200.0   # +20 min -> 14:30 UTC
+        claude_reset = curr_ts + 6600.0   # +110 min (1h 50m) -> 16:00 UTC
+
+        cache_data = {
+            "timestamp": curr_ts,
+            "accounts": {
+                "acc1": {
+                    "groups": [
+                        {
+                            "displayName": "Gemini 1.5 Pro",
+                            "buckets": [
+                                {
+                                    "remainingFraction": 0.0,
+                                    "resetTime": "2024-11-06T14:30:00Z",
+                                }
+                            ],
+                        },
+                        {
+                            "displayName": "Claude 3.5 Sonnet",
+                            "buckets": [
+                                {
+                                    "remainingFraction": 0.0,
+                                    "resetTime": "2024-11-06T16:00:00Z",
+                                }
+                            ],
+                        },
+                    ],
+                },
+                "acc2": {
+                    "gemini": {"quota": 0, "reset_time": gemini_reset},
+                    "claude": {"quota": 0, "reset_time": claude_reset},
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        summary = switcher_api.get_fleet_quota_summary(model="all", engine=self.engine)
+        self.assertIsInstance(summary, switcher_api.FleetQuotaSummary)
+        self.assertEqual(summary.model, "all")
+        self.assertEqual(summary.total_accounts, 2)
+
+        # Both accounts must contain independently evaluated quota and reset times for both families
+        for acc_name in ("acc1", "acc2"):
+            acc_data = summary.accounts[acc_name]
+            self.assertIn("gemini", acc_data)
+            self.assertIn("claude", acc_data)
+            self.assertEqual(acc_data["gemini"]["quota"], 0)
+            self.assertEqual(acc_data["claude"]["quota"], 0)
+            self.assertIsNotNone(acc_data["gemini"]["reset_time"])
+            self.assertIsNotNone(acc_data["claude"]["reset_time"])
+            # Gemini and Claude have independent reset times
+            self.assertNotEqual(acc_data["gemini"]["reset_time"], acc_data["claude"]["reset_time"])
+
+        # Formatting user failure notice displays the relevant reset time for the currently requested turn model
+        msg_gemini = switcher_api.format_fleet_exhaustion_message(summary, model="gemini", current_time=curr_ts)
+        self.assertIn("14:30", msg_gemini)
+        self.assertIn("20 menit lagi", msg_gemini)
+        self.assertNotIn("16:00", msg_gemini)
+
+        msg_claude = switcher_api.format_fleet_exhaustion_message(summary, model="claude", current_time=curr_ts)
+        self.assertIn("16:00", msg_claude)
+        self.assertIn("1 jam 50 menit lagi", msg_claude)
+        self.assertNotIn("14:30", msg_claude)
+
+    def test_panic_edge_002_missing_or_indefinite_reset_timestamp_handling(self) -> None:
+        """[PANIC-EDGE-002] All accounts exhausted with indefinite or missing reset timestamps in telemetry.
+
+        GIVEN CloudCode quota API returns 0% quota without providing a specific reset countdown timestamp,
+        WHEN the Fleet Exhaustion message is synthesized,
+        THEN the formatter indicates that quota is exhausted and will refresh on the standard rolling window schedule,
+        AND does not display 'None' or negative countdown durations.
+        """
+        curr_ts = 1730902200.0
+
+        # Scenario 2a: CloudCode returns raw groups with 0% quota and no resetTime
+        cache_data_groups = {
+            "timestamp": curr_ts,
+            "accounts": {
+                "acc1": {
+                    "groups": [
+                        {
+                            "displayName": "Gemini 1.5 Pro",
+                            "buckets": [
+                                {
+                                    "remainingFraction": 0.0,
+                                    # resetTime is omitted / not provided
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "acc2": {
+                    "groups": [
+                        {
+                            "displayName": "Gemini 1.5 Flash",
+                            "buckets": [
+                                {
+                                    "remainingFraction": 0.0,
+                                    "resetTime": None,  # Explicitly None
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data_groups), encoding="utf-8")
+
+        summary = switcher_api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+        for acc_name in ("acc1", "acc2"):
+            acc_data = summary.accounts[acc_name]
+            self.assertEqual(acc_data["quota"], 0)
+            self.assertIsNone(acc_data["reset_time"], f"{acc_name} reset_time should be None, got {acc_data['reset_time']!r}")
+
+        msg = switcher_api.format_fleet_exhaustion_message(summary, model="gemini", current_time=curr_ts)
+        self.assertNotIn("None", msg)
+        self.assertNotIn("-", msg.replace("⚠️", ""))  # No negative numbers
+        self.assertEqual(
+            msg,
+            "⚠️ Seluruh kuota akun sedang habis. Silakan coba kembali dalam beberapa saat atau periksa status dengan /quota.",
+        )
+
+        # Scenario 2b: Multi-model (model="all") where both gemini and claude have missing reset timestamps
+        cache_data_multi_indef = {
+            "timestamp": curr_ts,
+            "accounts": {
+                "acc1": {
+                    "gemini": {"quota": 0, "reset_time": None},
+                    "claude": {"quota": 0, "reset_time": None},
+                },
+                "acc2": {
+                    "gemini": {"quota": 0, "reset_time": ""},
+                    "claude": {"quota": 0, "reset_time": None},
+                },
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data_multi_indef), encoding="utf-8")
+        summary_all = switcher_api.get_fleet_quota_summary(model="all", engine=self.engine)
+        self.assertIsNone(summary_all.accounts["acc1"]["gemini"]["reset_time"])
+        self.assertIsNone(summary_all.accounts["acc1"]["claude"]["reset_time"])
+
+        msg_gemini_indef = switcher_api.format_fleet_exhaustion_message(summary_all, model="gemini", current_time=curr_ts)
+        self.assertNotIn("None", msg_gemini_indef)
+        self.assertEqual(
+            msg_gemini_indef,
+            "⚠️ Seluruh kuota akun sedang habis. Silakan coba kembali dalam beberapa saat atau periksa status dengan /quota.",
+        )
+
+        # Scenario 2c: Expired timestamps in the past do not produce negative countdown durations
+        cache_data_expired = {
+            "timestamp": curr_ts,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 0, "reset_time": curr_ts - 500.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data_expired), encoding="utf-8")
+        summary_expired = switcher_api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+        msg_expired = switcher_api.format_fleet_exhaustion_message(summary_expired, model="gemini", current_time=curr_ts)
+        self.assertNotIn("None", msg_expired)
+        self.assertNotIn("-", msg_expired.replace("⚠️", ""))
+        self.assertEqual(
+            msg_expired,
+            "⚠️ Seluruh kuota akun sedang habis. Silakan coba kembali dalam beberapa saat atau periksa status dengan /quota.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 

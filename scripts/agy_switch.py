@@ -136,6 +136,8 @@ from agy_switcher.api import (
     auto_rotate_on_exhaustion,
     get_active_account,
     get_fleet_quota_summary,
+    format_fleet_exhaustion_message,
+    format_fleet_exhaustion_notice,
     switch_account,
 )
 from agy_switcher.cli import build_parser, handle_vault, main
@@ -217,6 +219,8 @@ __all__ = [
     "auto_rotate_on_exhaustion",
     "switch_account",
     "get_fleet_quota_summary",
+    "format_fleet_exhaustion_message",
+    "format_fleet_exhaustion_notice",
     "build_parser",
     "handle_vault",
     "main",

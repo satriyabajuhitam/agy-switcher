@@ -11,20 +11,107 @@ and Layer 2 (vault, rotation).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
 import json
 import math
 from pathlib import Path
+import re
 import sys
 import threading
 import time
 from typing import Any
 
 from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError
+from agy_switcher.formatters import (
+    format_fleet_exhaustion_message,
+    format_fleet_exhaustion_notice,
+)
 from agy_switcher.models import AccountInfo, RotationResult, FleetQuotaSummary
 from agy_switcher.rotation import RotationEngine
 from agy_switcher.security import extract_email_from_jwt
 from agy_switcher.telemetry import normalize_model_name
 from agy_switcher.vault import AgySwitchEngine
+
+
+def _sanitize_reset_time_and_delta(val: Any, current_ts: float) -> tuple[Any, int | None]:
+    """Sanitizes reset_time and computes remaining minutes relative to current_ts.
+
+    Returns (sanitized_reset_time, remaining_minutes or None).
+    If reset_time is missing, None, non-numeric unparseable, or <= 0, returns (None, None).
+    If reset_time is in the past (expired), returns (val_f, None).
+    """
+    if val is None or isinstance(val, bool):
+        return (None, None)
+
+    if isinstance(val, (int, float)):
+        if not math.isfinite(val) or val <= 0 or val > 32503680000.0:
+            return (None, None)
+        val_f = float(val)
+        delta_seconds = val_f - current_ts
+        if delta_seconds > 0:
+            return (val_f, max(1, int(round(delta_seconds / 60))))
+        return (val_f, None)
+
+    if isinstance(val, datetime):
+        dt = val.astimezone(timezone.utc) if val.tzinfo else val.replace(tzinfo=timezone.utc)
+        if dt.year >= 9000:
+            return (None, None)
+        val_f = dt.timestamp()
+        if not math.isfinite(val_f) or val_f <= 0 or val_f > 32503680000.0:
+            return (None, None)
+        delta_seconds = val_f - current_ts
+        if delta_seconds > 0:
+            return (val_f, max(1, int(round(delta_seconds / 60))))
+        return (val_f, None)
+
+    if isinstance(val, str):
+        cleaned = val.strip()
+        if not cleaned or cleaned.lower() in ("none", "null", "-", "undefined"):
+            return (None, None)
+        if "t" in cleaned.lower():
+            try:
+                dt = datetime.fromisoformat(cleaned.replace("Z", "+00:00")).astimezone(timezone.utc)
+                if dt.year >= 9000:
+                    return (None, None)
+                val_f = dt.timestamp()
+                if not math.isfinite(val_f) or val_f <= 0 or val_f > 32503680000.0:
+                    return (None, None)
+                delta_seconds = val_f - current_ts
+                if delta_seconds > 0:
+                    return (val_f, max(1, int(round(delta_seconds / 60))))
+                return (val_f, None)
+            except Exception:
+                pass
+        try:
+            val_f = float(cleaned)
+            if not math.isfinite(val_f) or val_f <= 0 or val_f > 32503680000.0:
+                return (None, None)
+            delta_seconds = val_f - current_ts
+            if delta_seconds > 0:
+                return (val_f, max(1, int(round(delta_seconds / 60))))
+            return (val_f, None)
+        except ValueError:
+            pass
+
+        # Check "14:30" or "14:30 UTC"
+        time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", cleaned)
+        if time_match:
+            try:
+                th = int(time_match.group(1))
+                tm = int(time_match.group(2))
+                if 0 <= th <= 23 and 0 <= tm <= 59:
+                    curr_dt = datetime.fromtimestamp(current_ts, tz=timezone.utc)
+                    reset_dt = curr_dt.replace(hour=th, minute=tm, second=0, microsecond=0)
+                    if reset_dt < curr_dt:
+                        reset_dt += timedelta(days=1)
+                    delta_seconds = (reset_dt - curr_dt).total_seconds()
+                    delta_m = max(1, int(round(delta_seconds / 60))) if delta_seconds > 0 else None
+                    return (cleaned, delta_m)
+            except Exception:
+                pass
+
+    return (None, None)
+
 
 _ROTATION_LOCK = threading.RLock()
 _LAST_ROTATION_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {}
@@ -603,25 +690,72 @@ def get_fleet_quota_summary(
             continue
 
         if target_model_key is None:
-            fleet_accounts[acc_name] = dict(cached_entry)
+            acc_dict = dict(cached_entry)
+            for m_key in ("gemini", "claude"):
+                if m_key in cached_entry and isinstance(cached_entry[m_key], dict):
+                    m_payload = dict(cached_entry[m_key])
+                    sanitized_r, rem_m = _sanitize_reset_time_and_delta(m_payload.get("reset_time"), current_ts=timestamp)
+                    m_payload["reset_time"] = sanitized_r
+                    if rem_m is not None and "remaining_minutes" not in m_payload:
+                        m_payload["remaining_minutes"] = rem_m
+                    acc_dict[m_key] = m_payload
+                elif "groups" in cached_entry and isinstance(cached_entry["groups"], list):
+                    try:
+                        rot = RotationEngine(vault_dir=engine.vault_dir, target_model=m_key)
+                        st = rot.get_quota_status(cached_entry, model_key=m_key)
+                        if st is not None:
+                            is_valid = st.reset_time and st.reset_time.year < 9000
+                            r_ts = st.reset_time.timestamp() if is_valid else None
+                            rem_m = max(1, int(round((r_ts - timestamp) / 60))) if (is_valid and r_ts is not None and r_ts > timestamp) else None
+                            m_payload = {
+                                "quota": st.remaining_percentage(),
+                                "reset_time": r_ts,
+                            }
+                            if rem_m is not None:
+                                m_payload["remaining_minutes"] = rem_m
+                            acc_dict[m_key] = m_payload
+                    except Exception:
+                        pass
+                elif "quota" in cached_entry and not isinstance(cached_entry["quota"], dict) and m_key == "gemini":
+                    m_payload = dict(cached_entry)
+                    sanitized_r, rem_m = _sanitize_reset_time_and_delta(m_payload.get("reset_time"), current_ts=timestamp)
+                    m_payload["reset_time"] = sanitized_r
+                    if rem_m is not None and "remaining_minutes" not in m_payload:
+                        m_payload["remaining_minutes"] = rem_m
+                    acc_dict["gemini"] = m_payload
+            fleet_accounts[acc_name] = acc_dict
         else:
-            acc_dict: dict[str, Any] = {}
+            acc_dict = {}
             if target_model_key in cached_entry and isinstance(cached_entry[target_model_key], dict):
                 model_payload = dict(cached_entry[target_model_key])
+                sanitized_r, rem_m = _sanitize_reset_time_and_delta(model_payload.get("reset_time"), current_ts=timestamp)
+                model_payload["reset_time"] = sanitized_r
+                if rem_m is not None and "remaining_minutes" not in model_payload:
+                    model_payload["remaining_minutes"] = rem_m
                 acc_dict.update(model_payload)
                 acc_dict[target_model_key] = model_payload
             elif "quota" in cached_entry and not isinstance(cached_entry["quota"], dict) and target_model_key == "gemini":
-                acc_dict = dict(cached_entry)
-                acc_dict["gemini"] = dict(cached_entry)
+                model_payload = dict(cached_entry)
+                sanitized_r, rem_m = _sanitize_reset_time_and_delta(model_payload.get("reset_time"), current_ts=timestamp)
+                model_payload["reset_time"] = sanitized_r
+                if rem_m is not None and "remaining_minutes" not in model_payload:
+                    model_payload["remaining_minutes"] = rem_m
+                acc_dict.update(model_payload)
+                acc_dict["gemini"] = model_payload
             elif "groups" in cached_entry and isinstance(cached_entry["groups"], list):
                 try:
                     rot = RotationEngine(vault_dir=engine.vault_dir, target_model=target_model_key)
                     st = rot.get_quota_status(cached_entry, model_key=target_model_key)
                     if st is not None:
+                        is_valid = st.reset_time and st.reset_time.year < 9000
+                        r_ts = st.reset_time.timestamp() if is_valid else None
+                        rem_m = max(1, int(round((r_ts - timestamp) / 60))) if (is_valid and r_ts is not None and r_ts > timestamp) else None
                         payload = {
                             "quota": st.remaining_percentage(),
-                            "reset_time": st.reset_time.timestamp(),
+                            "reset_time": r_ts,
                         }
+                        if rem_m is not None:
+                            payload["remaining_minutes"] = rem_m
                         acc_dict.update(payload)
                         acc_dict[target_model_key] = payload
                 except Exception:
@@ -649,6 +783,8 @@ __all__ = [
     "switch_account",
     "get_fleet_quota_summary",
     "handle_soft_import_rotation",
+    "format_fleet_exhaustion_message",
+    "format_fleet_exhaustion_notice",
     "FALLBACK_MISSING_SWITCHER_MESSAGE",
     "AccountInfo",
     "RotationResult",

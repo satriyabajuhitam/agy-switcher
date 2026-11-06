@@ -6,7 +6,7 @@ Pure Python 3.10+ standard library. Zero external dependencies.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import math
 import re
 import time
@@ -349,12 +349,205 @@ def format_diagnostic_report(report: DiagnosticReport) -> str:
     return "\n".join(lines)
 
 
+def format_fleet_exhaustion_message(
+    summary: Any = None,
+    model: str | None = None,
+    current_time: float | datetime | None = None,
+) -> str:
+    """Formats a user-facing failure response displaying earliest reset ETA.
+
+    Adheres to [PANIC-ESC-003], [PANIC-ERR-003], [PANIC-EDGE-001], [PANIC-EDGE-002].
+    """
+    default_msg = (
+        "⚠️ Seluruh kuota akun sedang habis. Silakan coba kembali dalam beberapa saat atau periksa status dengan /quota."
+    )
+
+    if summary is None:
+        return default_msg
+
+    accounts_map = getattr(summary, "accounts", None)
+    if accounts_map is None and isinstance(summary, dict):
+        accounts_map = summary.get("accounts")
+
+    if not isinstance(accounts_map, dict) or not accounts_map:
+        return default_msg
+
+    curr_dt: datetime
+    if current_time is None:
+        summary_ts = getattr(summary, "timestamp", None)
+        if summary_ts is None and isinstance(summary, dict):
+            summary_ts = summary.get("timestamp")
+        if isinstance(summary_ts, (int, float)) and not isinstance(summary_ts, bool) and summary_ts > 0:
+            try:
+                curr_dt = datetime.fromtimestamp(float(summary_ts), tz=timezone.utc)
+            except Exception:
+                curr_dt = datetime.now(timezone.utc)
+        else:
+            curr_dt = datetime.now(timezone.utc)
+    elif isinstance(current_time, (int, float)) and not isinstance(current_time, bool):
+        try:
+            curr_dt = datetime.fromtimestamp(float(current_time), tz=timezone.utc)
+        except Exception:
+            curr_dt = datetime.now(timezone.utc)
+    elif isinstance(current_time, datetime):
+        curr_dt = current_time.astimezone(timezone.utc) if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
+    else:
+        curr_dt = datetime.now(timezone.utc)
+
+    norm_target = model.strip().lower() if (isinstance(model, str) and model.strip()) else "gemini"
+    family = "claude" if "claude" in norm_target else ("gemini" if "gemini" in norm_target else norm_target)
+
+    earliest_candidate: tuple[float, str, int] | None = None
+
+    for acc_name, acc_data in accounts_map.items():
+        if not isinstance(acc_data, dict):
+            continue
+
+        source_dict = acc_data
+        if family and family in acc_data and isinstance(acc_data[family], dict):
+            source_dict = acc_data[family]
+        elif norm_target and norm_target in acc_data and isinstance(acc_data[norm_target], dict):
+            source_dict = acc_data[norm_target]
+
+        raw_val = (
+            source_dict.get("reset_time")
+            or source_dict.get("resetTime")
+            or source_dict.get("resets_at")
+            or source_dict.get("reset_eta")
+            or source_dict.get("reset")
+            or acc_data.get("reset_time")
+            or acc_data.get("resetTime")
+            or acc_data.get("resets_at")
+            or acc_data.get("reset_eta")
+            or acc_data.get("reset")
+        )
+
+        if raw_val is None or raw_val == "" or str(raw_val).strip().lower() in ("none", "null", "-", "undefined"):
+            continue
+
+        explicit_minutes: int | None = None
+        for k in ("remaining_minutes", "remaining", "reset_delta", "delta_minutes", "minutes_remaining"):
+            val = source_dict.get(k) if k in source_dict else acc_data.get(k)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                if math.isfinite(val) and val > 0:
+                    explicit_minutes = max(1, int(round(val)))
+                    break
+            elif isinstance(val, str) and val.strip():
+                m = re.search(r"(\d+)", val)
+                if m:
+                    parsed_m = int(m.group(1))
+                    if parsed_m > 0:
+                        explicit_minutes = parsed_m
+                        break
+
+        time_str: str | None = None
+        sort_key: float | None = None
+        delta_minutes: int | None = explicit_minutes
+
+        if isinstance(raw_val, datetime):
+            try:
+                dt = raw_val.astimezone(timezone.utc) if raw_val.tzinfo else raw_val.replace(tzinfo=timezone.utc)
+                if dt.year < 9000:
+                    delta_seconds = dt.timestamp() - curr_dt.timestamp()
+                    if delta_seconds > 0 or (delta_minutes is not None and delta_minutes > 0):
+                        sort_key = dt.timestamp()
+                        time_str = dt.strftime("%H:%M")
+                        if delta_minutes is None:
+                            delta_minutes = max(1, int(round(delta_seconds / 60)))
+            except Exception:
+                pass
+        elif isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
+            try:
+                val_f = float(raw_val)
+                if math.isfinite(val_f) and 0 < val_f < 32503680000.0:
+                    delta_seconds = val_f - curr_dt.timestamp()
+                    if delta_seconds > 0 or (delta_minutes is not None and delta_minutes > 0):
+                        sort_key = val_f
+                        dt = datetime.fromtimestamp(val_f, tz=timezone.utc)
+                        time_str = dt.strftime("%H:%M")
+                        if delta_minutes is None:
+                            delta_minutes = max(1, int(round(delta_seconds / 60)))
+            except Exception:
+                pass
+        elif isinstance(raw_val, str) and raw_val.strip():
+            clean_str = raw_val.strip()
+            if "t" in clean_str.lower():
+                try:
+                    dt = datetime.fromisoformat(clean_str.replace("Z", "+00:00")).astimezone(timezone.utc)
+                    if dt.year < 9000:
+                        delta_seconds = dt.timestamp() - curr_dt.timestamp()
+                        if delta_seconds > 0 or (delta_minutes is not None and delta_minutes > 0):
+                            sort_key = dt.timestamp()
+                            time_str = dt.strftime("%H:%M")
+                            if delta_minutes is None:
+                                delta_minutes = max(1, int(round(delta_seconds / 60)))
+                except Exception:
+                    pass
+            elif clean_str.replace(".", "", 1).isdigit():
+                try:
+                    val_f = float(clean_str)
+                    if math.isfinite(val_f) and 0 < val_f < 32503680000.0:
+                        delta_seconds = val_f - curr_dt.timestamp()
+                        if delta_seconds > 0 or (delta_minutes is not None and delta_minutes > 0):
+                            sort_key = val_f
+                            dt = datetime.fromtimestamp(val_f, tz=timezone.utc)
+                            time_str = dt.strftime("%H:%M")
+                            if delta_minutes is None:
+                                delta_minutes = max(1, int(round(delta_seconds / 60)))
+                except Exception:
+                    pass
+
+            if time_str is None:
+                time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", clean_str)
+                if time_match:
+                    try:
+                        th = int(time_match.group(1))
+                        tm = int(time_match.group(2))
+                        if 0 <= th <= 23 and 0 <= tm <= 59:
+                            time_str = f"{th:02d}:{tm:02d}"
+                            reset_dt = curr_dt.replace(hour=th, minute=tm, second=0, microsecond=0)
+                            if delta_minutes is None:
+                                if reset_dt < curr_dt:
+                                    reset_dt += timedelta(days=1)
+                                delta_seconds = (reset_dt - curr_dt).total_seconds()
+                                if delta_seconds > 0:
+                                    delta_minutes = max(1, int(round(delta_seconds / 60)))
+                            if delta_minutes is not None and delta_minutes > 0:
+                                sort_key = curr_dt.timestamp() + delta_minutes * 60
+                    except Exception:
+                        pass
+
+        if time_str is not None and sort_key is not None and delta_minutes is not None and delta_minutes > 0:
+            candidate = (sort_key, time_str, delta_minutes)
+            if earliest_candidate is None or candidate[0] < earliest_candidate[0]:
+                earliest_candidate = candidate
+
+    if earliest_candidate is None:
+        return default_msg
+
+    _, time_str, delta_minutes = earliest_candidate
+
+    if delta_minutes < 60:
+        countdown_str = f"{delta_minutes} menit lagi"
+    else:
+        h = delta_minutes // 60
+        rem_minutes = delta_minutes % 60
+        countdown_str = f"{h} jam {rem_minutes} menit lagi" if rem_minutes > 0 else f"{h} jam lagi"
+
+    return f"⚠️ Seluruh kuota akun sedang dalam masa tunggu. Kuota diperkirakan pulih pada pk {time_str} ({countdown_str})."
+
+
+format_fleet_exhaustion_notice = format_fleet_exhaustion_message
+
+
 __all__ = [
     "format_countdown",
     "format_accounts_listicle",
     "format_accounts_table",
     "format_status_report",
     "format_diagnostic_report",
+    "format_fleet_exhaustion_message",
+    "format_fleet_exhaustion_notice",
     "_format_bucket_countdown",
     "_format_gemini_quota_summary",
     "_format_model_quota_summary",
