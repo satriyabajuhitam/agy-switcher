@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 from typing import Any, Callable
+import urllib.parse
 
 from agy_switcher.exceptions import (
     AccountNotFoundError,
@@ -32,6 +33,7 @@ from agy_switcher.formatters import (
 )
 from agy_switcher.models import DiagnosticItem, DiagnosticReport, QuotaStatus
 from agy_switcher.telemetry import (
+    DEFAULT_CLIENT_ID,
     QuotaClient,
     fetch_all_accounts_quota,
     normalize_model_name,
@@ -217,6 +219,16 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing account without confirmation prompt"
     )
+    login_parser.add_argument(
+        "--headless", action="store_true", help="Headless OAuth 2.0 credential acquisition flow"
+    )
+    login_parser.add_argument(
+        "--auth-code",
+        dest="auth_code",
+        type=str,
+        default=None,
+        help="OAuth 2.0 authorization code (skips stdin prompt in headless mode)",
+    )
 
     # Command: config
     config_parser = subparsers.add_parser("config", help="Manage vault configuration")
@@ -278,6 +290,151 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("internal-probe", help=argparse.SUPPRESS)
 
     return parser
+
+
+def _account_exists(engine: Any, alias: str) -> bool:
+    """Checks whether an account alias already exists in the vault."""
+    if hasattr(engine, "has_account") and callable(engine.has_account):
+        res = engine.has_account(alias)
+        if isinstance(res, bool):
+            return res
+    if hasattr(engine, "vault") and hasattr(engine.vault, "has_account") and callable(engine.vault.has_account):
+        res = engine.vault.has_account(alias)
+        if isinstance(res, bool):
+            return res
+    if hasattr(engine, "accounts_dir") and isinstance(getattr(engine, "accounts_dir", None), Path):
+        return (engine.accounts_dir / alias).is_dir()
+    if hasattr(engine, "list_accounts") and callable(engine.list_accounts):
+        try:
+            accounts_data = engine.list_accounts()
+            if isinstance(accounts_data, dict):
+                for acc in accounts_data.get("accounts", []):
+                    if isinstance(acc, dict) and acc.get("name") == alias:
+                        return True
+                    elif isinstance(acc, str) and acc == alias:
+                        return True
+        except Exception:
+            pass
+    return False
+
+
+def _get_default_oauth_url() -> str:
+    """Constructs default Google OAuth authorization URL for headless login."""
+    params = urllib.parse.urlencode({
+        "client_id": DEFAULT_CLIENT_ID,
+        "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+        "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform",
+        "access_type": "offline",
+        "prompt": "consent",
+    })
+    return f"https://accounts.google.com/o/oauth2/auth?{params}"
+
+
+def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
+    """Dispatches login command, supporting interactive headless and browser-based modes."""
+    alias = getattr(args, "name", "")
+    force = getattr(args, "force", False)
+
+    if getattr(args, "headless", False):
+        if hasattr(engine, "validate_account_alias") and callable(engine.validate_account_alias):
+            try:
+                res_alias = engine.validate_account_alias(alias)
+                if isinstance(res_alias, str):
+                    alias = res_alias
+            except AgySwitchError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+        if not force and _account_exists(engine, alias):
+            try:
+                confirm = input(f"Account '{alias}' already exists. Overwrite? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
+                return 1
+
+            if confirm not in ("y", "yes"):
+                print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
+                return 1
+            force = True
+
+        auth_code = getattr(args, "auth_code", None)
+        if not auth_code:
+            oauth_url = None
+            if hasattr(engine, "get_oauth_url") and callable(engine.get_oauth_url):
+                try:
+                    res_url = engine.get_oauth_url()
+                    if isinstance(res_url, str) and res_url:
+                        oauth_url = res_url
+                except Exception:
+                    pass
+
+            if not oauth_url:
+                oauth_url = _get_default_oauth_url()
+
+            print(f"Please visit this URL to authorize this application: {oauth_url}")
+            try:
+                auth_code = input("Enter authorization code: ").strip()
+            except EOFError:
+                print("Error: No authorization code provided and stdin closed.", file=sys.stderr)
+                return 1
+            except KeyboardInterrupt:
+                print("Error: Login process interrupted by user.", file=sys.stderr)
+                return 1
+
+            if not auth_code:
+                print("Error: Authorization code must be a non-empty string.", file=sys.stderr)
+                return 1
+
+        agy_binary = getattr(args, "agy_binary", None)
+        timeout = getattr(args, "timeout", 600)
+
+        try:
+            success, msg = engine.login_headless(
+                alias=alias,
+                auth_code=auth_code,
+                force=force,
+                agy_binary=agy_binary,
+                timeout=timeout,
+            )
+        except AgySwitchError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        if success:
+            print(f"[agy-switch] Account '{alias}' successfully logged in and saved to vault.")
+            print(f"  - Status: Standby (Run 'agy-switch switch {alias}' to activate)")
+            if hasattr(engine, "accounts_dir") and engine.accounts_dir:
+                print(f"  - Vault : {engine.accounts_dir / alias / 'token.json'}")
+            return 0
+        else:
+            err_msg = str(msg)
+            if err_msg.startswith("Error:"):
+                print(err_msg, file=sys.stderr)
+            else:
+                print(f"Error: {err_msg}", file=sys.stderr)
+            return 1
+
+    try:
+        res = engine.login_account(
+            alias,
+            agy_binary=args.agy_binary,
+            timeout=args.timeout,
+            force=force,
+        )
+        email_info = f" ({res['email']})" if res.get("email") else ""
+        print(
+            f"[agy-switch] Account '{res['name']}'{email_info} successfully logged in and saved to vault."
+        )
+        print(f"  - Status: Standby (Run 'agy-switch switch {res['name']}' to activate)")
+        print(f"  - Vault : {engine.accounts_dir / res['name'] / 'token.json'}")
+        return 0
+    except AgySwitchError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -> int:
@@ -410,7 +567,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         else:
             print(format_diagnostic_report(report))
 
-        return report.exit_code
+        return int(report.exit_code) if report.exit_code is not None else 0
 
     if args.command == "internal-probe":
         accounts_data = engine.list_accounts().get("accounts", [])
@@ -590,23 +747,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             return 1
 
     if args.command == "login":
-        try:
-            res = engine.login_account(
-                args.name,
-                agy_binary=args.agy_binary,
-                timeout=args.timeout,
-                force=args.force,
-            )
-            email_info = f" ({res['email']})" if res.get("email") else ""
-            print(
-                f"[agy-switch] Account '{res['name']}'{email_info} successfully logged in and saved to vault."
-            )
-            print(f"  - Status: Standby (Run 'agy-switch switch {res['name']}' to activate)")
-            print(f"  - Vault : {engine.accounts_dir / res['name'] / 'token.json'}")
-            return 0
-        except AgySwitchError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+        return handle_login(args, engine)
 
     if args.command == "remove":
         try:
