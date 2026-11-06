@@ -24,6 +24,9 @@ _EXPORTS: dict[str, str] = {
     "DiagnosticReport": "agy_switcher.models",
     "QuotaStatus": "agy_switcher.models",
     "EvaluationCandidate": "agy_switcher.models",
+    "AccountInfo": "agy_switcher.models",
+    "RotationResult": "agy_switcher.models",
+    "FleetQuotaSummary": "agy_switcher.models",
     # Layer 0: Security
     "_atomic_write_file": "agy_switcher.security",
     "_atomic_write_json": "agy_switcher.security",
@@ -84,8 +87,13 @@ _EXPORTS: dict[str, str] = {
     "DaemonManager": "agy_switcher.watcher",
     # Layer 3: Hook
     "handle_pre_invocation_hook": "agy_switcher.hook",
-    # Layer 4: CLI
+    # Layer 4: Facade & CLI
+    "get_active_account": "agy_switcher.api",
+    "auto_rotate_on_exhaustion": "agy_switcher.api",
+    "switch_account": "agy_switcher.api",
+    "get_fleet_quota_summary": "agy_switcher.api",
     "build_parser": "agy_switcher.cli",
+    "handle_vault": "agy_switcher.cli",
     "main": "agy_switcher.cli",
 }
 

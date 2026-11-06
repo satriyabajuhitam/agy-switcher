@@ -55,6 +55,20 @@ def _get_fetch_account_quota() -> Any:
 DEFAULT_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 DEFAULT_CLIENT_SECRET = "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"
 
+
+def build_oauth_url(client_id: str = DEFAULT_CLIENT_ID) -> str:
+    """Constructs default Google OAuth authorization URL for headless login."""
+    params = urllib.parse.urlencode({
+        "client_id": client_id,
+        "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+        "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform",
+        "access_type": "offline",
+        "prompt": "consent",
+    })
+    return f"https://accounts.google.com/o/oauth2/auth?{params}"
+
+
 DEFAULT_CLOUDCODE_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com"
 DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT = "https://cloudcode-pa.googleapis.com"
 QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary"

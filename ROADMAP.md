@@ -40,6 +40,16 @@ Dokumen ini melacak rencana pengembangan strategis, fitur masa depan, dan riwaya
   - Preservasi antarmuka publik dan transparansi runtime mocking melalui *Dynamic Module Proxy Bridge* pada `hook.py` dan `cli.py`.
   - Re-Export Facade Launchers kanonikal (`scripts/agy_switch.py` & `scripts/watch.py`) dengan resolusi symlink `os.path.realpath`.
   - Suite pengujian statis AST DAG dan validasi integritas namespace terisolasi pada `tests/test_modular_architecture.py`.
+- [x] **Siklus 1 (Triad): Fondasi Stabilitas Headless & Bugfixing Kritis**:
+  - Eliminasi dead code tak terjangkau di `ProcessSupervisor._poll_process_exit` ([PRUNE]).
+  - Active File Descriptor ownership scan di `/proc/*/fd` dan pembersihan otomatis stale presence lock file.
+  - Pemindaian dual-directory `~/.gemini/antigravity/` (Desktop) dan `~/.gemini/antigravity-cli/` (CLI) di `presence.py` dan `watcher.py`.
+  - Perbaikan perutean parameter `target_model` pada formatter tabel dan listicle kuota Claude vs Gemini.
+- [x] **Siklus 2 (Triad): Paketasi Modul, In-Process SDK Interface, & Headless Operations**:
+  - Standardisasi packaging deklaratif root `pyproject.toml` dengan mapping `package_dir = {"": "scripts"}` dan console script `agy-switch` (tetap zero external pip dependencies).
+  - Pembangunan In-Process SDK Facade di `scripts/agy_switcher/api.py` (Layer 4 DAG) dengan Disk-Only Swap (`reload_server=False`) secara default untuk mencegah blokir presence lock selama failover otomatis.
+  - Alur otentikasi remote VPS `login --headless` (mode interaktif stdin dan non-interaktif `--auth-code`).
+  - Utilitas migrasi vault `vault export` dan `vault import` berbasis gzipped tarball murni standard library dengan verifikasi checksum SHA-256 dan penegakan izin `0600`.
 
 ---
 
@@ -135,17 +145,17 @@ Detail arsitektur, data flow, dan analisis kegagalan terdokumentasi di [`.scratc
 
 ### Siklus 1: Fondasi Stabilitas Headless & Bugfixing Kritis
 * **Fokus**: Menghilangkan false positive dan bug blocking pada headless VPS / server CLI.
-* **Status**: Direncanakan (Planned)
+* **Status**: Selesai (Shipped)
 * **Tiket Pekerjaan**:
-  - [ ] **[P0-1] Perbaikan Stale Lock Trap pada `ProcessSupervisor.is_server_busy`**:
+  - [x] **[P0-1] Perbaikan Stale Lock Trap pada `ProcessSupervisor.is_server_busy`**:
     - Validasi keaktifan lock melalui kepemilikan file descriptor PID aktif di `/proc` (bukan sekadar `iterdir()`).
     - Otomatis bersihkan lock basi yang tidak memiliki proses hidup terkait di `scripts/agy_switcher/supervisor.py`.
-  - [ ] **[P0-2] Dual-Directory Presence & Brain CLI Scan**:
+  - [x] **[P0-2] Dual-Directory Presence & Brain CLI Scan**:
     - Tambahkan pemindaian `~/.gemini/antigravity-cli/presence` dan `~/.gemini/antigravity-cli/brain` di `presence.py` dan `watcher.py` agar transkrip sesi CLI terpantau.
-  - [ ] **[P0-3] Perbaikan Formatter Model Claude**:
+  - [x] **[P0-3] Perbaikan Formatter Model Claude**:
     - Teruskan parameter `target_model` dari `cli.py` ke `format_accounts_table` dan `format_accounts_listicle` di `formatters.py`.
     - Tampilkan header dinamis `CLAUDE QUOTA` vs `GEMINI QUOTA`.
-  - [ ] **[P0-4] Pembersihan Unreachable Dead Code**:
+  - [x] **[P0-4] Pembersihan Unreachable Dead Code**:
     - Hapus duplikat perulangan tak terjangkau setelah `return False` di `scripts/agy_switcher/supervisor.py#L181-L194`.
 * **Kriteria Selesai (DoD)**:
   - Rotasi `agy-switch switch <alias>` tidak lagi diblokir oleh lock file yatim pada server headless.
@@ -156,21 +166,21 @@ Detail arsitektur, data flow, dan analisis kegagalan terdokumentasi di [`.scratc
 
 ### Siklus 2: Paketasi Modul & In-Process SDK Interface
 * **Fokus**: Menjadikan `agy-switcher` sebagai library Python standar yang dapat diinstal (`pip install -e .`) dan diimpor langsung oleh `agy-telemote`.
-* **Status**: Direncanakan (Planned)
+* **Status**: Selesai (Shipped — [PR #2](https://github.com/satriyabajuhitam/agy-switcher/pull/2))
 * **Tiket Pekerjaan**:
-  - [ ] **[P1-1] Standardisasi Packaging Python (`pyproject.toml`)**:
+  - [x] **[P1-1] Standardisasi Packaging Python (`pyproject.toml`)**:
     - Konfigurasi `pyproject.toml` berbasis standard-library setuptools tanpa external dependencies.
     - Pendaftaran console script CLI `agy-switch = "agy_switcher.cli:main"`.
-  - [ ] **[P1-2] In-Process SDK Facade (`scripts/agy_switcher/api.py`)**:
+  - [x] **[P1-2] In-Process SDK Facade (`scripts/agy_switcher/api.py`)**:
     - Sediakan antarmuka publik Python murni type-hinted:
       - `get_active_account() -> AccountInfo`
       - `auto_rotate_on_exhaustion(model="gemini") -> RotationResult`
       - `switch_account(name: str) -> bool`
-      - `get_fleet_quota_summary(model="all") -> dict[str, Any]`
-  - [ ] **[P1-3] Alur Otentikasi Remote VPS (`login --headless`)**:
+      - `get_fleet_quota_summary(model="all") -> FleetQuotaSummary`
+  - [x] **[P1-3] Alur Otentikasi Remote VPS (`login --headless`)**:
     - Tangkap URL otentikasi Google dari `stderr` saat memanggil `agy -p "auth check"` tanpa TUI curses.
     - Terima kode otentikasi via stdin/argumen dan simpan token langsung ke vault.
-  - [ ] **[P2-4] Utilitas Migrasi Vault (`export` & `import`)**:
+  - [x] **[P2-4] Utilitas Migrasi Vault (`export` & `import`)**:
     - Perintah `agy-switch vault export --bundle <file.tar.gz>` dan `agy-switch vault import <file.tar.gz>`.
 * **Kriteria Selesai (DoD)**:
   - `pip install -e /srv/agy-workspaces/booster/agy-switcher` sukses tanpa error build.
