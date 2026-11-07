@@ -1942,6 +1942,170 @@ class TestWatcherWebhookAlert(unittest.TestCase):
         self.assertIn("https://dual.example.com/webhook", urls)
 
 
+
+class TestWatcherSslResilience(unittest.TestCase):
+    """Test suite validating LogWatcher resilience against malformed webhook URLs and SSL errors.
+
+    Specifications & Scenarios:
+    - [CMD-ALERT-EDGE-002]: Malformed webhook URL or SSL handshake failure silently logged without crashing watcher.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+        self.vault_dir = self.base_dir / ".antigravity-vault"
+        self.gemini_dir = self.base_dir / ".gemini"
+        self.legacy_root = self.base_dir / ".agy-cli-manager"
+        self.proc_dir = self.base_dir / "proc"
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+        self.token_acc1 = create_mock_oauth_token("acc1@example.com", "ya29.acc1")
+        self.token_acc2 = create_mock_oauth_token("acc2@example.com", "ya29.acc2")
+
+        self._setup_account("acc1", self.token_acc1)
+        self._setup_account("acc2", self.token_acc2)
+        self.engine.set_active_name("acc1")
+
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "acc2": {"gemini": {"quota": 100, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        self.watcher = LogWatcher(
+            engine=self.engine,
+            log_dirs=[str(self.base_dir)],
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _setup_account(self, name: str, token_data: dict[str, Any]) -> None:
+        acc_dir = self.engine.accounts_dir / name
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(token_data), encoding="utf-8")
+
+    def test_cmd_alert_edge_002_ssl_error_in_dispatch_alert_is_handled(self) -> None:
+        """[CMD-ALERT-EDGE-002]: Broken SSL certificate in webhook URL logs warning and keeps daemon running."""
+        def ssl_error_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise ssl.SSLError("CERTIFICATE_VERIFY_FAILED: self signed certificate in certificate chain")
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://broken-ssl.example.com/alerts",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=ssl_error_urlopen):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini-2.5-pro",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-2.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_edge_002_invalid_url_scheme_in_dispatch_alert(self) -> None:
+        """[CMD-ALERT-EDGE-002]: Invalid URL scheme in WATCHER_WEBHOOK_URL is caught cleanly and daemon continues."""
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "invalid-scheme://webhook.example.com/alert",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+            )
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_edge_002_malformed_url_syntax_in_dispatch_alert(self) -> None:
+        """[CMD-ALERT-EDGE-002]: Malformed URL syntax in WATCHER_WEBHOOK_URL is handled without crashing."""
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "://malformed-url-syntax",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+            )
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_edge_002_direct_dispatch_alert_catches_ssl_and_value_errors(self) -> None:
+        """[CMD-ALERT-EDGE-002]: dispatch_alert directly catches ssl.SSLError and ValueError without bubbling."""
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://alerts.example.com/webhook",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch.object(self.watcher, "dispatch_webhook", side_effect=ssl.SSLError("Direct SSL handshake failure")):
+            thread = self.watcher.dispatch_alert("acc1", "acc2")
+            self.assertIsNone(thread)
+
+        with patch.dict(os.environ, env_vars), \
+             patch.object(self.watcher, "dispatch_webhook", side_effect=ValueError("Invalid URL")):
+            thread = self.watcher.dispatch_alert("acc1", "acc2")
+            self.assertIsNone(thread)
+
+        with patch.dict(os.environ, env_vars), \
+             patch.object(self.watcher, "dispatch_webhook", side_effect=urllib.error.URLError("DNS failure")):
+            thread = self.watcher.dispatch_alert("acc1", "acc2")
+            self.assertIsNone(thread)
+
+    def test_cmd_alert_edge_002_logger_warning_emitted_on_error(self) -> None:
+        """[CMD-ALERT-EDGE-002]: Warning is logged via logger when dispatching alert fails."""
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://broken-ssl.example.com/alerts",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch.object(self.watcher, "dispatch_webhook", side_effect=ssl.SSLError("SSL verification failed")):
+            with patch("agy_switcher.watcher.logger.warning") as mock_log_warn:
+                self.watcher.dispatch_alert("acc1", "acc2")
+                mock_log_warn.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 

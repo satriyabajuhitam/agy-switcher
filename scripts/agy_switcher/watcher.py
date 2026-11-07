@@ -11,12 +11,14 @@ import argparse
 from datetime import datetime, timezone
 import glob
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -35,6 +37,8 @@ from agy_switcher.telemetry import QuotaClient as _RealQuotaClient
 RotationEngine: Any = None
 QuotaClient: Any = None
 AgySwitchEngine: Any = None
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_MAX_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB read bound
@@ -674,8 +678,9 @@ class LogWatcher:
                 )
                 with urllib.request.urlopen(req, timeout=3.0) as resp:
                     resp.read()
-            except Exception as e:
+            except (ssl.SSLError, urllib.error.URLError, ValueError, ConnectionError, OSError, Exception) as e:
                 getattr(e, "close", lambda: None)()
+                logger.warning("[watch] %s alert dispatch failed: %s", label, e)
                 print(f"[watch] {label} alert dispatch failed: {e}", file=sys.stderr)
 
         try:
@@ -683,6 +688,7 @@ class LogWatcher:
             t.start()
             return t
         except Exception as e:
+            logger.warning("[watch] Failed to spawn %s alert thread: %s", label, e)
             print(f"[watch] Failed to spawn {label} alert thread: {e}", file=sys.stderr)
             return None
 
@@ -690,32 +696,32 @@ class LogWatcher:
         self, previous_account: str, new_account: str, model_hint: str | None = None, timestamp: str | None = None
     ) -> threading.Thread | None:
         """Dispatches non-blocking alerts (e.g. Telegram Bot, Webhook) upon rotation completion."""
-        raw_bot, raw_chat = os.environ.get("TELEGRAM_ALERT_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_ALERT_CHAT_ID", "").strip()
-        webhook_url = os.environ.get("WATCHER_WEBHOOK_URL", "").strip() or None
-        bot_token, chat_id = raw_bot or None, raw_chat or None
-        if not bot_token and not webhook_url:
+        try:
+            raw_bot, raw_chat = os.environ.get("TELEGRAM_ALERT_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_ALERT_CHAT_ID", "").strip()
+            webhook_url = os.environ.get("WATCHER_WEBHOOK_URL", "").strip() or None
+            bot_token, chat_id = raw_bot or None, raw_chat or None
+            if not bot_token and not webhook_url:
+                return None
+
+            ts = timestamp or datetime.now(timezone.utc).isoformat()
+            t_thread = None
+            if bot_token and chat_id:
+                msg = f"🔄 Antigravity Auto-Rotation Alert\n• Previous: {previous_account}\n• Active: {new_account}\n• Model: {model_hint or 'default'}\n• Timestamp: {ts}"
+                payload = json.dumps({"chat_id": chat_id, "text": msg}).encode("utf-8")
+                t_thread = self._dispatch_http_post(f"https://api.telegram.org/bot{bot_token}/sendMessage", payload, "Telegram")
+
+            w_thread = self.dispatch_webhook(
+                previous_account=previous_account, new_account=new_account, model_hint=model_hint, timestamp=ts, webhook_url=webhook_url
+            ) if webhook_url else None
+            return t_thread or w_thread
+        except (ssl.SSLError, urllib.error.URLError, ValueError, ConnectionError, OSError, Exception) as e:
+            logger.warning("[watch] Alert dispatch failed: %s", e)
+            print(f"[watch] Alert dispatch failed: {e}", file=sys.stderr)
             return None
 
-        ts = timestamp or datetime.now(timezone.utc).isoformat()
-        t_thread = None
-        if bot_token and chat_id:
-            msg = f"🔄 Antigravity Auto-Rotation Alert\n• Previous: {previous_account}\n• Active: {new_account}\n• Model: {model_hint or 'default'}\n• Timestamp: {ts}"
-            payload = json.dumps({"chat_id": chat_id, "text": msg}).encode("utf-8")
-            t_thread = self._dispatch_http_post(f"https://api.telegram.org/bot{bot_token}/sendMessage", payload, "Telegram")
-
-        w_thread = self.dispatch_webhook(
-            previous_account=previous_account, new_account=new_account, model_hint=model_hint, timestamp=ts, webhook_url=webhook_url
-        ) if webhook_url else None
-        return t_thread or w_thread
-
     def dispatch_webhook(
-        self,
-        previous_account: str = "",
-        new_account: str = "",
-        model_hint: str | None = None,
-        timestamp: str | None = None,
-        webhook_url: str | None = None,
-        **kwargs: Any,
+        self, previous_account: str = "", new_account: str = "", model_hint: str | None = None,
+        timestamp: str | None = None, webhook_url: str | None = None, **kwargs: Any,
     ) -> threading.Thread | None:
         """Dispatches non-blocking JSON alert to configured webhook URL upon rotation completion."""
         target_url = (webhook_url or kwargs.get("url") or kwargs.get("endpoint") or "").strip()
@@ -732,19 +738,13 @@ class LogWatcher:
         return self._dispatch_http_post(target_url, json.dumps(payload).encode("utf-8"), "Webhook")
 
     def trigger_switch(
-        self,
-        line: str = "",
-        model_hint: str | None = None,
-        file_path: str | None = None,
+        self, line: str = "", model_hint: str | None = None, file_path: str | None = None
     ) -> bool:
         """Backward-compatible alias forwarding to handle_exhaustion."""
         return self.handle_exhaustion(line=line, model_hint=model_hint, file_path=file_path)
 
     def handle_exhaustion(
-        self,
-        line: str = "",
-        model_hint: str | None = None,
-        file_path: str | None = None,
+        self, line: str = "", model_hint: str | None = None, file_path: str | None = None
     ) -> bool:
         # Check damping window
         now = time.time()
