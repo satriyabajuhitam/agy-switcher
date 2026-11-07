@@ -48,7 +48,6 @@ from agy_switcher.presence import (
     append_secure_log_entry,
 )
 
-
 def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> Any:
     """Resolves symbol from sys.modules if mocked/present; falls back to sub-package default."""
     for mod_name in ("agy_switcher.watcher", "scripts.watch", "watch", "agy_switch", "scripts.agy_switch"):
@@ -667,50 +666,70 @@ class LogWatcher:
         log_line = f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n" if (old_account or reloaded) else f"{ts} [watch] {prefix} ({log_reason})\n"
         append_secure_log_entry(log_dir / "watch.log", log_line)
 
+    def _dispatch_http_post(self, url: str, data: bytes, label: str) -> threading.Thread | None:
+        def _send() -> None:
+            try:
+                req = urllib.request.Request(
+                    url, data=data, headers={"Content-Type": "application/json", "User-Agent": "agy-switcher-watcher/1.0"}, method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    resp.read()
+            except Exception as e:
+                getattr(e, "close", lambda: None)()
+                print(f"[watch] {label} alert dispatch failed: {e}", file=sys.stderr)
+
+        try:
+            t = threading.Thread(target=_send, name=f"watcher-{label.lower()}-alert", daemon=True)
+            t.start()
+            return t
+        except Exception as e:
+            print(f"[watch] Failed to spawn {label} alert thread: {e}", file=sys.stderr)
+            return None
+
     def dispatch_alert(
         self, previous_account: str, new_account: str, model_hint: str | None = None, timestamp: str | None = None
     ) -> threading.Thread | None:
         """Dispatches non-blocking alerts (e.g. Telegram Bot, Webhook) upon rotation completion."""
-        raw_bot_token, raw_chat_id = os.environ.get("TELEGRAM_ALERT_BOT_TOKEN"), os.environ.get("TELEGRAM_ALERT_CHAT_ID")
-        raw_webhook_url = os.environ.get("WATCHER_WEBHOOK_URL")
-        bot_token = raw_bot_token.strip() if raw_bot_token and raw_bot_token.strip() else None
-        chat_id = raw_chat_id.strip() if raw_chat_id and raw_chat_id.strip() else None
-        webhook_url = raw_webhook_url.strip() if raw_webhook_url and raw_webhook_url.strip() else None
+        raw_bot, raw_chat = os.environ.get("TELEGRAM_ALERT_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_ALERT_CHAT_ID", "").strip()
+        webhook_url = os.environ.get("WATCHER_WEBHOOK_URL", "").strip() or None
+        bot_token, chat_id = raw_bot or None, raw_chat or None
         if not bot_token and not webhook_url:
             return None
 
         ts = timestamp or datetime.now(timezone.utc).isoformat()
-        thread: threading.Thread | None = None
+        t_thread = None
         if bot_token and chat_id:
-            try:
-                url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                msg = f"🔄 Antigravity Auto-Rotation Alert\n• Previous: {previous_account}\n• Active: {new_account}\n• Model: {model_hint or 'default'}\n• Timestamp: {ts}"
-                data = json.dumps({"chat_id": chat_id, "text": msg}).encode("utf-8")
+            msg = f"🔄 Antigravity Auto-Rotation Alert\n• Previous: {previous_account}\n• Active: {new_account}\n• Model: {model_hint or 'default'}\n• Timestamp: {ts}"
+            payload = json.dumps({"chat_id": chat_id, "text": msg}).encode("utf-8")
+            t_thread = self._dispatch_http_post(f"https://api.telegram.org/bot{bot_token}/sendMessage", payload, "Telegram")
 
-                def _send() -> None:
-                    try:
-                        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-                        with urllib.request.urlopen(req, timeout=3.0) as resp:
-                            resp.read()
-                    except Exception as e:
-                        print(f"[watch] Telegram alert dispatch failed: {e}", file=sys.stderr)
+        w_thread = self.dispatch_webhook(
+            previous_account=previous_account, new_account=new_account, model_hint=model_hint, timestamp=ts, webhook_url=webhook_url
+        ) if webhook_url else None
+        return t_thread or w_thread
 
-                t = threading.Thread(target=_send, name="watcher-telegram-alert", daemon=True)
-                t.start()
-                thread = t
-            except Exception as e:
-                thread = None
-                print(f"[watch] Failed to spawn Telegram alert thread: {e}", file=sys.stderr)
+    def dispatch_webhook(
+        self,
+        previous_account: str = "",
+        new_account: str = "",
+        model_hint: str | None = None,
+        timestamp: str | None = None,
+        webhook_url: str | None = None,
+        **kwargs: Any,
+    ) -> threading.Thread | None:
+        """Dispatches non-blocking JSON alert to configured webhook URL upon rotation completion."""
+        target_url = (webhook_url or kwargs.get("url") or kwargs.get("endpoint") or "").strip()
+        prev_acc, new_acc = previous_account or "", new_account or ""
+        if (not target_url) and isinstance(prev_acc, str) and prev_acc.startswith(("http://", "https://")):
+            target_url, prev_acc, new_acc = prev_acc.strip(), new_acc, model_hint or ""
+        target_url = target_url or os.environ.get("WATCHER_WEBHOOK_URL", "").strip()
+        if not target_url:
+            return None
 
-        if webhook_url and hasattr(self, "dispatch_webhook"):
-            try:
-                getattr(self, "dispatch_webhook")(
-                    webhook_url=webhook_url, previous_account=previous_account, new_account=new_account, model_hint=model_hint, timestamp=ts
-                )
-            except Exception as e:
-                print(f"[watch] Webhook alert dispatch failed: {e}", file=sys.stderr)
-
-        return thread
+        raw_ts = timestamp or kwargs.get("ts")
+        ts = raw_ts.isoformat() if isinstance(raw_ts, datetime) else (str(raw_ts) if raw_ts is not None else datetime.now(timezone.utc).isoformat())
+        payload = {"event": "auto_rotation", "previous_account": str(prev_acc), "new_account": str(new_acc), "timestamp": ts}
+        return self._dispatch_http_post(target_url, json.dumps(payload).encode("utf-8"), "Webhook")
 
     def trigger_switch(
         self,
@@ -1270,7 +1289,7 @@ class DaemonManager:
             targets: list[str] = []
             try:
                 detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
-                targets = list(detector.get_watch_targets(as_str=True))
+                targets = [str(t) for t in detector.get_watch_targets(as_str=True)]
             except Exception:
                 targets = []
 
@@ -1363,25 +1382,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "AgySwitchError",
-    "DaemonError",
-    "DaemonAlreadyRunningError",
-    "QuotaClient",
-    "RotationEngine",
-    "AgySwitchEngine",
-    "DEFAULT_VAULT_DIR",
-    "DEFAULT_GEMINI_DIR",
-    "DEFAULT_MAX_CHUNK_BYTES",
-    "_open_secure_log_file",
-    "append_secure_log_entry",
-    "PresenceDetector",
-    "CooldownManager",
-    "LogWatcher",
-    "DaemonManager",
-    "main",
-    "time",
-    "shutil",
-    "subprocess",
+    "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError",
+    "QuotaClient", "RotationEngine", "AgySwitchEngine",
+    "DEFAULT_VAULT_DIR", "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES",
+    "_open_secure_log_file", "append_secure_log_entry",
+    "PresenceDetector", "CooldownManager", "LogWatcher", "DaemonManager",
+    "main", "time", "shutil", "subprocess",
 ]
 
 

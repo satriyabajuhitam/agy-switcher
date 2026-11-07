@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+from datetime import datetime, timezone
+import http.client
 import json
 import os
 from pathlib import Path
+import ssl
 import sys
 import tempfile
 import threading
@@ -1419,6 +1422,524 @@ class TestWatcherTelegramAlert(unittest.TestCase):
             )
             # When thread.start fails, caller catches error, thread is not active
             self.assertIsNone(thread)
+
+class TestWatcherWebhookAlert(unittest.TestCase):
+    """Test suite validating LogWatcher non-blocking Webhook alert dispatch and network fault tolerance.
+
+    Specifications & Scenarios:
+    - [CMD-ALERT-005]: Webhook JSON alert via WATCHER_WEBHOOK_URL upon background rotation.
+    - [CMD-ALERT-ERR-004]: Network timeout, DNS failure, and HTTP error resilience logging non-fatal warnings without stalling.
+    - [CMD-ALERT-EDGE-001]: Clean no-op (0ms overhead) when alert env vars are unset.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+        self.vault_dir = self.base_dir / ".antigravity-vault"
+        self.gemini_dir = self.base_dir / ".gemini"
+        self.legacy_root = self.base_dir / ".agy-cli-manager"
+        self.proc_dir = self.base_dir / "proc"
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+        # Scaffolding accounts: acc1 (primary) and acc2 (standby)
+        self.token_acc1 = create_mock_oauth_token("acc1@example.com", "ya29.acc1")
+        self.token_acc2 = create_mock_oauth_token("acc2@example.com", "ya29.acc2")
+
+        self._setup_account("acc1", self.token_acc1)
+        self._setup_account("acc2", self.token_acc2)
+        self.engine.set_active_name("acc1")
+
+        # Quota cache indicating acc1 has quota 0 and acc2 has quota 100
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "acc2": {"gemini": {"quota": 100, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        self.watcher = LogWatcher(
+            engine=self.engine,
+            log_dirs=[str(self.base_dir)],
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _setup_account(self, name: str, token_data: dict[str, Any]) -> None:
+        acc_dir = self.engine.accounts_dir / name
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(token_data), encoding="utf-8")
+
+    def test_cmd_alert_005_webhook_alert_on_successful_rotation(self) -> None:
+        """[CMD-ALERT-005]: LogWatcher sends non-blocking JSON webhook alert upon background rotation."""
+        called_event = threading.Event()
+        captured_requests: list[urllib.request.Request] = []
+        captured_timeouts: list[float] = []
+
+        def mock_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            captured_timeouts.append(timeout)
+            called_event.set()
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.getcode.return_value = 200
+            mock_resp.read.return_value = b'{"status": "ok"}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+            "TELEGRAM_ALERT_CHAT_ID": "",
+            "WATCHER_WEBHOOK_URL": "https://alerts.example.com/agy-rotation",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+            self.assertTrue(
+                called_event.wait(timeout=2.0),
+                "Webhook alert HTTP call was not dispatched asynchronously within 2.0s",
+            )
+
+        self.assertEqual(len(captured_requests), 1)
+        req = captured_requests[0]
+        self.assertEqual(req.full_url, "https://alerts.example.com/agy-rotation")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.headers.get("Content-type"), "application/json")
+        self.assertEqual(captured_timeouts[0], 3.0)
+
+        self.assertIsInstance(req.data, (bytes, bytearray))
+        assert isinstance(req.data, (bytes, bytearray))
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(payload["event"], "auto_rotation")
+        self.assertEqual(payload["previous_account"], "acc1")
+        self.assertEqual(payload["new_account"], "acc2")
+        self.assertIn("timestamp", payload)
+
+    def test_cmd_alert_005_webhook_alert_handles_http_204_cleanly(self) -> None:
+        """[CMD-ALERT-005]: Webhook alert endpoint returning HTTP 204 No Content is handled cleanly."""
+        called_event = threading.Event()
+
+        def mock_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            called_event.set()
+            mock_resp = MagicMock()
+            mock_resp.status = 204
+            mock_resp.getcode.return_value = 204
+            mock_resp.read.return_value = b""
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://alerts.example.com/empty-webhook",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="https://alerts.example.com/empty-webhook",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+            self.assertTrue(called_event.is_set())
+
+    def test_cmd_alert_005_direct_dispatch_webhook_seam(self) -> None:
+        """[CMD-ALERT-005]: Direct invocation of LogWatcher.dispatch_webhook public seam."""
+        called_event = threading.Event()
+        captured_requests: list[urllib.request.Request] = []
+        fixed_ts = "2026-11-07T12:00:00Z"
+
+        def mock_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            called_event.set()
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = b'{"ok": true}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                timestamp=fixed_ts,
+                webhook_url="https://custom.webhook.org/hook",
+            )
+            self.assertIsNotNone(thread)
+            self.assertTrue(called_event.wait(timeout=2.0))
+            if thread:
+                thread.join(timeout=1.0)
+
+        self.assertEqual(len(captured_requests), 1)
+        req = captured_requests[0]
+        self.assertEqual(req.full_url, "https://custom.webhook.org/hook")
+        assert isinstance(req.data, (bytes, bytearray))
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(
+            payload,
+            {
+                "event": "auto_rotation",
+                "previous_account": "acc1",
+                "new_account": "acc2",
+                "timestamp": fixed_ts,
+            },
+        )
+
+    def test_cmd_alert_005_non_blocking_execution(self) -> None:
+        """[CMD-ALERT-005]: Webhook alert dispatch is non-blocking with asynchronous execution."""
+        def slow_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            time.sleep(0.3)
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = b'{"ok": true}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=slow_urlopen):
+            t0 = time.time()
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="https://slow.webhook.org/hook",
+            )
+            elapsed = time.time() - t0
+            self.assertLess(elapsed, 0.1, "dispatch_webhook must return immediately without waiting for HTTP response")
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+
+    def test_cmd_alert_err_004_network_timeout_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: Socket timeout / TimeoutError logs non-fatal warning and completes rotation."""
+        def timeout_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise TimeoutError("Connection timed out after 3.0s")
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://timeout.example.com/agy-rotation",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=timeout_urlopen):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+            )
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            # Auto-rotation via handle_exhaustion completes successfully without rolling back or stalling
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_err_004_url_error_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: URLError (DNS failure, connection refused) logs non-fatal warning without crashing."""
+        def error_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise urllib.error.URLError("DNS resolution failed for alerts.example.com")
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://unreachable.example.com/agy-rotation",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=error_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="https://unreachable.example.com/agy-rotation",
+            )
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_err_004_http_504_gateway_timeout_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: HTTP 504 Gateway Timeout logs warning and does not stall rotation."""
+        def gateway_timeout_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise urllib.error.HTTPError(
+                url="https://alerts.example.com/agy-rotation",
+                code=504,
+                msg="Gateway Timeout",
+                hdrs=MagicMock(),
+                fp=None,
+            )
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://alerts.example.com/agy-rotation",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=gateway_timeout_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="https://alerts.example.com/agy-rotation",
+            )
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_edge_001_no_alert_when_env_unset(self) -> None:
+        """[CMD-ALERT-EDGE-001]: No network call attempted when WATCHER_WEBHOOK_URL is unset (0ms no-op)."""
+        captured_requests: list[Any] = []
+
+        def mock_urlopen(req: Any, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            return MagicMock()
+
+        env_clean = {
+            k: v for k, v in os.environ.items()
+            if k not in ("WATCHER_WEBHOOK_URL", "TELEGRAM_ALERT_BOT_TOKEN", "TELEGRAM_ALERT_CHAT_ID")
+        }
+
+        with patch.dict(os.environ, env_clean, clear=True), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            res = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+            )
+            self.assertIsNone(res)
+
+        self.assertEqual(len(captured_requests), 0)
+
+    def test_cmd_alert_edge_001_whitespace_url_treated_as_unset(self) -> None:
+        """[CMD-ALERT-EDGE-001]: Whitespace-only WATCHER_WEBHOOK_URL treated as unset."""
+        captured_requests: list[Any] = []
+
+        def mock_urlopen(req: Any, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            return MagicMock()
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "   \t  \n ",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+            "TELEGRAM_ALERT_CHAT_ID": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            res = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+            )
+            self.assertIsNone(res)
+
+        self.assertEqual(len(captured_requests), 0)
+
+    def test_cmd_alert_edge_002_ssl_handshake_failure_resilience(self) -> None:
+        """[CMD-ALERT-EDGE-002]: SSL handshake failure is caught in thread, logs warning, and does not crash watcher."""
+        def ssl_error_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise ssl.SSLError("CERTIFICATE_VERIFY_FAILED: certificate verify failed")
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://bad-ssl.example.com/agy-rotation",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=ssl_error_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="https://bad-ssl.example.com/agy-rotation",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_edge_002_malformed_url_resilience(self) -> None:
+        """[CMD-ALERT-EDGE-002]: Malformed webhook URL format caught cleanly without crashing watcher."""
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "://malformed-url-format",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="://malformed-url-format",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_err_004_remote_disconnected_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: http.client.RemoteDisconnected exception handled without crashing thread."""
+        def disconnected_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://flaky.example.com/agy-rotation",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=disconnected_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="https://flaky.example.com/agy-rotation",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_err_004_socket_os_error_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: Low-level OSError (network unreachable) handled without crashing thread."""
+        def os_error_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise OSError(101, "Network is unreachable")
+
+        env_vars = {
+            "WATCHER_WEBHOOK_URL": "https://unreachable.example.com/agy-rotation",
+            "TELEGRAM_ALERT_BOT_TOKEN": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=os_error_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account="acc1",
+                new_account="acc2",
+                webhook_url="https://unreachable.example.com/agy-rotation",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_edge_001_none_and_datetime_parameters_resilience(self) -> None:
+        """[CMD-ALERT-EDGE-001]: None accounts and datetime object timestamps handled safely."""
+        captured_requests: list[urllib.request.Request] = []
+        dt = datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+        def mock_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = b'{"ok": true}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            thread = self.watcher.dispatch_webhook(
+                previous_account=None,  # type: ignore[arg-type]
+                new_account=None,  # type: ignore[arg-type]
+                timestamp=dt,  # type: ignore[arg-type]
+                webhook_url="https://alerts.example.com/agy-rotation",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+
+        self.assertEqual(len(captured_requests), 1)
+        req = captured_requests[0]
+        assert isinstance(req.data, (bytes, bytearray))
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(payload["previous_account"], "")
+        self.assertEqual(payload["new_account"], "")
+        self.assertEqual(payload["timestamp"], dt.isoformat())
+
+    def test_cmd_alert_005_both_telegram_and_webhook_alerts_dispatched(self) -> None:
+        """[CMD-ALERT-005]: Both Telegram and Webhook alerts are dispatched when both are configured."""
+        captured_requests: list[urllib.request.Request] = []
+        events_fired = threading.Barrier(3)  # Main thread + 2 worker threads
+
+        def mock_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            events_fired.wait(timeout=2.0)
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = b'{"ok": true}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "dual_bot",
+            "TELEGRAM_ALERT_CHAT_ID": "dual_chat",
+            "WATCHER_WEBHOOK_URL": "https://dual.example.com/webhook",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+            events_fired.wait(timeout=2.0)
+
+        self.assertEqual(len(captured_requests), 2)
+        urls = {req.full_url for req in captured_requests}
+        self.assertIn("https://api.telegram.org/botdual_bot/sendMessage", urls)
+        self.assertIn("https://dual.example.com/webhook", urls)
 
 
 if __name__ == "__main__":
