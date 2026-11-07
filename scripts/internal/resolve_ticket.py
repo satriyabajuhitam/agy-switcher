@@ -1249,7 +1249,11 @@ def parse_task_graph_tickets(task_graph_path: Path | str) -> list[dict[str, Any]
         return []
 
     tickets: list[dict[str, Any]] = []
-    status_table_match = re.search(r"##\s*Status\s*Progress\s*Table.*", content, re.DOTALL | re.IGNORECASE)
+    status_table_match = re.search(
+        r"#{2,3}\s*Status\s*Progress\s*Table.*?(?=\n##\s+|\Z)",
+        content,
+        re.DOTALL | re.IGNORECASE,
+    )
     search_content = status_table_match.group(0) if status_table_match else content
 
     table_row_regex = re.compile(

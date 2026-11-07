@@ -8,5 +8,15 @@
         "timeout": 5
       }
     ]
+  },
+  "build-quality-gate": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "bash /srv/agy-workspaces/booster/agy-switcher/scripts/verify-build.sh",
+        "timeout": 45
+      }
+    ]
   }
 }

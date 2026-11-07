@@ -13,4 +13,10 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+# Auto-fallback: if the first argument is a file ending in .md or an existing path without a subcommand,
+# default to the 'validate' subcommand to prevent argparse invalid choice errors.
+if [[ $# -gt 0 && ("$1" == *.md || -f "$1") ]]; then
+    set -- validate "$@"
+fi
+
 exec python3 "${REPO_ROOT}/scripts/internal/verify_spec.py" "$@"
