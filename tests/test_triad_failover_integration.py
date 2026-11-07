@@ -20,9 +20,12 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 from typing import Any
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+import urllib.error
+import urllib.request
 
 # Guarantee scripts directory is in sys.path for in-process SDK dynamic imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +35,7 @@ if SCRIPTS_DIR not in sys.path:
 
 from agy_switcher.models import RotationResult
 from agy_switcher.vault import AgySwitchEngine
+from agy_switcher.watcher import LogWatcher
 import agy_switcher.api as switcher_api
 
 
@@ -1049,6 +1053,375 @@ class TestMultiModelTelemetry(unittest.TestCase):
         )
 
 
+class TestWatcherTelegramAlert(unittest.TestCase):
+    """Test suite validating LogWatcher non-blocking Telegram Bot API alert dispatch.
+
+    Specifications & Scenarios:
+    - [CMD-ALERT-004]: Telegram alert via Bot API on rotation completion (async, 3.0s timeout).
+    - [CMD-ALERT-EDGE-001]: Clean no-op (0ms overhead) when alert env vars are unset.
+    - [CMD-ALERT-ERR-004]: Network exceptions log warning and do not block rotation.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+        self.vault_dir = self.base_dir / ".antigravity-vault"
+        self.gemini_dir = self.base_dir / ".gemini"
+        self.legacy_root = self.base_dir / ".agy-cli-manager"
+        self.proc_dir = self.base_dir / "proc"
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+        # Scaffolding accounts: acc1 (primary) and acc2 (standby)
+        self.token_acc1 = create_mock_oauth_token("acc1@example.com", "ya29.acc1")
+        self.token_acc2 = create_mock_oauth_token("acc2@example.com", "ya29.acc2")
+
+        self._setup_account("acc1", self.token_acc1)
+        self._setup_account("acc2", self.token_acc2)
+        self.engine.set_active_name("acc1")
+
+        # Quota cache indicating acc1 has quota 0 and acc2 has quota 100
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "acc1": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "acc2": {"gemini": {"quota": 100, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        self.watcher = LogWatcher(
+            engine=self.engine,
+            log_dirs=[str(self.base_dir)],
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _setup_account(self, name: str, token_data: dict[str, Any]) -> None:
+        acc_dir = self.engine.accounts_dir / name
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(token_data), encoding="utf-8")
+
+    def test_cmd_alert_004_telegram_alert_on_successful_rotation(self) -> None:
+        """[CMD-ALERT-004]: LogWatcher sends non-blocking Telegram alert via Bot API on rotation."""
+        called_event = threading.Event()
+        captured_requests: list[urllib.request.Request] = []
+        captured_timeouts: list[float] = []
+
+        def mock_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            captured_timeouts.append(timeout)
+            called_event.set()
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = b'{"ok": true}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "test_token_abc",
+            "TELEGRAM_ALERT_CHAT_ID": "-100123456789",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+            self.assertTrue(
+                called_event.wait(timeout=2.0),
+                "Telegram alert HTTP call was not dispatched asynchronously within 2.0s",
+            )
+
+        self.assertEqual(len(captured_requests), 1)
+        req = captured_requests[0]
+        self.assertEqual(req.full_url, "https://api.telegram.org/bottest_token_abc/sendMessage")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.headers.get("Content-type"), "application/json")
+        self.assertEqual(captured_timeouts[0], 3.0)
+
+        self.assertIsInstance(req.data, (bytes, bytearray))
+        assert isinstance(req.data, (bytes, bytearray))
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(payload["chat_id"], "-100123456789")
+        text = payload["text"]
+        self.assertIn("acc1", text)
+        self.assertIn("acc2", text)
+        self.assertIn("gemini-1.5-pro", text)
+        # Verify timestamp presence
+        self.assertTrue(any(c.isdigit() for c in text))
+
+    def test_cmd_alert_edge_001_no_alert_when_env_unset(self) -> None:
+        """[CMD-ALERT-EDGE-001]: No alert dispatched when env vars unset (0ms no-op)."""
+        captured_requests: list[Any] = []
+
+        def mock_urlopen(req: Any, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            return MagicMock()
+
+        env_clean = {
+            k: v for k, v in os.environ.items()
+            if k not in ("TELEGRAM_ALERT_BOT_TOKEN", "WATCHER_WEBHOOK_URL", "TELEGRAM_ALERT_CHAT_ID")
+        }
+
+        with patch.dict(os.environ, env_clean, clear=True), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            # Test direct seam
+            res = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertIsNone(res)
+
+            # Test through handle_exhaustion
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini-1.5-pro",
+            )
+            self.assertTrue(success)
+
+        self.assertEqual(
+            len(captured_requests), 0,
+            "No network requests should be attempted when alert env vars are unset",
+        )
+
+    def test_cmd_alert_004_direct_dispatch_seam(self) -> None:
+        """Validates LogWatcher.dispatch_alert public seam directly with explicit parameters."""
+        called_event = threading.Event()
+        captured_requests: list[urllib.request.Request] = []
+
+        def mock_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            called_event.set()
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = b'{"ok": true}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "bot999888",
+            "TELEGRAM_ALERT_CHAT_ID": "443322",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        fixed_ts = "2026-11-07T10:15:30Z"
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="claude-3-5-sonnet",
+                timestamp=fixed_ts,
+            )
+            self.assertIsNotNone(thread)
+            self.assertTrue(called_event.wait(timeout=2.0))
+            if thread:
+                thread.join(timeout=1.0)
+
+        self.assertEqual(len(captured_requests), 1)
+        req = captured_requests[0]
+        self.assertEqual(req.full_url, "https://api.telegram.org/botbot999888/sendMessage")
+        self.assertIsInstance(req.data, (bytes, bytearray))
+        assert isinstance(req.data, (bytes, bytearray))
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(payload["chat_id"], "443322")
+        self.assertIn("acc1", payload["text"])
+        self.assertIn("acc2", payload["text"])
+        self.assertIn("claude-3-5-sonnet", payload["text"])
+        self.assertIn(fixed_ts, payload["text"])
+
+    def test_cmd_alert_004_non_blocking_execution(self) -> None:
+        """Confirms alert dispatch does not block the caller even if network has delay."""
+        def slow_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            time.sleep(0.3)
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = b'{"ok": true}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "slow_bot",
+            "TELEGRAM_ALERT_CHAT_ID": "slow_chat",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=slow_urlopen):
+            t0 = time.time()
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini",
+            )
+            elapsed = time.time() - t0
+            self.assertLess(elapsed, 0.1, "dispatch_alert must be non-blocking and return immediately")
+            if thread:
+                thread.join(timeout=1.0)
+
+    def test_cmd_alert_err_004_network_error_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: Network exceptions (URLError, TimeoutError) log non-fatal warnings and do not crash."""
+        def failing_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise urllib.error.URLError("Temporary DNS failure")
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "fail_bot",
+            "TELEGRAM_ALERT_CHAT_ID": "fail_chat",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=failing_urlopen):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini",
+            )
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+            # Rotation through handle_exhaustion also succeeds cleanly
+            success = self.watcher.handle_exhaustion(
+                line="RESOURCE_EXHAUSTED",
+                model_hint="gemini",
+            )
+            self.assertTrue(success)
+
+    def test_cmd_alert_edge_001_whitespace_env_vars_treated_as_unset(self) -> None:
+        """[CMD-ALERT-EDGE-001]: Whitespace-only alert env vars are stripped and treated as unset (0ms no-op)."""
+        captured_requests: list[Any] = []
+
+        def mock_urlopen(req: Any, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            return MagicMock()
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "   ",
+            "TELEGRAM_ALERT_CHAT_ID": "   ",
+            "WATCHER_WEBHOOK_URL": "   ",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            res = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini",
+            )
+            self.assertIsNone(res)
+
+        self.assertEqual(len(captured_requests), 0)
+
+    def test_cmd_alert_edge_001_bot_token_without_chat_id_returns_none(self) -> None:
+        """[CMD-ALERT-EDGE-001]: Configured bot token without chat ID returns None without network calls."""
+        captured_requests: list[Any] = []
+
+        def mock_urlopen(req: Any, timeout: float = 0.0) -> Any:
+            captured_requests.append(req)
+            return MagicMock()
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "bot_only_token",
+            "TELEGRAM_ALERT_CHAT_ID": "",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            res = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini",
+            )
+            self.assertIsNone(res)
+
+        self.assertEqual(len(captured_requests), 0)
+
+    def test_cmd_alert_err_004_http_error_response_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: HTTPError (e.g. 401 Unauthorized or 400 Bad Request) logs warning without crashing."""
+        def unauthorized_urlopen(req: urllib.request.Request, timeout: float = 0.0) -> Any:
+            raise urllib.error.HTTPError(
+                url="https://api.telegram.org/botfake/sendMessage",
+                code=401,
+                msg="Unauthorized",
+                hdrs=MagicMock(),
+                fp=None,
+            )
+
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "invalid_bot_token",
+            "TELEGRAM_ALERT_CHAT_ID": "123456",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.urlopen", side_effect=unauthorized_urlopen):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+    def test_cmd_alert_err_004_request_creation_failure_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: Malformed URL or Request creation exception is caught cleanly in worker thread."""
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "token_with_bad_chars",
+            "TELEGRAM_ALERT_CHAT_ID": "123456",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("urllib.request.Request", side_effect=ValueError("Invalid URL format")):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini",
+            )
+            self.assertIsNotNone(thread)
+            if thread:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+
+    def test_cmd_alert_err_004_thread_spawn_failure_resilience(self) -> None:
+        """[CMD-ALERT-ERR-004]: Thread spawn failure (e.g. RuntimeError) is caught and does not block caller."""
+        env_vars = {
+            "TELEGRAM_ALERT_BOT_TOKEN": "bot_ok",
+            "TELEGRAM_ALERT_CHAT_ID": "chat_ok",
+            "WATCHER_WEBHOOK_URL": "",
+        }
+
+        with patch.dict(os.environ, env_vars), \
+             patch("threading.Thread.start", side_effect=RuntimeError("cannot start thread")):
+            thread = self.watcher.dispatch_alert(
+                previous_account="acc1",
+                new_account="acc2",
+                model_hint="gemini",
+            )
+            # When thread.start fails, caller catches error, thread is not active
+            self.assertIsNone(thread)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -19,8 +19,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable
+import urllib.error
+import urllib.request
 
 from agy_switcher.exceptions import (
     AgySwitchError,
@@ -58,10 +61,8 @@ def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> An
 def _get_rotation_engine_class() -> Any:
     return _resolve_symbol("RotationEngine", lambda: __import__("agy_switcher.rotation", fromlist=["RotationEngine"]).RotationEngine)
 
-
 def _get_quota_client_class() -> Any:
     return _resolve_symbol("QuotaClient", lambda: _RealQuotaClient)
-
 
 def _get_engine_class() -> Any:
     def _fallback():
@@ -73,14 +74,11 @@ def _get_engine_class() -> Any:
         return None
     return _resolve_symbol("AgySwitchEngine", _fallback)
 
-
 def _get_shutil() -> Any:
     return _resolve_symbol("shutil", lambda: shutil)
 
-
 def _get_subprocess() -> Any:
     return _resolve_symbol("subprocess", lambda: subprocess)
-
 
 def _get_time() -> Any:
     return _resolve_symbol("time", lambda: time)
@@ -113,11 +111,8 @@ class CooldownManager:
             except ValueError:
                 pass
             try:
-                iso_str = cleaned.replace("Z", "+00:00")
-                dt = datetime.fromisoformat(iso_str)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                ts = dt.timestamp()
+                dt = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+                ts = dt.replace(tzinfo=timezone.utc).timestamp() if dt.tzinfo is None else dt.timestamp()
                 return ts if math.isfinite(ts) and ts > 0 else float("inf")
             except Exception:
                 pass
@@ -451,18 +446,8 @@ class LogWatcher:
         self.active_transcript_path: Path | None = None
         self.max_chunk_bytes = int(max_chunk_bytes)
 
-        if presence_detector is not None:
-            self.presence_detector = presence_detector
-        else:
-            gemini_dir = getattr(self.engine, "gemini_dir", None)
-            self.presence_detector = PresenceDetector(gemini_dir=gemini_dir)
-
-        if log_dirs is not None:
-            self.log_dirs = log_dirs
-        else:
-            self.log_dirs = [
-                str(self.presence_detector.cli_log_dir),
-            ]
+        self.presence_detector = presence_detector or PresenceDetector(gemini_dir=getattr(self.engine, "gemini_dir", None))
+        self.log_dirs = log_dirs if log_dirs is not None else [str(self.presence_detector.cli_log_dir)]
         self.cooldown_minutes = cooldown_minutes
 
         if cooldown_manager is not None:
@@ -471,19 +456,9 @@ class LogWatcher:
             cache_dir = getattr(self.engine, "cache_dir", None)
             if not isinstance(cache_dir, (str, Path)):
                 vault_dir = getattr(self.engine, "vault_dir", None)
-                if isinstance(vault_dir, (str, Path)):
-                    cache_dir = Path(vault_dir) / "cache"
-                else:
-                    cache_dir = Path.home() / ".antigravity-vault" / "cache"
-            self.cooldown_manager = CooldownManager(
-                cache_dir=cache_dir,
-                default_cooldown_seconds=cooldown_minutes * 60,
-            )
-        self.cooldown_file = getattr(
-            self.cooldown_manager,
-            "cooldown_file",
-            getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json"
-        )
+                cache_dir = Path(vault_dir) / "cache" if isinstance(vault_dir, (str, Path)) else Path.home() / ".antigravity-vault" / "cache"
+            self.cooldown_manager = CooldownManager(cache_dir=cache_dir, default_cooldown_seconds=cooldown_minutes * 60)
+        self.cooldown_file = getattr(self.cooldown_manager, "cooldown_file", getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json")
 
         self.exhaustion_regex = re.compile(
             r"RESOURCE_EXHAUSTED|\bcode\s*429\b|429\s+Too\s+Many\s+Requests|Individual quota reached|weekly quota reached",
@@ -580,13 +555,7 @@ class LogWatcher:
 
         error_val = data.get("error")
         if error_val:
-            if isinstance(error_val, str):
-                error_parts.append(error_val)
-            else:
-                try:
-                    error_parts.append(json.dumps(error_val))
-                except Exception:
-                    error_parts.append(str(error_val))
+            error_parts.append(error_val if isinstance(error_val, str) else json.dumps(error_val, default=str))
 
         content_val = data.get("content")
         if content_val and (status == "ERROR" or msg_type == "ERROR_MESSAGE"):
@@ -682,20 +651,10 @@ class LogWatcher:
         notify_bin = shutil_mod.which("notify-send")
         if notify_bin:
             try:
-
-                if reloaded:
-                    msg = f"🔄 Antigravity switched to {target_account} & reloaded language_server"
-                else:
-                    msg = f"🔄 Antigravity switched to {target_account}"
-
+                msg = f"🔄 Antigravity switched to {target_account}" + (" & reloaded language_server" if reloaded else "")
                 if clean_reason:
                     msg += f" ({clean_reason})"
-
-                _get_subprocess().Popen(
-                    [notify_bin, "agy-switch", msg],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                _get_subprocess().Popen([notify_bin, "agy-switch", msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
@@ -703,15 +662,55 @@ class LogWatcher:
         log_dir = Path(vault_dir) if isinstance(vault_dir, (str, Path)) else DEFAULT_VAULT_DIR
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         log_reason = clean_reason if clean_reason else reason
-        if old_account and reloaded:
-            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' with force-restart language_server (reason: {log_reason})\n"
-        elif old_account:
-            log_line = f"{ts} [watch] Switched from '{old_account}' to '{target_account}' (reason: {log_reason})\n"
-        elif reloaded:
-            log_line = f"{ts} [watch] Switched to '{target_account}' with force-restart language_server (reason: {log_reason})\n"
-        else:
-            log_line = f"{ts} [watch] Switched to '{target_account}' ({log_reason})\n"
+        suffix = " with force-restart language_server" if reloaded else ""
+        prefix = f"Switched from '{old_account}' to '{target_account}'" if old_account else f"Switched to '{target_account}'"
+        log_line = f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n" if (old_account or reloaded) else f"{ts} [watch] {prefix} ({log_reason})\n"
         append_secure_log_entry(log_dir / "watch.log", log_line)
+
+    def dispatch_alert(
+        self, previous_account: str, new_account: str, model_hint: str | None = None, timestamp: str | None = None
+    ) -> threading.Thread | None:
+        """Dispatches non-blocking alerts (e.g. Telegram Bot, Webhook) upon rotation completion."""
+        raw_bot_token, raw_chat_id = os.environ.get("TELEGRAM_ALERT_BOT_TOKEN"), os.environ.get("TELEGRAM_ALERT_CHAT_ID")
+        raw_webhook_url = os.environ.get("WATCHER_WEBHOOK_URL")
+        bot_token = raw_bot_token.strip() if raw_bot_token and raw_bot_token.strip() else None
+        chat_id = raw_chat_id.strip() if raw_chat_id and raw_chat_id.strip() else None
+        webhook_url = raw_webhook_url.strip() if raw_webhook_url and raw_webhook_url.strip() else None
+        if not bot_token and not webhook_url:
+            return None
+
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
+        thread: threading.Thread | None = None
+        if bot_token and chat_id:
+            try:
+                url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                msg = f"🔄 Antigravity Auto-Rotation Alert\n• Previous: {previous_account}\n• Active: {new_account}\n• Model: {model_hint or 'default'}\n• Timestamp: {ts}"
+                data = json.dumps({"chat_id": chat_id, "text": msg}).encode("utf-8")
+
+                def _send() -> None:
+                    try:
+                        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+                        with urllib.request.urlopen(req, timeout=3.0) as resp:
+                            resp.read()
+                    except Exception as e:
+                        print(f"[watch] Telegram alert dispatch failed: {e}", file=sys.stderr)
+
+                t = threading.Thread(target=_send, name="watcher-telegram-alert", daemon=True)
+                t.start()
+                thread = t
+            except Exception as e:
+                thread = None
+                print(f"[watch] Failed to spawn Telegram alert thread: {e}", file=sys.stderr)
+
+        if webhook_url and hasattr(self, "dispatch_webhook"):
+            try:
+                getattr(self, "dispatch_webhook")(
+                    webhook_url=webhook_url, previous_account=previous_account, new_account=new_account, model_hint=model_hint, timestamp=ts
+                )
+            except Exception as e:
+                print(f"[watch] Webhook alert dispatch failed: {e}", file=sys.stderr)
+
+        return thread
 
     def trigger_switch(
         self,
@@ -809,16 +808,10 @@ class LogWatcher:
             res = self.engine.switch_tokens(target_account, restart_server=True, force=True)
 
             # Check for failure in return value
-            if res is False or res is None:
-                print(f"[watch] Failed to switch accounts to '{target_account}': switch_tokens returned {res}", file=sys.stderr)
+            if not res or (isinstance(res, dict) and (res.get("success") is False or (res.get("error") and not res.get("active")))):
+                err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
+                print(f"[watch] Failed to switch accounts to '{target_account}': {err_msg}", file=sys.stderr)
                 return False
-            if isinstance(res, dict):
-                if res.get("success") is False:
-                    print(f"[watch] Failed to switch accounts to '{target_account}': {res.get('error', 'unsuccessful')}", file=sys.stderr)
-                    return False
-                if res.get("error") and not res.get("active"):
-                    print(f"[watch] Failed to switch accounts to '{target_account}': {res.get('error')}", file=sys.stderr)
-                    return False
 
             self.last_switch_time = time.time()
             print(f"[watch] Successfully switched to '{target_account}'.", file=sys.stderr)
@@ -847,6 +840,15 @@ class LogWatcher:
                 old_account=active_name,
                 reason="quota 429",
                 reloaded=server_restarted,
+            )
+
+            # Fire external alerts (Telegram Bot, Webhook)
+            ts = datetime.now(timezone.utc).isoformat()
+            self.dispatch_alert(
+                previous_account=active_name,
+                new_account=target_account,
+                model_hint=resolved_model,
+                timestamp=ts,
             )
 
             return True
@@ -879,24 +881,14 @@ class LogWatcher:
                 del self.file_cursors[path_key]
                 self._stagnant_sizes.pop(path_key, None)
 
-        targets = list(self.presence_detector.get_watch_targets(as_str=True, session_id=current_session_id))
+        targets = [str(t) for t in self.presence_detector.get_watch_targets(as_str=True, session_id=current_session_id)]
 
         if getattr(self, "log_dirs", None):
             for log_dir in self.log_dirs:
-                if not os.path.isdir(log_dir):
-                    continue
-                if hasattr(self.presence_detector, "cli_log_dir") and os.path.abspath(log_dir) == os.path.abspath(str(self.presence_detector.cli_log_dir)):
-                    continue
-                for f in glob.glob(os.path.join(log_dir, "*.log")):
-                    targets.append(f)
+                if os.path.isdir(log_dir) and (not hasattr(self.presence_detector, "cli_log_dir") or os.path.abspath(log_dir) != os.path.abspath(str(self.presence_detector.cli_log_dir))):
+                    targets.extend(glob.glob(os.path.join(log_dir, "*.log")))
 
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for t in targets:
-            if t not in seen:
-                seen.add(t)
-                deduped.append(t)
-        return deduped
+        return list(dict.fromkeys(targets))
 
     def scan_new_files(self) -> list[str]:
         return self.scan_active_targets()
