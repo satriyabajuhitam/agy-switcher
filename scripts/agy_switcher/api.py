@@ -11,18 +11,115 @@ and Layer 2 (vault, rotation).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
 import json
 import math
 from pathlib import Path
+import re
+import sys
+import threading
 import time
 from typing import Any
 
 from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError
+from agy_switcher.formatters import (
+    format_fleet_exhaustion_message,
+    format_fleet_exhaustion_notice,
+)
 from agy_switcher.models import AccountInfo, RotationResult, FleetQuotaSummary
 from agy_switcher.rotation import RotationEngine
 from agy_switcher.security import extract_email_from_jwt
 from agy_switcher.telemetry import normalize_model_name
 from agy_switcher.vault import AgySwitchEngine
+
+
+def _sanitize_reset_time_and_delta(val: object, current_ts: float) -> tuple[object, int | None]:
+    """Sanitizes reset_time and computes remaining minutes relative to current_ts.
+
+    Returns (sanitized_reset_time, remaining_minutes or None).
+    If reset_time is missing, None, non-numeric unparseable, or <= 0, returns (None, None).
+    If reset_time is in the past (expired), returns (val_f, None).
+    """
+    if val is None or isinstance(val, bool):
+        return (None, None)
+
+    if isinstance(val, (int, float)):
+        if not math.isfinite(val) or val <= 0 or val > 32503680000.0:
+            return (None, None)
+        val_f = float(val)
+        delta_seconds = val_f - current_ts
+        if delta_seconds > 0:
+            return (val_f, max(1, int(round(delta_seconds / 60))))
+        return (val_f, None)
+
+    if isinstance(val, datetime):
+        dt = val.astimezone(timezone.utc) if val.tzinfo else val.replace(tzinfo=timezone.utc)
+        if dt.year >= 9000:
+            return (None, None)
+        val_f = dt.timestamp()
+        if not math.isfinite(val_f) or val_f <= 0 or val_f > 32503680000.0:
+            return (None, None)
+        delta_seconds = val_f - current_ts
+        if delta_seconds > 0:
+            return (val_f, max(1, int(round(delta_seconds / 60))))
+        return (val_f, None)
+
+    if isinstance(val, str):
+        cleaned = val.strip()
+        if not cleaned or cleaned.lower() in ("none", "null", "-", "undefined"):
+            return (None, None)
+        if "t" in cleaned.lower():
+            try:
+                dt = datetime.fromisoformat(cleaned.replace("Z", "+00:00")).astimezone(timezone.utc)
+                if dt.year >= 9000:
+                    return (None, None)
+                val_f = dt.timestamp()
+                if not math.isfinite(val_f) or val_f <= 0 or val_f > 32503680000.0:
+                    return (None, None)
+                delta_seconds = val_f - current_ts
+                if delta_seconds > 0:
+                    return (val_f, max(1, int(round(delta_seconds / 60))))
+                return (val_f, None)
+            except Exception:
+                pass
+        try:
+            val_f = float(cleaned)
+            if not math.isfinite(val_f) or val_f <= 0 or val_f > 32503680000.0:
+                return (None, None)
+            delta_seconds = val_f - current_ts
+            if delta_seconds > 0:
+                return (val_f, max(1, int(round(delta_seconds / 60))))
+            return (val_f, None)
+        except ValueError:
+            pass
+
+        # Check "14:30" or "14:30 UTC"
+        time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", cleaned)
+        if time_match:
+            try:
+                th = int(time_match.group(1))
+                tm = int(time_match.group(2))
+                if 0 <= th <= 23 and 0 <= tm <= 59:
+                    curr_dt = datetime.fromtimestamp(current_ts, tz=timezone.utc)
+                    reset_dt = curr_dt.replace(hour=th, minute=tm, second=0, microsecond=0)
+                    if reset_dt < curr_dt:
+                        reset_dt += timedelta(days=1)
+                    delta_seconds = (reset_dt - curr_dt).total_seconds()
+                    delta_m = max(1, int(round(delta_seconds / 60))) if delta_seconds > 0 else None
+                    return (cleaned, delta_m)
+            except Exception:
+                pass
+
+    return (None, None)
+
+
+_ROTATION_LOCK = threading.RLock()
+_LAST_ROTATION_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {}
+
+FALLBACK_MISSING_SWITCHER_MESSAGE = (
+    "Quota limit reached (RESOURCE_EXHAUSTED). "
+    "Manual re-login or installing 'agy-switcher' is required."
+)
 
 
 def get_active_account(engine: AgySwitchEngine | None = None) -> AccountInfo:
@@ -80,10 +177,44 @@ def get_active_account(engine: AgySwitchEngine | None = None) -> AccountInfo:
         )
 
 
+def handle_soft_import_rotation(
+    model: str = "gemini",
+    reload_server: bool = False,
+    engine: AgySwitchEngine | None = None,
+    current_account: str | None = None,
+) -> tuple[bool, RotationResult | None, str]:
+    """Gracefully executes rotation via soft-import, handling missing agy-switcher without crashes.
+
+    Encapsulates dynamic import of agy_switcher.api. If agy_switcher is absent from the
+    runtime environment (ImportError / ModuleNotFoundError), catches the error cleanly
+    and returns actionable fallback guidance.
+
+    Returns:
+        tuple[bool, RotationResult | None, str]: (success, rotation_result, message)
+    """
+    try:
+        import importlib
+        switcher_api = importlib.import_module("agy_switcher.api")
+        if not hasattr(switcher_api, "auto_rotate_on_exhaustion"):
+            return (False, None, FALLBACK_MISSING_SWITCHER_MESSAGE)
+        res = switcher_api.auto_rotate_on_exhaustion(
+            model=model,
+            reload_server=reload_server,
+            engine=engine,
+            current_account=current_account,
+        )
+        return (res.success, res, res.message)
+    except (ImportError, ModuleNotFoundError):
+        return (False, None, FALLBACK_MISSING_SWITCHER_MESSAGE)
+    except Exception as exc:
+        return (False, None, f"Rotation error: {exc}")
+
+
 def auto_rotate_on_exhaustion(
     model: str = "gemini",
     reload_server: bool = False,
     engine: AgySwitchEngine | None = None,
+    current_account: str | None = None,
 ) -> RotationResult:
     """Rotates to the optimal account with remaining quota for target model using Disk-Only Swap."""
     try:
@@ -100,126 +231,241 @@ def auto_rotate_on_exhaustion(
             active_account=None,
         )
 
-    if engine is None:
+    with _ROTATION_LOCK:
+        if engine is None:
+            try:
+                engine = AgySwitchEngine()
+            except Exception as exc:
+                return RotationResult(
+                    success=False,
+                    previous_account=None,
+                    new_account=None,
+                    model=model,
+                    message=f"Failed to initialize vault engine: {exc}",
+                    quota_remaining=None,
+                    reloaded_server=False,
+                    active_account=None,
+                )
+
         try:
-            engine = AgySwitchEngine()
+            vault_key = str(engine.vault_dir.resolve())
+        except Exception:
+            vault_key = str(id(engine))
+
+        reg_key = (vault_key, model_key)
+
+        try:
+            active_account = engine.get_active_name()
+            if active_account:
+                active_account = active_account.strip()
+            if not active_account:
+                active_account = None
+        except Exception:
+            active_account = None
+
+        now = time.time()
+        # Clean up stale registry entries older than 60 seconds
+        for k in list(_LAST_ROTATION_REGISTRY.keys()):
+            if now - float(_LAST_ROTATION_REGISTRY[k].get("timestamp", 0.0)) > 60.0:
+                _LAST_ROTATION_REGISTRY.pop(k, None)
+
+        last_rot = _LAST_ROTATION_REGISTRY.get(reg_key)
+
+        # Anti-double-hopping check:
+        # If a recent rotation for this vault and model succeeded within a short debounce window (2.0s)
+        # and the vault's active account matches the newly rotated account:
+        if (
+            last_rot is not None
+            and (now - float(last_rot.get("timestamp", 0.0)) < 2.0)
+            and last_rot.get("model") == model_key
+            and isinstance(last_rot.get("result"), RotationResult)
+            and last_rot["result"].success
+            and active_account == last_rot.get("new_account")
+        ):
+            if current_account is None or current_account == last_rot.get("previous_account"):
+                return last_rot["result"]
+
+        # Explicit current_account guard: if the caller's turn ran on current_account, but the active
+        # account has already transitioned away:
+        if current_account and active_account and active_account != current_account:
+            # Case A: A recent rotation for this specific model already rotated to active_account
+            if (
+                last_rot is not None
+                and last_rot.get("model") == model_key
+                and last_rot.get("new_account") == active_account
+                and isinstance(last_rot.get("result"), RotationResult)
+                and last_rot["result"].success
+            ):
+                if last_rot.get("previous_account") == current_account:
+                    return last_rot["result"]
+                res = last_rot["result"]
+                return RotationResult(
+                    success=True,
+                    previous_account=current_account,
+                    new_account=active_account,
+                    model=model,
+                    message=f"Account already rotated from '{current_account}' to '{active_account}' for model '{model}'.",
+                    quota_remaining=res.quota_remaining,
+                    reloaded_server=False,
+                    active_account=active_account,
+                )
+
+            # Case B: active_account was changed (e.g. by another model rotation).
+            # Inspect whether active_account actually has available quota for this target model.
+            rot_engine_probe = RotationEngine(
+                vault_dir=engine.vault_dir,
+                active_account_id=active_account,
+                target_model=model_key,
+            )
+            probe_cache = rot_engine_probe._load_quota_cache()
+            probe_accounts_map = (
+                probe_cache.get("accounts", {})
+                if isinstance(probe_cache, dict) and isinstance(probe_cache.get("accounts"), dict)
+                else (probe_cache if isinstance(probe_cache, dict) else {})
+            )
+            active_acc_quota = probe_accounts_map.get(active_account, {}) if isinstance(probe_accounts_map, dict) else {}
+            active_status = rot_engine_probe.get_quota_status(active_acc_quota, model_key=model_key)
+            active_quota_rem = active_status.fraction if active_status is not None else None
+
+            # If active_account has available quota (> 0.0) for target model, retain it safely
+            if active_quota_rem is not None and active_quota_rem > 0:
+                return RotationResult(
+                    success=True,
+                    previous_account=current_account,
+                    new_account=active_account,
+                    model=model,
+                    message=f"Account already transitioned from '{current_account}' to '{active_account}'.",
+                    quota_remaining=active_quota_rem,
+                    reloaded_server=False,
+                    active_account=active_account,
+                )
+            # If active_account is also exhausted for model_key, fall through to rotate to a healthy account!
+
+        previous_account = active_account
+
+        try:
+            accounts_data = engine.list_accounts()
+        except Exception:
+            accounts_data = {"active": previous_account, "accounts": []}
+
+        accounts_list = accounts_data.get("accounts") or []
+        valid_accounts = [acc for acc in accounts_list if isinstance(acc, dict) and acc.get("valid", True)]
+
+        try:
+            cooldowns = dict(engine.get_cooldowns())
+        except Exception:
+            cooldowns = {}
+
+        if current_account:
+            cooldowns[current_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
+        if active_account:
+            if active_account != current_account:
+                cooldowns[active_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
+        elif previous_account:
+            cooldowns[previous_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
+
+        rot_engine = RotationEngine(
+            vault_dir=engine.vault_dir,
+            active_account_id=previous_account,
+            target_model=model_key,
+        )
+        try:
+            target_account = rot_engine.evaluate(
+                valid_accounts,
+                current_active=previous_account,
+                target_model=model_key,
+                cooldowns=cooldowns,
+            )
         except Exception as exc:
             return RotationResult(
                 success=False,
-                previous_account=None,
+                previous_account=current_account or previous_account,
                 new_account=None,
                 model=model,
-                message=f"Failed to initialize vault engine: {exc}",
-                quota_remaining=None,
-                reloaded_server=False,
-                active_account=None,
-            )
-
-    try:
-        previous_account = engine.get_active_name()
-        if previous_account:
-            previous_account = previous_account.strip()
-        if not previous_account:
-            previous_account = None
-    except Exception:
-        previous_account = None
-
-    try:
-        accounts_data = engine.list_accounts()
-    except Exception:
-        accounts_data = {"active": previous_account, "accounts": []}
-
-    accounts_list = accounts_data.get("accounts") or []
-    valid_accounts = [acc for acc in accounts_list if isinstance(acc, dict) and acc.get("valid", True)]
-
-    try:
-        cooldowns = dict(engine.get_cooldowns())
-    except Exception:
-        cooldowns = {}
-
-    if previous_account:
-        cooldowns[previous_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
-
-    rot_engine = RotationEngine(
-        vault_dir=engine.vault_dir,
-        active_account_id=previous_account,
-        target_model=model_key,
-    )
-    target_account = rot_engine.evaluate(
-        valid_accounts,
-        current_active=previous_account,
-        target_model=model_key,
-        cooldowns=cooldowns,
-    )
-
-    if not target_account or target_account == previous_account:
-        return RotationResult(
-            success=False,
-            previous_account=previous_account,
-            new_account=None,
-            model=model,
-            message=f"All accounts exhausted for model '{model}'.",
-            quota_remaining=None,
-            reloaded_server=False,
-            active_account=None,
-        )
-
-    if reload_server:
-        pid = engine.locate_language_server_pid()
-        if engine.is_server_busy(pid):
-            return RotationResult(
-                success=False,
-                previous_account=previous_account,
-                new_account=None,
-                model=model,
-                message=(
-                    "Antigravity is currently busy processing an agent turn or background task. "
-                    "Cannot reload language server during active turn."
-                ),
+                message=f"Rotation evaluation failed: {exc}",
                 quota_remaining=None,
                 reloaded_server=False,
                 active_account=previous_account,
             )
 
-    try:
-        switch_res = engine.switch_tokens(target_account, restart_server=reload_server, force=False)
-        server_reloaded = bool(switch_res.get("server_restarted", False)) if reload_server else False
-    except Exception as exc:
-        return RotationResult(
-            success=False,
-            previous_account=previous_account,
-            new_account=None,
+        if not target_account or target_account == previous_account:
+            return RotationResult(
+                success=False,
+                previous_account=current_account or previous_account,
+                new_account=None,
+                model=model,
+                message=f"All accounts exhausted for model '{model}'.",
+                quota_remaining=None,
+                reloaded_server=False,
+                active_account=None,
+            )
+
+        if reload_server:
+            pid = engine.locate_language_server_pid()
+            if engine.is_server_busy(pid):
+                return RotationResult(
+                    success=False,
+                    previous_account=current_account or previous_account,
+                    new_account=None,
+                    model=model,
+                    message=(
+                        "Antigravity is currently busy processing an agent turn or background task. "
+                        "Cannot reload language server during active turn."
+                    ),
+                    quota_remaining=None,
+                    reloaded_server=False,
+                    active_account=previous_account,
+                )
+
+        try:
+            switch_res = engine.switch_tokens(target_account, restart_server=reload_server, force=False)
+            server_reloaded = bool(switch_res.get("server_restarted", False)) if reload_server else False
+        except Exception as exc:
+            return RotationResult(
+                success=False,
+                previous_account=current_account or previous_account,
+                new_account=None,
+                model=model,
+                message=f"Failed to switch account to '{target_account}': {exc}",
+                quota_remaining=None,
+                reloaded_server=False,
+                active_account=previous_account,
+            )
+
+        target_quota_cache = rot_engine._load_quota_cache()
+        if isinstance(target_quota_cache, dict):
+            target_accounts_map = (
+                target_quota_cache.get("accounts", {})
+                if isinstance(target_quota_cache.get("accounts"), dict)
+                else target_quota_cache
+            )
+        else:
+            target_accounts_map = {}
+
+        target_acc_quota = target_accounts_map.get(target_account, {}) if isinstance(target_accounts_map, dict) else {}
+        target_status = rot_engine.get_quota_status(target_acc_quota, model_key=model_key)
+        quota_rem = target_status.fraction if target_status is not None else None
+
+        rotation_res = RotationResult(
+            success=True,
+            previous_account=current_account or previous_account,
+            new_account=target_account,
             model=model,
-            message=f"Failed to switch account to '{target_account}': {exc}",
-            quota_remaining=None,
-            reloaded_server=False,
-            active_account=previous_account,
+            message=f"Successfully rotated to '{target_account}' for model '{model}'.",
+            quota_remaining=quota_rem,
+            reloaded_server=server_reloaded,
+            active_account=target_account,
         )
 
-    target_quota_cache = rot_engine._load_quota_cache()
-    if isinstance(target_quota_cache, dict):
-        target_accounts_map = (
-            target_quota_cache.get("accounts", {})
-            if isinstance(target_quota_cache.get("accounts"), dict)
-            else target_quota_cache
-        )
-    else:
-        target_accounts_map = {}
+        _LAST_ROTATION_REGISTRY[reg_key] = {
+            "timestamp": now,
+            "model": model_key,
+            "previous_account": current_account or previous_account,
+            "new_account": target_account,
+            "result": rotation_res,
+        }
 
-    target_acc_quota = target_accounts_map.get(target_account, {}) if isinstance(target_accounts_map, dict) else {}
-    target_status = rot_engine.get_quota_status(target_acc_quota, model_key=model_key)
-    quota_rem = target_status.fraction if target_status is not None else None
-
-    return RotationResult(
-        success=True,
-        previous_account=previous_account,
-        new_account=target_account,
-        model=model,
-        message=f"Successfully rotated to '{target_account}' for model '{model}'.",
-        quota_remaining=quota_rem,
-        reloaded_server=server_reloaded,
-        active_account=target_account,
-    )
+        return rotation_res
 
 
 def switch_account(
@@ -290,6 +536,54 @@ def switch_account(
 
     engine.switch_tokens(name=clean_name, restart_server=reload_server, force=False)
     return True
+
+
+def list_accounts(engine: AgySwitchEngine | None = None) -> dict[str, object]:
+    """Returns all registered vault accounts and active account pointer."""
+    if engine is None:
+        try:
+            engine = AgySwitchEngine()
+        except Exception:
+            return {"active": None, "accounts": []}
+    return engine.list_accounts()
+
+
+def get_accounts(engine: AgySwitchEngine | None = None) -> list[AccountInfo]:
+    """Returns a list of all registered vault accounts as AccountInfo objects."""
+    res = list_accounts(engine=engine)
+    active_name = res.get("active")
+    raw_accounts = res.get("accounts", [])
+    result: list[AccountInfo] = []
+    if isinstance(raw_accounts, list):
+        for acc in raw_accounts:
+            if isinstance(acc, dict):
+                name = str(acc.get("name", "")).strip()
+                if not name:
+                    continue
+                email = acc.get("email")
+                is_act = bool(acc.get("is_active", False) or (name and name == active_name))
+                token_path = acc.get("token_path")
+                status = "active" if is_act else "standby"
+                result.append(
+                    AccountInfo(
+                        name=name,
+                        email=email,
+                        is_active=is_act,
+                        token_path=token_path,
+                        status=status,
+                    )
+                )
+            elif isinstance(acc, str) and acc.strip():
+                name = acc.strip()
+                is_act = (name == active_name)
+                result.append(
+                    AccountInfo(
+                        name=name,
+                        is_active=is_act,
+                        status="active" if is_act else "standby",
+                    )
+                )
+    return result
 
 
 def get_fleet_quota_summary(
@@ -367,10 +661,18 @@ def get_fleet_quota_summary(
     if cache_file and isinstance(cache_file, Path) and cache_file.is_file():
         try:
             raw_content = cache_file.read_text(encoding="utf-8")
-            parsed = json.loads(raw_content)
-            if isinstance(parsed, dict):
-                cache_data = parsed
-        except Exception:
+            if not raw_content.strip():
+                print(f"[agy_switcher.api] Warning: Quota cache file {cache_file} is empty", file=sys.stderr)
+                cache_data = {}
+            else:
+                parsed = json.loads(raw_content)
+                if isinstance(parsed, dict):
+                    cache_data = parsed
+                else:
+                    print(f"[agy_switcher.api] Warning: Quota cache file {cache_file} does not contain a JSON object", file=sys.stderr)
+                    cache_data = {}
+        except Exception as exc:
+            print(f"[agy_switcher.api] Warning: Failed to parse quota cache file {cache_file} (corrupt JSON): {exc}", file=sys.stderr)
             cache_data = {}
 
     if not cache_data:
@@ -436,25 +738,72 @@ def get_fleet_quota_summary(
             continue
 
         if target_model_key is None:
-            fleet_accounts[acc_name] = dict(cached_entry)
+            acc_dict = dict(cached_entry)
+            for m_key in ("gemini", "claude"):
+                if m_key in cached_entry and isinstance(cached_entry[m_key], dict):
+                    m_payload = dict(cached_entry[m_key])
+                    sanitized_r, rem_m = _sanitize_reset_time_and_delta(m_payload.get("reset_time"), current_ts=timestamp)
+                    m_payload["reset_time"] = sanitized_r
+                    if rem_m is not None and "remaining_minutes" not in m_payload:
+                        m_payload["remaining_minutes"] = rem_m
+                    acc_dict[m_key] = m_payload
+                elif "groups" in cached_entry and isinstance(cached_entry["groups"], list):
+                    try:
+                        rot = RotationEngine(vault_dir=engine.vault_dir, target_model=m_key)
+                        st = rot.get_quota_status(cached_entry, model_key=m_key)
+                        if st is not None:
+                            is_valid = st.reset_time and st.reset_time.year < 9000
+                            r_ts = st.reset_time.timestamp() if is_valid else None
+                            rem_m = max(1, int(round((r_ts - timestamp) / 60))) if (is_valid and r_ts is not None and r_ts > timestamp) else None
+                            m_payload = {
+                                "quota": st.remaining_percentage(),
+                                "reset_time": r_ts,
+                            }
+                            if rem_m is not None:
+                                m_payload["remaining_minutes"] = rem_m
+                            acc_dict[m_key] = m_payload
+                    except Exception:
+                        pass
+                elif "quota" in cached_entry and not isinstance(cached_entry["quota"], dict) and m_key == "gemini":
+                    m_payload = dict(cached_entry)
+                    sanitized_r, rem_m = _sanitize_reset_time_and_delta(m_payload.get("reset_time"), current_ts=timestamp)
+                    m_payload["reset_time"] = sanitized_r
+                    if rem_m is not None and "remaining_minutes" not in m_payload:
+                        m_payload["remaining_minutes"] = rem_m
+                    acc_dict["gemini"] = m_payload
+            fleet_accounts[acc_name] = acc_dict
         else:
-            acc_dict: dict[str, Any] = {}
+            acc_dict = {}
             if target_model_key in cached_entry and isinstance(cached_entry[target_model_key], dict):
                 model_payload = dict(cached_entry[target_model_key])
+                sanitized_r, rem_m = _sanitize_reset_time_and_delta(model_payload.get("reset_time"), current_ts=timestamp)
+                model_payload["reset_time"] = sanitized_r
+                if rem_m is not None and "remaining_minutes" not in model_payload:
+                    model_payload["remaining_minutes"] = rem_m
                 acc_dict.update(model_payload)
                 acc_dict[target_model_key] = model_payload
             elif "quota" in cached_entry and not isinstance(cached_entry["quota"], dict) and target_model_key == "gemini":
-                acc_dict = dict(cached_entry)
-                acc_dict["gemini"] = dict(cached_entry)
+                model_payload = dict(cached_entry)
+                sanitized_r, rem_m = _sanitize_reset_time_and_delta(model_payload.get("reset_time"), current_ts=timestamp)
+                model_payload["reset_time"] = sanitized_r
+                if rem_m is not None and "remaining_minutes" not in model_payload:
+                    model_payload["remaining_minutes"] = rem_m
+                acc_dict.update(model_payload)
+                acc_dict["gemini"] = model_payload
             elif "groups" in cached_entry and isinstance(cached_entry["groups"], list):
                 try:
                     rot = RotationEngine(vault_dir=engine.vault_dir, target_model=target_model_key)
                     st = rot.get_quota_status(cached_entry, model_key=target_model_key)
                     if st is not None:
+                        is_valid = st.reset_time and st.reset_time.year < 9000
+                        r_ts = st.reset_time.timestamp() if is_valid else None
+                        rem_m = max(1, int(round((r_ts - timestamp) / 60))) if (is_valid and r_ts is not None and r_ts > timestamp) else None
                         payload = {
                             "quota": st.remaining_percentage(),
-                            "reset_time": st.reset_time.timestamp(),
+                            "reset_time": r_ts,
                         }
+                        if rem_m is not None:
+                            payload["remaining_minutes"] = rem_m
                         acc_dict.update(payload)
                         acc_dict[target_model_key] = payload
                 except Exception:
@@ -480,7 +829,13 @@ __all__ = [
     "get_active_account",
     "auto_rotate_on_exhaustion",
     "switch_account",
+    "list_accounts",
+    "get_accounts",
     "get_fleet_quota_summary",
+    "handle_soft_import_rotation",
+    "format_fleet_exhaustion_message",
+    "format_fleet_exhaustion_notice",
+    "FALLBACK_MISSING_SWITCHER_MESSAGE",
     "AccountInfo",
     "RotationResult",
     "FleetQuotaSummary",

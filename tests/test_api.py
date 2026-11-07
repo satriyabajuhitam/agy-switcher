@@ -14,7 +14,7 @@ import sys
 import tempfile
 from typing import Any
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -1041,6 +1041,33 @@ class TestSDKModels(unittest.TestCase):
 
         info_str = AccountInfo(name="acc", token_path="/var/token.json")
         self.assertEqual(info_str.to_dict()["token_path"], "/var/token.json")
+
+    def test_list_accounts_and_get_accounts(self) -> None:
+        """Verifies list_accounts and get_accounts return expected metadata and models."""
+        from agy_switcher.api import list_accounts, get_accounts
+
+        mock_engine = MagicMock()
+        mock_engine.list_accounts.return_value = {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "email": "acc1@test.com", "valid": True, "is_active": True},
+                {"name": "acc2", "email": "acc2@test.com", "valid": True, "is_active": False},
+            ],
+        }
+
+        listed = list_accounts(engine=mock_engine)
+        self.assertEqual(listed["active"], "acc1")
+        self.assertEqual(len(listed["accounts"]), 2)
+
+        acc_objs = get_accounts(engine=mock_engine)
+        self.assertEqual(len(acc_objs), 2)
+        self.assertEqual(acc_objs[0].name, "acc1")
+        self.assertTrue(acc_objs[0].is_active)
+        self.assertEqual(acc_objs[0].status, "active")
+        self.assertEqual(acc_objs[1].name, "acc2")
+        self.assertFalse(acc_objs[1].is_active)
+        self.assertEqual(acc_objs[1].status, "standby")
+
 
 
 if __name__ == "__main__":

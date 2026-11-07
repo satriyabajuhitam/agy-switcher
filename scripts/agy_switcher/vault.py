@@ -945,6 +945,7 @@ class AgySwitchEngine:
         """Performs headless OAuth token exchange, saving credentials to vault with 0600 mode.
 
         Supports non-interactive code injection and interactive stdin/prompt fallback.
+        Note: `name` and `code` are legacy parameter aliases for `alias` and `auth_code`.
         Returns tuple[bool, str] representing (success, message).
         """
         raw_alias = alias or name or ""
@@ -1346,7 +1347,6 @@ class AgySwitchEngine:
 
                 # Step 1: Preflight inspection of all archive members
                 for m in members:
-                    # Check symlinks and hardlinks
                     if m.issym() or m.islnk() or m.type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
                         raise AgySwitchError(
                             f"Security violation: archive member is a symbolic or hard link: '{m.name}'"
