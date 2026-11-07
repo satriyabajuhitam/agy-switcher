@@ -538,6 +538,54 @@ def switch_account(
     return True
 
 
+def list_accounts(engine: AgySwitchEngine | None = None) -> dict[str, Any]:
+    """Returns all registered vault accounts and active account pointer."""
+    if engine is None:
+        try:
+            engine = AgySwitchEngine()
+        except Exception:
+            return {"active": None, "accounts": []}
+    return engine.list_accounts()
+
+
+def get_accounts(engine: AgySwitchEngine | None = None) -> list[AccountInfo]:
+    """Returns a list of all registered vault accounts as AccountInfo objects."""
+    res = list_accounts(engine=engine)
+    active_name = res.get("active")
+    raw_accounts = res.get("accounts", [])
+    result: list[AccountInfo] = []
+    if isinstance(raw_accounts, list):
+        for acc in raw_accounts:
+            if isinstance(acc, dict):
+                name = str(acc.get("name", "")).strip()
+                if not name:
+                    continue
+                email = acc.get("email")
+                is_act = bool(acc.get("is_active", False) or (name and name == active_name))
+                token_path = acc.get("token_path")
+                status = "active" if is_act else "standby"
+                result.append(
+                    AccountInfo(
+                        name=name,
+                        email=email,
+                        is_active=is_act,
+                        token_path=token_path,
+                        status=status,
+                    )
+                )
+            elif isinstance(acc, str) and acc.strip():
+                name = acc.strip()
+                is_act = (name == active_name)
+                result.append(
+                    AccountInfo(
+                        name=name,
+                        is_active=is_act,
+                        status="active" if is_act else "standby",
+                    )
+                )
+    return result
+
+
 def get_fleet_quota_summary(
     model: str = "all",
     engine: AgySwitchEngine | None = None,
@@ -781,6 +829,8 @@ __all__ = [
     "get_active_account",
     "auto_rotate_on_exhaustion",
     "switch_account",
+    "list_accounts",
+    "get_accounts",
     "get_fleet_quota_summary",
     "handle_soft_import_rotation",
     "format_fleet_exhaustion_message",
