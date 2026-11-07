@@ -155,7 +155,7 @@ class AccountInfo:
     token_path: Path | str | None = None
     status: str = "standby"  # "active", "standby", "exhausted", "corrupt", "none"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         str_token_path = str(self.token_path).strip() if self.token_path is not None else None
         if str_token_path in ("", "."):
             str_token_path = None
@@ -187,7 +187,7 @@ class RotationResult:
         elif self.new_account is None and self.active_account is not None and self.success:
             self.new_account = self.active_account
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "success": self.success,
             "previous_account": self.previous_account,
@@ -206,11 +206,11 @@ class FleetQuotaSummary:
 
     total_accounts: int
     active_account: str | None
-    accounts: dict[str, dict[str, Any]]
+    accounts: dict[str, dict[str, object]]
     model: str
     timestamp: float
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "total_accounts": self.total_accounts,
             "active_account": self.active_account,

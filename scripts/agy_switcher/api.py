@@ -33,7 +33,7 @@ from agy_switcher.telemetry import normalize_model_name
 from agy_switcher.vault import AgySwitchEngine
 
 
-def _sanitize_reset_time_and_delta(val: Any, current_ts: float) -> tuple[Any, int | None]:
+def _sanitize_reset_time_and_delta(val: object, current_ts: float) -> tuple[object, int | None]:
     """Sanitizes reset_time and computes remaining minutes relative to current_ts.
 
     Returns (sanitized_reset_time, remaining_minutes or None).
@@ -538,7 +538,7 @@ def switch_account(
     return True
 
 
-def list_accounts(engine: AgySwitchEngine | None = None) -> dict[str, Any]:
+def list_accounts(engine: AgySwitchEngine | None = None) -> dict[str, object]:
     """Returns all registered vault accounts and active account pointer."""
     if engine is None:
         try:

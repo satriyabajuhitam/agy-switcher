@@ -122,10 +122,12 @@ def _format_model_quota_summary(
         return "Error / Unreachable"
 
     model_key = _normalize_target_model(model)
-    q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
-    model_data = q_root.get(model_key) if isinstance(q_root.get(model_key), dict) else None
+    raw_quota_val = acc.get("quota")
+    q_root: dict[str, Any] = raw_quota_val if isinstance(raw_quota_val, dict) else {}
+    raw_model_data = q_root.get(model_key)
+    model_data: dict[str, Any] | None = raw_model_data if isinstance(raw_model_data, dict) else None
 
-    if q_root.get("error") or model_data is None or (isinstance(model_data, dict) and model_data.get("error")):
+    if q_root.get("error") or model_data is None or model_data.get("error"):
         return "Error / Unreachable"
 
     if not isinstance(model_data, dict):
@@ -147,9 +149,14 @@ def _format_model_quota_summary(
     if is_cached:
         return f"{quota}% (Cached)"
 
-    buckets = model_data.get("buckets") if isinstance(model_data.get("buckets"), dict) else {}
-    b_5h = buckets.get("5h") if isinstance(buckets.get("5h"), dict) else {}
-    b_wk = buckets.get("weekly") if isinstance(buckets.get("weekly"), dict) else (buckets.get("wk") if isinstance(buckets.get("wk"), dict) else {})
+    raw_buckets = model_data.get("buckets")
+    buckets: dict[str, Any] = raw_buckets if isinstance(raw_buckets, dict) else {}
+    raw_b_5h = buckets.get("5h")
+    b_5h: dict[str, Any] = raw_b_5h if isinstance(raw_b_5h, dict) else {}
+    raw_b_wk = buckets.get("weekly")
+    if not isinstance(raw_b_wk, dict):
+        raw_b_wk = buckets.get("wk")
+    b_wk: dict[str, Any] = raw_b_wk if isinstance(raw_b_wk, dict) else {}
 
     def _render_bucket(tag: str, b_data: dict[str, Any]) -> str:
         raw_b = b_data.get("quota")
@@ -350,7 +357,7 @@ def format_diagnostic_report(report: DiagnosticReport) -> str:
 
 
 def format_fleet_exhaustion_message(
-    summary: Any = None,
+    summary: object = None,
     model: str | None = None,
     current_time: float | datetime | None = None,
 ) -> str:

@@ -861,7 +861,6 @@ class LogWatcher:
                 reloaded=server_restarted,
             )
 
-            # Fire external alerts (Telegram Bot, Webhook)
             ts = datetime.now(timezone.utc).isoformat()
             self.dispatch_alert(
                 previous_account=active_name,
