@@ -1195,8 +1195,8 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
         self.assertEqual(len(res["accounts"]), 2)
         mock_client.save_cache.assert_called_once()
 
-    def test_run_quota_pipeline_preserves_claude_quota(self):
-        """run_quota_pipeline retains Claude quota models and does not mark pure Claude accounts as error."""
+    def test_run_quota_pipeline_strips_claude_quota_and_retains_gemini(self):
+        """[QUOTA-GEMINI-EDGE-001] run_quota_pipeline strictly retains Gemini and excises Claude keys."""
         mock_engine = MagicMock()
         mock_engine.get_account_tokens.side_effect = lambda name: {
             "acc_claude": {"access_token": "token_claude"},
@@ -1227,30 +1227,28 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
         data = {"accounts": [{"name": "acc_claude"}, {"name": "acc_gemini"}, {"name": "acc_hybrid"}]}
         res = run_quota_pipeline(mock_engine, data, client=mock_client)
 
-        # Verify save_cache was called with all valid quotas including Claude
+        # Verify save_cache was called with Gemini-bearing quotas; pure Claude is discarded
         self.assertTrue(mock_client.save_cache.called)
         saved_cache = mock_client.save_cache.call_args[0][0]
-        self.assertIn("acc_claude", saved_cache["accounts"])
+        self.assertNotIn("acc_claude", saved_cache["accounts"])
         self.assertIn("acc_gemini", saved_cache["accounts"])
         self.assertIn("acc_hybrid", saved_cache["accounts"])
 
         acc_map = {a["name"]: a for a in res["accounts"]}
-        # acc_claude must retain claude quota and NOT be marked Unreachable
-        self.assertIn("claude", acc_map["acc_claude"]["quota"])
-        self.assertEqual(acc_map["acc_claude"]["quota"]["claude"]["quota"], 80)
-        self.assertNotIn("error", acc_map["acc_claude"]["quota"])
+        # acc_claude lacks gemini, marked Unreachable
+        self.assertEqual(acc_map["acc_claude"]["quota"].get("error"), "Unreachable")
 
-        # acc_hybrid must retain both gemini and claude
+        # acc_hybrid must strictly retain gemini without repopulating claude
         self.assertIn("gemini", acc_map["acc_hybrid"]["quota"])
-        self.assertIn("claude", acc_map["acc_hybrid"]["quota"])
+        self.assertNotIn("claude", acc_map["acc_hybrid"]["quota"])
 
         # Sorting by gemini model must place acc_gemini (90%) before others
         sorted_by_gemini = sort_accounts_by_quota(res["accounts"], target_model="gemini")
         gemini_order = [a["name"] for a in sorted_by_gemini]
         self.assertEqual(gemini_order[0], "acc_gemini")
 
-    def test_run_quota_pipeline_claude_cache_fallback(self):
-        """run_quota_pipeline falls back to cached Claude quota when live fetch fails."""
+    def test_run_quota_pipeline_claude_cache_ignored(self):
+        """[QUOTA-GEMINI-EDGE-001] run_quota_pipeline does not fall back to legacy cached Claude when live fetch fails."""
         mock_engine = MagicMock()
         mock_engine.get_account_tokens.return_value = {"access_token": "fake_token"}
         mock_client = MagicMock()
@@ -1268,13 +1266,12 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
         res = run_quota_pipeline(mock_engine, data, client=mock_client)
         acc_map = {a["name"]: a for a in res["accounts"]}
 
-        self.assertIn("claude", acc_map["acc_claude"]["quota"])
-        self.assertEqual(acc_map["acc_claude"]["quota"]["claude"]["quota"], 75)
-        self.assertTrue(acc_map["acc_claude"]["quota"]["claude"]["cached"])
-        self.assertNotIn("error", acc_map["acc_claude"]["quota"])
+        # Cached Claude must not be used as fallback; account marked Unreachable
+        self.assertEqual(acc_map["acc_claude"]["quota"]["error"], "Unreachable")
+        self.assertIsNone(acc_map["acc_claude"]["quota"]["gemini"])
 
-    def test_run_quota_pipeline_partial_live_merges_with_cache(self):
-        """run_quota_pipeline preserves cached Claude when live fetch only returns Gemini."""
+    def test_run_quota_pipeline_partial_live_excises_claude_cache(self):
+        """[QUOTA-GEMINI-EDGE-001] run_quota_pipeline retains live Gemini and ignores legacy cached Claude."""
         mock_engine = MagicMock()
         mock_engine.get_account_tokens.return_value = {"access_token": "token_partial"}
         mock_client = MagicMock()
@@ -1295,11 +1292,9 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
         acc = res["accounts"][0]
 
         self.assertIn("gemini", acc["quota"])
-        self.assertIn("claude", acc["quota"])
+        self.assertNotIn("claude", acc["quota"])
         self.assertEqual(acc["quota"]["gemini"]["quota"], 90)
         self.assertFalse(acc["quota"]["gemini"]["cached"])
-        self.assertEqual(acc["quota"]["claude"]["quota"], 65)
-        self.assertTrue(acc["quota"]["claude"]["cached"])
 
     def test_run_quota_pipeline_unreachable_symmetric_model_schema(self):
         """run_quota_pipeline provides both gemini and claude keys when account is unreachable and uncached."""

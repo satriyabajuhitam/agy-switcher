@@ -1365,7 +1365,7 @@ def run_quota_pipeline(
     # 2. Extract valid quotas and merge into cache
     valid_quotas: dict[str, Any] = {}
     for name, q in raw_quotas.items():
-        if isinstance(q, dict) and not q.get("error") and (q.get("gemini") or q.get("claude")):
+        if isinstance(q, dict) and not q.get("error") and (q.get("gemini")):
             valid_quotas[name] = q
 
     if valid_quotas:
@@ -1398,11 +1398,6 @@ def run_quota_pipeline(
             and not cached_acc["gemini"].get("error")
             and "quota" in cached_acc["gemini"]
         )
-        has_valid_claude_cache = (
-            isinstance(cached_acc.get("claude"), dict)
-            and not cached_acc["claude"].get("error")
-            and "quota" in cached_acc["claude"]
-        )
         has_legacy_cache = (
             "quota" in cached_acc
             and not cached_acc.get("error")
@@ -1411,19 +1406,18 @@ def run_quota_pipeline(
         has_live_models = (
             isinstance(live_q, dict)
             and not live_q.get("error")
-            and (live_q.get("gemini") or live_q.get("claude"))
+            and (live_q.get("gemini"))
         )
 
         if has_live_models:
-            # Live telemetry succeeded: retain all valid model keys (gemini, claude)
+            # Live telemetry succeeded: retain valid gemini model keys
             new_quota: dict[str, Any] = {}
-            for k in ("gemini", "claude"):
-                if isinstance(live_q.get(k), dict):
-                    m_copy = dict(live_q[k])
-                    m_copy["cached"] = False
-                    new_quota[k] = m_copy
-                elif k in live_q and live_q[k] is not None:
-                    new_quota[k] = live_q[k]
+            if isinstance(live_q.get("gemini"), dict):
+                m_copy = dict(live_q["gemini"])
+                m_copy["cached"] = False
+                new_quota["gemini"] = m_copy
+            elif "gemini" in live_q and live_q["gemini"] is not None:
+                new_quota["gemini"] = live_q["gemini"]
 
             # Preserve cached models if missing from partial live response
             if "gemini" not in new_quota:
@@ -1439,11 +1433,6 @@ def run_quota_pipeline(
                         "buckets": {},
                     }
 
-            if "claude" not in new_quota and has_valid_claude_cache:
-                c_copy = dict(cached_acc["claude"])
-                c_copy["cached"] = True
-                new_quota["claude"] = c_copy
-
             acc["quota"] = new_quota
         else:
             # Live fetch failed or error returned: check cache
@@ -1452,10 +1441,6 @@ def run_quota_pipeline(
                 gemini_copy = dict(cached_acc["gemini"])
                 gemini_copy["cached"] = True
                 fallback_quota["gemini"] = gemini_copy
-            if has_valid_claude_cache:
-                claude_copy = dict(cached_acc["claude"])
-                claude_copy["cached"] = True
-                fallback_quota["claude"] = claude_copy
 
             if not fallback_quota and has_legacy_cache:
                 gemini_copy = {

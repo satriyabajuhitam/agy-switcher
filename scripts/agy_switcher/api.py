@@ -365,7 +365,7 @@ def auto_rotate_on_exhaustion(
 
         # Non-Gemini cooldowns are retired and must never penalize Gemini rotation
         if cooldowns and model_key == "gemini":
-            filtered_cooldowns: dict[str, Any] = {}
+            filtered_cooldowns: dict[str, object] = {}
             for acc, rec in cooldowns.items():
                 if isinstance(rec, dict):
                     m_rec = str(rec.get("model", "")).strip().lower()

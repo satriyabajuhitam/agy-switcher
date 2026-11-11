@@ -282,7 +282,8 @@ class TestCLI(unittest.TestCase):
         self.assertIn("buckets", acc1["quota"]["gemini"])
 
     @patch('agy_switch.QuotaClient')
-    def test_quota_subcommand_json_preserves_claude(self, mock_qc_class):
+    def test_quota_subcommand_json_excises_claude(self, mock_qc_class):
+        """[QUOTA-GEMINI-EDGE-001] agy-switch quota --json strictly retains Gemini and strips Claude."""
         mock_qc = mock_qc_class.return_value
         mock_qc.fetch_quota.return_value = {
             "gemini": {
@@ -308,8 +309,8 @@ class TestCLI(unittest.TestCase):
         data = json.loads(buf.getvalue())
         for acc in data["accounts"]:
             self.assertIn("gemini", acc["quota"])
-            self.assertIn("claude", acc["quota"])
-            self.assertEqual(set(acc["quota"].keys()), {"gemini", "claude"})
+            self.assertNotIn("claude", acc["quota"])
+            self.assertEqual(set(acc["quota"].keys()), {"gemini"})
 
     def test_quota_subcommand_model_claude_sorting(self):
         """agy-switch quota --model claude is rejected with exit code 1."""

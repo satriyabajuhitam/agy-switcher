@@ -37,10 +37,10 @@ from agy_switcher.telemetry import (
     fetch_account_quota as _real_fetch_account_quota,
 )
 
-RotationEngine: Any = None
-QuotaClient: Any = None
-fetch_account_quota: Any = None
-AgySwitchEngine: Any = None
+RotationEngine: type[object] | None = None
+QuotaClient: type[object] | None = None
+fetch_account_quota: Callable[..., tuple[str, Mapping[str, object] | None]] | None = None
+AgySwitchEngine: type[object] | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ def _get_rotation_engine_class() -> Any:
 def _get_quota_client_class() -> Any:
     return _resolve_symbol("QuotaClient", lambda: _RealQuotaClient)
 
-def _get_fetch_account_quota() -> Any:
+def _get_fetch_account_quota() -> Callable[..., tuple[str, Mapping[str, object] | None]] | None:
     return _resolve_symbol("fetch_account_quota", lambda: _real_fetch_account_quota)
 
 def _get_engine_class() -> Any:
@@ -729,7 +729,7 @@ class LogWatcher:
                 pass
         if not isinstance(acc_quota, Mapping):
             return None
-        # 1. Try RotationEngine.get_quota_status
+        # Prefer RotationEngine parser for multi-bucket group structures before flat fallback
         rot_cls = _get_rotation_engine_class()
         try:
             rot = rot_cls(model_name=model_name, active_account_id=active_account)
