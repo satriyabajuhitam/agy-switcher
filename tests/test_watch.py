@@ -983,6 +983,90 @@ class TestLogWatcher(unittest.TestCase):
         self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
 
     @patch("scripts.watch.time.sleep", return_value=None)
+    def test_pre_switch_probe_boundary_and_cache_missing(self, mock_sleep):
+        """[PRE-PROBE-EDGE-001] & [PRE-PROBE-ERR-001]: Pre-Switch Quota Probe boundaries and IO fallback.
+        - [PRE-PROBE-EDGE-001]: Exactly 25.0% Gemini quota (fraction = 0.25) evaluates as depleted (<= 25%),
+          authorizing account rotation to preserve agent operation before zero-token hard cutoff.
+        - [PRE-PROBE-ERR-001]: Missing or unparseable last_known_quota.json treats active account quota as
+          unverified rather than assuming healthy, and falls back to standard exhaustion rotation so the
+          agent turn is not permanently blocked.
+        """
+        cache_dir = Path(self.tmpdir) / "cache_boundary"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        self.engine_mock.cache_dir = cache_dir
+        self.engine_mock.cache_file = cache_file
+
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True, "is_active": True},
+                {"name": "standby-acc", "valid": True, "is_active": False},
+            ],
+        }
+        self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+        exhaustion_line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
+
+        # --- [PRE-PROBE-EDGE-001]: Exact boundary at fraction = 0.25 authorizes rotation ---
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 0.0
+        self.engine_mock.switch_tokens.reset_mock()
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.25}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        res_boundary = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertTrue(res_boundary)
+        self.assertIn("primary-acc", self.watcher.get_cooldowns())
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # Also verify integer percentage quota = 25 (25% <= 25% boundary)
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 0.0
+        self.engine_mock.switch_tokens.reset_mock()
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"quota": 25}},
+                    "standby-acc": {"gemini": {"quota": 90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        res_boundary_int = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertTrue(res_boundary_int)
+        self.assertIn("primary-acc", self.watcher.get_cooldowns())
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # --- [PRE-PROBE-ERR-001]: Missing last_known_quota.json falls back safely to rotation ---
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 0.0
+        self.engine_mock.switch_tokens.reset_mock()
+        cache_file.unlink(missing_ok=True)
+
+        res_missing = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertTrue(res_missing)
+        self.assertIn("primary-acc", self.watcher.get_cooldowns())
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # --- [PRE-PROBE-ERR-001]: Unparseable/corrupted last_known_quota.json falls back safely to rotation ---
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 0.0
+        self.engine_mock.switch_tokens.reset_mock()
+        cache_file.write_text("{ unparseable corrupted json", encoding="utf-8")
+
+        res_corrupt = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertTrue(res_corrupt)
+        self.assertIn("primary-acc", self.watcher.get_cooldowns())
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
     def test_truncation_resets_cursor_and_clock_skew(self, mock_sleep):
         """[WATCH-BOUND-EDGE-003] and [PRE-PROBE-EDGE-002]:
         1. [WATCH-BOUND-EDGE-003]: File truncation during transcript tailing resets cursor to 0 and resumes tailing.
@@ -1120,6 +1204,123 @@ class TestLogWatcher(unittest.TestCase):
                 with patch.object(self.watcher, "handle_exhaustion", return_value=False):
                     self.watcher.process_line(exhaustion_line)
                     self.assertEqual(self.watcher.last_switch_time, 0.0)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_damping_60s_suppresses_bursts(self, mock_sleep):
+        """[PRE-PROBE-003], [PRE-PROBE-ERR-003], and [PRE-PROBE-004]:
+        1. Default damping_seconds is 60.0, custom damping_seconds is preserved and honored.
+        2. [PRE-PROBE-003]: Auto-rotation occurred 25s ago (elapsed=25.0s < 60.0s); subsequent
+           exhaustion error is suppressed without placing any account into cooldown.
+        3. [PRE-PROBE-ERR-003]: Auto-rotation occurred 10s ago (elapsed=10.0s < 60.0s); 10 consecutive
+           burst exhaustion lines arriving within 2s are all suppressed with zero token switches or cooldown penalties.
+        4. Exact boundary conditions:
+           - elapsed = 59.9s (< 60.0s) -> suppressed.
+           - elapsed = 60.0s (== 60.0s >= 60.0s) -> allowed, failover authorized when quota depleted.
+           - [PRE-PROBE-004]: elapsed = 61.0s (>= 60.0s) -> re-arms failover switching.
+        """
+        # 1. Verify default damping_seconds and custom damping_seconds preservation
+        default_watcher = LogWatcher(engine=self.engine_mock)
+        self.assertEqual(default_watcher.damping_seconds, 60.0)
+
+        none_watcher = LogWatcher(engine=self.engine_mock, damping_seconds=None)
+        self.assertEqual(none_watcher.damping_seconds, 60.0)
+
+        custom_watcher = LogWatcher(engine=self.engine_mock, damping_seconds=45.0)
+        self.assertEqual(custom_watcher.damping_seconds, 45.0)
+
+        legacy_watcher = LogWatcher(engine=self.engine_mock, damping_seconds=["/var/log/custom"])
+        self.assertEqual(legacy_watcher.damping_seconds, 60.0)
+
+        # Setup mock cache and engine for exhaustion testing
+        cache_dir = Path(self.tmpdir) / "cache_burst"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        self.engine_mock.cache_dir = cache_dir
+        self.engine_mock.cache_file = cache_file
+
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True, "is_active": True},
+                {"name": "standby-acc", "valid": True, "is_active": False},
+            ],
+        }
+        # Depleted quota on primary-acc (10%), healthy on standby-acc (90%)
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        self.engine_mock.switch_tokens.reset_mock()
+        self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.assertEqual(self.watcher.damping_seconds, 60.0)
+
+        exhaustion_line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
+
+        # 2. [PRE-PROBE-003]: Auto-rotation occurred 25s ago (elapsed = 25.0s < 60.0s)
+        self.watcher.last_switch_time = 1000.0
+        with patch("time.time", return_value=1025.0):
+            res_25s = self.watcher.handle_exhaustion(line=exhaustion_line)
+            self.assertFalse(res_25s, "Exhaustion at elapsed=25.0s must be suppressed")
+            self.engine_mock.switch_tokens.assert_not_called()
+            self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
+            self.assertEqual(self.watcher.last_switch_time, 1000.0)
+
+        # 3. [PRE-PROBE-ERR-003]: Auto-rotation occurred 10s ago (elapsed = 10.0s < 60.0s);
+        #    10 consecutive exhaustion lines arrive within 2 seconds
+        self.watcher.last_switch_time = 1000.0
+        self.engine_mock.switch_tokens.reset_mock()
+        self.watcher.cooldown_manager.clear_cooldown()
+
+        for i in range(10):
+            # Arrival times from 1010.0 to 1011.8 (elapsed 10.0s to 11.8s)
+            arrival_time = 1010.0 + (i * 0.2)
+            with patch("time.time", return_value=arrival_time):
+                suppressed_proc = self.watcher.process_line(exhaustion_line)
+                self.assertFalse(suppressed_proc, f"Burst event {i} must be suppressed by process_line")
+                suppressed_handle = self.watcher.handle_exhaustion(line=exhaustion_line)
+                self.assertFalse(suppressed_handle, f"Burst event {i} must be suppressed by handle_exhaustion")
+
+        # Zero additional token switches or cooldown penalties across entire burst
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertEqual(len(self.watcher.get_cooldowns()), 0)
+        self.assertEqual(self.watcher.last_switch_time, 1000.0)
+
+        # 4. Exact boundary conditions:
+        # 4a. elapsed = 59.9s (< 60.0s) -> suppressed
+        self.watcher.last_switch_time = 1000.0
+        with patch("time.time", return_value=1059.9):
+            res_59_9 = self.watcher.handle_exhaustion(line=exhaustion_line)
+            self.assertFalse(res_59_9, "Exhaustion at elapsed=59.9s must be suppressed")
+            self.engine_mock.switch_tokens.assert_not_called()
+            self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
+
+        # 4b. elapsed = 60.0s (== 60.0s, boundary elapsed >= damping_seconds) -> allowed
+        self.watcher.last_switch_time = 1000.0
+        self.engine_mock.switch_tokens.reset_mock()
+        with patch("time.time", return_value=1060.0):
+            res_60_0 = self.watcher.handle_exhaustion(line=exhaustion_line)
+            self.assertTrue(res_60_0, "Exhaustion at elapsed=60.0s must be allowed (elapsed >= damping_seconds)")
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.assertIn("primary-acc", self.watcher.get_cooldowns())
+            self.assertEqual(self.watcher.last_switch_time, 1060.0)
+
+        # 4c. [PRE-PROBE-004]: Damping window expiration at elapsed = 61.0s (>= 60.0s) re-arms failover
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 1000.0
+        self.engine_mock.switch_tokens.reset_mock()
+        with patch("time.time", return_value=1061.0):
+            res_61_0 = self.watcher.handle_exhaustion(line=exhaustion_line)
+            self.assertTrue(res_61_0, "[PRE-PROBE-004] Exhaustion at elapsed=61.0s re-arms failover")
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.assertIn("primary-acc", self.watcher.get_cooldowns())
+            self.assertEqual(self.watcher.last_switch_time, 1061.0)
 
 
 
