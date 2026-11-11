@@ -299,7 +299,8 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(res2["gemini"]["quota"], 5)
         self.assertEqual(res2["gemini"]["reset_time"], 1791633600)
 
-    def test_parse_quota_response_claude_preservation(self):
+    def test_parse_quota_response_claude_ignored(self):
+        """[QUOTA-GEMINI-002] parse_quota_response ignores Claude and GPT model groups completely."""
         payload = {
             "groups": [
                 {
@@ -312,12 +313,8 @@ class TestQuotaClient(unittest.TestCase):
             ]
         }
         res = self.client.parse_quota_response(payload)
-        self.assertIn("claude", res)
-        self.assertEqual(res["claude"]["quota"], 60)
-        self.assertEqual(res["claude"]["reset_time"], 1791201600)
-        self.assertFalse(res["claude"]["cached"])
-        self.assertIn("5h", res["claude"]["buckets"])
-        self.assertIn("weekly", res["claude"]["buckets"])
+        self.assertEqual(res, {})
+        self.assertNotIn("claude", res)
 
     def test_parse_quota_response_malformed_reset_time(self):
         payload = {

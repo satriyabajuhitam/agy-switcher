@@ -175,7 +175,7 @@ def normalize_model_name(model: str) -> str:
     if not model or not isinstance(model, str):
         raise AgySwitchError(f"Unsupported model '{model}'. Allowed model is strictly 'gemini'.")
     m = model.strip().lower()
-    if "gemini" in m and "claude" not in m and "anthropic" not in m:
+    if m.startswith("gemini") and "claude" not in m and "anthropic" not in m:
         return "gemini"
     raise AgySwitchError(
         f"Unsupported model '{model}'. Allowed model is strictly 'gemini'. Non-Gemini models are retired and unsupported."
@@ -308,12 +308,14 @@ def _is_stale_exhausted_cache(
     if status.fraction > 0.0:
         return False
     cached_at_val = cached_entry.get("cached_at")
-    try:
-        c_at = float(cached_at_val)
-        if not math.isfinite(c_at) or c_at <= 0 or isinstance(cached_at_val, bool):
+    c_at = 0.0
+    if cached_at_val is not None and not isinstance(cached_at_val, bool):
+        try:
+            c_at = float(cached_at_val)
+            if not math.isfinite(c_at) or c_at <= 0:
+                c_at = 0.0
+        except (ValueError, TypeError, OverflowError):
             c_at = 0.0
-    except (ValueError, TypeError, OverflowError):
-        c_at = 0.0
 
     is_expired = (c_at <= 0.0) or (now - c_at > ttl_seconds) or (now - c_at < -clock_skew_tolerance)
     try:
@@ -462,7 +464,11 @@ class QuotaClient:
             return None
 
     def parse_quota_response(self, raw_resp: dict[str, Any]) -> dict[str, Any]:
-        """Parses CloudCode response into the standardized Hybrid Quota Schema."""
+        """Parses CloudCode response into the standardized Gemini Quota Schema.
+
+        Extracts weekly and five-hour quota metrics exclusively for Gemini Models
+        under the 'gemini' key, completely ignoring any third-party or Claude models.
+        """
         if not isinstance(raw_resp, dict):
             return {}
         groups = raw_resp.get("groups")
@@ -478,10 +484,8 @@ class QuotaClient:
                 continue
 
             group_name_lower = group_name.lower()
-            if "gemini" in group_name_lower:
+            if "gemini" in group_name_lower and "claude" not in group_name_lower and "anthropic" not in group_name_lower:
                 key = "gemini"
-            elif "claude" in group_name_lower:
-                key = "claude"
             else:
                 continue
 
@@ -658,13 +662,17 @@ class QuotaClient:
         cache_path = Path(self.cache_file)
         if cache_path.is_file():
             try:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
+                loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    return loaded
             except Exception:
                 return {}
         legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
         if legacy_cache.is_file():
             try:
-                return json.loads(legacy_cache.read_text(encoding="utf-8"))
+                loaded_legacy = json.loads(legacy_cache.read_text(encoding="utf-8"))
+                if isinstance(loaded_legacy, dict):
+                    return loaded_legacy
             except Exception:
                 return {}
         return {}
@@ -951,8 +959,10 @@ def sort_accounts_by_quota(
         if not isinstance(acc, dict):
             return (1, float("inf"), "")
 
-        q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
-        q_data = q_root.get(model_key) if isinstance(q_root.get(model_key), dict) else {}
+        q_root_val = acc.get("quota")
+        q_root: dict[str, Any] = q_root_val if isinstance(q_root_val, dict) else {}
+        q_data_val = q_root.get(model_key)
+        q_data: dict[str, Any] = q_data_val if isinstance(q_data_val, dict) else {}
 
         quota_val: int | float = -1
         reset_time: float = float("inf")
@@ -1023,9 +1033,10 @@ def run_quota_pipeline(
     for acc in accounts:
         acc_name = acc.get("name", "")
         live_q = raw_quotas.get(acc_name)
-        cached_acc = (
-            cached_accounts.get(acc_name)
-            if isinstance(cached_accounts.get(acc_name), dict)
+        cached_acc_val = cached_accounts.get(acc_name)
+        cached_acc: dict[str, Any] = (
+            cached_acc_val
+            if isinstance(cached_acc_val, dict)
             else {}
         )
         has_valid_gemini_cache = (

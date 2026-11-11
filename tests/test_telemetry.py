@@ -114,6 +114,13 @@ class TestDefensiveParsers(unittest.TestCase):
         with self.assertRaises(AgySwitchError):
             normalize_model_name(None)  # type: ignore
 
+    def test_normalize_model_name_gemini_variants(self) -> None:
+        """[QUOTA-GEMINI-001] normalize_model_name normalizes Gemini model variants to 'gemini'."""
+        variants = ["gemini", "gemini-3.8-flash", "gemini-3.8-pro", "GEMINI-2.5-FLASH"]
+        for var in variants:
+            with self.subTest(variant=var):
+                self.assertEqual(normalize_model_name(var), "gemini")
+
     def test_normalize_model_name_rejects_non_gemini(self) -> None:
         """[QUOTA-GEMINI-ERR-001] normalize_model_name raises AgySwitchError on non-Gemini models."""
         unsupported_models = [
@@ -237,8 +244,65 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(res["gemini"]["quota"], 80)
         self.assertEqual(res["gemini"]["buckets"]["5h"]["quota"], 80)
         self.assertEqual(res["gemini"]["buckets"]["weekly"]["quota"], 95)
-        self.assertIn("claude", res)
-        self.assertEqual(res["claude"]["quota"], 50)
+        self.assertNotIn("claude", res)
+
+    def test_parse_quota_response_gemini_exclusive(self) -> None:
+        """[QUOTA-GEMINI-002] parse_quota_response extracts exclusively Gemini models and ignores Claude/third-party."""
+        raw = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": 0.8, "resetTime": "2026-10-05T12:00:00Z"},
+                        {"bucketId": "weekly", "remainingFraction": 0.95, "resetTime": "2026-10-10T12:00:00Z"},
+                    ]
+                },
+                {
+                    "group": "Claude Models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": 0.5, "resetTime": "2026-10-05T15:00:00Z"}
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {"bucketId": "weekly", "remainingFraction": 0.3, "resetTime": "2026-10-05T15:00:00Z"}
+                    ]
+                },
+                {
+                    "displayName": "Anthropic Claude 3.5 Sonnet",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": 0.4, "resetTime": "2026-10-05T15:00:00Z"}
+                    ]
+                }
+            ]
+        }
+        res = self.client.parse_quota_response(raw)
+        self.assertIn("gemini", res)
+        self.assertEqual(res["gemini"]["quota"], 80)
+        self.assertEqual(res["gemini"]["buckets"]["5h"]["quota"], 80)
+        self.assertEqual(res["gemini"]["buckets"]["weekly"]["quota"], 95)
+        # Verify third-party / Claude models are completely ignored
+        self.assertNotIn("claude", res)
+        self.assertNotIn("gpt", res)
+        self.assertNotIn("anthropic", res)
+        self.assertEqual(list(res.keys()), ["gemini"])
+
+    def test_parse_quota_response_missing_or_empty_gemini_group(self) -> None:
+        """[QUOTA-GEMINI-ERR-002] parse_quota_response handles missing or empty Gemini group gracefully."""
+        cases: list[dict[str, Any]] = [
+            {},
+            {"groups": []},
+            {"groups": [{"displayName": "Claude Models", "buckets": [{"bucketId": "5h", "remainingFraction": 0.5}]}]},
+            {"groups": [{"displayName": "Gemini Models", "buckets": []}]},
+            {"groups": [{"displayName": "Gemini Models"}]},
+            {"groups": [None, 123, "corrupted"]},
+        ]
+        for case in cases:
+            with self.subTest(payload=case):
+                res = self.client.parse_quota_response(case)
+                self.assertEqual(res, {})
+                self.assertNotIn("gemini", res)
 
     @patch("urllib.request.urlopen")
     def test_fetch_quota_success(self, mock_urlopen):
