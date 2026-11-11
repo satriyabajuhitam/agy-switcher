@@ -2021,12 +2021,258 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         # Clean up lock fd so server becomes quiescent
         (pid_fd / "4").unlink()
         self.assertFalse(self.supervisor.is_server_busy())
+        lock_path.touch()
 
         # Case C: Both conditions met (turn completed with USER_INPUT or DONE AND server quiescent)
         # Safe Turn Boundary is reached -> rotation proceeds!
         res_quiescent = watcher.poll_once()
         self.assertTrue(res_quiescent, "poll_once() must trigger rotation once Safe Turn Boundary is reached")
         self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+
+class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
+    """Tests for session discovery guards and reload resilience during proactive failover.
+
+    Covers:
+    - [WATCH-PROACTIVE-ERR-002]: Missing transcript or unresolvable active session skips proactive rotation safely.
+    - [WATCH-PROACTIVE-ERR-003]: Server reload failure on Safe Turn Boundary logged safely without crashing watcher daemon.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-acc", "valid": True},
+            ]
+        }
+
+        # Setup quota cache: primary-acc at 14% (<= 20% threshold), standby-acc at 90%
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_session_discovery_missing_transcript_skips_proactive_rotation(self):
+        """[WATCH-PROACTIVE-ERR-002]: GIVEN no Antigravity session transcript is discovered by PresenceDetector
+        WHEN LogWatcher.poll_once() evaluates proactive rotation
+        THEN it determines that no active session boundary can be verified
+        AND skips proactive rotation evaluation safely without raising exceptions.
+        """
+        # Case A: Old inactive session transcript exists in brain_dir from a previous session
+        old_logs_dir = self.gemini_dir / "antigravity" / "brain" / "old-session-inactive" / ".system_generated" / "logs"
+        old_logs_dir.mkdir(parents=True, exist_ok=True)
+        old_transcript = old_logs_dir / "transcript.jsonl"
+        old_transcript.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Old finished session."}) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(old_transcript, (time.time() - 3600.0, time.time() - 3600.0))
+
+        # PresenceDetector discovers NO active session (no presence lock exists)
+        self.assertIsNone(self.detector.get_active_session_id())
+        self.assertIsNone(self.detector.get_active_transcript_path())
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # poll_once must safely evaluate proactive rotation, determine that no active
+        # session boundary can be verified, and skip rotation without exceptions.
+        res = watcher.poll_once()
+        self.assertEqual(res, 0, "Must return 0 switches when active session cannot be verified")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+        # Case B: Completely absent transcript file
+        old_transcript.unlink(missing_ok=True)
+        res_empty = watcher.poll_once()
+        self.assertEqual(res_empty, 0, "Must return 0 switches when no transcript exists")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+    def test_session_discovery_detector_exception_skips_safely(self):
+        """[WATCH-PROACTIVE-ERR-002]: GIVEN PresenceDetector raises an error during discovery
+        WHEN LogWatcher.poll_once() evaluates proactive rotation
+        THEN it catches the exception and skips rotation safely without crashing.
+        """
+        mock_detector = MagicMock(spec=PresenceDetector)
+        mock_detector.get_active_session_id.side_effect = OSError("Presence directory read failure")
+        mock_detector.get_active_transcript_path.side_effect = OSError("Presence directory read failure")
+        mock_detector.get_watch_targets.return_value = []
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=mock_detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        res = watcher.poll_once()
+        self.assertEqual(res, 0, "Must gracefully handle discovery error and return 0")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+    def test_session_discovery_reload_failure_due_to_supervisor_error_logged_and_preserves_state(self):
+        """[WATCH-PROACTIVE-ERR-003]: GIVEN LogWatcher triggers proactive rotation to standby account "standby-acc"
+        AND switch_tokens fails to terminate or restart language_server due to ProcessSupervisor error
+        WHEN LogWatcher receives the failed switch result
+        THEN it logs the failure message to stderr
+        AND does not advance last_switch_time
+        AND continues its polling loop cleanly without unhandled crash.
+        """
+        # Setup an active session at a valid Safe Turn Boundary
+        session_id = "session-active-003"
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / f"{session_id}.lock").touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Assistant finished turn."}) + "\n",
+            encoding="utf-8",
+        )
+
+        # switch_tokens returns a failed switch result due to ProcessSupervisor error
+        self.engine_mock.switch_tokens.return_value = {
+            "success": False,
+            "error": "ProcessSupervisor error: language_server failed to terminate cleanly",
+        }
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        initial_switch_time = watcher.last_switch_time
+
+        from io import StringIO
+        stderr_capture = StringIO()
+        with patch("sys.stderr", stderr_capture):
+            res = watcher.poll_once()
+
+        self.assertEqual(res, 0, "poll_once() must return 0 when switch_tokens fails")
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn("ProcessSupervisor error: language_server failed to terminate cleanly", stderr_output)
+        self.assertEqual(watcher.last_switch_time, initial_switch_time, "last_switch_time must not advance on reload failure")
+
+        # Daemon polling loop can continue cleanly without crash
+        stderr_capture_2 = StringIO()
+        with patch("sys.stderr", stderr_capture_2):
+            res_2 = watcher.poll_once()
+        self.assertEqual(res_2, 0)
+
+    def test_session_discovery_reload_failure_with_active_in_result_dict(self):
+        """[WATCH-PROACTIVE-ERR-003]: GIVEN switch_tokens returns a dict with error even if active key exists
+        WHEN LogWatcher processes the failed result
+        THEN it treats the switch as failed, logs to stderr, and does not advance last_switch_time.
+        """
+        session_id = "session-active-003b"
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / f"{session_id}.lock").touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-acc",
+            "error": "ProcessSupervisor error: language_server failed to restart",
+        }
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        initial_switch_time = watcher.last_switch_time
+
+        from io import StringIO
+        stderr_capture = StringIO()
+        with patch("sys.stderr", stderr_capture):
+            res = watcher.poll_once()
+
+        self.assertEqual(res, 0)
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn("ProcessSupervisor error: language_server failed to restart", stderr_output)
+        self.assertEqual(watcher.last_switch_time, initial_switch_time)
+
+    def test_session_discovery_reload_exception_from_supervisor_handled_cleanly(self):
+        """[WATCH-PROACTIVE-ERR-003]: GIVEN switch_tokens raises an unhandled ProcessSupervisor exception
+        WHEN LogWatcher evaluates proactive rotation
+        THEN it logs the exception to stderr, does not advance last_switch_time, and continues cleanly.
+        """
+        session_id = "session-active-003c"
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / f"{session_id}.lock").touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        self.engine_mock.switch_tokens.side_effect = RuntimeError("ProcessSupervisor error: SIGKILL escalation timed out")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        initial_switch_time = watcher.last_switch_time
+
+        from io import StringIO
+        stderr_capture = StringIO()
+        with patch("sys.stderr", stderr_capture):
+            res = watcher.poll_once()
+
+        self.assertEqual(res, 0)
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn("ProcessSupervisor error: SIGKILL escalation timed out", stderr_output)
+        self.assertEqual(watcher.last_switch_time, initial_switch_time)
 
 
 if __name__ == '__main__':
