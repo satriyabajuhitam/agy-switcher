@@ -694,7 +694,7 @@ class LogWatcher:
         cooldowns: dict[str, Any],
         accounts_cache: dict[str, Any] | None = None,
     ) -> bool:
-        """Determines if an account in cooldown is penalized or granted immunity (ADR 0016)."""
+        """Determines if an account in cooldown is penalized or granted immunity (ADR 0016 / COOLDOWN-IMMUNITY)."""
         if not isinstance(cooldowns, dict) or not acc_name:
             return False
         clean_name = acc_name.strip() if isinstance(acc_name, str) else ""
