@@ -6,12 +6,11 @@ Zero external dependencies. Pure Python 3.10+ standard library.
 
 from __future__ import annotations
 
+from typing import Mapping, Sequence
 from datetime import datetime, timezone
 import json
-import math
 import os
 from pathlib import Path
-from typing import Any, Optional, Union
 
 from agy_switcher.exceptions import AgySwitchError
 from agy_switcher.models import EvaluationCandidate, QuotaStatus
@@ -19,6 +18,18 @@ from agy_switcher.telemetry import normalize_model_name
 
 
 DEFAULT_QUOTA_THRESHOLD: float = 0.25
+_QUOTA_PAYLOAD_KEYS: tuple[str, ...] = ("gemini", "quota", "groups")
+
+
+def _resolve_model_key(model_name: object, fallback: str = "gemini") -> str:
+    """Normalizes Gemini model variants via normalize_model_name while preserving legacy routing."""
+    if not isinstance(model_name, str) or not model_name.strip():
+        return fallback
+    raw = model_name.strip()
+    try:
+        return normalize_model_name(raw)
+    except AgySwitchError:
+        return "claude" if "claude" in raw.lower() else "gemini"
 
 
 class RotationEngine:
@@ -27,21 +38,21 @@ class RotationEngine:
     def __init__(
         self,
         vault_or_model: Path | str | None = None,
-        client_or_active: Any | None = None,
-        cooldown_manager: Any | None = None,
+        client_or_active: object = None,
+        cooldown_manager: object = None,
         *,
         model_name: str | None = None,
         active_account_id: str | None = None,
         vault_dir: Path | str | None = None,
-        client: Any | None = None,
+        client: object = None,
         target_model: str | None = None,
         threshold: float | int | None = None,
     ) -> None:
         resolved_vault: Path | None = Path(vault_dir).expanduser() if vault_dir else None
-        resolved_client = client
+        resolved_client: object = client
         resolved_active = active_account_id
         resolved_model = model_name or target_model
-        resolved_cm = cooldown_manager
+        resolved_cm: object = cooldown_manager
 
         if vault_or_model is not None:
             if isinstance(vault_or_model, Path):
@@ -56,7 +67,7 @@ class RotationEngine:
                 try:
                     normalize_model_name(vault_or_model)
                     is_known_model = True
-                except Exception:
+                except AgySwitchError:
                     is_known_model = False
 
                 if not is_explicit_path and is_known_model:
@@ -81,17 +92,8 @@ class RotationEngine:
         self.cooldown_manager = resolved_cm
         self.active_account_id = resolved_active
         self.model_name = resolved_model or "gemini"
-
-        norm_model = (self.model_name or "gemini").strip()
-        try:
-            self.target_model_key = normalize_model_name(norm_model)
-        except Exception:
-            self.target_model_key = "claude" if "claude" in norm_model.lower() else "gemini"
-
-        if self.target_model_key == "claude":
-            self.target_group_prefix = "Claude"
-        else:
-            self.target_group_prefix = "Gemini"
+        self.target_model_key = _resolve_model_key(self.model_name, fallback="gemini")
+        self.target_group_prefix = "Claude" if self.target_model_key == "claude" else "Gemini"
 
         if threshold is not None:
             try:
@@ -114,13 +116,13 @@ class RotationEngine:
         else:
             self.threshold = DEFAULT_QUOTA_THRESHOLD
 
-    def _parse_time(self, t_val: Any) -> datetime:
+    def _parse_time(self, t_val: object) -> datetime:
         """Parses various timestamp representations into a timezone-aware UTC datetime."""
         if not t_val:
             return datetime.max.replace(tzinfo=timezone.utc)
         if isinstance(t_val, datetime):
             return t_val if t_val.tzinfo else t_val.replace(tzinfo=timezone.utc)
-        if isinstance(t_val, (int, float)):
+        if isinstance(t_val, (int, float)) and not isinstance(t_val, bool):
             try:
                 return datetime.fromtimestamp(t_val, tz=timezone.utc)
             except Exception:
@@ -141,25 +143,32 @@ class RotationEngine:
                 return datetime.max.replace(tzinfo=timezone.utc)
         return datetime.max.replace(tzinfo=timezone.utc)
 
-    def get_quota_status(self, quota_data: dict, model_key: str | None = None) -> Optional[QuotaStatus]:
+    def get_quota_status(
+        self,
+        quota_data: Mapping[str, object],
+        model_key: str | None = None,
+    ) -> QuotaStatus | None:
         """Extracts QuotaStatus for the target model_key from quota payload dictionary."""
-        if not quota_data or not isinstance(quota_data, dict):
+        if not quota_data or not isinstance(quota_data, Mapping):
             return None
 
-        m_key = model_key or self.target_model_key
+        m_key = _resolve_model_key(model_key, fallback=self.target_model_key)
 
         # 1. Check last_known_quota.json cache schema: {"gemini": {"quota": X, "reset_time": Y}}
-        target_info = None
-        if m_key in quota_data and isinstance(quota_data[m_key], dict):
-            target_info = quota_data[m_key]
-        elif "quota" in quota_data and not isinstance(quota_data["quota"], dict) and m_key == "gemini":
+        target_info: Mapping[str, object] | None = None
+        candidate = quota_data.get(m_key)
+        if isinstance(candidate, Mapping):
+            target_info = candidate
+        elif "quota" in quota_data and not isinstance(quota_data["quota"], Mapping) and m_key == "gemini":
             target_info = quota_data
 
-        if target_info is not None and isinstance(target_info, dict):
+        if target_info is not None:
             q_val = target_info.get("quota")
             r_val = target_info.get("reset_time")
             if q_val is not None:
-                if isinstance(q_val, int):
+                if isinstance(q_val, bool):
+                    fraction = 0.0
+                elif isinstance(q_val, int):
                     fraction = max(0.0, min(1.0, float(q_val) / 100.0))
                 elif isinstance(q_val, float):
                     if q_val > 1.0:
@@ -176,18 +185,30 @@ class RotationEngine:
         # 2. Check CloudCode raw groups schema: {"groups": [{"group": "...", "buckets": [...]}]}
         if "groups" in quota_data:
             target_prefix = "Claude" if "claude" in m_key.lower() else "Gemini"
-            target_group = None
-            for group in quota_data.get("groups", []):
-                g_name = group.get("displayName") or group.get("group", "")
-                if g_name.startswith(target_prefix):
-                    target_group = group
-                    break
+            target_group: Mapping[str, object] | None = None
+            raw_groups = quota_data.get("groups")
+            if isinstance(raw_groups, list):
+                for group in raw_groups:
+                    if not isinstance(group, Mapping):
+                        continue
+                    g_name = group.get("displayName") or group.get("group", "")
+                    if isinstance(g_name, str) and g_name.startswith(target_prefix):
+                        target_group = group
+                        break
 
-            if target_group and "buckets" in target_group:
+            raw_buckets = target_group.get("buckets") if target_group is not None else None
+            if isinstance(raw_buckets, list):
                 lowest_fraction = 1.0
                 earliest_reset = datetime.max.replace(tzinfo=timezone.utc)
-                for bucket in target_group["buckets"]:
-                    frac = bucket.get("remainingFraction", 1.0)
+                for bucket in raw_buckets:
+                    if not isinstance(bucket, Mapping):
+                        continue
+                    raw_frac = bucket.get("remainingFraction", 1.0)
+                    frac = (
+                        float(raw_frac)
+                        if isinstance(raw_frac, (int, float)) and not isinstance(raw_frac, bool)
+                        else 1.0
+                    )
                     reset_time = self._parse_time(bucket.get("resetTime"))
                     if frac < lowest_fraction:
                         lowest_fraction = frac
@@ -198,14 +219,14 @@ class RotationEngine:
 
         return None
 
-    def is_exhausted(self, quota_data: dict) -> bool:
+    def is_exhausted(self, quota_data: Mapping[str, object]) -> bool:
         """Returns True if the relevant quota is completely exhausted (0% remaining)."""
         status = self.get_quota_status(quota_data)
         if status is None:
             return False
         return status.is_exhausted()
 
-    def has_available_quota(self, quota_data: dict) -> bool:
+    def has_available_quota(self, quota_data: Mapping[str, object]) -> bool:
         """Returns True if the relevant quota has positive remaining quota (> 0%)."""
         status = self.get_quota_status(quota_data)
         if status is None:
@@ -220,43 +241,39 @@ class RotationEngine:
         self,
         model_key: str,
         fraction: float,
-        rec: Any,
-        q_data: dict,
+        rec: object,
+        q_data: Mapping[str, object] | None = None,
     ) -> bool:
         """Determines if an account in cooldown is penalized for the target model_key.
 
         An account in cooldown is exempt from penalty for model_key ONLY if:
         1. It has healthy quota (> self.threshold) for the target model.
-        2. The cooldown was triggered by exhaustion of the alternate model family.
-        3. The cooldown does not explicitly penalize the target model family.
+        2. The cooldown record explicitly names an alternate model family in reason/model
+           (alternate model quota state in q_data is never probed).
+        3. The cooldown record does not explicitly penalize the target model family.
         """
         if fraction <= self.threshold:
             return True
 
-        norm_key = "claude" if "claude" in model_key.lower() else "gemini"
+        norm_key = _resolve_model_key(model_key, fallback=self.target_model_key)
+        target_tokens: tuple[str, ...]
+        alt_tokens: tuple[str, ...]
         if norm_key == "claude":
             target_tokens = ("claude", "anthropic")
-            alt_model_key = "gemini"
             alt_tokens = ("gemini",)
         else:
             target_tokens = ("gemini",)
-            alt_model_key = "claude"
             alt_tokens = ("claude", "anthropic")
 
         is_alt_exhausted = False
         is_explicitly_target = False
 
-        if isinstance(rec, dict):
+        if isinstance(rec, Mapping):
             r_str = str(rec.get("reason", "")).lower()
             m_str = str(rec.get("model", "")).lower()
             if any(tok in r_str or tok in m_str for tok in target_tokens):
                 is_explicitly_target = True
             if any(tok in r_str or tok in m_str for tok in alt_tokens):
-                is_alt_exhausted = True
-
-        if not is_explicitly_target and not is_alt_exhausted:
-            alt_status = self.get_quota_status(q_data, model_key=alt_model_key)
-            if alt_status is not None and alt_status.fraction <= 0.0:
                 is_alt_exhausted = True
 
         if is_alt_exhausted and not is_explicitly_target:
@@ -266,13 +283,14 @@ class RotationEngine:
 
     _is_cooldown_penalized_for_model = is_cooldown_penalized_for_model
 
-    def _load_quota_cache(self) -> dict[str, Any]:
+    def _load_quota_cache(self) -> dict[str, object]:
         """Loads quota cache from client or vault_dir/cache/last_known_quota.json."""
-        if self.client is not None and hasattr(self.client, "load_cache"):
+        load_cache_fn = getattr(self.client, "load_cache", None)
+        if callable(load_cache_fn):
             try:
-                data = self.client.load_cache()
+                data = load_cache_fn()
                 if isinstance(data, dict):
-                    return data
+                    return {str(k): v for k, v in data.items()}
             except Exception:
                 pass
         if self.vault_dir is not None:
@@ -281,18 +299,18 @@ class RotationEngine:
                 try:
                     data = json.loads(cache_file.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
-                        return data
+                        return {str(k): v for k, v in data.items()}
                 except Exception:
                     pass
         return {}
 
     def evaluate(
         self,
-        accounts: list[dict] | list[str] | dict,
+        accounts: Sequence[Mapping[str, object] | str] | Mapping[str, object],
         current_active: str | None = None,
         target_model: str | None = None,
         current_time: datetime | None = None,
-        cooldowns: dict | None = None,
+        cooldowns: Mapping[str, object] | None = None,
         strategy: str = "auto_highest",
         *,
         active: str | None = None,
@@ -313,48 +331,58 @@ class RotationEngine:
         elif current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=timezone.utc)
 
-        target_model = target_model or self.model_name or "gemini"
-        try:
-            model_key = normalize_model_name(target_model)
-        except Exception:
-            model_key = "claude" if "claude" in str(target_model).lower() else "gemini"
+        model_key = _resolve_model_key(target_model, fallback=_resolve_model_key(self.model_name, fallback="gemini"))
 
         # Resolve cooldowns from cooldown_manager if not provided explicitly
         if cooldowns is None and self.cooldown_manager is not None:
-            if hasattr(self.cooldown_manager, "get_active_cooldowns"):
+            get_cooldowns_fn = getattr(self.cooldown_manager, "get_active_cooldowns", None)
+            if callable(get_cooldowns_fn):
                 try:
-                    cooldowns = self.cooldown_manager.get_active_cooldowns()
+                    raw_cd = get_cooldowns_fn()
+                    if isinstance(raw_cd, Mapping):
+                        cooldowns = raw_cd
                 except Exception:
                     pass
-            elif hasattr(self.cooldown_manager, "cooldowns"):
-                cooldowns = getattr(self.cooldown_manager, "cooldowns")
+            else:
+                raw_cd = getattr(self.cooldown_manager, "cooldowns", None)
+                if isinstance(raw_cd, Mapping):
+                    cooldowns = raw_cd
 
         # Normalize accounts into a list of (account_id, quota_dict)
-        cached_data: dict[str, Any] | None = None
+        cached_data: dict[str, object] | None = None
 
-        def _get_cached_map() -> dict[str, Any]:
+        def _get_cached_map() -> dict[str, object]:
             nonlocal cached_data
             if cached_data is None:
                 raw_cache = self._load_quota_cache()
-                if isinstance(raw_cache, dict):
-                    accounts_field = raw_cache.get("accounts")
-                    cached_data = accounts_field if isinstance(accounts_field, dict) else raw_cache
+                accounts_field = raw_cache.get("accounts")
+                if isinstance(accounts_field, Mapping):
+                    cached_data = {str(k): v for k, v in accounts_field.items()}
                 else:
-                    cached_data = {}
-            return cached_data if isinstance(cached_data, dict) else {}
+                    cached_data = raw_cache
+            return cached_data
 
-        items: list[tuple[str, dict]] = []
-        raw_quota_map: dict[str, dict] = {}
+        def _resolve_account_quota(acc_name: str, q_candidate: Mapping[str, object]) -> dict[str, object]:
+            has_quota = any(k in q_candidate for k in _QUOTA_PAYLOAD_KEYS)
+            if has_quota:
+                return dict(q_candidate)
+            cached_entry = _get_cached_map().get(acc_name, q_candidate)
+            return dict(cached_entry) if isinstance(cached_entry, Mapping) else {}
 
-        if isinstance(accounts, dict):
-            if current_active is None and isinstance(accounts.get("active"), str):
-                current_active = accounts["active"]
+        items: list[tuple[str, dict[str, object]]] = []
+        raw_quota_map: dict[str, dict[str, object]] = {}
+
+        accounts_to_process: Sequence[Mapping[str, object] | str] | Mapping[str, object]
+        if isinstance(accounts, Mapping):
+            raw_active = accounts.get("active")
+            if current_active is None and isinstance(raw_active, str):
+                current_active = raw_active
 
             acc_list_or_map = accounts.get("accounts")
             if isinstance(acc_list_or_map, list):
                 # Standard vault or quota pipeline structure: {"active": "...", "accounts": [...]}
                 accounts_to_process = acc_list_or_map
-            elif isinstance(acc_list_or_map, dict):
+            elif isinstance(acc_list_or_map, Mapping):
                 # Cache structure: {"timestamp": ..., "accounts": {"acc1": {...}}}
                 accounts_to_process = acc_list_or_map
             else:
@@ -362,41 +390,42 @@ class RotationEngine:
         else:
             accounts_to_process = accounts
 
-        if isinstance(accounts_to_process, dict):
+        if isinstance(accounts_to_process, Mapping):
             for acc_id, q_data in accounts_to_process.items():
                 if not isinstance(acc_id, str) or not acc_id.strip():
                     continue
                 # Skip non-account metadata keys if legacy root dict passed
-                if acc_id in ("timestamp", "active", "error") and not isinstance(q_data, dict):
+                if acc_id in ("timestamp", "active", "error") and not isinstance(q_data, Mapping):
                     continue
                 acc_name = acc_id.strip()
-                if isinstance(q_data, dict):
-                    has_quota = any(k in q_data for k in ("gemini", "claude", "quota", "groups"))
-                    if not has_quota:
-                        q_data = _get_cached_map().get(acc_name, q_data)
+                if isinstance(q_data, Mapping):
+                    resolved_q = _resolve_account_quota(acc_name, q_data)
                 else:
-                    q_data = _get_cached_map().get(acc_name, {})
-                items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
-        elif isinstance(accounts_to_process, list):
+                    cached_entry = _get_cached_map().get(acc_name, {})
+                    resolved_q = dict(cached_entry) if isinstance(cached_entry, Mapping) else {}
+                items.append((acc_name, resolved_q))
+        elif isinstance(accounts_to_process, Sequence) and not isinstance(accounts_to_process, (str, bytes)):
             for acc in accounts_to_process:
                 if isinstance(acc, str):
                     acc_name = acc.strip()
                     if not acc_name:
                         continue
-                    q_data = _get_cached_map().get(acc_name, {})
-                    items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
-                elif isinstance(acc, dict):
-                    acc_name = acc.get("name") or acc.get("account") or acc.get("id")
-                    if not acc_name or not isinstance(acc_name, str):
+                    cached_entry = _get_cached_map().get(acc_name, {})
+                    resolved_q = dict(cached_entry) if isinstance(cached_entry, Mapping) else {}
+                    items.append((acc_name, resolved_q))
+                elif isinstance(acc, Mapping):
+                    raw_name = acc.get("name") or acc.get("account") or acc.get("id")
+                    if not isinstance(raw_name, str) or not raw_name.strip():
                         continue
-                    acc_name = acc_name.strip()
+                    acc_name = raw_name.strip()
                     if current_active is None and acc.get("is_active"):
                         current_active = acc_name
-                    q_data = acc.get("quota") if "quota" in acc and isinstance(acc["quota"], dict) else acc
-                    has_quota = any(k in q_data for k in ("gemini", "claude", "quota", "groups"))
-                    if not has_quota:
-                        q_data = _get_cached_map().get(acc_name, q_data)
-                    items.append((acc_name, q_data if isinstance(q_data, dict) else {}))
+                    raw_quota_field = acc.get("quota")
+                    q_dict: Mapping[str, object] = (
+                        raw_quota_field if isinstance(raw_quota_field, Mapping) else acc
+                    )
+                    resolved_q = _resolve_account_quota(acc_name, q_dict)
+                    items.append((acc_name, resolved_q))
 
         if current_active is None:
             current_active = self.active_account_id
@@ -417,7 +446,7 @@ class RotationEngine:
 
         active_status = evaluated.get(current_active) if current_active else None
         is_active_in_cooldown = bool(cooldowns and current_active and current_active in cooldowns)
-        if is_active_in_cooldown and active_status is not None:
+        if is_active_in_cooldown and active_status is not None and current_active is not None and cooldowns is not None:
             rec = cooldowns[current_active]
             q_data = raw_quota_map.get(current_active, {})
             is_active_in_cooldown = self._is_cooldown_penalized_for_model(
@@ -430,7 +459,7 @@ class RotationEngine:
                 return None
 
             # 2. drain_window heuristic: retain current active if fraction > 0.05 and reset in <= 30m
-            if active_status is not None and active_status.fraction > 0.05:
+            if active_status is not None and active_status.fraction > 0.05 and current_active is not None:
                 reset_delta = reset_deltas.get(current_active, float("inf"))
                 if 0 <= reset_delta <= 30:
                     return None
