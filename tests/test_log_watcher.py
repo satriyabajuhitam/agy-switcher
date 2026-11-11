@@ -1586,6 +1586,174 @@ class TestLogWatcherProcessing(unittest.TestCase):
             self.assertEqual(switches_after_error, 1)
             self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
 
+    def test_process_line_triggers_on_error_status_resource_exhausted(self) -> None:
+        """[WATCH-BOUND-002] status == 'ERROR' with RESOURCE_EXHAUSTED dispatches exhaustion handling."""
+        line = json.dumps({
+            "status": "ERROR",
+            "error": "Quota exceeded for project: RESOURCE_EXHAUSTED",
+        })
+        with patch.dict(os.environ, {}, clear=True), patch("scripts.watch.shutil.which", return_value=None):
+            for is_jsonl in (True, False):
+                with self.subTest(is_jsonl=is_jsonl):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(line, is_jsonl=is_jsonl))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    cooldowns = cooldown_mgr.get_cooldowns()
+                    self.assertIn("acc1", cooldowns)
+                    self.assertEqual(cooldowns["acc1"]["reason"], "RESOURCE_EXHAUSTED")
+                    self.assertGreater(watcher.last_switch_time, 0.0)
+
+    def test_process_line_triggers_on_error_status_error_message_http_429(self) -> None:
+        """[WATCH-BOUND-003] type == 'ERROR_MESSAGE' with HTTP 429 dispatches exhaustion handling."""
+        line = json.dumps({
+            "type": "ERROR_MESSAGE",
+            "message": "googleapi: Error 429: Rate limit exceeded",
+        })
+        with patch.dict(os.environ, {}, clear=True), patch("scripts.watch.shutil.which", return_value=None):
+            for is_jsonl in (True, False):
+                with self.subTest(is_jsonl=is_jsonl):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(line, is_jsonl=is_jsonl))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    cooldowns = cooldown_mgr.get_cooldowns()
+                    self.assertIn("acc1", cooldowns)
+                    self.assertGreater(watcher.last_switch_time, 0.0)
+
+    def test_process_line_triggers_on_error_status_http_429_variants_and_non_quota_guards(self) -> None:
+        """HTTP 429 structured error variants trigger dispatch while unrelated 429 numbers do not."""
+        triggering_payloads: list[dict[str, object]] = [
+            {"type": "ERROR_MESSAGE", "message": "HTTP 429: Too Many Requests"},
+            {"type": "ERROR_MESSAGE", "message": "HTTP/1.1 429 Too Many Requests"},
+            {"status": "ERROR", "error": {"code": 429, "message": "Rate limit exceeded"}},
+            {"status": "ERROR", "message": "status: 429 rate limited"},
+            {"type": "ERROR_MESSAGE", "message": "429: Rate limit exceeded"},
+            {"type": "ERROR_MESSAGE", "message": "googleapi: Error (429): Rate limit exceeded"},
+            {"status": "ERROR", "error": "status (429) rate limited"},
+            {"type": "ERROR_MESSAGE", "message": "(429) Too Many Requests"},
+            {"type": "ERROR_MESSAGE", "message": "429: Quota exceeded"},
+            {"type": "ERROR_MESSAGE", "message": "Rate limit exceeded (429)"},
+            {"type": "ERROR_MESSAGE", "message": "errorCode: 429"},
+            {"status": "ERROR", "error": "http_status=429 rate limited"},
+            {"status": "ERROR", "error": "rpc error: code = ResourceExhausted desc = Quota limit reached"},
+        ]
+        non_triggering_payloads: list[dict[str, object]] = [
+            {"status": "ERROR", "error": "SyntaxError at line 429: unexpected EOF"},
+            {"status": "ERROR", "error": "Error at line 429: invalid token"},
+            {"type": "ERROR_MESSAGE", "message": "Connection failed on port 4290"},
+            {"type": "ERROR_MESSAGE", "message": "Connection failed on port 429"},
+            {"status": "ERROR", "error": "Processed 429 items before timeout"},
+            {"type": "ERROR_MESSAGE", "message": "Timeout after 429ms waiting for socket"},
+            {"status": "ERROR", "error": "429: invalid JSON syntax"},
+            {"type": "ERROR_MESSAGE", "message": "Error code: 4291"},
+            {"status": "INFO", "code": 429, "message": "Rate limit exceeded"},
+        ]
+
+        with patch.dict(os.environ, {}, clear=True), patch("shutil.which", return_value=None):
+            for payload in triggering_payloads:
+                with self.subTest(triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+
+            for payload in non_triggering_payloads:
+                with self.subTest(non_triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertFalse(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [])
+                    self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+
+    def test_process_line_triggers_on_error_status_nested_payloads_and_envelope_normalization(self) -> None:
+        """Nested dict/list payloads, numeric status codes, and case/whitespace envelopes trigger safely."""
+        triggering_payloads: list[dict[str, object]] = [
+            {"type": "ERROR_MESSAGE", "message": {"detail": "Upstream failed:\nError 429"}},
+            {"type": "ERROR_MESSAGE", "message": {"detail": "Upstream failed:\nError 429: Rate limit exceeded"}},
+            {"type": "ERROR_MESSAGE", "message": {"detail": "Upstream failed:\n429 Too Many Requests"}},
+            {"type": "ERROR_MESSAGE", "message": [{"type": "text", "text": 'HTTP "429" Too Many Requests'}]},
+            {"status": "ERROR", "error": {"details": [{"metadata": {"http_status": "429"}}]}},
+            {"status": "ERROR", "content": {"parts": [{"text": "Upstream:\nError (429): Quota exceeded"}]}},
+            {"status": "ERROR", "error": 429},
+            {"status": "ERROR", "code": 429, "message": "Rate limit exceeded"},
+            {"type": "ERROR_MESSAGE", "http_status": 429, "message": "Rate limit exceeded"},
+            {"status": "error", "message": "googleapi: Error 429: Rate limit exceeded"},
+            {"status": " ERROR ", "content": "RESOURCE_EXHAUSTED"},
+            {"type": "error_message", "message": "googleapi: Error 429: Rate limit exceeded"},
+            {"type": " ERROR_MESSAGE ", "message": "googleapi: Error 429: Rate limit exceeded"},
+        ]
+        non_triggering_payloads: list[dict[str, object]] = [
+            {"status": " done ", "error": "RESOURCE_EXHAUSTED", "code": 429},
+            {"type": " user_input ", "status": "ERROR", "code": 429, "message": "Error 429"},
+            {"status": "ERROR", "line": 429, "error": "SyntaxError"},
+            {"status": "ERROR", "error": {"line": 429, "detail": "Processed 429 items"}},
+            {"status": "ERROR", "error": True},
+        ]
+
+        with patch.dict(os.environ, {}, clear=True), patch("shutil.which", return_value=None):
+            for payload in triggering_payloads:
+                with self.subTest(triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+
+            for payload in non_triggering_payloads:
+                with self.subTest(non_triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertFalse(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [])
+                    self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+
+    def test_process_line_triggers_on_error_status_transcript_tailing(self) -> None:
+        """[WATCH-BOUND-002][WATCH-BOUND-003] poll_once dispatches exhaustion for structured transcript lines."""
+        cases = [
+            (
+                "watch-bound-002",
+                {"status": "ERROR", "error": "Quota exceeded for project: RESOURCE_EXHAUSTED"},
+            ),
+            (
+                "watch-bound-003",
+                {"type": "ERROR_MESSAGE", "message": "googleapi: Error 429: Rate limit exceeded"},
+            ),
+        ]
+
+        with patch.dict(os.environ, {}, clear=True), patch("shutil.which", return_value=None):
+            for session_id, payload in cases:
+                with self.subTest(session_id=session_id):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, gemini_dir = self._build_isolated_watcher()
+
+                    lock_file = gemini_dir / "antigravity" / "presence" / f"{session_id}.lock"
+                    lock_file.parent.mkdir(parents=True, exist_ok=True)
+                    lock_file.touch()
+                    try:
+                        transcript_file = (
+                            gemini_dir
+                            / "antigravity"
+                            / "brain"
+                            / session_id
+                            / ".system_generated"
+                            / "logs"
+                            / "transcript.jsonl"
+                        )
+                        transcript_file.parent.mkdir(parents=True, exist_ok=True)
+                        transcript_file.write_text('{"type": "START"}\n', encoding="utf-8")
+
+                        self.assertEqual(watcher.poll_once(), 0)
+                        with open(transcript_file, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(payload) + "\n")
+
+                        self.assertEqual(watcher.poll_once(), 1)
+                        self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                        self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+                    finally:
+                        lock_file.unlink(missing_ok=True)
+
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
     def test_jsonl_immunity_model_thinking_and_code_view(self, mock_switch):
         """Line representing model thinking or code file inspection DOES NOT trigger rotation."""

@@ -42,6 +42,38 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_MAX_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB read bound
+_EXHAUSTION_REGEX: re.Pattern[str] = re.compile(
+    r"resource_?exhausted"
+    r"|\b(?:http(?:/\d+(?:\.\d+)?)?(?:_?(?:status|code))?|(?:grpc|response|api|http)_?(?:status|error)(?:_?code)?|error(?:_?code)?|code|status(?:_?code)?)\"?\s*(?:[:=]|\()?\s*\"?429\b"
+    r"|\b429\b\"?\s*\)?\s*(?:[:\-]?\s*(?:quota\s+(?:exceeded|exhausted|reached)|resource\s*exhausted|rate[- ]?limit|too\s+many\s+requests)\b|:\s*quota\b)"
+    r"|\b(?:too\s+many\s+requests|rate[- ]?limit(?:ed|\s+exceeded)?|quota\s+(?:exceeded|exhausted|reached))\s*[:\-]?\s*[\(\[]\s*429\s*[\)\]]"
+    r"|Individual quota reached|weekly quota reached",
+    re.IGNORECASE,
+)
+_ERROR_CODE_KEYS: tuple[str, ...] = ("code", "status_code", "statusCode", "error_code", "errorCode", "http_status", "httpStatus")
+
+
+def _is_scalar_code(val: object) -> bool:
+    return (isinstance(val, int) and not isinstance(val, bool)) or (isinstance(val, str) and val.strip().isdigit())
+
+
+def _extract_text_fragments(value: object) -> list[str]:
+    """Extracts unescaped text fragments and scalar status codes from nested JSON payloads."""
+    fragments: list[str] = []
+    stack: list[object] = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str) and current:
+            fragments.append(current)
+        elif isinstance(current, (list, tuple)):
+            stack.extend(reversed(current))
+        elif isinstance(current, dict):
+            for k, v in reversed(list(current.items())):
+                if isinstance(k, str) and _is_scalar_code(v):
+                    stack.append(f"{k}: {str(v).strip()}")
+                elif isinstance(v, (str, list, tuple, dict)) and v:
+                    stack.append(v)
+    return fragments
 
 # Re-exported from presence.py (Layer 2)
 from agy_switcher.presence import (
@@ -463,10 +495,7 @@ class LogWatcher:
             self.cooldown_manager = CooldownManager(cache_dir=cache_dir, default_cooldown_seconds=cooldown_minutes * 60)
         self.cooldown_file = getattr(self.cooldown_manager, "cooldown_file", getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json")
 
-        self.exhaustion_regex = re.compile(
-            r"RESOURCE_EXHAUSTED|\bcode\s*429\b|429\s+Too\s+Many\s+Requests|Individual quota reached|weekly quota reached",
-            re.IGNORECASE
-        )
+        self.exhaustion_regex = _EXHAUSTION_REGEX
 
     def is_exhausted_message(self, line: str) -> bool:
         if not line or not isinstance(line, str):
@@ -532,61 +561,34 @@ class LogWatcher:
 
         status: object = data.get("status")
         msg_type: object = data.get("type")
-        # Short-circuit DONE and USER_INPUT records before inspecting error or content regexes.
-        if (isinstance(status, str) and status.strip().upper() == "DONE") or (
-            isinstance(msg_type, str) and msg_type.strip().upper() == "USER_INPUT"
-        ):
+        norm_status = status.strip().upper() if isinstance(status, str) else ""
+        norm_type = msg_type.strip().upper() if isinstance(msg_type, str) else ""
+        if norm_status == "DONE" or norm_type == "USER_INPUT":
             return False
 
-        # ONLY evaluate if status == "ERROR", type == "ERROR_MESSAGE", or non-empty error field
-        is_error = (
-            status == "ERROR"
-            or msg_type == "ERROR_MESSAGE"
-            or bool(data.get("error"))
-        )
-        if not is_error:
+        error_val: object = data.get("error")
+        has_error_field = bool(error_val) and not (isinstance(error_val, str) and not error_val.strip())
+        is_error_envelope = norm_status == "ERROR" or norm_type == "ERROR_MESSAGE"
+        if not (is_error_envelope or has_error_field):
             return False
 
-        # Extract text from content, message, and/or error payload
         error_parts: list[str] = []
-
-        error_val = data.get("error")
-        if error_val:
-            error_parts.append(error_val if isinstance(error_val, str) else json.dumps(error_val, default=str))
-
-        content_val = data.get("content")
-        if content_val and (status == "ERROR" or msg_type == "ERROR_MESSAGE"):
-            if isinstance(content_val, str):
-                error_parts.append(content_val)
-            elif isinstance(content_val, list):
-                for item in content_val:
-                    if isinstance(item, str):
-                        error_parts.append(item)
-                    elif isinstance(item, dict):
-                        if "text" in item:
-                            error_parts.append(str(item["text"]))
-                        else:
-                            try:
-                                error_parts.append(json.dumps(item))
-                            except Exception:
-                                error_parts.append(str(item))
-                    else:
-                        error_parts.append(str(item))
-            elif isinstance(content_val, dict):
-                try:
-                    error_parts.append(json.dumps(content_val))
-                except Exception:
-                    error_parts.append(str(content_val))
-
-        message_val = data.get("message")
-        if message_val and (status == "ERROR" or msg_type == "ERROR_MESSAGE"):
-            if isinstance(message_val, str):
-                error_parts.append(message_val)
+        if has_error_field:
+            if _is_scalar_code(error_val):
+                error_parts.append(f"error: {str(error_val).strip()}")
             else:
-                try:
-                    error_parts.append(json.dumps(message_val))
-                except Exception:
-                    error_parts.append(str(message_val))
+                error_parts.extend(_extract_text_fragments(error_val))
+
+        for code_key in _ERROR_CODE_KEYS:
+            code_val: object = data.get(code_key)
+            if _is_scalar_code(code_val):
+                error_parts.append(f"{code_key}: {str(code_val).strip()}")
+
+        if is_error_envelope:
+            for field in ("content", "message"):
+                field_val: object = data.get(field)
+                if field_val:
+                    error_parts.extend(_extract_text_fragments(field_val))
 
         combined_text = " ".join(error_parts).encode("utf-8", errors="replace").decode("utf-8")
         if self.is_exhausted_message(combined_text):
@@ -603,13 +605,8 @@ class LogWatcher:
     ) -> bool:
         """Dispatches exhaustion handling, preserving overrides/mocks on trigger_switch."""
         if getattr(self.trigger_switch, "__func__", None) is not LogWatcher.trigger_switch:
-            kwargs: dict[str, Any] = {"line": line}
-            if model_hint is not None:
-                kwargs["model_hint"] = model_hint
-            if file_path is not None:
-                kwargs["file_path"] = file_path
             try:
-                return self.trigger_switch(**kwargs)
+                return self.trigger_switch(line=line, model_hint=model_hint, file_path=file_path)
             except TypeError:
                 return self.trigger_switch(line=line)
         return self.handle_exhaustion(line=line, model_hint=model_hint, file_path=file_path)
