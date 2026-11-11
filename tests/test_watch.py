@@ -845,6 +845,79 @@ class TestLogWatcher(unittest.TestCase):
             self.assertTrue(watch_log.is_file())
             self.assertIn("Switched from 'acc1' to 'acc2' with force-restart language_server", watch_log.read_text(encoding="utf-8"))
 
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_pre_switch_quota_probe_healthy_and_depleted(self, mock_sleep):
+        """[PRE-PROBE-001] & [PRE-PROBE-002]: LogWatcher.handle_exhaustion executes Pre-Switch Quota Probe.
+        - Healthy Gemini quota (>25%) suppresses rotation and cooldown application (transient RPC anomaly).
+        - Depleted Gemini quota (<=25%) authorizes cooldown and rotation to standby account with available quota.
+        """
+        cache_dir = Path(self.tmpdir) / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "last_known_quota.json"
+        self.engine_mock.cache_dir = cache_dir
+        self.engine_mock.cache_file = cache_file
+
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True, "is_active": True},
+                {"name": "standby-acc", "valid": True, "is_active": False},
+            ],
+        }
+
+        exhaustion_line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
+
+        # --- [PRE-PROBE-001]: Healthy quota (> 25%) suppresses rotation ---
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"quota": 85}},
+                    "standby-acc": {"gemini": {"quota": 90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        res_healthy = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertFalse(res_healthy)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
+        self.assertFalse(self.watcher.is_in_cooldown("primary-acc"))
+
+        # Also verify float fraction representation (0.85 > 0.25)
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.85}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        res_healthy_fraction = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertFalse(res_healthy_fraction)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
+
+        # --- [PRE-PROBE-002]: Depleted quota (<= 25%) authorizes rotation ---
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+
+        res_depleted = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertTrue(res_depleted)
+        self.assertIn("primary-acc", self.watcher.get_cooldowns())
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+
 
 class TestPresenceDetectorWatchTargets(unittest.TestCase):
     def setUp(self):

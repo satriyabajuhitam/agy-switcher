@@ -28,6 +28,7 @@ def _atomic_write_file(target_path: Path | str, content: str | bytes, mode: int 
         os.chmod(target_path.parent, 0o700)
     except OSError:
         pass
+    tmp_file: str | None = None
     tmp_fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=f".{target_path.name}.tmp.")
     try:
         if isinstance(content, bytes):

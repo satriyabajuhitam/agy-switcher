@@ -57,6 +57,9 @@ class DoctorEngine:
     ) -> None:
         self.engine = engine
 
+        resolved_gemini: Path | str | None = None
+        resolved_proc: Path | str | None = None
+
         # Positional arguments disambiguation
         if isinstance(config_file, ProcessSupervisor):
             # Legacy 4-positional call: DoctorEngine(vault_dir, gemini_dir, proc_dir, supervisor)

@@ -2425,6 +2425,159 @@ class TestLogWatcherProcessing(unittest.TestCase):
             self.assertEqual(switches2, 0)
             mock_proc.assert_not_called()
 
+    def test_nested_error_payload_and_io_robustness_nested_content_traversal(self) -> None:
+        """[WATCH-BOUND-EDGE-001] GIVEN JSON line with nested content payload,
+        LogWatcher.process_line() extracts tokens, matches ResourceExhausted, and triggers exhaustion.
+        """
+        nested_payloads = [
+            # Exact AC specification line:
+            {"status": "ERROR", "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted desc = Quota limit reached"}]},
+            # Deeply nested content structures:
+            {"status": "ERROR", "content": [{"parts": [{"text": "rpc error: code = ResourceExhausted desc = Quota limit reached"}]}]},
+            {"status": "ERROR", "content": {"details": [{"message": "rpc error: code = ResourceExhausted desc = Quota limit reached"}]}},
+            {"status": "ERROR", "content": [{"type": "text", "text": "resource exhausted: quota exceeded"}]},
+            {"status": "ERROR", "content": [{"code": [429], "desc": "rate limit exceeded"}]},
+        ]
+
+        for payload in nested_payloads:
+            line = json.dumps(payload)
+            with self.subTest(payload=payload):
+                with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+                    res = self.watcher.process_line(line, is_jsonl=True)
+                    self.assertTrue(res)
+                    mock_handle.assert_called_once()
+                    call_kwargs = mock_handle.call_args.kwargs
+                    line_arg = call_kwargs.get("line") or (mock_handle.call_args.args[0] if mock_handle.call_args.args else "")
+                    self.assertTrue(
+                        any(token in line_arg.lower() for token in ("resourceexhausted", "resource exhausted", "429")),
+                        f"Expected exhaustion token in dispatched line, got: {line_arg}",
+                    )
+
+        # End-to-end verification with isolated stub engine
+        watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+        line = json.dumps({
+            "status": "ERROR",
+            "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted desc = Quota limit reached"}],
+        })
+        with patch("scripts.watch.shutil.which", return_value=None):
+            self.assertTrue(watcher.process_line(line, is_jsonl=True))
+            self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+            self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+
+    def test_nested_error_payload_and_io_robustness_unreadable_transcript_io(self) -> None:
+        """[WATCH-BOUND-ERR-003] GIVEN active transcript path unreadable due to filesystem permissions,
+        LogWatcher.poll_once() catches OSError safely and skips target without raising or terminating watcher loop.
+        """
+        transcript_file = self.base_dir / "unreadable_robustness.transcript.jsonl"
+        transcript_file.write_text('{"type": "START"}\n', encoding="utf-8")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "unreadable-robustness-session"
+        mock_detector.get_active_transcript_path.return_value = transcript_file
+        mock_detector.get_watch_targets.return_value = [str(transcript_file)]
+        self.watcher.presence_detector = mock_detector
+
+        # Initial poll primes cursor
+        self.watcher.poll_once()
+        initial_cursor = self.watcher.file_cursors[str(transcript_file)]
+        self.assertGreater(initial_cursor, 0)
+
+        # Append new exhaustion error record
+        error_line = json.dumps({"status": "ERROR", "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted"}]}) + "\n"
+        with open(transcript_file, "a", encoding="utf-8") as f:
+            f.write(error_line)
+
+        # Scenario A: Real filesystem permission denied (chmod 000)
+        transcript_file.chmod(0o000)
+        try:
+            switches = self.watcher.poll_once()
+            # Must catch OSError and skip target safely without raising
+            self.assertEqual(switches, 0)
+        finally:
+            transcript_file.chmod(0o644)
+
+        # Scenario B: Simulated open PermissionError / EACCES via mock
+        orig_open = open
+
+        def mock_open_permission_denied(path, mode="r", *args, **kwargs):
+            if str(path) == str(transcript_file) and "b" in mode:
+                raise PermissionError(13, "Permission denied")
+            return orig_open(path, mode, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=mock_open_permission_denied):
+            # poll_once must handle PermissionError safely
+            switches = self.watcher.poll_once()
+            self.assertEqual(switches, 0)
+
+            # watch_loop must continue running without terminating on PermissionError
+            self.watcher.watch_loop(poll_interval=0.0, max_iterations=2)
+
+        # Scenario C: Restored readable permissions resumes tailing cleanly
+        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            switches_resumed = self.watcher.poll_once()
+            self.assertEqual(switches_resumed, 1)
+            mock_switch.assert_called_once()
+
+    def test_nested_error_payload_and_io_robustness_adversarial_edge_cases(self) -> None:
+        """Adversarial stress-testing: non-scalars, cycles, protobuf oneof keys, and scan OSError."""
+        # 1. Non-string types, None, booleans, floats, empty strings
+        adversarial_payload = {
+            "status": "ERROR",
+            "content": [
+                None,
+                True,
+                False,
+                42.5,
+                "",
+                {"details": None, "active": True, "count": 0, "blank": "  "},
+                {"parts": [{"type": "text", "text": "rpc error: code = ResourceExhausted"}]},
+            ],
+        }
+        with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+            self.assertTrue(self.watcher.process_line(json.dumps(adversarial_payload), is_jsonl=True))
+            mock_handle.assert_called_once()
+
+        # 2. Cycle resilience in _extract_text_fragments
+        from agy_switcher.watcher import _extract_text_fragments
+        cyclic_dict: dict[str, object] = {"label": "node"}
+        cyclic_dict["self"] = cyclic_dict
+        cyclic_list: list[object] = ["text fragment"]
+        cyclic_list.append(cyclic_list)
+        cyclic_dict["sublist"] = cyclic_list
+
+        extracted = _extract_text_fragments(cyclic_dict)
+        self.assertIn("node", extracted)
+        self.assertIn("text fragment", extracted)
+
+        # 3. Protobuf / gRPC oneof error keys where values are empty or None
+        oneof_payloads = [
+            {"status": "ERROR", "content": [{"ResourceExhausted": {}}]},
+            {"status": "ERROR", "content": [{"resource_exhausted": None}]},
+        ]
+        for p in oneof_payloads:
+            with self.subTest(oneof=p):
+                with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+                    self.assertTrue(self.watcher.process_line(json.dumps(p), is_jsonl=True))
+                    mock_handle.assert_called_once()
+
+        # 4. Top-level type == "ERROR" and top-level details / detail / reason
+        extended_envelopes = [
+            {"type": "ERROR", "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted"}]},
+            {"status": "ERROR", "details": [{"message": "rpc error: code = ResourceExhausted"}]},
+            {"status": "ERROR", "detail": "429: Too Many Requests"},
+            {"status": "ERROR", "reason": "RESOURCE_EXHAUSTED"},
+        ]
+        for p in extended_envelopes:
+            with self.subTest(envelope=p):
+                with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+                    self.assertTrue(self.watcher.process_line(json.dumps(p), is_jsonl=True))
+                    mock_handle.assert_called_once()
+
+        # 5. scan_active_targets OSError robustness
+        with patch.object(self.watcher, "scan_active_targets", side_effect=PermissionError(13, "Permission denied")):
+            self.assertEqual(self.watcher.poll_once(), 0)
+
+
 
 class TestDaemonLifecycle(unittest.TestCase):
     def setUp(self):

@@ -231,14 +231,14 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error")))
                 and is_auth_err_fn(err_obj, client=client)
             )
-            if is_active_auth_err:
+            if is_active_auth_err and active_name:
                 combined_quotas.pop(active_name, None)
                 evict_keys.add(active_name)
                 terminal_auth_keys.add(active_name)
             elif active_name and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error"))):
                 # Active account probe encountered network error; check if cached data is stale 0%
-                active_entry = combined_quotas.get(active_name)
-                if _is_stale_exhausted_cache(active_entry, rot_engine, model_key, now):
+                cached_active_entry = combined_quotas.get(active_name)
+                if _is_stale_exhausted_cache(cached_active_entry, rot_engine, model_key, now):
                     combined_quotas.pop(active_name, None)
 
             # Persist fresh telemetry to cache

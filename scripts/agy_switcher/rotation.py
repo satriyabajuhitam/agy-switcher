@@ -159,11 +159,11 @@ class RotationEngine:
         candidate = quota_data.get(m_key)
         if isinstance(candidate, Mapping):
             target_info = candidate
-        elif "quota" in quota_data and not isinstance(quota_data["quota"], Mapping) and m_key == "gemini":
+        elif ("quota" in quota_data or "fraction" in quota_data) and not isinstance(quota_data.get("quota"), Mapping) and m_key == "gemini":
             target_info = quota_data
 
         if target_info is not None:
-            q_val = target_info.get("quota")
+            q_val = target_info.get("quota") if target_info.get("quota") is not None else target_info.get("fraction")
             r_val = target_info.get("reset_time")
             if q_val is not None:
                 if isinstance(q_val, bool):
