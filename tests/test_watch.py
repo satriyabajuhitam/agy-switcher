@@ -2141,6 +2141,95 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         self.assertEqual(res, 0, "Must gracefully handle discovery error and return 0")
         self.engine_mock.switch_tokens.assert_not_called()
 
+    def test_session_discovery_recent_inactive_transcript_without_lock_skips_proactive_rotation(self):
+        """[WATCH-PROACTIVE-ERR-002]: GIVEN an inactive transcript exists with recent mtime (not backdated)
+        AND no Antigravity session presence lock is active
+        WHEN LogWatcher.poll_once() evaluates proactive rotation
+        THEN it determines that no active session boundary can be verified
+        AND skips proactive rotation evaluation safely without triggering rotation.
+        """
+        recent_logs_dir = self.gemini_dir / "antigravity" / "brain" / "recent-inactive" / ".system_generated" / "logs"
+        recent_logs_dir.mkdir(parents=True, exist_ok=True)
+        recent_transcript = recent_logs_dir / "transcript.jsonl"
+        recent_transcript.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Recently finished turn."}) + "\n",
+            encoding="utf-8",
+        )
+        # Note: Transcript is brand new (mtime is now), but NO presence lock exists
+
+        self.assertIsNone(self.detector.get_active_session_id())
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        res = watcher.poll_once()
+        self.assertEqual(res, 0, "Must not trigger rotation on inactive session even if transcript is recent")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+    def test_session_discovery_active_session_with_missing_transcript_file_skips_safely(self):
+        """[WATCH-PROACTIVE-ERR-002]: GIVEN an active session presence lock exists
+        BUT transcript.jsonl has not yet been created on disk
+        WHEN LogWatcher.poll_once() evaluates proactive rotation
+        THEN it skips proactive rotation safely without raising exceptions.
+        """
+        session_id = "session-active-no-transcript"
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / f"{session_id}.lock").touch()
+
+        self.assertEqual(self.detector.get_active_session_id(), session_id)
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        res = watcher.poll_once()
+        self.assertEqual(res, 0, "Must return 0 when transcript file is missing")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+    def test_session_discovery_proactive_rotation_unexpected_engine_error_handled_cleanly(self):
+        """[WATCH-PROACTIVE-ERR-003]: GIVEN an unexpected engine exception during proactive rotation evaluation
+        WHEN LogWatcher.poll_once() evaluates proactive rotation
+        THEN it logs the error to stderr and continues cleanly without crashing.
+        """
+        session_id = "session-active-err"
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / f"{session_id}.lock").touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        self.engine_mock.get_active_name.side_effect = OSError("Disk read error on active account file")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        from io import StringIO
+        stderr_capture = StringIO()
+        with patch("sys.stderr", stderr_capture):
+            res = watcher.poll_once()
+
+        self.assertEqual(res, 0)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertIn("Error evaluating proactive rotation", stderr_capture.getvalue())
+
     def test_session_discovery_reload_failure_due_to_supervisor_error_logged_and_preserves_state(self):
         """[WATCH-PROACTIVE-ERR-003]: GIVEN LogWatcher triggers proactive rotation to standby account "standby-acc"
         AND switch_tokens fails to terminate or restart language_server due to ProcessSupervisor error

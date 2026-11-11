@@ -1118,14 +1118,6 @@ class LogWatcher:
                     p = self.presence_detector.get_active_transcript_path(session_id=self.active_session_id)
                     if p and p.is_file():
                         target_path = p
-                    else:
-                        now_ts, newest_m = time.time(), -1.0
-                        for b_dir in (getattr(self.presence_detector, "brain_dir", None), getattr(self.presence_detector, "cli_brain_dir", None)):
-                            if b_dir and b_dir.is_dir():
-                                for s_dir in b_dir.iterdir():
-                                    t = s_dir / ".system_generated" / "logs" / "transcript.jsonl"
-                                    if t.is_file() and (m := t.stat().st_mtime) > newest_m and (now_ts - m) <= 120.0:
-                                        newest_m, target_path = m, t
                 except Exception:
                     target_path = None
 
@@ -1234,114 +1226,118 @@ class LogWatcher:
 
     def _evaluate_proactive_rotation(self) -> bool:
         """Evaluates proactive rotation eligibility at a Safe Turn Boundary."""
-        threshold = 0.20
-        if hasattr(self.engine, "get_quota_threshold"):
-            try:
-                threshold = float(self.engine.get_quota_threshold())
-            except Exception:
-                pass
-        elif hasattr(self.engine, "quota_threshold"):
-            try:
-                threshold = float(self.engine.quota_threshold)
-            except Exception:
-                pass
-        else:
-            return False
-
-        if not self._is_turn_quiescent():
-            return False
-
-        cache_data: dict[str, Any] = {}
-        client = None
         try:
-            client = _get_quota_client_class()(self.engine)
-            loaded = client.load_cache()
-            if isinstance(loaded, dict):
-                cache_data = loaded
-        except Exception:
-            pass
-        if not cache_data and (c_dir := self._resolve_cache_dir()):
-            try:
-                if (q_path := c_dir / "last_known_quota.json").is_file():
-                    cache_data = json.loads(q_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        if not cache_data:
-            return False
-
-        now = time.time()
-        if self.last_switch_time > 0:
-            elapsed = now - self.last_switch_time
-            if 0 <= elapsed < self.damping_seconds:
-                return False
-            elif elapsed < 0:
-                self.last_switch_time = 0.0
-
-        get_active_fn = getattr(self.engine, "get_active_name", None)
-        if not callable(get_active_fn):
-            return False
-        active_name = get_active_fn()
-        if not active_name or not isinstance(active_name, str):
-            return False
-
-        accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
-        active_quota_fraction = self._probe_active_quota(
-            active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini"
-        )
-        if active_quota_fraction is None:
-            return False
-
-        if active_quota_fraction > threshold:
-            return False
-
-        accounts_data: dict[str, Any] = getattr(self.engine, "list_accounts", lambda: {})()
-        accounts_list = accounts_data.get("accounts") or []
-        cooldowns = self.get_cooldowns() if hasattr(self, "get_cooldowns") else {}
-
-        best_standby = None
-        best_quota = -1.0
-        for acc in accounts_list:
-            acc_name = acc.get("name") if isinstance(acc, dict) else None
-            if not acc_name or acc_name == active_name:
-                continue
-            if self._is_account_cooldown_penalized(acc_name, cooldowns, accounts_cache if isinstance(accounts_cache, dict) else None):
-                continue
-            if not acc.get("valid", True):
-                continue
-            acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
-            q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name="gemini")
-            if q_frac is not None and q_frac >= 0.70:
-                if q_frac > best_quota:
-                    best_quota = q_frac
-                    best_standby = acc_name
-
-        if not best_standby:
-            return False
-
-        print(
-            f"[watch] Proactive threshold failover: Active account '{active_name}' quota "
-            f"({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. "
-            f"Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).",
-            file=sys.stderr,
-        )
-        try:
-            res = self.engine.switch_tokens(best_standby, restart_server=True, force=True)
-            if not res or (isinstance(res, dict) and (res.get("success") is False or bool(res.get("error")) or (not res.get("active") and not res.get("success")))):
-                err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
-                print(f"[watch] Failed to proactively switch accounts to '{best_standby}': {err_msg}", file=sys.stderr)
-                return False
-            self.last_switch_time = time.time()
-            print(f"[watch] Successfully proactively switched to '{best_standby}'.", file=sys.stderr)
-            for target_file in list(self.file_cursors.keys()):
+            threshold = 0.20
+            if hasattr(self.engine, "get_quota_threshold"):
                 try:
-                    if os.path.isfile(target_file):
-                        self.file_cursors[target_file] = os.path.getsize(target_file)
-                except OSError:
+                    threshold = float(self.engine.get_quota_threshold())
+                except Exception:
                     pass
-            self._stagnant_sizes.clear()
-            return True
+            elif hasattr(self.engine, "quota_threshold"):
+                try:
+                    threshold = float(self.engine.quota_threshold)
+                except Exception:
+                    pass
+            else:
+                return False
+
+            if not self._is_turn_quiescent():
+                return False
+
+            cache_data: dict[str, Any] = {}
+            client = None
+            try:
+                client = _get_quota_client_class()(self.engine)
+                loaded = client.load_cache()
+                if isinstance(loaded, dict):
+                    cache_data = loaded
+            except Exception:
+                pass
+            if not cache_data and (c_dir := self._resolve_cache_dir()):
+                try:
+                    if (q_path := c_dir / "last_known_quota.json").is_file():
+                        cache_data = json.loads(q_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if not cache_data:
+                return False
+
+            now = time.time()
+            if self.last_switch_time > 0:
+                elapsed = now - self.last_switch_time
+                if 0 <= elapsed < self.damping_seconds:
+                    return False
+                elif elapsed < 0:
+                    self.last_switch_time = 0.0
+
+            get_active_fn = getattr(self.engine, "get_active_name", None)
+            if not callable(get_active_fn):
+                return False
+            active_name = get_active_fn()
+            if not active_name or not isinstance(active_name, str):
+                return False
+
+            accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
+            active_quota_fraction = self._probe_active_quota(
+                active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini"
+            )
+            if active_quota_fraction is None:
+                return False
+
+            if active_quota_fraction > threshold:
+                return False
+
+            accounts_data: dict[str, Any] = getattr(self.engine, "list_accounts", lambda: {})()
+            accounts_list = accounts_data.get("accounts") or []
+            cooldowns = self.get_cooldowns() if hasattr(self, "get_cooldowns") else {}
+
+            best_standby = None
+            best_quota = -1.0
+            for acc in accounts_list:
+                acc_name = acc.get("name") if isinstance(acc, dict) else None
+                if not acc_name or acc_name == active_name:
+                    continue
+                if self._is_account_cooldown_penalized(acc_name, cooldowns, accounts_cache if isinstance(accounts_cache, dict) else None):
+                    continue
+                if not acc.get("valid", True):
+                    continue
+                acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
+                q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name="gemini")
+                if q_frac is not None and q_frac >= 0.70:
+                    if q_frac > best_quota:
+                        best_quota = q_frac
+                        best_standby = acc_name
+
+            if not best_standby:
+                return False
+
+            print(
+                f"[watch] Proactive threshold failover: Active account '{active_name}' quota "
+                f"({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. "
+                f"Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).",
+                file=sys.stderr,
+            )
+            try:
+                res = self.engine.switch_tokens(best_standby, restart_server=True, force=True)
+                if not res or (isinstance(res, dict) and (res.get("success") is False or bool(res.get("error")) or (not res.get("active") and not res.get("success")))):
+                    err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
+                    print(f"[watch] Failed to proactively switch accounts to '{best_standby}': {err_msg}", file=sys.stderr)
+                    return False
+                self.last_switch_time = time.time()
+                print(f"[watch] Successfully proactively switched to '{best_standby}'.", file=sys.stderr)
+                for target_file in list(self.file_cursors.keys()):
+                    try:
+                        if os.path.isfile(target_file):
+                            self.file_cursors[target_file] = os.path.getsize(target_file)
+                    except OSError:
+                        pass
+                self._stagnant_sizes.clear()
+                return True
+            except Exception as e:
+                print(f"[watch] Error during proactive account rotation: {e}", file=sys.stderr)
+                return False
         except Exception as e:
-            print(f"[watch] Error during proactive account rotation: {e}", file=sys.stderr)
+            print(f"[watch] Error evaluating proactive rotation: {e}", file=sys.stderr)
             return False
 
     def poll_once(self) -> int:
@@ -1421,8 +1417,12 @@ class LogWatcher:
                         self._stagnant_sizes.pop(target, None)
                 except OSError:
                     continue
-        if switches_triggered == 0 and self._evaluate_proactive_rotation():
-            switches_triggered += 1
+        if switches_triggered == 0:
+            try:
+                if self._evaluate_proactive_rotation():
+                    switches_triggered += 1
+            except Exception as e:
+                print(f"[watch] Error evaluating proactive rotation: {e}", file=sys.stderr)
         return switches_triggered
 
     def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None) -> None:
