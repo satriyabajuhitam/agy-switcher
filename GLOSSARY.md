@@ -48,3 +48,15 @@ _Avoid_: All down, zero quota, total burnout
 A high-severity lifecycle signal emitted upon Fleet Exhaustion to record structured failure reflections into persistent memory (`agy-memory`) and notify human operators with estimated reset times.
 _Avoid_: Crash dump, fatal alert, alarm trigger
 
+**Transcript-Bounded Watching**:
+The strict restriction of log tailing to structured session JSONL files (`transcript.jsonl`), completely excluding unformatted CLI and terminal logs to eliminate false-positive quota triggers.
+_Avoid_: Log globbing, raw CLI log tailing, unparsed stream tailing
+
+**Gemini-Exclusive Architecture**:
+The singular architectural and operational focus on Google Gemini model quotas and rotation, permanently retiring non-Gemini (Claude/Anthropic) model branches, cross-model leakage checks, and legacy flags.
+_Avoid_: Multi-model routing, Claude failover, hybrid family tracking
+
+**Pre-Switch Quota Probe**:
+An active, high-speed telemetry verification executed before mid-turn failover that validates whether the active account's Gemini quota is genuinely depleted (e.g. <=25%) before allowing account rotation.
+_Avoid_: Blind regex failover, unvalidated switch
+
