@@ -32,10 +32,14 @@ from agy_switcher.exceptions import (
     DaemonError,
     DaemonAlreadyRunningError,
 )
-from agy_switcher.telemetry import QuotaClient as _RealQuotaClient
+from agy_switcher.telemetry import (
+    QuotaClient as _RealQuotaClient,
+    fetch_account_quota as _real_fetch_account_quota,
+)
 
 RotationEngine: Any = None
 QuotaClient: Any = None
+fetch_account_quota: Any = None
 AgySwitchEngine: Any = None
 
 logger = logging.getLogger(__name__)
@@ -53,10 +57,8 @@ _EXHAUSTION_REGEX: re.Pattern[str] = re.compile(
 )
 _ERROR_CODE_KEYS: tuple[str, ...] = ("code", "status_code", "statusCode", "error_code", "errorCode", "http_status", "httpStatus")
 
-
 def _is_scalar_code(val: object) -> bool:
     return (isinstance(val, int) and not isinstance(val, bool)) or (isinstance(val, str) and val.strip().isdigit())
-
 
 def _extract_text_fragments(value: object, max_items: int = 10000) -> list[str]:
     """Extracts unescaped text fragments and scalar status codes from nested JSON payloads.
@@ -115,12 +117,14 @@ def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> An
             return getattr(mod, symbol_name)
     return fallback_factory()
 
-
 def _get_rotation_engine_class() -> Any:
     return _resolve_symbol("RotationEngine", lambda: __import__("agy_switcher.rotation", fromlist=["RotationEngine"]).RotationEngine)
 
 def _get_quota_client_class() -> Any:
     return _resolve_symbol("QuotaClient", lambda: _RealQuotaClient)
+
+def _get_fetch_account_quota() -> Any:
+    return _resolve_symbol("fetch_account_quota", lambda: _real_fetch_account_quota)
 
 def _get_engine_class() -> Any:
     def _fallback():
@@ -140,7 +144,6 @@ def _get_subprocess() -> Any:
 
 def _get_time() -> Any:
     return _resolve_symbol("time", lambda: time)
-
 
 class CooldownManager:
     """
@@ -384,14 +387,14 @@ class CooldownManager:
         now = time.time()
         active_records, _ = self._parse_and_prune(raw_data, now)
         if account_name is None:
-            if not active_records:
+            if not raw_data:
                 return False
             self._atomic_write({})
             return True
         else:
             clean_name = account_name.strip() if isinstance(account_name, str) else account_name
-            if clean_name in active_records:
-                del active_records[clean_name]
+            if clean_name in raw_data or clean_name in active_records:
+                active_records.pop(clean_name, None)
                 self._atomic_write(active_records)
                 return True
             return False
@@ -449,7 +452,6 @@ class CooldownManager:
         if candidates:
             return min(candidates)
         return None
-
 
 class LogWatcher:
     def __init__(
@@ -782,22 +784,49 @@ class LogWatcher:
             return False
         # Read cache to get quotas first
         cache_data: dict[str, Any] = {}
+        client = None
         try:
-            client_cls = _get_quota_client_class()
-            client = client_cls(self.engine)
+            client = _get_quota_client_class()(self.engine)
             cache_data = client.load_cache()
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            logger.warning("[watch] Pre-Switch Quota Probe cache load network error: %s", e)
+            print(f"[watch] Pre-Switch Quota Probe cache load network error: {e}. Treating quota as unverified.", file=sys.stderr)
         except Exception as e:
             logger.debug("[watch] Pre-Switch Quota Probe cache load failure: %s", e)
         accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
-        # Dynamically infer model family FIRST
         resolved_model = model_hint or self.infer_target_model(line=line, active_account=active_name, cache=accounts_cache)
-        # Pre-Switch Quota Probe: Validate active account quota before setting cooldown or rotating
         probe_model = resolved_model if resolved_model in ("gemini", "claude") else "gemini"
         active_quota_fraction = self._probe_active_quota(
-            active_name,
-            accounts_cache if isinstance(accounts_cache, Mapping) else None,
-            model_name=probe_model,
+            active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name=probe_model
         )
+        is_cache_stale = False
+        if isinstance(accounts_cache, Mapping) and isinstance(accounts_cache.get(active_name), Mapping):
+            acc_entry = accounts_cache[active_name]
+            if acc_entry.get("stale") is True:
+                is_cache_stale = True
+            elif acc_entry.get("cached_at") is not None and not isinstance(acc_entry.get("cached_at"), bool):
+                try:
+                    c_at = float(acc_entry["cached_at"])
+                    is_cache_stale = (now - c_at > 300.0) or (now - c_at < -5.0)
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        if active_quota_fraction is None or is_cache_stale:
+            try:
+                fetch_acc_fn = _get_fetch_account_quota()
+                if fetch_acc_fn is not None:
+                    _, live_data = fetch_acc_fn(self.engine, active_name, client=client)
+                    if isinstance(live_data, Mapping) and not live_data.get("error"):
+                        active_quota_fraction = self._probe_active_quota(active_name, {active_name: live_data}, model_name=probe_model)
+                    else:
+                        active_quota_fraction = None
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                logger.warning("[watch] Pre-Switch Quota Probe live telemetry network error for '%s': %s", active_name, e)
+                print(f"[watch] Pre-Switch Quota Probe live telemetry network error for '{active_name}': {e}. Treating quota as unverified.", file=sys.stderr)
+                active_quota_fraction = None
+            except Exception as e:
+                logger.debug("[watch] Pre-Switch Quota Probe live telemetry failure for '%s': %s", active_name, e)
+                active_quota_fraction = None
+
         if active_quota_fraction is not None and active_quota_fraction > 0.25:
             print(
                 f"[watch] Pre-Switch Quota Probe: Active account '{active_name}' has healthy quota "
@@ -1019,7 +1048,6 @@ class LogWatcher:
             except Exception as e:
                 print(f"[watch] Unhandled exception in loop: {e}", file=sys.stderr)
                 time.sleep(5)
-
 
 class DaemonManager:
     """
@@ -1300,7 +1328,6 @@ class DaemonManager:
             target.write_text(self.SYSTEMD_TEMPLATE, encoding="utf-8")
         return self.SYSTEMD_TEMPLATE
 
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="watch.py", description="Antigravity Account Switcher Log Watcher & Daemon")
     parser.add_argument("action", nargs="?", choices=["run", "start", "stop", "status"], default="run", help="Daemon action")
@@ -1355,17 +1382,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     return 0
 
-
 __all__ = [
     "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError",
-    "QuotaClient", "RotationEngine", "AgySwitchEngine",
+    "QuotaClient", "fetch_account_quota", "RotationEngine", "AgySwitchEngine",
     "DEFAULT_VAULT_DIR", "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES",
     "DEFAULT_DAMPING_SECONDS",
     "_open_secure_log_file", "append_secure_log_entry",
     "PresenceDetector", "CooldownManager", "LogWatcher", "DaemonManager",
     "main", "time", "shutil", "subprocess",
 ]
-
 
 if __name__ == "__main__":
     sys.exit(main())

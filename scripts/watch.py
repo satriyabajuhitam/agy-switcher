@@ -27,7 +27,7 @@ from agy_switcher.exceptions import (
     DaemonError,
     DaemonAlreadyRunningError,
 )
-from agy_switcher.telemetry import QuotaClient
+from agy_switcher.telemetry import QuotaClient, fetch_account_quota
 from agy_switcher.rotation import RotationEngine
 try:
     from agy_switcher.vault import AgySwitchEngine
@@ -55,6 +55,7 @@ __all__ = [
     "DaemonError",
     "DaemonAlreadyRunningError",
     "QuotaClient",
+    "fetch_account_quota",
     "RotationEngine",
     "AgySwitchEngine",
     "DEFAULT_VAULT_DIR",
