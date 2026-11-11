@@ -342,7 +342,7 @@ class AgySwitchEngine:
         return "gemini"
 
     def set_default_model(self, model: str) -> dict[str, Any]:
-        """Persists validated default model ('gemini' or 'claude') to config.json."""
+        """Persists validated default model ('gemini') to config.json."""
         normalized = normalize_model_name(model)
         cfg = self.load_config()
         cfg["default_model"] = normalized

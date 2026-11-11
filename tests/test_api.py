@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError, InvalidTokenError
+from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError, AgySwitchError, InvalidTokenError
 from agy_switcher.models import AccountInfo, RotationResult, FleetQuotaSummary
 from agy_switcher.security import extract_email_from_jwt
 from agy_switcher.vault import AgySwitchEngine
@@ -339,38 +339,26 @@ class TestSDKFacade(unittest.TestCase):
         self.assertIn("All accounts exhausted for model 'gemini'", result.message)
         self.assertEqual(self.engine.get_active_name(), "acc1")
 
-    def test_auto_rotate_on_exhaustion_model_steering_claude(self) -> None:
-        """[REQ-2-SCN-005] auto_rotate_on_exhaustion steers rotation using model-specific telemetry."""
+    def test_auto_rotate_rejects_non_gemini(self) -> None:
+        """[FAILOVER-ERR-004] Invoking auto_rotate_on_exhaustion with non-Gemini model raises AgySwitchError."""
         acc1_dir = self.engine.accounts_dir / "acc1"
         acc1_dir.mkdir(parents=True, exist_ok=True)
-        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
-
-        acc2_dir = self.engine.accounts_dir / "acc2"
-        acc2_dir.mkdir(parents=True, exist_ok=True)
-        (acc2_dir / "token.json").write_text(json.dumps(create_sample_token("acc2@example.com")), encoding="utf-8")
-
-        acc3_dir = self.engine.accounts_dir / "acc3"
-        acc3_dir.mkdir(parents=True, exist_ok=True)
-        (acc3_dir / "token.json").write_text(json.dumps(create_sample_token("acc3@example.com")), encoding="utf-8")
-
+        acc1_token = acc1_dir / "token.json"
+        acc1_token_data = create_sample_token("acc1@example.com")
+        acc1_token.write_text(json.dumps(acc1_token_data), encoding="utf-8")
         self.engine.set_active_name("acc1")
 
-        cache_data = {
-            "timestamp": 1700000000,
-            "accounts": {
-                "acc1": {"claude": {"quota": 0}, "gemini": {"quota": 100}},
-                "acc2": {"claude": {"quota": 100}, "gemini": {"quota": 10}},
-                "acc3": {"claude": {"quota": 50}, "gemini": {"quota": 90}},
-            },
-        }
-        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+        active_before = self.engine.get_active_name()
+        token_before = acc1_token.read_text(encoding="utf-8")
 
-        result = api.auto_rotate_on_exhaustion(model="claude", engine=self.engine)
+        for non_gemini in ["claude", "CLAUDE", "claude-3-5-sonnet", "anthropic", "  claude-3-5-sonnet  "]:
+            with self.assertRaises(AgySwitchError) as ctx:
+                api.auto_rotate_on_exhaustion(model=non_gemini, engine=self.engine)
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.new_account, "acc2")
-        self.assertEqual(result.model, "claude")
-        self.assertEqual(self.engine.get_active_name(), "acc2")
+            err_msg = str(ctx.exception).lower()
+            self.assertTrue("retired" in err_msg or "strictly 'gemini'" in err_msg or "unsupported" in err_msg)
+            self.assertEqual(self.engine.get_active_name(), active_before)
+            self.assertEqual(acc1_token.read_text(encoding="utf-8"), token_before)
 
     def test_auto_rotate_on_exhaustion_unsupported_model(self) -> None:
         """[REQ-2-ERR-004] auto_rotate_on_exhaustion handles unsupported model gracefully."""

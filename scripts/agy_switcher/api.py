@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Any
 
-from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError
+from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError, AgySwitchError
 from agy_switcher.formatters import (
     format_fleet_exhaustion_message,
     format_fleet_exhaustion_notice,
@@ -217,6 +217,10 @@ def auto_rotate_on_exhaustion(
     current_account: str | None = None,
 ) -> RotationResult:
     """Rotates to the optimal account with remaining quota for target model using Disk-Only Swap."""
+    if model and isinstance(model, str) and any(k in model.lower() for k in ("claude", "anthropic")):
+        raise AgySwitchError(
+            f"Non-Gemini model '{model}' is retired and unsupported. Allowed model is strictly 'gemini'."
+        )
     try:
         model_key = normalize_model_name(model)
     except Exception:

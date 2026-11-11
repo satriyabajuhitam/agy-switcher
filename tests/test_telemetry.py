@@ -103,14 +103,38 @@ class TestDefensiveParsers(unittest.TestCase):
     def test_normalize_model_name(self):
         self.assertEqual(normalize_model_name("gemini"), "gemini")
         self.assertEqual(normalize_model_name("Gemini-3.8-Pro"), "gemini")
-        self.assertEqual(normalize_model_name("claude"), "claude")
-        self.assertEqual(normalize_model_name("claude-3-5-sonnet"), "claude")
+        with self.assertRaises(AgySwitchError):
+            normalize_model_name("claude")
+        with self.assertRaises(AgySwitchError):
+            normalize_model_name("claude-3-5-sonnet")
         with self.assertRaises(AgySwitchError):
             normalize_model_name("gpt-4")
         with self.assertRaises(AgySwitchError):
             normalize_model_name("")
         with self.assertRaises(AgySwitchError):
             normalize_model_name(None)  # type: ignore
+
+    def test_normalize_model_name_rejects_non_gemini(self) -> None:
+        """[QUOTA-GEMINI-ERR-001] normalize_model_name raises AgySwitchError on non-Gemini models."""
+        unsupported_models = [
+            "claude",
+            "CLAUDE",
+            "claude-3-5-sonnet",
+            "  claude-3-5-sonnet  ",
+            "gpt-4o",
+            "GPT-4O",
+            "anthropic",
+            "ANTHROPIC",
+            "  anthropic  ",
+            "deepseek",
+            "llama-3",
+            "gemini-claude",
+            "   ",
+        ]
+        for unsupported in unsupported_models:
+            with self.assertRaises(AgySwitchError) as ctx:
+                normalize_model_name(unsupported)
+            self.assertIn("strictly 'gemini'", str(ctx.exception).lower())
 
     def test_has_auth_indicator(self):
         self.assertTrue(_has_auth_indicator("HTTP Error 401: Unauthorized"))
@@ -322,10 +346,10 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
 
     def test_sort_accounts_by_quota_custom_model(self):
         accounts = [
-            {"name": "acc1", "quota": {"claude": {"quota": 30, "reset_time": 1000}}},
-            {"name": "acc2", "quota": {"claude": {"quota": 80, "reset_time": 1000}}},
+            {"name": "acc1", "quota": {"gemini": {"quota": 30, "reset_time": 1000}}},
+            {"name": "acc2", "quota": {"gemini": {"quota": 80, "reset_time": 1000}}},
         ]
-        sorted_accs = sort_accounts_by_quota(accounts, target_model="claude")
+        sorted_accs = sort_accounts_by_quota(accounts, target_model="gemini-3.8-flash")
         self.assertEqual([a["name"] for a in sorted_accs], ["acc2", "acc1"])
 
     def test_fetch_account_quota_and_all_accounts(self):
@@ -410,11 +434,10 @@ class TestStandaloneTelemetryHelpers(unittest.TestCase):
         self.assertIn("gemini", acc_map["acc_hybrid"]["quota"])
         self.assertIn("claude", acc_map["acc_hybrid"]["quota"])
 
-        # Sorting by claude model must place acc_hybrid (95%) before acc_claude (80%)
-        sorted_by_claude = sort_accounts_by_quota(res["accounts"], target_model="claude")
-        claude_order = [a["name"] for a in sorted_by_claude]
-        self.assertEqual(claude_order[0], "acc_hybrid")
-        self.assertEqual(claude_order[1], "acc_claude")
+        # Sorting by gemini model must place acc_gemini (90%) before others
+        sorted_by_gemini = sort_accounts_by_quota(res["accounts"], target_model="gemini")
+        gemini_order = [a["name"] for a in sorted_by_gemini]
+        self.assertEqual(gemini_order[0], "acc_gemini")
 
     def test_run_quota_pipeline_claude_cache_fallback(self):
         """run_quota_pipeline falls back to cached Claude quota when live fetch fails."""

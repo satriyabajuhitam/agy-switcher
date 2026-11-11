@@ -329,21 +329,15 @@ class TestRotationEngine(unittest.TestCase):
             self.assertEqual(best, "acc2")
 
     def test_init_model_vs_local_directory(self):
-        """RotationEngine('claude') does not misidentify model name as local directory path even if dir exists."""
+        """RotationEngine('gemini') does not misidentify model name as local directory path even if dir exists."""
         import tempfile
         import os
         with tempfile.TemporaryDirectory() as tmpdir:
             old_cwd = os.getcwd()
             try:
                 os.chdir(tmpdir)
-                os.mkdir("claude")
                 os.mkdir("gemini")
-
-                # Must resolve to model 'claude', not vault_dir
-                engine_claude = RotationEngine("claude")
-                self.assertEqual(engine_claude.model_name, "claude")
-                self.assertEqual(engine_claude.target_model_key, "claude")
-                self.assertIsNone(engine_claude.vault_dir)
+                os.mkdir("gemini-3.8-pro")
 
                 # Must resolve to model 'gemini', not vault_dir
                 engine_gemini = RotationEngine("gemini")
@@ -352,9 +346,9 @@ class TestRotationEngine(unittest.TestCase):
                 self.assertIsNone(engine_gemini.vault_dir)
 
                 # Specific slug must resolve to model
-                engine_slug = RotationEngine("claude-3-5-sonnet")
-                self.assertEqual(engine_slug.model_name, "claude-3-5-sonnet")
-                self.assertEqual(engine_slug.target_model_key, "claude")
+                engine_slug = RotationEngine("gemini-3.8-pro")
+                self.assertEqual(engine_slug.model_name, "gemini-3.8-pro")
+                self.assertEqual(engine_slug.target_model_key, "gemini")
                 self.assertIsNone(engine_slug.vault_dir)
 
                 # Explicit relative path must still resolve to vault_dir

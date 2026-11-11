@@ -167,22 +167,19 @@ def _parse_quota_defensive(val: Any) -> int | float:
 
 
 def normalize_model_name(model: str) -> str:
-    """Validates and normalizes model name to 'gemini' or 'claude'.
+    """Validates and normalizes model name strictly to 'gemini'.
 
-    Tolerant of specific slugs like 'gemini-3.8-pro' or 'claude-3-5-sonnet'.
-    Raises AgySwitchError for unsupported models.
+    Tolerant of specific slugs like 'gemini-3.8-pro' or 'gemini-2.5-flash'.
+    Raises AgySwitchError for non-Gemini models (allowed model is strictly 'gemini').
     """
     if not model or not isinstance(model, str):
-        raise AgySwitchError(f"Unsupported model '{model}'. Allowed models: 'gemini', 'claude'.")
+        raise AgySwitchError(f"Unsupported model '{model}'. Allowed model is strictly 'gemini'.")
     m = model.strip().lower()
-    has_gemini = "gemini" in m
-    has_claude = "claude" in m
-    if has_gemini and not has_claude:
+    if "gemini" in m and "claude" not in m and "anthropic" not in m:
         return "gemini"
-    elif has_claude and not has_gemini:
-        return "claude"
-    else:
-        raise AgySwitchError(f"Unsupported model '{model}'. Allowed models: 'gemini', 'claude'.")
+    raise AgySwitchError(
+        f"Unsupported model '{model}'. Allowed model is strictly 'gemini'. Non-Gemini models are retired and unsupported."
+    )
 
 
 def _is_auth_error(error_val: Any, client: Any = None) -> bool:
