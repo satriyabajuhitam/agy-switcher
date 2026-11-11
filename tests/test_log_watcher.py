@@ -230,7 +230,7 @@ class TestPresenceDetector(unittest.TestCase):
         self.assertIsNone(self.detector.get_active_transcript_path())
 
     def test_watch_targets_aggregates_transcript_and_cli_logs(self):
-        """Returns active transcript path (if existing) and existing antigravity-cli/log/*.log files."""
+        """Returns active transcript path (if existing) and strictly omits antigravity-cli/log/*.log files."""
         uuid = "eeeeeeee-1111-2222-3333-444444444444"
         (self.presence_dir / f"{uuid}.lock").touch()
 
@@ -253,20 +253,19 @@ class TestPresenceDetector(unittest.TestCase):
 
         targets = self.detector.get_watch_targets()
 
-        # Target list must include transcript and cli logs as Paths
-        self.assertIn(transcript_file, targets)
-        self.assertIn(cli_log1, targets)
-        self.assertIn(cli_log2, targets)
+        # Target list must include transcript and omit raw cli logs as Paths
+        self.assertEqual(targets, [transcript_file])
+        self.assertNotIn(cli_log1, targets)
+        self.assertNotIn(cli_log2, targets)
         self.assertNotIn(cli_txt, targets)
         self.assertNotIn(old_invalid_dir / "fake.log", targets)
 
         # Also verify string output support if requested
         str_targets = self.detector.get_watch_targets(as_str=True)
-        self.assertIn(str(transcript_file), str_targets)
-        self.assertIn(str(cli_log1), str_targets)
+        self.assertEqual(str_targets, [str(transcript_file)])
 
     def test_watch_targets_when_transcript_not_created_yet(self):
-        """If session dir exists but transcript.jsonl has not yet been created, omit transcript from targets."""
+        """If session dir exists but transcript.jsonl has not yet been created, omit transcript and return empty."""
         uuid = "ffffffff-1111-2222-3333-444444444444"
         (self.presence_dir / f"{uuid}.lock").touch()
 
@@ -278,7 +277,7 @@ class TestPresenceDetector(unittest.TestCase):
         cli_log.touch()
 
         targets = self.detector.get_watch_targets()
-        self.assertEqual(targets, [cli_log])
+        self.assertEqual(targets, [])
 
     def test_default_init_paths(self):
         """Verify default constructor uses ~/.gemini and /proc."""
@@ -612,7 +611,7 @@ class TestPresenceDetector(unittest.TestCase):
     def test_transcript_targets_deduplication(self):
         """[REQ-2-SCN-006]: GIVEN an active CLI transcript file exists and multiple .log files exist
         in ~/.gemini/antigravity-cli/log/, WHEN PresenceDetector.get_watch_targets() is invoked,
-        THEN the returned list contains the CLI transcript path and existing .log paths with zero duplicates.
+        THEN the returned list contains exclusively the CLI transcript path and omits raw .log files.
         """
         session_id = "cli-dedup-sess"
         cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
@@ -630,18 +629,12 @@ class TestPresenceDetector(unittest.TestCase):
         log2.write_text("runner log", encoding="utf-8")
 
         targets_path = self.detector.get_watch_targets(as_str=False)
-        self.assertEqual(len(targets_path), 3)
-        self.assertEqual(len(targets_path), len(set(targets_path)))
-        self.assertEqual(targets_path[0], cli_transcript)
-        self.assertIn(log1, targets_path)
-        self.assertIn(log2, targets_path)
+        self.assertEqual(targets_path, [cli_transcript])
+        self.assertNotIn(log1, targets_path)
+        self.assertNotIn(log2, targets_path)
 
         targets_str = self.detector.get_watch_targets(as_str=True)
-        self.assertEqual(len(targets_str), 3)
-        self.assertEqual(len(targets_str), len(set(targets_str)))
-        self.assertIn(str(cli_transcript), targets_str)
-        self.assertIn(str(log1), targets_str)
-        self.assertIn(str(log2), targets_str)
+        self.assertEqual(targets_str, [str(cli_transcript)])
 
     def test_transcript_targets_unreadable_omitted_safely(self):
         """[REQ-2-ERR-002]: GIVEN an active session ID is discovered,

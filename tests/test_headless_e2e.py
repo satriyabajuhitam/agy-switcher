@@ -167,7 +167,8 @@ class TestHeadlessLifecycleE2E(unittest.TestCase):
         self.assertIsNone(watcher.active_session_id)
         self.assertIsNone(watcher.active_transcript_path)
         self.assertNotIn(str(desktop_transcript_2), targets_idle)
-        self.assertIn(str(runner_log), targets_idle)
+        self.assertNotIn(str(runner_log), targets_idle)
+        self.assertEqual(targets_idle, [])
         self.assertNotIn(str(desktop_transcript_2), watcher.file_cursors)
         self.assertEqual(watcher.file_cursors.get(str(runner_log)), 50)
 

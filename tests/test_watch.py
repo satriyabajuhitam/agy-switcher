@@ -8,7 +8,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.watch import LogWatcher
+from scripts.watch import LogWatcher, PresenceDetector
 
 class TestLogWatcher(unittest.TestCase):
     def setUp(self):
@@ -841,6 +841,68 @@ class TestLogWatcher(unittest.TestCase):
             watch_log = vault_path / "watch.log"
             self.assertTrue(watch_log.is_file())
             self.assertIn("Switched from 'acc1' to 'acc2' with force-restart language_server", watch_log.read_text(encoding="utf-8"))
+
+
+class TestPresenceDetectorWatchTargets(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_get_watch_targets_omits_cli_logs(self):
+        """[WATCH-BOUND-001]: GIVEN an active Antigravity session with active transcript
+        and directory ~/.gemini/antigravity-cli/log/ contains multiple cli-*.log files,
+        WHEN PresenceDetector.get_watch_targets() is invoked,
+        THEN the returned target list contains exclusively the resolved transcript.jsonl path,
+        and contains zero paths from ~/.gemini/antigravity-cli/log/.
+        """
+        session_id = "test-session-bound-001"
+        self.detector.presence_dir.mkdir(parents=True, exist_ok=True)
+        (self.detector.presence_dir / f"{session_id}.lock").touch()
+
+        transcript_dir = self.detector.brain_dir / session_id / ".system_generated" / "logs"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = transcript_dir / "transcript.jsonl"
+        transcript_path.write_text('{"event": "start"}\n', encoding="utf-8")
+
+        self.detector.cli_log_dir.mkdir(parents=True, exist_ok=True)
+        cli_log1 = self.detector.cli_log_dir / "cli-20261111-1.log"
+        cli_log2 = self.detector.cli_log_dir / "cli-20261111-2.log"
+        cli_log1.write_text("CLI log 1", encoding="utf-8")
+        cli_log2.write_text("CLI log 2", encoding="utf-8")
+
+        targets = self.detector.get_watch_targets()
+        self.assertEqual(targets, [transcript_path])
+        self.assertNotIn(cli_log1, targets)
+        self.assertNotIn(cli_log2, targets)
+        for target in targets:
+            self.assertFalse(str(target).startswith(str(self.detector.cli_log_dir)))
+
+        str_targets = self.detector.get_watch_targets(as_str=True)
+        self.assertEqual(str_targets, [str(transcript_path)])
+
+    def test_get_watch_targets_omits_cli_logs_when_no_active_transcript(self):
+        """[WATCH-BOUND-EDGE-002]: GIVEN no Antigravity Desktop or CLI presence locks exist on the host,
+        and PresenceDetector.get_active_transcript_path() returns None,
+        WHEN PresenceDetector.get_watch_targets() is invoked,
+        THEN it returns an empty list [] without raising FileNotFoundError or inspecting CLI logs.
+        """
+        self.detector.cli_log_dir.mkdir(parents=True, exist_ok=True)
+        cli_log = self.detector.cli_log_dir / "cli-orphan.log"
+        cli_log.write_text("Orphan CLI log", encoding="utf-8")
+
+        self.assertIsNone(self.detector.get_active_transcript_path())
+
+        targets = self.detector.get_watch_targets()
+        self.assertEqual(targets, [])
+
+        str_targets = self.detector.get_watch_targets(as_str=True)
+        self.assertEqual(str_targets, [])
 
 
 if __name__ == '__main__':
