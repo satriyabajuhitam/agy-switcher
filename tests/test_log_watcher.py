@@ -1268,6 +1268,42 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
         )
 
 
+class _StubSwitchEngine:
+    """External engine stub for testing LogWatcher at its public seam without internal mocking."""
+
+    def __init__(self, cache_dir: Path, vault_dir: Path, gemini_dir: Path) -> None:
+        self.cache_dir = cache_dir
+        self.vault_dir = vault_dir
+        self.gemini_dir = gemini_dir
+        self.active_name_calls = 0
+        self.list_accounts_calls = 0
+        self.switch_calls: list[tuple[str, bool, bool]] = []
+
+    def get_active_name(self) -> str:
+        self.active_name_calls += 1
+        return "acc1"
+
+    def list_accounts(self) -> dict[str, object]:
+        self.list_accounts_calls += 1
+        return {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},
+            ],
+        }
+
+    def switch_tokens(
+        self,
+        target_account: str,
+        *,
+        restart_server: bool = False,
+        force: bool = False,
+    ) -> dict[str, object]:
+        self.switch_calls.append((target_account, restart_server, force))
+        return {"success": True, "active": target_account, "server_restarted": False}
+
+
 class TestLogWatcherProcessing(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -1397,6 +1433,158 @@ class TestLogWatcherProcessing(unittest.TestCase):
         res = self.watcher.process_line(line, is_jsonl=True)
         self.assertFalse(res)
         mock_switch.assert_not_called()
+
+    def _build_isolated_watcher(
+        self,
+    ) -> tuple[LogWatcher, _StubSwitchEngine, CooldownManager, Path]:
+        """Builds a LogWatcher wired only to isolated temp files and an external engine stub."""
+        gemini_dir = self.base_dir / ".gemini_immunity"
+        gemini_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({
+                "timestamp": 1700000000.0,
+                "accounts": {
+                    "acc1": {"gemini": {"quota": 0, "reset_time": "2026-11-11T12:00:00Z"}},
+                    "acc2": {"gemini": {"quota": 90, "reset_time": "2026-11-11T12:00:00Z"}},
+                },
+            }),
+            encoding="utf-8",
+        )
+        engine_stub = _StubSwitchEngine(
+            cache_dir=self.cache_dir,
+            vault_dir=self.vault_dir,
+            gemini_dir=gemini_dir,
+        )
+        detector = PresenceDetector(
+            gemini_dir=gemini_dir,
+            proc_dir=self.base_dir / "nonexistent_proc",
+        )
+        cooldown_mgr = CooldownManager(self.cache_dir)
+        watcher = LogWatcher(
+            engine=engine_stub,
+            cooldown_manager=cooldown_mgr,
+            damping_seconds=15.0,
+            presence_detector=detector,
+        )
+        return watcher, engine_stub, cooldown_mgr, gemini_dir
+
+    def test_process_line_immunity_done_and_user_input_done_status(self) -> None:
+        """[WATCH-BOUND-004] Records with status DONE are granted immediate immunity without calling handle_exhaustion."""
+        done_variants: list[dict[str, str]] = [
+            {"status": "DONE", "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase"},
+            {
+                "status": "DONE",
+                "type": "ERROR_MESSAGE",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "message": "429 Too Many Requests",
+                "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase",
+            },
+            {
+                "status": "done",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase",
+            },
+            {
+                "status": " DONE ",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase",
+            },
+        ]
+
+        with patch("shutil.which", return_value=None):
+            for payload in done_variants:
+                line = json.dumps(payload)
+                for is_jsonl in (True, False):
+                    with self.subTest(payload=payload, is_jsonl=is_jsonl):
+                        watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                        self.assertFalse(watcher.process_line(line, is_jsonl=is_jsonl))
+                        self.assertEqual(engine_stub.switch_calls, [])
+                        self.assertEqual(engine_stub.active_name_calls, 0)
+                        self.assertEqual(engine_stub.list_accounts_calls, 0)
+                        self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+                        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_process_line_immunity_done_and_user_input_user_input_type(self) -> None:
+        """[WATCH-BOUND-005] Records with type USER_INPUT are suppressed immediately without calling handle_exhaustion."""
+        user_input_variants: list[dict[str, str]] = [
+            {"type": "USER_INPUT", "content": "How do I handle RESOURCE_EXHAUSTED and code 429?"},
+            {
+                "type": "USER_INPUT",
+                "status": "ERROR",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "message": "Individual quota reached",
+                "content": "How do I handle RESOURCE_EXHAUSTED and code 429?",
+            },
+            {
+                "type": "user_input",
+                "status": "ERROR",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "How do I handle RESOURCE_EXHAUSTED and code 429?",
+            },
+            {
+                "type": " USER_INPUT ",
+                "status": "ERROR",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "How do I handle RESOURCE_EXHAUSTED and code 429?",
+            },
+        ]
+
+        with patch("shutil.which", return_value=None):
+            for payload in user_input_variants:
+                line = json.dumps(payload)
+                for is_jsonl in (True, False):
+                    with self.subTest(payload=payload, is_jsonl=is_jsonl):
+                        watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                        self.assertFalse(watcher.process_line(line, is_jsonl=is_jsonl))
+                        self.assertEqual(engine_stub.switch_calls, [])
+                        self.assertEqual(engine_stub.active_name_calls, 0)
+                        self.assertEqual(engine_stub.list_accounts_calls, 0)
+                        self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+                        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_process_line_immunity_done_and_user_input_transcript_tailing(self) -> None:
+        """[WATCH-BOUND-004][WATCH-BOUND-005] poll_once ignores DONE and USER_INPUT lines before rotating on real ERROR."""
+        watcher, engine_stub, cooldown_mgr, gemini_dir = self._build_isolated_watcher()
+
+        session_id = "immunity-session-01"
+        lock_file = gemini_dir / "antigravity" / "presence" / f"{session_id}.lock"
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_file.touch()
+
+        transcript_file = (
+            gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs" / "transcript.jsonl"
+        )
+        transcript_file.parent.mkdir(parents=True, exist_ok=True)
+        transcript_file.write_text('{"type": "START"}\n', encoding="utf-8")
+
+        watcher.poll_once()
+        initial_cursor = watcher.file_cursors[str(transcript_file)]
+
+        immune_batch = (
+            json.dumps({"status": "DONE", "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase"}) + "\n"
+            + json.dumps({"type": "USER_INPUT", "content": "How do I handle RESOURCE_EXHAUSTED and code 429?"}) + "\n"
+        )
+        with open(transcript_file, "a", encoding="utf-8") as f:
+            f.write(immune_batch)
+
+        with patch("shutil.which", return_value=None):
+            switches = watcher.poll_once()
+            self.assertEqual(switches, 0)
+            self.assertEqual(engine_stub.switch_calls, [])
+            self.assertEqual(engine_stub.active_name_calls, 0)
+            self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+            self.assertEqual(
+                watcher.file_cursors[str(transcript_file)],
+                initial_cursor + len(immune_batch.encode("utf-8")),
+            )
+
+            error_line = json.dumps({"status": "ERROR", "error": "Quota exceeded: RESOURCE_EXHAUSTED (code 429)"}) + "\n"
+            with open(transcript_file, "a", encoding="utf-8") as f:
+                f.write(error_line)
+
+            switches_after_error = watcher.poll_once()
+            self.assertEqual(switches_after_error, 1)
+            self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
 
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
     def test_jsonl_immunity_model_thinking_and_code_view(self, mock_switch):

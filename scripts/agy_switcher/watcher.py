@@ -524,18 +524,18 @@ class LogWatcher:
             return False
 
         try:
-            data = json.loads(line_clean)
+            data: object = json.loads(line_clean)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return False
-
         if not isinstance(data, dict):
             return False
 
-        status = data.get("status")
-        msg_type = data.get("type")
-
-        # IMMUNITY RULE: NEVER trigger rotation on DONE status or USER_INPUT type
-        if status == "DONE" or msg_type == "USER_INPUT":
+        status: object = data.get("status")
+        msg_type: object = data.get("type")
+        # Short-circuit DONE and USER_INPUT records before inspecting error or content regexes.
+        if (isinstance(status, str) and status.strip().upper() == "DONE") or (
+            isinstance(msg_type, str) and msg_type.strip().upper() == "USER_INPUT"
+        ):
             return False
 
         # ONLY evaluate if status == "ERROR", type == "ERROR_MESSAGE", or non-empty error field
