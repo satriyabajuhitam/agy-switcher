@@ -1425,12 +1425,190 @@ class TestLogWatcherProcessing(unittest.TestCase):
         self.assertFalse(self.watcher.process_line("", is_jsonl=True))
 
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
-    def test_raw_cli_log_detects_exhaustion(self, mock_switch):
-        """Raw CLI text line with exhaustion pattern triggers rotation."""
-        line = "2026-10-14 10:00:00 [ERROR] RESOURCE_EXHAUSTED (code 429) received"
-        res = self.watcher.process_line(line, is_jsonl=False)
-        self.assertTrue(res)
-        mock_switch.assert_called_once_with(line=line)
+    def test_process_line_ignores_non_json_plain_text(self, mock_switch):
+        """[WATCH-BOUND-ERR-001] Non-JSON line in transcript or plain text file is unconditionally ignored."""
+        plain_variants = [
+            "RESOURCE_EXHAUSTED: unit test simulated failure",
+            "  RESOURCE_EXHAUSTED: unit test simulated failure\n",
+            "\tRESOURCE_EXHAUSTED: unit test simulated failure\r\n",
+            "\ufeffRESOURCE_EXHAUSTED: unit test simulated failure\n",
+            "\ufeff{\"status\": \"ERROR\", \"error\": \"RESOURCE_EXHAUSTED\"}\n",
+            "2026-10-14 10:00:00 [ERROR] RESOURCE_EXHAUSTED (code 429) received",
+            "   \t\r\n",
+        ]
+        for line in plain_variants:
+            for is_jsonl in (True, False):
+                with self.subTest(line=line, is_jsonl=is_jsonl):
+                    self.assertFalse(self.watcher.process_line(line, is_jsonl=is_jsonl))
+        mock_switch.assert_not_called()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_process_line_ignores_non_json_non_dict_and_missing_envelope(self, mock_switch):
+        """[WATCH-BOUND-ERR-001] Non-dict JSON and JSON dicts lacking required error envelopes are ignored."""
+        non_dict_or_envelope_missing = [
+            json.dumps("RESOURCE_EXHAUSTED"),
+            json.dumps(["RESOURCE_EXHAUSTED"]),
+            json.dumps([{"status": "ERROR", "error": "RESOURCE_EXHAUSTED"}]),
+            json.dumps(123),
+            json.dumps(None),
+            json.dumps(True),
+            json.dumps({}),
+            json.dumps({"text": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"content": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"message": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"status": "INFO", "content": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"status": "ERROR", "error": ""}),
+            json.dumps({"status": "ERROR", "error": None}),
+            json.dumps({"status": "ERROR", "thinking": "RESOURCE_EXHAUSTED"}),
+        ]
+        for line in non_dict_or_envelope_missing:
+            for is_jsonl in (True, False):
+                with self.subTest(line=line, is_jsonl=is_jsonl):
+                    self.assertFalse(self.watcher.process_line(line, is_jsonl=is_jsonl))
+        mock_switch.assert_not_called()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_process_line_ignores_non_json_malformed_truncated(self, mock_switch):
+        """[WATCH-BOUND-ERR-002] Malformed or truncated JSON line does not crash watcher daemon."""
+        partial_line = '{"status": "ERROR", "error": "RESOURCE_EX'
+        self.assertFalse(self.watcher.process_line(partial_line, is_jsonl=True))
+        self.assertFalse(self.watcher.process_line(partial_line, is_jsonl=False))
+        mock_switch.assert_not_called()
+
+        # Additional malformed variations
+        for bad_line in (
+            '{"status": "ERROR", ',
+            "{invalid json",
+            '{"status": "ERROR", "error": "RESOURCE_EX\ufffd',
+            '{"status": "ERROR", "error": "RESOURCE_EXHAUSTED"} trailing',
+            '{"status": "ERROR"}{"error": "RESOURCE_EXHAUSTED"}',
+        ):
+            with self.subTest(bad_line=bad_line):
+                self.assertFalse(self.watcher.process_line(bad_line, is_jsonl=True))
+                self.assertFalse(self.watcher.process_line(bad_line, is_jsonl=False))
+        mock_switch.assert_not_called()
+
+    def test_process_line_ignores_non_json_surrogate_stderr_safety(self):
+        """[WATCH-BOUND-ERR-002] Escaped surrogate in JSON error payload does not raise UnicodeEncodeError on strict stderr."""
+        strict_err = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        line = '{"status": "ERROR", "error": "RESOURCE_EXHAUSTED \\ud800"}'
+        with patch("sys.stderr", strict_err), patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            self.assertTrue(self.watcher.process_line(line, is_jsonl=True))
+            mock_switch.assert_called_once()
+
+    def test_process_line_ignores_non_json_poll_once_survives_corrupt_and_non_utf8(self):
+        """[WATCH-BOUND-ERR-002] Tailing loop survives corrupt/non-UTF8/plain-text lines and processes subsequent valid JSON errors."""
+        test_file = self.base_dir / "corrupt_recovery.transcript.jsonl"
+        test_file.write_bytes(b"")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "corrupt-session"
+        mock_detector.get_active_transcript_path.return_value = test_file
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        self.watcher.presence_detector = mock_detector
+
+        self.watcher.poll_once()
+        self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
+
+        # Tick 1: Write corrupt/truncated JSON, non-UTF8 JSON bytes, plain text, and envelope-missing JSON
+        corrupt_batch = (
+            b'{"status": "ERROR", "error": "RESOURCE_EX\n'
+            b'{"status": "ERROR", \xff\xfe"error": "RESOURCE_EXHAUSTED"}\n'
+            b"RESOURCE_EXHAUSTED: unit test simulated failure\n"
+            b'{"content": "RESOURCE_EXHAUSTED"}\n'
+        )
+        test_file.write_bytes(corrupt_batch)
+
+        def _mock_switch(*args, **kwargs):
+            for f in list(self.watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        self.watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
+            self.assertEqual(self.watcher.poll_once(), 0)
+            mock_switch.assert_not_called()
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(corrupt_batch))
+
+            # Tick 2: Mid-flush partial JSON without newline holds cursor safely
+            partial_mid_flush = b'{"status": "ERROR", "error": "RESOURCE_EX'
+            with open(test_file, "ab") as f:
+                f.write(partial_mid_flush)
+            self.assertEqual(self.watcher.poll_once(), 0)
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(corrupt_batch))
+
+            # Tick 3: Flush newline terminating the corrupt line + valid structured JSON error line
+            valid_line = b'\n{"status": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"}\n'
+            with open(test_file, "ab") as f:
+                f.write(valid_line)
+
+            self.assertEqual(self.watcher.poll_once(), 1)
+            mock_switch.assert_called_once()
+            self.assertEqual(
+                self.watcher.file_cursors[str(test_file)],
+                len(corrupt_batch) + len(partial_mid_flush) + len(valid_line),
+            )
+
+        # Verify watch_loop does not crash or stop across corrupt + valid iterations
+        self.watcher.last_switch_time = 0.0
+        with open(test_file, "ab") as f:
+            f.write(b'{"status": "ERROR", "error": "RESOURCE_EX\n')
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
+            self.watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            mock_switch.assert_not_called()
+            with open(test_file, "ab") as f:
+                f.write(b'{"status": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"}\n')
+            self.watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            mock_switch.assert_called_once()
+
+    def test_process_line_ignores_non_json_poll_once_oversized_unterminated_line(self):
+        """[WATCH-BOUND-ERR-002] Oversized corrupt line exceeding max_chunk_bytes advances cursor instead of wedging tailer."""
+        test_file = self.base_dir / "oversized_corrupt.transcript.jsonl"
+        test_file.write_bytes(b"")
+
+        bounded_watcher = LogWatcher(
+            engine=self.engine_mock,
+            cooldown_manager=self.cooldown_mgr,
+            damping_seconds=15.0,
+            log_dirs=[str(self.base_dir)],
+            max_chunk_bytes=64,
+        )
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "oversized-session"
+        mock_detector.get_active_transcript_path.return_value = test_file
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        bounded_watcher.presence_detector = mock_detector
+
+        bounded_watcher.poll_once()
+
+        oversized_corrupt = b'{"status": "ERROR", "error": "' + (b"X" * 100) + b"\n"
+        valid_error = b'{"status": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"}\n'
+        test_file.write_bytes(oversized_corrupt + valid_error)
+
+        def _mock_switch(*args, **kwargs):
+            for f in list(bounded_watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        bounded_watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(bounded_watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
+            switches = 0
+            for _ in range(5):
+                switches += bounded_watcher.poll_once()
+                if switches:
+                    break
+            self.assertEqual(switches, 1)
+            mock_switch.assert_called_once()
+            self.assertEqual(
+                bounded_watcher.file_cursors[str(test_file)],
+                len(oversized_corrupt) + len(valid_error),
+            )
 
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
     def test_raw_cli_log_ignores_normal_lines(self, mock_switch):
@@ -1791,22 +1969,36 @@ class TestLogWatcherProcessing(unittest.TestCase):
 
     def test_poll_once_multibyte_utf8_split_chunk(self):
         """Splitting multibyte UTF-8 characters across chunk boundaries does not corrupt stream cursor or error detection."""
-        test_file = self.base_dir / "multibyte_test.log"
+        test_file = self.base_dir / "multibyte_test.transcript.jsonl"
         test_file.write_bytes(b"")
 
         mock_detector = MagicMock()
         mock_detector.get_active_session_id.return_value = "multibyte-session"
-        mock_detector.get_active_transcript_path.return_value = None
+        mock_detector.get_active_transcript_path.return_value = test_file
         mock_detector.get_watch_targets.return_value = [str(test_file)]
         self.watcher.presence_detector = mock_detector
 
         self.watcher.poll_once()
         self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
 
-        # Line 1: Normal line containing 4-byte UTF-8 emoji 🚀 (b'\xf0\x9f\x9a\x80') with newline
-        line1_bytes = "info 🚀 normal operation\n".encode("utf-8")
-        # Line 2 partial: Prefix ending in the FIRST 2 BYTES of 3-byte Japanese char 日本 ('\xe6\x97') without newline
-        line2_partial = "error prefix 日本".encode("utf-8")[: -2]  # cut mid-character
+        # Line 1: Normal JSON line containing 4-byte UTF-8 emoji 🚀 (b'\xf0\x9f\x9a\x80') with newline
+        line1_bytes = (
+            json.dumps({"type": "info", "content": "info 🚀 normal operation"}, ensure_ascii=False).encode("utf-8")
+            + b"\n"
+        )
+        # Line 2: Structured error containing 3-byte Japanese char 日本 ('\xe6\x97\xa5\xe6\x9c\xac')
+        full_line2_bytes = (
+            json.dumps(
+                {"status": "ERROR", "content": "error prefix 日本 RESOURCE_EXHAUSTED (code 429)"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        nihon_idx = full_line2_bytes.index("日本".encode("utf-8"))
+        split_point = nihon_idx + 1  # cut mid-character
+        line2_partial = full_line2_bytes[:split_point]
+        line2_remainder = full_line2_bytes[split_point:]
+
         test_file.write_bytes(line1_bytes + line2_partial)
 
         def _mock_switch(*args, **kwargs):
@@ -1826,35 +2018,33 @@ class TestLogWatcherProcessing(unittest.TestCase):
             self.assertEqual(self.watcher.file_cursors[str(test_file)], len(line1_bytes))
 
             # Tick 2: Append remainder of multibyte character + error keyword + newline
-            line2_remainder = "error prefix 日本".encode("utf-8")[-2:] + b" RESOURCE_EXHAUSTED (code 429)\n"
             with open(test_file, "ab") as f:
                 f.write(line2_remainder)
 
             switches2 = self.watcher.poll_once()
             self.assertEqual(switches2, 1)
             mock_switch.assert_called_once()
-            full_line2_len = len("error prefix 日本 RESOURCE_EXHAUSTED (code 429)\n".encode("utf-8"))
             self.assertEqual(
                 self.watcher.file_cursors[str(test_file)],
-                len(line1_bytes) + full_line2_len,
+                len(line1_bytes) + len(full_line2_bytes),
             )
 
     def test_poll_once_mid_batch_switch_advances_cursor_to_eof(self):
         """When failover triggers under ADR 0010, cursor advances to EOF to prevent restart storms."""
-        test_file = self.base_dir / "batch_test.log"
+        test_file = self.base_dir / "batch_test.transcript.jsonl"
         test_file.write_bytes(b"")
 
         mock_detector = MagicMock()
         mock_detector.get_active_session_id.return_value = "batch-session"
-        mock_detector.get_active_transcript_path.return_value = None
+        mock_detector.get_active_transcript_path.return_value = test_file
         mock_detector.get_watch_targets.return_value = [str(test_file)]
         self.watcher.presence_detector = mock_detector
 
         self.watcher.poll_once()
 
-        line1 = b"line 1: startup normal\n"
-        line2 = b"line 2: RESOURCE_EXHAUSTED (code 429)\n"
-        line3 = b"line 3: subsequent message that must be preserved\n"
+        line1 = json.dumps({"type": "info", "content": "startup normal"}).encode("utf-8") + b"\n"
+        line2 = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"}).encode("utf-8") + b"\n"
+        line3 = json.dumps({"type": "info", "content": "subsequent message that must be preserved"}).encode("utf-8") + b"\n"
         test_file.write_bytes(line1 + line2 + line3)
 
         def _mock_switch(*args, **kwargs):

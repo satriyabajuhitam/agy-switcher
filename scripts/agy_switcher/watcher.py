@@ -518,12 +518,6 @@ class LogWatcher:
             elif elapsed < 0:
                 self.last_switch_time = 0.0
 
-        if not is_jsonl:
-            if self.is_exhausted_message(line):
-                print(f"[watch] Detected quota exhaustion: {line.strip()}", file=sys.stderr)
-                return self._dispatch_exhaustion(line=line, file_path=file_path)
-            return False
-
         # Structured JSON-First Event Filtering
         line_clean = line.strip()
         if not line_clean.startswith("{"):
@@ -594,7 +588,7 @@ class LogWatcher:
                 except Exception:
                     error_parts.append(str(message_val))
 
-        combined_text = " ".join(error_parts)
+        combined_text = " ".join(error_parts).encode("utf-8", errors="replace").decode("utf-8")
         if self.is_exhausted_message(combined_text):
             print(f"[watch] Detected structured JSON quota exhaustion: {combined_text.strip()[:160]}", file=sys.stderr)
             return self._dispatch_exhaustion(line=combined_text, file_path=file_path)
@@ -961,6 +955,11 @@ class LogWatcher:
 
                     last_nl = chunk.rfind(b"\n")
                     if last_nl == -1:
+                        if len(chunk) >= self.max_chunk_bytes:
+                            # Oversized unterminated line exceeds read bound; advance cursor so tailing cannot wedge.
+                            self.file_cursors[target] = cursor + len(chunk)
+                            self._stagnant_sizes.pop(target, None)
+                            continue
                         # No complete line has arrived; hold cursor and track file size
                         self.file_cursors[target] = cursor
                         self._stagnant_sizes[target] = current_size

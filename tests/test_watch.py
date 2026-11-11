@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import MagicMock, patch, mock_open
 from pathlib import Path
@@ -38,7 +39,7 @@ class TestLogWatcher(unittest.TestCase):
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_trigger_switch_on_exhaustion(self, sleep_mock):
-        line = "RESOURCE_EXHAUSTED (code 429)"
+        line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
         
         self.engine_mock.get_active_name.return_value = 'acc1'
         self.engine_mock.list_accounts.return_value = {
@@ -60,7 +61,7 @@ class TestLogWatcher(unittest.TestCase):
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_trigger_switch_aborts_when_all_exhausted(self, sleep_mock):
-        line = "RESOURCE_EXHAUSTED (code 429)"
+        line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
         self.engine_mock.get_active_name.return_value = 'acc1'
         self.engine_mock.list_accounts.return_value = {
             "active": "acc1",
@@ -141,7 +142,7 @@ class TestLogWatcher(unittest.TestCase):
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_trigger_switch_passes_claude_to_rotation_engine(self, sleep_mock):
-        line = "RESOURCE_EXHAUSTED (code 429) for claude-3-5-sonnet"
+        line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429) for claude-3-5-sonnet"})
         self.engine_mock.get_active_name.return_value = 'acc1'
         self.engine_mock.list_accounts.return_value = {
             "active": "acc1",
@@ -166,7 +167,7 @@ class TestLogWatcher(unittest.TestCase):
     @patch("scripts.watch.time.sleep", return_value=None)
     @patch("scripts.watch.QuotaClient")
     def test_trigger_switch_uses_quota_client_load_cache(self, mock_quota_client_cls, sleep_mock):
-        line = "RESOURCE_EXHAUSTED (code 429)"
+        line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
         self.engine_mock.get_active_name.return_value = 'acc1'
         self.engine_mock.list_accounts.return_value = {
             "active": "acc1",
@@ -206,7 +207,7 @@ class TestLogWatcher(unittest.TestCase):
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_failover_selects_claude_quota_when_claude_exhausted(self, sleep_mock):
-        line = "RESOURCE_EXHAUSTED (code 429) for claude-3-5-sonnet"
+        line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429) for claude-3-5-sonnet"})
         self.engine_mock.get_active_name.return_value = 'acc1'
         self.engine_mock.list_accounts.return_value = {
             "active": "acc1",
@@ -248,12 +249,13 @@ class TestLogWatcher(unittest.TestCase):
         self.assertFalse(self.watcher.process_line("Normal log line"))
 
         # Exhausted with switch returns True
+        exhausted_line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
         with patch.object(self.watcher, "trigger_switch", return_value=True):
-            self.assertTrue(self.watcher.process_line("RESOURCE_EXHAUSTED (code 429)"))
+            self.assertTrue(self.watcher.process_line(exhausted_line))
 
         # Exhausted with failed switch returns False
         with patch.object(self.watcher, "trigger_switch", return_value=False):
-            self.assertFalse(self.watcher.process_line("RESOURCE_EXHAUSTED (code 429)"))
+            self.assertFalse(self.watcher.process_line(exhausted_line))
 
     def test_watch_batch_burst_lines_breaks_on_switch(self):
         """Verify that when a batch of lines contains multiple 429 errors, only the first triggers a switch."""
@@ -266,9 +268,9 @@ class TestLogWatcher(unittest.TestCase):
         self.watcher.trigger_switch = fake_trigger_switch
 
         batch_lines = [
-            "RESOURCE_EXHAUSTED (code 429) line 1\n",
-            "RESOURCE_EXHAUSTED (code 429) line 2\n",
-            "RESOURCE_EXHAUSTED (code 429) line 3\n",
+            json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429) line 1"}) + "\n",
+            json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429) line 2"}) + "\n",
+            json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429) line 3"}) + "\n",
         ]
 
         # Simulate batch processing in watch_loop
@@ -359,9 +361,9 @@ class TestLogWatcher(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = os.path.join(tmpdir, "test.log")
-            line1 = "line 1: normal startup\n"
-            line2 = "line 2: RESOURCE_EXHAUSTED (code 429)\n"
-            line3 = "line 3: trailing content\n"
+            line1 = json.dumps({"type": "info", "content": "normal startup"}) + "\n"
+            line2 = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"}) + "\n"
+            line3 = json.dumps({"type": "info", "content": "trailing content"}) + "\n"
             with open(test_file, "w", encoding="utf-8") as fp:
                 fp.write(line1 + line2 + line3)
 
@@ -416,15 +418,16 @@ class TestLogWatcher(unittest.TestCase):
             rot_mock.evaluate.return_value = 'acc2'
             rot_cls_mock.return_value = rot_mock
 
+            exhausted_line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
             with patch("time.time", return_value=100.0):
-                switched = self.watcher.process_line("RESOURCE_EXHAUSTED (code 429)")
+                switched = self.watcher.process_line(exhausted_line)
                 self.assertTrue(switched)
                 self.assertEqual(self.watcher.last_switch_time, 100.0)
                 self.assertEqual(self.watcher.damping_seconds, 15.0)
 
             # Inside damping window (100.0 + 5.0 < 100.0 + 15.0) -> suppressed
             with patch("time.time", return_value=105.0):
-                switched_suppressed = self.watcher.process_line("RESOURCE_EXHAUSTED (code 429)")
+                switched_suppressed = self.watcher.process_line(exhausted_line)
                 self.assertFalse(switched_suppressed)
                 # Switch count should still be 1
                 self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
@@ -432,7 +435,7 @@ class TestLogWatcher(unittest.TestCase):
 
             # Outside damping window (100.0 + 16.0 > 100.0 + 15.0) -> allowed
             with patch("time.time", return_value=116.0):
-                switched_allowed = self.watcher.process_line("RESOURCE_EXHAUSTED (code 429)")
+                switched_allowed = self.watcher.process_line(exhausted_line)
                 self.assertTrue(switched_allowed)
                 self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
                 self.assertEqual(self.watcher.last_switch_time, 116.0)
