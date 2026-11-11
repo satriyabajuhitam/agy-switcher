@@ -32,6 +32,7 @@ from agy_switcher.exceptions import (
     DaemonError,
     DaemonAlreadyRunningError,
 )
+from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.telemetry import (
     QuotaClient as _RealQuotaClient,
     fetch_account_quota as _real_fetch_account_quota,
@@ -401,6 +402,55 @@ class CooldownManager:
                 return True
             return False
 
+    def _extract_5h_rolling_reset(self, target_dict: dict[str, Any], now: float) -> float | None:
+        """Extracts valid 5-hour rolling bucket reset timestamp, rejecting weekly timestamps > 5 hours.
+        Adheres to ADR 0016 / [COOLDOWN-CLAMP-001] / [COOLDOWN-CLAMP-003].
+        """
+        max_rolling_window = 18000.0  # 5 hours
+        max_daily_window = 86400.0    # 24 hours (multi-day boundary)
+        raw_buckets = target_dict.get("buckets")
+
+        def _is_weekly(identifier: str) -> bool:
+            return any(x in identifier for x in ("weekly", "week", "7d", "wk"))
+
+        def _is_5h_rolling(identifier: str) -> bool:
+            return any(x in identifier for x in ("5h", "five_hour", "five_hours", "5_hour", "5-hour", "rolling_5h"))
+
+        bucket_items: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(raw_buckets, dict):
+            bucket_items = [(str(k).strip().lower(), b) for k, b in raw_buckets.items() if isinstance(b, dict)]
+        elif isinstance(raw_buckets, list):
+            bucket_items = [(str(b.get("bucketId", "")).strip().lower(), b) for b in raw_buckets if isinstance(b, dict)]
+
+        if bucket_items:
+            for ident, b in bucket_items:
+                if _is_5h_rolling(ident):
+                    rt = b.get("reset_time") if "reset_time" in b else b.get("resetTime")
+                    rt_val = self._parse_timestamp(rt)
+                    if math.isfinite(rt_val) and rt_val > now:
+                        return min(rt_val, now + max_rolling_window)
+
+            if all(_is_weekly(ident) for ident, _ in bucket_items):
+                return None
+
+            for ident, b in bucket_items:
+                if not _is_weekly(ident):
+                    rt = b.get("reset_time") if "reset_time" in b else b.get("resetTime")
+                    rt_val = self._parse_timestamp(rt)
+                    if math.isfinite(rt_val) and rt_val > now and (rt_val - now) <= max_daily_window:
+                        return min(rt_val, now + max_rolling_window)
+
+            if any(_is_weekly(ident) for ident, _ in bucket_items):
+                return None
+
+        top_rt = target_dict.get("reset_time") if "reset_time" in target_dict else target_dict.get("resetTime")
+        if top_rt is not None:
+            rt_val = self._parse_timestamp(top_rt)
+            if math.isfinite(rt_val) and rt_val > now and (rt_val - now) <= max_daily_window:
+                return min(rt_val, now + max_rolling_window)
+
+        return None
+
     def get_reset_time_from_cache(self, account_name: str, model_hint: str | None = None) -> float | None:
         """
         Helper to read quota reset_time for account_name from last_known_quota.json if present.
@@ -409,6 +459,7 @@ class CooldownManager:
             returns None (strictly preventing cross-model leakage per ADR 0001).
         If model_hint is None:
             Checks ("gemini", "claude") and returns the earliest future reset time.
+        Eliminates weekly reset timestamp inheritance, clamping strictly to 5h rolling bucket (ADR 0016).
         """
         if not isinstance(self.cache_dir, (str, Path, os.PathLike)):
             return None
@@ -429,27 +480,20 @@ class CooldownManager:
         now = time.time()
         has_nested_models = any(isinstance(acc_data.get(k), dict) for k in ("gemini", "claude"))
         if not has_nested_models:
-            # Flat cache schema support: e.g. {"quota": 0, "reset_time": 1791201600}
-            if "reset_time" in acc_data:
-                rt_val = self._parse_timestamp(acc_data["reset_time"])
-                if math.isfinite(rt_val) and rt_val > now:
-                    return rt_val
-            return None
+            return self._extract_5h_rolling_reset(acc_data, now)
         if model_hint:
             model_key = model_hint.lower()
             m_data = acc_data.get(model_key)
-            if isinstance(m_data, dict) and "reset_time" in m_data:
-                rt_val = self._parse_timestamp(m_data["reset_time"])
-                if math.isfinite(rt_val) and rt_val > now:
-                    return rt_val
+            if isinstance(m_data, dict):
+                return self._extract_5h_rolling_reset(m_data, now)
             # STRICT CONTRACT: If model_hint is specified, NEVER cross-contaminate with other models
             return None
         candidates: list[float] = []
         for m_key in ("gemini", "claude"):
             m_data = acc_data.get(m_key)
-            if isinstance(m_data, dict) and "reset_time" in m_data:
-                rt_val = self._parse_timestamp(m_data["reset_time"])
-                if math.isfinite(rt_val) and rt_val > now:
+            if isinstance(m_data, dict):
+                rt_val = self._extract_5h_rolling_reset(m_data, now)
+                if rt_val is not None:
                     candidates.append(rt_val)
         if candidates:
             return min(candidates)
@@ -465,6 +509,7 @@ class LogWatcher:
         cooldown_minutes: int = 60,
         presence_detector: PresenceDetector | None = None,
         max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
+        supervisor: ProcessSupervisor | None = None,
     ):
         self.engine = engine
         if damping_seconds is None:
@@ -492,6 +537,23 @@ class LogWatcher:
             self.cooldown_manager = CooldownManager(cache_dir=cache_dir, default_cooldown_seconds=cooldown_minutes * 60)
         self.cooldown_file = getattr(self.cooldown_manager, "cooldown_file", getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json")
         self.exhaustion_regex = _EXHAUSTION_REGEX
+        if supervisor is not None:
+            self.supervisor = supervisor
+        elif hasattr(self.engine, "supervisor") and self.engine.supervisor is not None:
+            self.supervisor = self.engine.supervisor
+        else:
+            self.supervisor = ProcessSupervisor(
+                gemini_dir=getattr(self.engine, "gemini_dir", None),
+                proc_dir=getattr(self.presence_detector, "proc_dir", None),
+            )
+        self._last_transcript_record: dict[str, Any] | None = None
+        try:
+            sid = self.presence_detector.get_active_session_id()
+            if sid:
+                self.active_session_id = sid
+                self.active_transcript_path = self.presence_detector.get_active_transcript_path(session_id=sid)
+        except Exception:
+            pass
 
     def is_exhausted_message(self, line: str) -> bool:
         if not line or not isinstance(line, str):
@@ -547,6 +609,9 @@ class LogWatcher:
             return False
         if not isinstance(data, dict):
             return False
+        data_dict = cast(dict[str, Any], data)
+        if is_jsonl:
+            self._last_transcript_record = data_dict
         status: object = data.get("status")
         msg_type: object = data.get("type")
         norm_status = status.strip().upper() if isinstance(status, str) else ""
@@ -599,8 +664,59 @@ class LogWatcher:
     def is_in_cooldown(self, account_name: str) -> bool:
         return self.cooldown_manager.is_in_cooldown(account_name)
 
-    def set_cooldown(self, account_name: str, reset_time: float | None = None, reason: str = "RESOURCE_EXHAUSTED") -> dict[str, object]:
-        return self.cooldown_manager.set_cooldown(account_name, reset_time=reset_time, reason=reason)
+    def set_cooldown(
+        self,
+        account_name: str,
+        reset_time: float | int | str | None = None,
+        reason: str = "RESOURCE_EXHAUSTED",
+        model_hint: str | None = None,
+    ) -> dict[str, object]:
+        """Sets cooldown for an account, clamping duration strictly to 5h rolling bucket or 30m fallback.
+        Explicitly rejects multi-day weekly reset timestamps (ADR 0016).
+        """
+        now = time.time()
+        max_cd, fallback_cd, max_daily = 18000.0, 1800.0, 86400.0
+
+        def _get_cached() -> float:
+            try:
+                crt = self.cooldown_manager.get_reset_time_from_cache(account_name, model_hint=model_hint)
+            except Exception:
+                crt = None
+            return min(crt, now + max_cd) if (crt and crt > now) else (now + fallback_cd)
+
+        if reset_time is not None and not isinstance(reset_time, bool):
+            parsed_rt = self.cooldown_manager._parse_timestamp(reset_time)
+            if math.isfinite(parsed_rt) and parsed_rt > now:
+                is_weekly = "weekly" in str(reason).lower() or (parsed_rt - now) > max_daily
+                effective_reset = _get_cached() if is_weekly else min(parsed_rt, now + max_cd)
+            else:
+                effective_reset = now + fallback_cd
+        else:
+            effective_reset = _get_cached()
+
+        return self.cooldown_manager.set_cooldown(
+            account_name, reset_time=effective_reset, reason=reason
+        )
+
+    def _is_account_cooldown_penalized(
+        self,
+        acc_name: str,
+        cooldowns: dict[str, Any],
+        accounts_cache: dict[str, Any] | None = None,
+    ) -> bool:
+        """Determines if an account in cooldown is penalized or granted immunity.
+        Prunes rigid in-memory filtering as foundation for Telemetry-Aware Cooldown Immunity (ADR 0016).
+        """
+        if not isinstance(cooldowns, dict) or not acc_name:
+            return False
+        if acc_name not in cooldowns:
+            return False
+        rec = cooldowns.get(acc_name)
+        if isinstance(rec, dict):
+            cd_until = rec.get("cooldown_until")
+            if isinstance(cd_until, (int, float)) and cd_until <= time.time():
+                return False
+        return True
 
     def _notify_desktop(
         self,
@@ -860,7 +976,7 @@ class LogWatcher:
             acc_name = acc.get("name") if isinstance(acc, dict) else None
             if not acc_name or acc_name == active_name:
                 continue
-            if acc_name in cooldowns:
+            if self._is_account_cooldown_penalized(acc_name, cooldowns, accounts_cache):
                 continue
             if acc.get("valid"):
                 valid_accounts.append(acc)
@@ -955,6 +1071,259 @@ class LogWatcher:
     def scan_new_files(self) -> list[str]:
         return self.scan_active_targets()
 
+    def _get_latest_transcript_record(
+        self, transcript_path: str | Path | None = None
+    ) -> dict[str, Any] | None:
+        """Reads and parses the latest JSON record from the active transcript file."""
+        target_path: Path | None = None
+        if transcript_path is not None:
+            target_path = Path(transcript_path)
+            if not target_path.is_file():
+                return None
+        else:
+            if self.active_transcript_path and self.active_transcript_path.is_file():
+                target_path = self.active_transcript_path
+            elif hasattr(self, "presence_detector") and self.presence_detector is not None:
+                p = self.presence_detector.get_active_transcript_path(
+                    session_id=self.active_session_id
+                )
+                if p and p.is_file():
+                    target_path = p
+                else:
+                    newest_mtime = -1.0
+                    for b_dir in (
+                        getattr(self.presence_detector, "brain_dir", None),
+                        getattr(self.presence_detector, "cli_brain_dir", None),
+                    ):
+                        if not b_dir or not b_dir.is_dir():
+                            continue
+                        try:
+                            for s_dir in b_dir.iterdir():
+                                t_file = s_dir / ".system_generated" / "logs" / "transcript.jsonl"
+                                if t_file.is_file() and (m := t_file.stat().st_mtime) > newest_mtime:
+                                    newest_mtime, target_path = m, t_file
+                        except OSError:
+                            pass
+
+        if not target_path or not target_path.is_file():
+            return None
+
+        try:
+            size = target_path.stat().st_size
+            if size == 0:
+                return None
+
+            # Bounded expanding backward window to accommodate large prompts/responses (>64KB)
+            max_read = 4 * 1024 * 1024
+            chunk_size = min(size, 65536)
+
+            with open(target_path, "rb") as f:
+                while True:
+                    f.seek(max(0, size - chunk_size))
+                    data = f.read(min(chunk_size, size))
+                    lines = data.splitlines()
+
+                    last_line_str: str | None = None
+                    for line in reversed(lines):
+                        s = line.strip().decode("utf-8", errors="replace")
+                        if s:
+                            last_line_str = s
+                            break
+
+                    if not last_line_str:
+                        return None
+
+                    if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
+                        chunk_size = min(size, chunk_size * 4, max_read)
+                        continue
+
+                    if not last_line_str.startswith("{"):
+                        return None
+
+                    try:
+                        parsed = json.loads(last_line_str)
+                        if isinstance(parsed, dict):
+                            return cast(dict[str, Any], parsed)
+                        return None
+                    except json.JSONDecodeError:
+                        if chunk_size < size and chunk_size < max_read:
+                            chunk_size = min(size, chunk_size * 4, max_read)
+                            continue
+                        return None
+        except OSError:
+            return None
+
+    def _is_server_busy(self) -> bool:
+        """Checks if language_server has active presence locks or busy child tasks."""
+        if getattr(self, "supervisor", None) is not None:
+            try:
+                pid = getattr(self.supervisor, "locate_language_server_pid", lambda: None)()
+                return bool(self.supervisor.is_server_busy(pid if isinstance(pid, int) else None))
+            except Exception:
+                pass
+        if hasattr(self.engine, "is_server_busy"):
+            try:
+                return bool(self.engine.is_server_busy())
+            except TypeError:
+                return bool(self.engine.is_server_busy(None))
+            except Exception:
+                pass
+        return False
+
+    def _is_turn_quiescent(self, transcript_path: str | Path | None = None) -> bool:
+        """Determines if the system is at a verified Safe Turn Boundary.
+
+        Dual inspection:
+        1. Verifies that the active session transcript records a completed turn event
+           (status == "DONE" or type == "USER_INPUT" indicating the assistant has
+           concluded its turn and is waiting for user input).
+        2. Confirms via ProcessSupervisor.is_server_busy() that the Language Server
+           process has no active locks or busy child tasks.
+        Returns False when either condition fails.
+        """
+        if getattr(self, "supervisor", None) is None and not hasattr(self.engine, "is_server_busy"):
+            return False
+
+        record = self._get_latest_transcript_record(transcript_path)
+        if not record:
+            return False
+
+        status = str(record.get("status", "")).strip().upper()
+        msg_type = str(record.get("type", "")).strip().upper()
+
+        if status in ("IN_PROGRESS", "RUNNING", "STREAMING"):
+            return False
+
+        if bool(record.get("tool_calls")):
+            return False
+
+        if status != "DONE" and msg_type != "USER_INPUT":
+            return False
+
+        if self._is_server_busy():
+            return False
+
+        return True
+
+    def _evaluate_proactive_rotation(self) -> bool:
+        """Evaluates proactive rotation eligibility at a Safe Turn Boundary."""
+        threshold = 0.20
+        if hasattr(self.engine, "get_quota_threshold"):
+            try:
+                t_val = self.engine.get_quota_threshold()
+                if isinstance(t_val, (int, float)):
+                    threshold = float(t_val)
+            except Exception:
+                threshold = 0.20
+        elif hasattr(self.engine, "quota_threshold"):
+            try:
+                threshold = float(self.engine.quota_threshold)
+            except Exception:
+                threshold = 0.20
+        else:
+            return False
+
+        if not self._is_turn_quiescent():
+            return False
+
+        cache_data: dict[str, Any] = {}
+        client = None
+        try:
+            client = _get_quota_client_class()(self.engine)
+            loaded = client.load_cache()
+            if isinstance(loaded, dict):
+                cache_data = loaded
+        except Exception:
+            pass
+        if not cache_data:
+            cache_file = getattr(self.engine, "cache_dir", None)
+            if cache_file:
+                q_path = Path(cache_file) / "last_known_quota.json"
+                if q_path.is_file():
+                    try:
+                        raw_data = json.loads(q_path.read_text(encoding="utf-8"))
+                        if isinstance(raw_data, dict):
+                            cache_data = raw_data
+                    except Exception:
+                        pass
+        if not cache_data:
+            return False
+
+        now = time.time()
+        if self.last_switch_time > 0:
+            elapsed = now - self.last_switch_time
+            if 0 <= elapsed < self.damping_seconds:
+                return False
+            elif elapsed < 0:
+                self.last_switch_time = 0.0
+
+        get_active_fn = getattr(self.engine, "get_active_name", None)
+        if not callable(get_active_fn):
+            return False
+        active_name = get_active_fn()
+        if not active_name or not isinstance(active_name, str):
+            return False
+
+        accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
+        active_quota_fraction = self._probe_active_quota(
+            active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini"
+        )
+        if active_quota_fraction is None:
+            return False
+
+        if active_quota_fraction > threshold:
+            return False
+
+        accounts_data: dict[str, Any] = getattr(self.engine, "list_accounts", lambda: {})()
+        accounts_list = accounts_data.get("accounts") or []
+        cooldowns = self.get_cooldowns() if hasattr(self, "get_cooldowns") else {}
+
+        best_standby = None
+        best_quota = -1.0
+        for acc in accounts_list:
+            acc_name = acc.get("name") if isinstance(acc, dict) else None
+            if not acc_name or acc_name == active_name:
+                continue
+            if self._is_account_cooldown_penalized(acc_name, cooldowns, accounts_cache if isinstance(accounts_cache, dict) else None):
+                continue
+            if not acc.get("valid", True):
+                continue
+            acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
+            q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name="gemini")
+            if q_frac is not None and q_frac >= 0.70:
+                if q_frac > best_quota:
+                    best_quota = q_frac
+                    best_standby = acc_name
+
+        if not best_standby:
+            return False
+
+        print(
+            f"[watch] Proactive threshold failover: Active account '{active_name}' quota "
+            f"({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. "
+            f"Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).",
+            file=sys.stderr,
+        )
+        try:
+            res = self.engine.switch_tokens(best_standby, restart_server=True, force=True)
+            if not res or (isinstance(res, dict) and (res.get("success") is False or (res.get("error") and not res.get("active")))):
+                err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
+                print(f"[watch] Failed to proactively switch accounts to '{best_standby}': {err_msg}", file=sys.stderr)
+                return False
+            self.last_switch_time = time.time()
+            print(f"[watch] Successfully proactively switched to '{best_standby}'.", file=sys.stderr)
+            for target_file in list(self.file_cursors.keys()):
+                try:
+                    if os.path.isfile(target_file):
+                        self.file_cursors[target_file] = os.path.getsize(target_file)
+                except OSError:
+                    pass
+            self._stagnant_sizes.clear()
+            return True
+        except Exception as e:
+            print(f"[watch] Error during proactive account rotation: {e}", file=sys.stderr)
+            return False
+
     def poll_once(self) -> int:
         """
         Polls active targets once for new lines and processes them.
@@ -1032,6 +1401,8 @@ class LogWatcher:
                         self._stagnant_sizes.pop(target, None)
                 except OSError:
                     continue
+        if switches_triggered == 0 and self._evaluate_proactive_rotation():
+            switches_triggered += 1
         return switches_triggered
 
     def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None) -> None:

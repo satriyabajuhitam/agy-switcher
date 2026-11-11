@@ -11,8 +11,10 @@ import time
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
 from scripts.watch import LogWatcher, PresenceDetector
+from agy_switcher.supervisor import ProcessSupervisor
 
 class TestLogWatcher(unittest.TestCase):
     def setUp(self):
@@ -1663,6 +1665,368 @@ class TestPresenceDetectorWatchTargets(unittest.TestCase):
 
         str_targets = self.detector.get_watch_targets(as_str=True)
         self.assertEqual(str_targets, [])
+
+
+class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
+    """Tests for Safe Turn Boundary detection and server quiescence engine.
+
+    Covers:
+    - [WATCH-PROACTIVE-005]: Safe Turn Boundary verification via transcript record and process supervisor.
+    - [WATCH-PROACTIVE-002]: Proactive rotation deferred while language server is busy or turn in-flight.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_session(self, session_id: str = "session-quiescent-001") -> Path:
+        """Helper creating presence lock and transcript directory structure."""
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / f"{session_id}.lock"
+        lock_file.touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        return transcript_path
+
+    def test_safe_turn_boundary_quiescent_user_input_and_server_idle(self):
+        """[WATCH-PROACTIVE-005]: GIVEN an active transcript tailing loop where the latest record
+        has type == 'USER_INPUT' AND no open presence locks or active child processes exist in /proc
+        for language_server,
+        WHEN LogWatcher._is_turn_quiescent() or ProcessSupervisor.is_server_busy() is evaluated,
+        THEN it confirms that the agent turn has completed and the system is waiting for user input
+        AND certifies the state as a verified Safe Turn Boundary.
+        """
+        transcript_path = self._setup_session("session-005")
+        records = [
+            {"type": "MESSAGE", "status": "DONE", "content": "Initial assistant response."},
+            {"type": "USER_INPUT", "content": "Next user instruction for the agent."},
+        ]
+        transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Confirm ProcessSupervisor sees no open presence locks or active child tasks
+        self.assertFalse(self.supervisor.is_server_busy(), "Server must be idle with no active locks or children")
+        # Confirm LogWatcher certifies the state as a verified Safe Turn Boundary
+        self.assertTrue(watcher._is_turn_quiescent(), "Safe Turn Boundary must be certified when latest record is USER_INPUT and server is idle")
+
+    def test_safe_turn_boundary_quiescent_status_done_and_server_idle(self):
+        """[WATCH-PROACTIVE-005]: Verifies status == 'DONE' also certifies Safe Turn Boundary."""
+        transcript_path = self._setup_session("session-done")
+        records = [
+            {"type": "USER_INPUT", "content": "Perform task."},
+            {"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Running..."},
+            {"type": "MESSAGE", "status": "DONE", "content": "Completed task."},
+        ]
+        transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertFalse(self.supervisor.is_server_busy())
+        self.assertTrue(watcher._is_turn_quiescent())
+
+    def test_safe_turn_boundary_not_quiescent_when_turn_in_flight(self):
+        """[WATCH-PROACTIVE-005]: When latest record is streaming (status == 'IN_PROGRESS'),
+        _is_turn_quiescent() returns False.
+        """
+        transcript_path = self._setup_session("session-streaming")
+        records = [
+            {"type": "USER_INPUT", "content": "Generate code."},
+            {"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Writing tokens..."},
+        ]
+        transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertFalse(self.supervisor.is_server_busy())
+        self.assertFalse(watcher._is_turn_quiescent(), "In-flight streaming turn must not be quiescent")
+
+    def test_safe_turn_boundary_not_quiescent_when_server_busy_with_presence_lock(self):
+        """[WATCH-PROACTIVE-005]: When a process holds an open fd to presence lock,
+        is_server_busy() is True and _is_turn_quiescent() returns False.
+        """
+        transcript_path = self._setup_session("session-locked")
+        transcript_path.write_text(json.dumps({"type": "USER_INPUT", "content": "Hello"}) + "\n", encoding="utf-8")
+
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-locked.lock"
+        pid_fd = self.proc_dir / "7777" / "fd"
+        pid_fd.mkdir(parents=True, exist_ok=True)
+        (pid_fd / "3").symlink_to(lock_path)
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertTrue(self.supervisor.is_server_busy(), "Open fd on presence lock marks server busy")
+        self.assertFalse(watcher._is_turn_quiescent(), "Turn must not be quiescent when presence lock is held")
+
+    def test_safe_turn_boundary_not_quiescent_when_server_busy_with_child_process(self):
+        """[WATCH-PROACTIVE-005]: When language_server has active child subtask in /proc,
+        is_server_busy() is True and _is_turn_quiescent() returns False.
+        """
+        transcript_path = self._setup_session("session-child")
+        transcript_path.write_text(json.dumps({"type": "USER_INPUT", "content": "Hello"}) + "\n", encoding="utf-8")
+
+        # Set up language_server at PID 500
+        ls_dir = self.proc_dir / "500"
+        ls_dir.mkdir(parents=True, exist_ok=True)
+        (ls_dir / "cmdline").write_bytes(b"/opt/antigravity/language_server\x00--standalone\x00--port\x008080\x00")
+
+        # Set up active child process at PID 600 with PPID 500 (state 'S' = sleeping/running, not 'Z')
+        child_dir = self.proc_dir / "600"
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / "stat").write_text("600 (active_tool) S 500 0 0 0 0")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertTrue(self.supervisor.is_server_busy(), "Active child task under language_server marks server busy")
+        self.assertFalse(watcher._is_turn_quiescent(), "Turn must not be quiescent when language_server has active child process")
+
+    def test_safe_turn_boundary_not_quiescent_empty_or_missing_transcript(self):
+        """[WATCH-PROACTIVE-005]: Missing or empty transcript returns False for _is_turn_quiescent()."""
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(watcher._is_turn_quiescent(), "No active transcript must return False")
+
+        # Empty transcript file
+        transcript_path = self._setup_session("session-empty")
+        transcript_path.write_text("", encoding="utf-8")
+        self.assertFalse(watcher._is_turn_quiescent(), "Empty transcript file must return False")
+
+    def test_safe_turn_boundary_not_quiescent_corrupt_or_partial_line(self):
+        """[WATCH-PROACTIVE-005]: Trailing unclosed JSON (streaming in flight) returns False."""
+        transcript_path = self._setup_session("session-partial")
+        # Line 1 completed, Line 2 is actively being streamed/written
+        transcript_path.write_text(
+            '{"type": "USER_INPUT", "content": "Prompt"}\n{"type": "MESSAGE", "status": "IN_PRO',
+            encoding="utf-8",
+        )
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(watcher._is_turn_quiescent(), "Incomplete trailing record must not be quiescent")
+
+    def test_safe_turn_boundary_quiescent_large_record_over_64kb(self):
+        """[WATCH-PROACTIVE-005]: Expanding backward window accommodates large prompts/responses (>64KB)."""
+        transcript_path = self._setup_session("session-large")
+        large_content = "X" * 75000
+        records = [
+            {"type": "MESSAGE", "status": "DONE", "content": "Short intro"},
+            {"type": "USER_INPUT", "content": large_content},
+        ]
+        transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(self.supervisor.is_server_busy())
+        self.assertTrue(watcher._is_turn_quiescent(), "Large record (>64KB) must be parsed without truncation")
+
+    def test_safe_turn_boundary_not_quiescent_explicit_nonexistent_transcript_path(self):
+        """[WATCH-PROACTIVE-005]: Explicit nonexistent path returns False without falling back to host brain_dir."""
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        nonexistent = Path(self.tmpdir) / "nonexistent" / "transcript.jsonl"
+        self.assertFalse(
+            watcher._is_turn_quiescent(transcript_path=nonexistent),
+            "Nonexistent explicit transcript path must immediately return False",
+        )
+
+    def test_safe_turn_boundary_not_quiescent_when_tool_calls_present(self):
+        """[WATCH-PROACTIVE-005]: Step with status DONE but pending tool_calls is not quiescent."""
+        transcript_path = self._setup_session("session-tool-calls")
+        record = {
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls"}}],
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(
+            watcher._is_turn_quiescent(),
+            "Turn awaiting tool call execution must not be quiescent",
+        )
+
+    def test_safe_turn_boundary_not_quiescent_when_status_in_progress_with_user_input(self):
+        """[WATCH-PROACTIVE-005]: IN_PROGRESS status is never quiescent even if type is USER_INPUT."""
+        transcript_path = self._setup_session("session-inprogress-user")
+        record = {
+            "type": "USER_INPUT",
+            "status": "IN_PROGRESS",
+            "content": "Streaming user input",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(watcher._is_turn_quiescent(), "IN_PROGRESS state must always return False")
+
+    def test_safe_turn_boundary_proc_reading_graceful_on_permission_error(self):
+        """[WATCH-PROACTIVE-005]: PermissionError during /proc traversal degrades gracefully to idle."""
+        transcript_path = self._setup_session("session-perm-err")
+        transcript_path.write_text(json.dumps({"type": "USER_INPUT", "content": "Hello"}) + "\n", encoding="utf-8")
+
+        mock_proc_dir = MagicMock(spec=Path)
+        mock_proc_dir.is_dir.return_value = True
+        mock_proc_dir.iterdir.side_effect = PermissionError("Access denied to /proc")
+
+        restricted_supervisor = ProcessSupervisor(
+            gemini_dir=self.gemini_dir,
+            proc_dir=mock_proc_dir,
+        )
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=restricted_supervisor,
+            log_dirs=[],
+        )
+        # Should not raise PermissionError; should handle gracefully
+        self.assertFalse(restricted_supervisor.is_server_busy())
+        self.assertTrue(watcher._is_turn_quiescent())
+
+    def test_proactive_rotation_deferred_while_server_busy_or_turn_not_quiescent(self):
+        """[WATCH-PROACTIVE-002]: GIVEN active account 'primary-acc' has depleted quota at 14% (<= 20%)
+        AND standby account 'standby-acc' has healthy quota at 90%
+        AND the language server is currently executing an agentic turn or ProcessSupervisor.is_server_busy() returns True,
+        WHEN LogWatcher.poll_once() evaluates proactive rotation eligibility,
+        THEN it detects that the system is not at a Safe Turn Boundary
+        AND defers credential rotation without restarting language_server or modifying active tokens
+        AND returns False until the turn concludes and the server becomes quiescent.
+        """
+        transcript_path = self._setup_session("session-proactive-002")
+        # Initially, the turn is in-flight (status == 'IN_PROGRESS')
+        transcript_path.write_text(
+            json.dumps({"type": "USER_INPUT", "content": "Do heavy computation."}) + "\n"
+            + json.dumps({"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Processing..."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-acc", "valid": True},
+            ]
+        }
+        self.engine_mock.switch_tokens.return_value = True
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Case A: Turn is in-flight in transcript, server idle
+        res_inflight = watcher.poll_once()
+        self.assertFalse(res_inflight, "poll_once() must return 0/False while turn is in-flight")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+        # Case B: Turn transcript reports DONE, but language_server is busy (e.g. presence lock held)
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Finished step 1."}) + "\n",
+            encoding="utf-8",
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-proactive-002.lock"
+        pid_fd = self.proc_dir / "8888" / "fd"
+        pid_fd.mkdir(parents=True, exist_ok=True)
+        (pid_fd / "4").symlink_to(lock_path)
+
+        self.assertTrue(self.supervisor.is_server_busy())
+        res_busy = watcher.poll_once()
+        self.assertFalse(res_busy, "poll_once() must return 0/False while server is busy")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+        # Clean up lock fd so server becomes quiescent
+        (pid_fd / "4").unlink()
+        self.assertFalse(self.supervisor.is_server_busy())
+
+        # Case C: Both conditions met (turn completed with USER_INPUT or DONE AND server quiescent)
+        # Safe Turn Boundary is reached -> rotation proceeds!
+        res_quiescent = watcher.poll_once()
+        self.assertTrue(res_quiescent, "poll_once() must trigger rotation once Safe Turn Boundary is reached")
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
 
 
 if __name__ == '__main__':

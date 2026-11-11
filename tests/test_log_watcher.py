@@ -1267,6 +1267,196 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
             stderr_buf.getvalue(),
         )
 
+    def test_cooldown_clamp_001_strictly_clamps_to_5h_rolling_bucket(self):
+        """[COOLDOWN-CLAMP-001]: On HTTP 429, clamps cooldown strictly to 5h rolling bucket reset timestamp."""
+        now = 1700000000.0
+        rolling_5h_reset = now + 7200.0  # 2 hours in future
+        weekly_reset = now + 432000.0    # 5 days in future
+        quota_data = {
+            "accounts": {
+                "primary-acc": {
+                    "gemini": {
+                        "quota": 0,
+                        "reset_time": weekly_reset,
+                        "buckets": {
+                            "5h": {"quota": 0, "reset_time": rolling_5h_reset},
+                            "weekly": {"quota": 0, "reset_time": weekly_reset},
+                        },
+                    }
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # Check get_reset_time_from_cache prioritizes 5h rolling bucket
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertEqual(cache_reset, rolling_5h_reset)
+
+            # Check set_cooldown clamps to 5h rolling bucket
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record["cooldown_until"], rolling_5h_reset)
+
+            # Verify persisted record in cooldown.json
+            on_disk = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("primary-acc", on_disk)
+            self.assertEqual(on_disk["primary-acc"]["cooldown_until"], rolling_5h_reset)
+
+    def test_cooldown_clamp_003_rejects_weekly_reset_and_caps_at_5h_or_fallback(self):
+        """[COOLDOWN-CLAMP-003]: Rejects multi-day weekly reset and caps duration at 5 hours or 30-min fallback."""
+        now = 1700000000.0
+        weekly_reset = now + 518400.0  # 6 days in future
+        quota_data = {
+            "accounts": {
+                "primary-acc": {
+                    "gemini": {
+                        "quota": 0,
+                        "reset_time": weekly_reset,
+                        "buckets": {
+                            "weekly": {"quota": 0, "reset_time": weekly_reset},
+                        },
+                    }
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # Weekly reset in cache must be rejected as candidate
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertIsNone(cache_reset)
+
+            # When set_cooldown is invoked, it rejects the weekly reset and caps at <= 18000 (30m fallback)
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertNotEqual(record["cooldown_until"], weekly_reset)
+            self.assertLessEqual(record["cooldown_until"] - now, 18000.0)
+            self.assertEqual(record["cooldown_until"], now + 1800.0)
+
+            # Verify persisted record in cooldown.json
+            on_disk = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("primary-acc", on_disk)
+            self.assertNotEqual(on_disk["primary-acc"]["cooldown_until"], weekly_reset)
+            self.assertLessEqual(on_disk["primary-acc"]["cooldown_until"] - now, 18000.0)
+
+            # Even if weekly reset is passed directly as argument, it must be rejected and capped
+            record_direct = self.watcher.set_cooldown("primary-acc", reset_time=weekly_reset)
+            self.assertNotEqual(record_direct["cooldown_until"], weekly_reset)
+            self.assertLessEqual(record_direct["cooldown_until"] - now, 18000.0)
+
+    def test_cooldown_clamp_clock_skew_5h_bucket_clamped_to_5h_ceiling(self):
+        """Probes edge case: 5h rolling bucket with duration exceeding 18000s (e.g. 18050s clock skew) is clamped to 5h ceiling."""
+        now = 1700000000.0
+        rolling_5h_skew = now + 18050.0  # 5 hours and 50 seconds in future
+        quota_data = {
+            "accounts": {
+                "primary-acc": {
+                    "gemini": {
+                        "quota": 0,
+                        "buckets": {
+                            "5h": {"quota": 0, "reset_time": rolling_5h_skew},
+                        },
+                    }
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # Cache extraction clamps to 18000s ceiling
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertEqual(cache_reset, now + 18000.0)
+
+            # set_cooldown clamps to exactly now + 18000.0 (5h) instead of dropping to 30m
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record["cooldown_until"], now + 18000.0)
+
+    def test_cooldown_clamp_non_weekly_bucket_exceeding_5h_clamped_to_5h_ceiling(self):
+        """Probes edge case: non-weekly bucket or direct reset_time of 6h (21600s) is clamped to 5h ceiling."""
+        now = 1700000000.0
+        six_hours_future = now + 21600.0  # 6 hours in future (non-weekly)
+
+        with patch("time.time", return_value=now):
+            # Direct reset_time of 6 hours must be clamped to 5h ceiling
+            record_direct = self.watcher.set_cooldown("primary-acc", reset_time=six_hours_future)
+            self.assertEqual(record_direct["cooldown_until"], now + 18000.0)
+
+            # In cache, a non-weekly bucket with duration > 18000s is clamped to 18000s
+            quota_data = {
+                "accounts": {
+                    "primary-acc": {
+                        "gemini": {
+                            "quota": 0,
+                            "buckets": [
+                                {"bucketId": "custom_window", "resetTime": six_hours_future}
+                            ],
+                        }
+                    }
+                }
+            }
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertEqual(cache_reset, now + 18000.0)
+
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record["cooldown_until"], now + 18000.0)
+
+    def test_cooldown_clamp_empty_none_or_malformed_buckets_graceful_handling(self):
+        """Probes edge case: buckets is None, empty list, or contains non-dict items."""
+        now = 1700000000.0
+
+        with patch("time.time", return_value=now):
+            # Case 1: buckets is None, flat schema with resetTime (camelCase)
+            q1 = {"accounts": {"primary-acc": {"gemini": {"quota": 0, "buckets": None, "resetTime": now + 7200.0}}}}
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(q1), encoding="utf-8")
+            self.assertEqual(self.cooldown_mgr.get_reset_time_from_cache("primary-acc", "gemini"), now + 7200.0)
+
+            # Case 2: buckets is empty list, no reset_time -> falls back to 30m
+            q2 = {"accounts": {"primary-acc": {"gemini": {"quota": 0, "buckets": []}}}}
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(q2), encoding="utf-8")
+            self.assertIsNone(self.cooldown_mgr.get_reset_time_from_cache("primary-acc", "gemini"))
+            rec2 = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(rec2["cooldown_until"], now + 1800.0)
+
+            # Case 3: buckets has invalid/corrupted elements [None, 123, "string"]
+            q3 = {"accounts": {"primary-acc": {"gemini": {"quota": 0, "buckets": [None, 123, "string"]}}}}
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(q3), encoding="utf-8")
+            self.assertIsNone(self.cooldown_mgr.get_reset_time_from_cache("primary-acc", "gemini"))
+
+    def test_cooldown_clamp_malformed_past_or_negative_delta_reset_time(self):
+        """Probes edge case: malformed, past, or negative-delta reset_time safely defaults to 30m fallback."""
+        now = 1700000000.0
+
+        with patch("time.time", return_value=now):
+            # Past timestamp
+            rec_past = self.watcher.set_cooldown("primary-acc", reset_time=now - 100.0)
+            self.assertEqual(rec_past["cooldown_until"], now + 1800.0)
+
+            # Exactly now
+            rec_now = self.watcher.set_cooldown("primary-acc", reset_time=now)
+            self.assertEqual(rec_now["cooldown_until"], now + 1800.0)
+
+            # Malformed string
+            rec_malformed = self.watcher.set_cooldown("primary-acc", reset_time="not-a-timestamp")
+            self.assertEqual(rec_malformed["cooldown_until"], now + 1800.0)
+
+            # Negative float
+            rec_neg = self.watcher.set_cooldown("primary-acc", reset_time=-500.0)
+            self.assertEqual(rec_neg["cooldown_until"], now + 1800.0)
+
+    def test_is_account_cooldown_penalized_clean_robustness(self):
+        """Probes _is_account_cooldown_penalized handles None/non-dict and expired cooldown records cleanly."""
+        now = 1700000000.0
+        with patch("time.time", return_value=now):
+            # Non-dict cooldowns
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("acc1", None))  # type: ignore[arg-type]
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("", {"acc1": {}}))
+
+            # Active cooldown
+            self.assertTrue(self.watcher._is_account_cooldown_penalized("acc1", {"acc1": {"cooldown_until": now + 600.0}}))
+
+            # Expired cooldown record
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("acc1", {"acc1": {"cooldown_until": now - 10.0}}))
+
 
 class _StubSwitchEngine:
     """External engine stub for testing LogWatcher at its public seam without internal mocking."""
