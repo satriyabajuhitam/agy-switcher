@@ -716,6 +716,12 @@ class LogWatcher:
         if isinstance(acc_quota, (int, float)) and not isinstance(acc_quota, bool):
             val = float(acc_quota)
             return val / 100.0 if val > 1.0 else max(0.0, val)
+        if isinstance(acc_quota, str):
+            try:
+                s_val = float(acc_quota.strip().rstrip("%"))
+                return s_val / 100.0 if s_val > 1.0 else max(0.0, s_val)
+            except ValueError:
+                pass
         if not isinstance(acc_quota, Mapping):
             return None
         # 1. Try RotationEngine.get_quota_status
@@ -737,6 +743,12 @@ class LogWatcher:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 val = float(v)
                 return val / 100.0 if val > 1.0 else max(0.0, val)
+            if isinstance(v, str):
+                try:
+                    s_val = float(v.strip().rstrip("%"))
+                    return s_val / 100.0 if s_val > 1.0 else max(0.0, s_val)
+                except ValueError:
+                    pass
         return None
 
     def trigger_switch(
@@ -766,9 +778,13 @@ class LogWatcher:
             print("[watch] No active account found. Cannot switch.", file=sys.stderr)
             return False
         # Read cache to get quotas first
-        client_cls = _get_quota_client_class()
-        client = client_cls(self.engine)
-        cache_data = client.load_cache()
+        cache_data: dict[str, Any] = {}
+        try:
+            client_cls = _get_quota_client_class()
+            client = client_cls(self.engine)
+            cache_data = client.load_cache()
+        except Exception as e:
+            logger.debug("[watch] Pre-Switch Quota Probe cache load failure: %s", e)
         accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
         # Dynamically infer model family FIRST
         resolved_model = model_hint or self.infer_target_model(line=line, active_account=active_name, cache=accounts_cache)

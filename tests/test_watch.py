@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -916,6 +917,70 @@ class TestLogWatcher(unittest.TestCase):
         self.assertTrue(res_depleted)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
         self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # --- Adversarial Edge Cases ---
+        # 1. Exact boundary at 0.25 (<= 0.25 is not healthy, authorizes rotation)
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 0.0
+        self.engine_mock.switch_tokens.reset_mock()
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.25}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        res_boundary = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertTrue(res_boundary)
+        self.assertIn("primary-acc", self.watcher.get_cooldowns())
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # 2. Healthy boundary just above threshold (0.26 > 0.25 suppresses rotation)
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 0.0
+        self.engine_mock.switch_tokens.reset_mock()
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.26}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        res_above = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertFalse(res_above)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
+
+        # 3. Missing active quota in cache falls back safely to rotation when standby available
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = 0.0
+        self.engine_mock.switch_tokens.reset_mock()
+        cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "standby-acc": {"gemini": {"quota": 90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        res_missing = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertTrue(res_missing)
+        self.assertIn("primary-acc", self.watcher.get_cooldowns())
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # 4. Active damping window suppresses rotation prior to quota probe
+        self.watcher.cooldown_manager.clear_cooldown()
+        self.watcher.last_switch_time = time.time() - 5.0
+        self.watcher.damping_seconds = 15.0
+        self.engine_mock.switch_tokens.reset_mock()
+        res_damped = self.watcher.handle_exhaustion(line=exhaustion_line)
+        self.assertFalse(res_damped)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
 
 
 
