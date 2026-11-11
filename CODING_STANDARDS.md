@@ -26,7 +26,7 @@
 - **Zero Unchecked `Any`**: Unchecked `Any` is strictly banned on public API signatures and models (`[ERR-POLY-RULE-03]`). Use explicit domain models, typed tuples, or `object` with runtime type narrowing.
 - **Verification Gate**: Any new public function or model must pass `mypy --strict` before review:
   ```bash
-  PYTHONPATH=scripts python3 -m mypy scripts/agy_switcher/api.py scripts/agy_switcher/models.py scripts/agy_switcher/formatters.py
+  PYTHONPATH=scripts python3 -m mypy scripts/agy_switcher/api.py scripts/agy_switcher/models.py scripts/agy_switcher/formatters.py scripts/agy_switcher/watcher.py
   ```
 
 ---

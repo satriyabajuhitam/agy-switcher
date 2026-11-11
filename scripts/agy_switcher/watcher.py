@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, TypeVar, cast
 import urllib.error
 import urllib.request
 
@@ -109,12 +109,14 @@ from agy_switcher.presence import (
     append_secure_log_entry,
 )
 
-def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> Any:
+_T = TypeVar("_T")
+
+def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], _T]) -> _T:
     """Resolves symbol from sys.modules if mocked/present; falls back to sub-package default."""
     for mod_name in ("agy_switcher.watcher", "scripts.watch", "watch", "agy_switch", "scripts.agy_switch"):
         mod = sys.modules.get(mod_name)
         if mod and getattr(mod, symbol_name, None) is not None:
-            return getattr(mod, symbol_name)
+            return cast(_T, getattr(mod, symbol_name))
     return fallback_factory()
 
 def _get_rotation_engine_class() -> Any:
@@ -127,7 +129,7 @@ def _get_fetch_account_quota() -> Callable[..., tuple[str, Mapping[str, object] 
     return _resolve_symbol("fetch_account_quota", lambda: _real_fetch_account_quota)
 
 def _get_engine_class() -> Any:
-    def _fallback():
+    def _fallback() -> Any:
         for m in ("agy_switcher.vault", "agy_switch", "scripts.agy_switch"):
             try:
                 return __import__(m, fromlist=["AgySwitchEngine"]).AgySwitchEngine
@@ -187,7 +189,7 @@ class CooldownManager:
         except OSError:
             return False
 
-    def _read_raw(self) -> tuple[dict | None, bool]:
+    def _read_raw(self) -> tuple[dict[str, Any] | None, bool]:
         """
         Reads raw JSON content from cooldown.json.
         Returns:
@@ -214,18 +216,18 @@ class CooldownManager:
         except Exception:
             return None, False
 
-    def _atomic_write(self, records: dict) -> None:
+    def _atomic_write(self, records: dict[str, Any]) -> None:
         """Atomically writes dictionary records to cooldown.json with strictly enforced 0600 mode."""
         payload = json.dumps(records, indent=2).encode("utf-8")
         _write_atomic_file_secure(self.cooldown_file, payload)
 
-    def _parse_and_prune(self, raw_data: dict, now: float) -> tuple[dict[str, dict], bool]:
+    def _parse_and_prune(self, raw_data: dict[str, Any], now: float) -> tuple[dict[str, dict[str, Any]], bool]:
         """
         Normalizes structured records and legacy float records.
         Filters out expired records (cooldown_until <= now).
         Returns (active_records, modified_flag).
         """
-        active_records: dict[str, dict] = {}
+        active_records: dict[str, dict[str, Any]] = {}
         modified = False
         if not isinstance(raw_data, dict):
             return {}, True
@@ -297,7 +299,7 @@ class CooldownManager:
                 modified = True
         return active_records, modified
 
-    def get_cooldowns(self) -> dict[str, dict]:
+    def get_cooldowns(self) -> dict[str, dict[str, Any]]:
         """
         Loads cooldown records from cooldown.json.
         Returns dict: {account_name: {"cooldown_until": float, "exhausted_at": float, "reason": str}}
@@ -342,7 +344,7 @@ class CooldownManager:
         account_name: str,
         reset_time: float | int | str | None = None,
         reason: str = "RESOURCE_EXHAUSTED",
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
         Sets cooldown for an account and atomically writes to cooldown.json with mode 0600.
         Uses reset_time if provided and in the future (reset_time > now);
@@ -496,7 +498,7 @@ class LogWatcher:
             return False
         return bool(self.exhaustion_regex.search(line))
 
-    def infer_target_model(self, line: str = "", active_account: str | None = None, cache: dict | None = None) -> str:
+    def infer_target_model(self, line: str = "", active_account: str | None = None, cache: dict[str, Any] | None = None) -> str:
         line_lower = line.lower() if line else ""
         if "claude" in line_lower or "anthropic" in line_lower:
             return "claude"
@@ -1032,7 +1034,7 @@ class LogWatcher:
                     continue
         return switches_triggered
 
-    def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None):
+    def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None) -> None:
         print("[watch] Daemon started, tailing logs for quota exhaustion...", file=sys.stderr)
         iterations = 0
         while True:
