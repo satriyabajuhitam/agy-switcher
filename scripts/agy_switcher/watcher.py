@@ -840,24 +840,13 @@ class LogWatcher:
             acc["quota"] = accounts_cache.get(acc["name"], {})
         rot_cls = _get_rotation_engine_class()
         rot_engine = rot_cls(model_name=resolved_model, active_account_id=active_name)
-        target_account = rot_engine.evaluate(valid_accounts, current_active=active_name, target_model=resolved_model)
+        target_account = rot_engine.evaluate(
+            valid_accounts, current_active=active_name, target_model=resolved_model, cooldowns=cooldowns
+        )
         valid_names = {acc["name"] for acc in valid_accounts}
         if not target_account or target_account == active_name or target_account not in valid_names:
-            is_mocked = hasattr(rot_engine, "evaluate") and (
-                hasattr(rot_engine.evaluate, "mock_calls") or hasattr(rot_engine.evaluate, "assert_called")
-            )
-            has_verified_quota = False
-            if isinstance(accounts_cache, Mapping):
-                for acc in valid_accounts:
-                    acc_name_val = acc.get("name")
-                    if isinstance(acc_name_val, str) and acc_name_val in accounts_cache and accounts_cache[acc_name_val]:
-                        has_verified_quota = True
-                        break
-            if not is_mocked and not has_verified_quota and valid_accounts:
-                target_account = valid_accounts[0]["name"]
-            else:
-                print("[watch] All other valid accounts are exhausted or in cooldown. Cannot switch.", file=sys.stderr)
-                return False
+            print("[watch] All other valid accounts are exhausted or in cooldown. Cannot switch.", file=sys.stderr)
+            return False
         print(f"[watch] Switching from '{active_name}' to '{target_account}' mid-turn...", file=sys.stderr)
         try:
             res = self.engine.switch_tokens(target_account, restart_server=True, force=True)

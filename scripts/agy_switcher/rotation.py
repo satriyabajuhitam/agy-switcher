@@ -19,6 +19,9 @@ from agy_switcher.telemetry import normalize_model_name
 
 DEFAULT_QUOTA_THRESHOLD: float = 0.25
 _QUOTA_PAYLOAD_KEYS: tuple[str, ...] = ("gemini", "quota", "groups")
+_ALL_TELEMETRY_KEYS: tuple[str, ...] = (
+    "gemini", "claude", "quota", "groups", "fraction", "remainingFraction", "remaining_fraction"
+)
 
 
 def _resolve_model_key(model_name: object, fallback: str = "gemini") -> str:
@@ -283,6 +286,22 @@ class RotationEngine:
 
     _is_cooldown_penalized_for_model = is_cooldown_penalized_for_model
 
+    def _get_unverified_candidate(
+        self,
+        items: Sequence[tuple[str, Mapping[str, object]]],
+        current_active: str | None,
+        cooldowns: Mapping[str, object] | None,
+    ) -> str | None:
+        """Finds first eligible standby account with missing or unverified quota telemetry."""
+        for acc_id, q_data in items:
+            if acc_id == current_active:
+                continue
+            if cooldowns and acc_id in cooldowns:
+                continue
+            if not any(k in q_data for k in _ALL_TELEMETRY_KEYS):
+                return acc_id
+        return None
+
     def _load_quota_cache(self) -> dict[str, object]:
         """Loads quota cache from client or vault_dir/cache/last_known_quota.json."""
         load_cache_fn = getattr(self.client, "load_cache", None)
@@ -441,9 +460,6 @@ class RotationEngine:
                 # Encapsulate reset delta calculation strictly once per account
                 reset_deltas[acc_id] = self.calculate_reset_delta(status.reset_time, current_time)
 
-        if not evaluated:
-            return None
-
         active_status = evaluated.get(current_active) if current_active else None
         is_active_in_cooldown = bool(cooldowns and current_active and current_active in cooldowns)
         if is_active_in_cooldown and active_status is not None and current_active is not None and cooldowns is not None:
@@ -452,6 +468,13 @@ class RotationEngine:
             is_active_in_cooldown = self._is_cooldown_penalized_for_model(
                 model_key, active_status.fraction, rec, q_data
             )
+
+        if not evaluated:
+            if is_active_in_cooldown or (current_active and current_active not in raw_quota_map) or current_active is None:
+                fallback = self._get_unverified_candidate(items, current_active, cooldowns)
+                if fallback is not None:
+                    return fallback
+            return None
 
         if not is_active_in_cooldown:
             # 1. cache_optimized heuristic: retain current active if fraction > self.threshold
@@ -490,6 +513,15 @@ class RotationEngine:
             )
 
         if not candidates:
+            if (
+                is_active_in_cooldown
+                or (active_status is not None and active_status.fraction <= 0.0)
+                or (current_active and current_active not in raw_quota_map)
+                or current_active is None
+            ):
+                fallback = self._get_unverified_candidate(items, current_active, cooldowns)
+                if fallback is not None:
+                    return fallback
             return None
 
         # Imminent reset priority: accounts nearing reset (reset_delta <= 45m)
