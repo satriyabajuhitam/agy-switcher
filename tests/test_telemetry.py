@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 from datetime import datetime, timezone
+import io
 import json
 import math
 import os
@@ -30,6 +31,7 @@ from agy_switcher.telemetry import (
     DEFAULT_CLIENT_SECRET,
     HTTP_SERVER_ERROR_PATTERN,
     QuotaClient,
+    _CACHE_LOCK,
     _has_auth_indicator,
     _is_auth_error,
     _is_network_error,
@@ -656,6 +658,490 @@ class TestThreadSafeCache(unittest.TestCase):
         self.assertNotIn("Claude", saved_disk)
         self.assertEqual(saved_disk["meta"], {})
         self.assertEqual(saved_disk["accounts"]["acc_save_nested"]["gemini"]["buckets"], {"5h": {"quota": 75}})
+
+    def test_cache_corruption_and_concurrency_load_resilience(self) -> None:
+        """[QUOTA-GEMINI-ERR-003] load_cache safely returns {} on binary corruption, bad JSON, and OSError."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        corrupt_payloads: list[tuple[str, bytes]] = [
+            ("binary_garbage", b"\xff\xfe\x00\x80\x81\x90\xde\xad\xbe\xef\x00\xff"),
+            ("empty_file", b""),
+            ("whitespace_only", b"   \n\t  "),
+            ("malformed_json", b"{malformed: json [unclosed"),
+            ("truncated_json", b'{"timestamp": 1700000000.0, "accounts": {"acc1": {"gemini":'),
+            ("nul_prefixed_json", b"\x00\x01\x02{\"accounts\": {}}"),
+            ("json_null", b"null"),
+            ("json_list", b"[1, 2, 3]"),
+            ("json_string", b'"corrupted-string"'),
+            ("json_number", b"42"),
+        ]
+        for case_name, raw_bytes in corrupt_payloads:
+            with self.subTest(case=case_name):
+                self.client.cache_file.write_bytes(raw_bytes)
+                self.assertEqual(self.client.load_cache(), {})
+
+        def _assert_empty_with_legacy_home(legacy_bytes: bytes, *, legacy_dir_mode: int = 0o700) -> None:
+            with tempfile.TemporaryDirectory() as fake_home:
+                legacy_dir = Path(fake_home) / ".gemini" / "config" / "skills" / "agy-quota-checker"
+                legacy_dir.mkdir(parents=True, exist_ok=True)
+                (legacy_dir / "last_known_quota.json").write_bytes(legacy_bytes)
+                if legacy_dir_mode != 0o700:
+                    os.chmod(legacy_dir, legacy_dir_mode)
+                try:
+                    with patch.dict(os.environ, {"HOME": fake_home}):
+                        self.assertEqual(self.client.load_cache(), {})
+                finally:
+                    if legacy_dir_mode != 0o700:
+                        os.chmod(legacy_dir, 0o700)
+
+        valid_legacy_bytes = json.dumps({"accounts": {"legacy_acc": {"gemini": {"quota": 55}}}}).encode("utf-8")
+
+        if os.geteuid() != 0:
+            with self.subTest(case="unreadable_cache_file_permission_error"):
+                self.client.save_cache(
+                    {"timestamp": 1700000000.0, "accounts": {"acc1": {"gemini": {"quota": 80}}}},
+                    merge=False,
+                )
+                os.chmod(self.client.cache_file, 0o000)
+                try:
+                    self.assertEqual(self.client.load_cache(), {})
+                finally:
+                    os.chmod(self.client.cache_file, 0o600)
+
+            with self.subTest(case="unreadable_cache_dir_permission_error"):
+                self.client.save_cache(
+                    {"timestamp": 1700000000.0, "accounts": {"acc1": {"gemini": {"quota": 80}}}},
+                    merge=False,
+                )
+                os.chmod(self.cache_dir, 0o000)
+                try:
+                    _assert_empty_with_legacy_home(valid_legacy_bytes)
+                finally:
+                    os.chmod(self.cache_dir, 0o700)
+
+        with self.subTest(case="directory_at_cache_path"):
+            if self.client.cache_file.exists():
+                self.client.cache_file.unlink()
+            self.client.cache_file.mkdir(parents=True, exist_ok=True)
+            try:
+                _assert_empty_with_legacy_home(valid_legacy_bytes)
+            finally:
+                self.client.cache_file.rmdir()
+
+        with self.subTest(case="broken_symlink_at_cache_path"):
+            self.client.cache_file.symlink_to(self.cache_dir / "nonexistent_target.json")
+            try:
+                _assert_empty_with_legacy_home(valid_legacy_bytes)
+            finally:
+                self.client.cache_file.unlink()
+
+        with self.subTest(case="corrupt_legacy_cache_fallback"):
+            if self.client.cache_file.exists():
+                self.client.cache_file.unlink()
+            _assert_empty_with_legacy_home(b"\xff\xfe{bad-legacy-json")
+            if os.geteuid() != 0:
+                _assert_empty_with_legacy_home(valid_legacy_bytes, legacy_dir_mode=0o000)
+
+        with self.subTest(case="valid_symlink_to_valid_and_corrupt_files"):
+            target_file = self.cache_dir / "symlink_target.json"
+            target_file.write_text(
+                json.dumps({"timestamp": 1700000000.0, "accounts": {"sym_acc": {"gemini": {"quota": 64}}}}),
+                encoding="utf-8",
+            )
+            self.client.cache_file.symlink_to(target_file)
+            try:
+                loaded_sym = self.client.load_cache()
+                self.assertIn("sym_acc", loaded_sym.get("accounts", {}))
+                self.assertEqual(loaded_sym["accounts"]["sym_acc"]["gemini"]["quota"], 64)
+
+                target_file.write_bytes(b"\xff\xfe{corrupt-target")
+                self.assertEqual(self.client.load_cache(), {})
+            finally:
+                if self.client.cache_file.is_symlink() or self.client.cache_file.exists():
+                    self.client.cache_file.unlink()
+                if target_file.exists():
+                    target_file.unlink()
+
+        if hasattr(os, "mkfifo"):
+            with self.subTest(case="fifo_special_file_does_not_block"):
+                os.mkfifo(self.client.cache_file)
+                try:
+                    _assert_empty_with_legacy_home(valid_legacy_bytes)
+                finally:
+                    self.client.cache_file.unlink()
+
+        with self.subTest(case="excessive_integer_digits_and_overflow_timestamps"):
+            excessive_digits_payload = (
+                '{"timestamp": ' + ("9" * 5000) + ', "accounts": {"acc1": {"gemini": {"quota": 80}}}}'
+            ).encode("utf-8")
+            self.client.cache_file.write_bytes(excessive_digits_payload)
+            self.assertEqual(self.client.load_cache(), {})
+
+            overflow_int = "9" * 400
+            overflow_with_claude = (
+                '{"timestamp": ' + overflow_int + ', "claude": 1, '
+                '"accounts": {"acc_ovf": {"cached_at": ' + overflow_int + ', "gemini": {"quota": 82}}}}'
+            ).encode("utf-8")
+            self.client.cache_file.write_bytes(overflow_with_claude)
+            loaded_ovf = self.client.load_cache()
+            self.assertIsInstance(loaded_ovf.get("timestamp"), float)
+            self.assertTrue(math.isfinite(float(loaded_ovf["timestamp"])))
+            self.assertIn("acc_ovf", loaded_ovf.get("accounts", {}))
+            self.assertNotIn("claude", loaded_ovf)
+
+        with self.subTest(case="deeply_nested_json_does_not_crash"):
+            depth = 1500
+            deep_json = (
+                '{"accounts": {"acc_deep": {"gemini": {"quota": 75}}}, "meta": '
+                + ('{"a": ' * depth)
+                + "1"
+                + ("}" * depth)
+                + "}"
+            ).encode("utf-8")
+            self.client.cache_file.write_bytes(deep_json)
+            loaded_deep = self.client.load_cache()
+            self.assertIsInstance(loaded_deep, dict)
+            if loaded_deep:
+                self.assertIn("acc_deep", loaded_deep.get("accounts", {}))
+
+        with self.subTest(case="recovery_via_save_cache_after_corruption"):
+            self.client.cache_file.write_bytes(b"\xff\xfe\x00\x80corrupted")
+            self.assertEqual(self.client.load_cache(), {})
+            self.client.save_cache(
+                {
+                    "timestamp": 1700000100.0,
+                    "accounts": {
+                        "acc_recovered": {
+                            "gemini": {"quota": 88, "reset_time": 1700005000},
+                        }
+                    },
+                },
+                merge=True,
+            )
+            recovered = self.client.load_cache()
+            self.assertIn("acc_recovered", recovered.get("accounts", {}))
+            self.assertEqual(recovered["accounts"]["acc_recovered"]["gemini"]["quota"], 88)
+
+    def test_cache_corruption_and_concurrency_save_resilience(self) -> None:
+        """[QUOTA-GEMINI-ERR-003] save_cache handles extreme payloads, I/O errors, and fd failures without leaks."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        with self.subTest(case="overflow_timestamp_and_cached_at"):
+            stderr_ovf = io.StringIO()
+            with patch("sys.stderr", stderr_ovf):
+                self.client.save_cache(
+                    {
+                        "timestamp": 10**400,
+                        "accounts": {
+                            "acc_save_ovf": {
+                                "cached_at": 10**400,
+                                "gemini": {"quota": 91, "reset_time": 1700005000},
+                            }
+                        },
+                    },
+                    merge=False,
+                )
+            self.assertEqual(stderr_ovf.getvalue(), "")
+            loaded = self.client.load_cache()
+            self.assertIn("acc_save_ovf", loaded.get("accounts", {}))
+            self.assertTrue(math.isfinite(float(loaded["timestamp"])))
+            self.assertTrue(math.isfinite(float(loaded["accounts"]["acc_save_ovf"]["cached_at"])))
+
+        with self.subTest(case="deeply_nested_payload_preserves_prior_cache_without_crash"):
+            self.client.save_cache(
+                {"accounts": {"acc_existing": {"gemini": {"quota": 72, "reset_time": 1700004000}}}},
+                merge=False,
+            )
+            deep_nested: dict[str, object] | int = 1
+            for _ in range(1500):
+                deep_nested = {"a": deep_nested}
+            stderr_deep = io.StringIO()
+            with patch("sys.stderr", stderr_deep):
+                self.client.save_cache(
+                    {
+                        "accounts": {"acc_new": {"gemini": {"quota": 91, "reset_time": 1700005000}}},
+                        "meta": deep_nested,
+                    },
+                    merge=True,
+                )
+            self.assertIn("[QuotaClient] Failed to persist quota cache", stderr_deep.getvalue())
+            self.assertEqual(list(self.cache_dir.glob("*.tmp")), [])
+            preserved = self.client.load_cache()
+            self.assertIn("acc_existing", preserved.get("accounts", {}))
+
+        with self.subTest(case="fdopen_failure_closes_fd_and_cleans_tmp"):
+            orig_mkstemp = tempfile.mkstemp
+            created_fds: list[int] = []
+            created_paths: list[str] = []
+
+            def spy_mkstemp(
+                suffix: str | None = None,
+                prefix: str | None = None,
+                dir: Path | str | None = None,
+                text: bool = False,
+            ) -> tuple[int, str]:
+                fd, tmp_path = orig_mkstemp(suffix=suffix, prefix=prefix, dir=dir, text=text)
+                created_fds.append(fd)
+                created_paths.append(tmp_path)
+                return fd, tmp_path
+
+            stderr_capture = io.StringIO()
+            with patch("sys.stderr", stderr_capture):
+                with patch("tempfile.mkstemp", side_effect=spy_mkstemp):
+                    with patch("os.fdopen", side_effect=OSError("fdopen boom")):
+                        self.client.save_cache({"accounts": {"acc_fd": {"gemini": {"quota": 50}}}}, merge=False)
+            self.assertEqual(len(created_fds), 1)
+            self.assertFalse(os.path.exists(created_paths[0]))
+            with self.assertRaises(OSError):
+                os.fstat(created_fds[0])
+            self.assertIn("fdopen boom", stderr_capture.getvalue())
+
+        with self.subTest(case="unwritable_target_dir_and_directory_target"):
+            dir_target_client = QuotaClient(cache_dir=self.cache_dir / "dir_collision")
+            dir_target_client.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            dir_target_client.cache_file.mkdir(parents=True, exist_ok=True)
+            stderr_capture = io.StringIO()
+            with patch("sys.stderr", stderr_capture):
+                dir_target_client.save_cache({"accounts": {"acc1": {"gemini": {"quota": 40}}}}, merge=False)
+            self.assertEqual(list(dir_target_client.cache_dir.glob("*.tmp")), [])
+            self.assertIn("[QuotaClient] Failed to persist quota cache", stderr_capture.getvalue())
+            dir_target_client.cache_file.rmdir()
+
+            if os.geteuid() != 0:
+                locked_parent = self.cache_dir / "locked_parent"
+                locked_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(locked_parent, 0o500)
+                try:
+                    unwritable_client = QuotaClient(cache_dir=locked_parent / "subcache")
+                    stderr_locked = io.StringIO()
+                    with patch("sys.stderr", stderr_locked):
+                        unwritable_client.save_cache({"accounts": {"acc1": {"gemini": {"quota": 40}}}}, merge=False)
+                    self.assertIn("[QuotaClient] Failed to persist quota cache", stderr_locked.getvalue())
+                finally:
+                    os.chmod(locked_parent, 0o700)
+
+        with self.subTest(case="invalid_nul_byte_cache_path"):
+            for bad_path in (
+                str(self.cache_dir / "bad\x00quota.json"),
+                str(self.cache_dir / "bad\x00dir" / "quota.json"),
+            ):
+                bad_client = QuotaClient(cache_dir=self.cache_dir)
+                bad_client.cache_file = bad_path
+                stderr_bad = io.StringIO()
+                with patch("sys.stderr", stderr_bad):
+                    bad_client.save_cache({"accounts": {"acc1": {"gemini": {"quota": 40}}}}, merge=False)
+                self.assertIn("[QuotaClient] Failed to persist quota cache", stderr_bad.getvalue())
+
+    def test_cache_corruption_and_concurrency_serializes_save_and_load(self) -> None:
+        """[QUOTA-GEMINI-EDGE-003] _CACHE_LOCK serializes concurrent save_cache and load_cache operations."""
+        self.client.save_cache(
+            {
+                "timestamp": 1700000000.0,
+                "accounts": {
+                    "acc_seed": {"gemini": {"quota": 99, "reset_time": 1700009000}},
+                },
+            },
+            merge=False,
+        )
+
+        # 1. Verify _CACHE_LOCK serializes both load_cache() and save_cache() across threads
+        load_started = threading.Event()
+        load_done = threading.Event()
+        save_started = threading.Event()
+        save_done = threading.Event()
+        lock_errors: list[BaseException] = []
+        loaded_under_lock: list[dict[str, object]] = []
+
+        def blocked_reader() -> None:
+            try:
+                reader_client = QuotaClient(cache_dir=self.cache_dir)
+                load_started.set()
+                loaded_under_lock.append(reader_client.load_cache())
+            except BaseException as exc:
+                lock_errors.append(exc)
+            finally:
+                load_done.set()
+
+        def blocked_writer() -> None:
+            try:
+                writer_client = QuotaClient(cache_dir=self.cache_dir)
+                save_started.set()
+                writer_client.save_cache(
+                    {
+                        "accounts": {
+                            "acc_lock_test": {"gemini": {"quota": 77, "reset_time": 1700008000}},
+                        }
+                    },
+                    merge=True,
+                )
+            except BaseException as exc:
+                lock_errors.append(exc)
+            finally:
+                save_done.set()
+
+        t_read = threading.Thread(target=blocked_reader)
+        t_write = threading.Thread(target=blocked_writer)
+
+        try:
+            with _CACHE_LOCK:
+                t_read.start()
+                t_write.start()
+                self.assertTrue(load_started.wait(timeout=2.0))
+                self.assertTrue(save_started.wait(timeout=2.0))
+                self.assertFalse(load_done.wait(timeout=0.05))
+                self.assertFalse(save_done.wait(timeout=0.05))
+
+            self.assertTrue(load_done.wait(timeout=5.0))
+            self.assertTrue(save_done.wait(timeout=5.0))
+        finally:
+            t_read.join(timeout=5.0)
+            t_write.join(timeout=5.0)
+        self.assertFalse(t_read.is_alive())
+        self.assertFalse(t_write.is_alive())
+        self.assertEqual(lock_errors, [])
+        self.assertEqual(len(loaded_under_lock), 1)
+        locked_accounts = loaded_under_lock[0].get("accounts")
+        if not isinstance(locked_accounts, dict):
+            self.fail(f"Expected dict 'accounts' under lock, got {type(locked_accounts).__name__}")
+        self.assertIn("acc_seed", locked_accounts)
+
+        # 2. Stress concurrent writers + readers simultaneously without truncated reads or lost updates
+        num_writers = 6
+        writes_per_writer = 10
+        num_readers = 6
+        start_barrier = threading.Barrier(num_writers + num_readers)
+        writers_done = threading.Event()
+        writer_errors: list[BaseException] = []
+        reader_errors: list[BaseException] = []
+        read_counts: list[int] = [0] * num_readers
+
+        def writer_worker(writer_id: int) -> None:
+            try:
+                w_client = QuotaClient(cache_dir=self.cache_dir)
+                start_barrier.wait(timeout=5.0)
+                for step in range(writes_per_writer):
+                    w_client.save_cache(
+                        {
+                            "accounts": {
+                                f"writer_{writer_id}": {
+                                    "gemini": {
+                                        "quota": 10 + step,
+                                        "reset_time": 1700001000 + step,
+                                    }
+                                }
+                            }
+                        },
+                        merge=True,
+                    )
+            except BaseException as exc:
+                writer_errors.append(exc)
+
+        def reader_worker(reader_id: int) -> None:
+            try:
+                r_client = QuotaClient(cache_dir=self.cache_dir)
+                start_barrier.wait(timeout=5.0)
+                while not writers_done.is_set() or read_counts[reader_id] < 10:
+                    snapshot = r_client.load_cache()
+                    self.assertIsInstance(snapshot, dict)
+                    accounts = snapshot.get("accounts")
+                    if not isinstance(accounts, dict):
+                        self.fail(f"Expected dict 'accounts' in cache snapshot, got {type(accounts).__name__}")
+                    self.assertIn("acc_seed", accounts)
+                    self.assertIn("acc_lock_test", accounts)
+                    for acc_entry in accounts.values():
+                        self.assertIsInstance(acc_entry, dict)
+                        self.assertIn("gemini", acc_entry)
+                        self.assertNotIn("claude", acc_entry)
+                    read_counts[reader_id] += 1
+            except BaseException as exc:
+                reader_errors.append(exc)
+
+        writers: list[threading.Thread] = [
+            threading.Thread(target=writer_worker, args=(i,)) for i in range(num_writers)
+        ]
+        readers: list[threading.Thread] = [
+            threading.Thread(target=reader_worker, args=(i,)) for i in range(num_readers)
+        ]
+        try:
+            for t in writers + readers:
+                t.start()
+            for t in writers:
+                t.join(timeout=15.0)
+        finally:
+            writers_done.set()
+            for t in writers + readers:
+                t.join(timeout=15.0)
+
+        for t in writers + readers:
+            self.assertFalse(t.is_alive())
+        self.assertEqual(writer_errors, [])
+        self.assertEqual(reader_errors, [])
+        self.assertTrue(all(count >= 10 for count in read_counts))
+
+        final_cache = self.client.load_cache()
+        final_accounts = final_cache.get("accounts", {})
+        self.assertIn("acc_seed", final_accounts)
+        self.assertIn("acc_lock_test", final_accounts)
+        for i in range(num_writers):
+            w_key = f"writer_{i}"
+            self.assertIn(w_key, final_accounts)
+            self.assertEqual(final_accounts[w_key]["gemini"]["quota"], 10 + writes_per_writer - 1)
+
+        self.assertEqual(list(self.cache_dir.glob("*.tmp")), [])
+        raw_disk = json.loads(self.client.cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(raw_disk, final_cache)
+
+        # 3. Concurrent readers and writers starting from a corrupted cache file
+        self.client.cache_file.write_bytes(b"\xff\xfe\x00corrupt-concurrent")
+        rec_barrier = threading.Barrier(4)
+        rec_done = threading.Event()
+        rec_errors: list[BaseException] = []
+        rec_reads: list[int] = [0, 0]
+
+        def rec_writer(idx: int) -> None:
+            try:
+                wc = QuotaClient(cache_dir=self.cache_dir)
+                rec_barrier.wait(timeout=5.0)
+                for step in range(5):
+                    wc.save_cache(
+                        {"accounts": {f"rec_{idx}": {"gemini": {"quota": 50 + step, "reset_time": 1700002000}}}},
+                        merge=True,
+                    )
+            except BaseException as exc:
+                rec_errors.append(exc)
+
+        def rec_reader(idx: int) -> None:
+            try:
+                rc = QuotaClient(cache_dir=self.cache_dir)
+                rec_barrier.wait(timeout=5.0)
+                while not rec_done.is_set() or rec_reads[idx] < 5:
+                    snap = rc.load_cache()
+                    self.assertIsInstance(snap, dict)
+                    if snap:
+                        self.assertIsInstance(snap.get("accounts"), dict)
+                    rec_reads[idx] += 1
+            except BaseException as exc:
+                rec_errors.append(exc)
+
+        rec_writers = [threading.Thread(target=rec_writer, args=(i,)) for i in range(2)]
+        rec_readers = [threading.Thread(target=rec_reader, args=(i,)) for i in range(2)]
+        try:
+            for t in rec_writers + rec_readers:
+                t.start()
+            for t in rec_writers:
+                t.join(timeout=10.0)
+        finally:
+            rec_done.set()
+            for t in rec_writers + rec_readers:
+                t.join(timeout=10.0)
+        for t in rec_writers + rec_readers:
+            self.assertFalse(t.is_alive())
+        self.assertEqual(rec_errors, [])
+        self.assertTrue(all(c >= 5 for c in rec_reads))
+        recovered_final = self.client.load_cache()
+        self.assertIn("rec_0", recovered_final.get("accounts", {}))
+        self.assertIn("rec_1", recovered_final.get("accounts", {}))
+        self.assertEqual(list(self.cache_dir.glob("*.tmp")), [])
 
 
 class TestStandaloneTelemetryHelpers(unittest.TestCase):

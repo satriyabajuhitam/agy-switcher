@@ -7,6 +7,7 @@ and Python standard library. Zero external dependencies.
 from __future__ import annotations
 
 import concurrent.futures
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -383,83 +384,142 @@ def _is_claude_key(key: object) -> bool:
     return "claude" in lowered or "anthropic" in lowered
 
 
+@dataclass(slots=True)
+class _StripFrame:
+    obj: object
+    obj_id: int
+    is_dict: bool
+    pending_dict: list[tuple[object, object]]
+    pending_list: list[object]
+    result_dict: dict[object, object]
+    result_list: list[object]
+    modified: bool = False
+    pending_key: object = None
+
+
+def _make_strip_frame(node: dict[object, object] | list[object]) -> _StripFrame:
+    if isinstance(node, dict):
+        return _StripFrame(
+            obj=node,
+            obj_id=id(node),
+            is_dict=True,
+            pending_dict=list(reversed(node.items())),
+            pending_list=[],
+            result_dict={},
+            result_list=[],
+        )
+    return _StripFrame(
+        obj=node,
+        obj_id=id(node),
+        is_dict=False,
+        pending_dict=[],
+        pending_list=list(reversed(node)),
+        result_dict={},
+        result_list=[],
+    )
+
+
 def _strip_claude_keys_recursive(
     value: object,
     _seen: set[int] | None = None,
 ) -> tuple[object, bool]:
-    """Recursively strips retired Claude/Anthropic keys from nested dicts and lists.
+    """Iteratively strips retired Claude/Anthropic keys from nested dicts and lists.
 
     Callers iterate the top-level 'accounts' mapping separately so account aliases
     containing 'claude' are not mistakenly deleted.
     """
-    if isinstance(value, dict):
-        obj_id = id(value)
-        seen = _seen if _seen is not None else set()
-        if obj_id in seen:
-            return {}, True
-        seen.add(obj_id)
-        try:
-            modified = False
-            cleaned: dict[object, object] = {}
-            for k, v in value.items():
-                if _is_claude_key(k):
-                    modified = True
+    if not isinstance(value, (dict, list)):
+        return value, False
+
+    seen = _seen if _seen is not None else set()
+    root_id = id(value)
+    if root_id in seen:
+        return ({} if isinstance(value, dict) else []), True
+
+    seen.add(root_id)
+    stack: list[_StripFrame] = [_make_strip_frame(value)]
+    try:
+        while stack:
+            top = stack[-1]
+            if top.is_dict:
+                if top.pending_dict:
+                    k, v = top.pending_dict.pop()
+                    if _is_claude_key(k):
+                        top.modified = True
+                        continue
+                    if not isinstance(v, (dict, list)):
+                        top.result_dict[k] = v
+                        continue
+                    v_id = id(v)
+                    if v_id in seen:
+                        top.modified = True
+                        top.result_dict[k] = {} if isinstance(v, dict) else []
+                        continue
+                    top.pending_key = k
+                    seen.add(v_id)
+                    stack.append(_make_strip_frame(v))
                     continue
-                clean_v, child_modified = _strip_claude_keys_recursive(v, seen)
-                if child_modified:
-                    modified = True
-                cleaned[k] = clean_v
-            return cleaned, modified
-        finally:
-            seen.remove(obj_id)
-    if isinstance(value, list):
-        obj_id = id(value)
-        seen = _seen if _seen is not None else set()
-        if obj_id in seen:
-            return [], True
-        seen.add(obj_id)
+            else:
+                if top.pending_list:
+                    v = top.pending_list.pop()
+                    if not isinstance(v, (dict, list)):
+                        top.result_list.append(v)
+                        continue
+                    v_id = id(v)
+                    if v_id in seen:
+                        top.modified = True
+                        top.result_list.append({} if isinstance(v, dict) else [])
+                        continue
+                    seen.add(v_id)
+                    stack.append(_make_strip_frame(v))
+                    continue
+
+            finished = stack.pop()
+            seen.discard(finished.obj_id)
+            finished_val: object = finished.result_dict if finished.is_dict else finished.result_list
+            if not stack:
+                return finished_val, finished.modified
+            parent = stack[-1]
+            if parent.is_dict:
+                parent.result_dict[parent.pending_key] = finished_val
+            else:
+                parent.result_list.append(finished_val)
+            if finished.modified:
+                parent.modified = True
+    finally:
+        for frame in stack:
+            seen.discard(frame.obj_id)
+
+    return ({} if isinstance(value, dict) else []), False
+
+
+def _coerce_positive_finite_float(raw_val: object) -> float | None:
+    """Coerces a numeric or string timestamp candidate to a positive finite float, or None."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return None
+    if isinstance(raw_val, (int, float, str, bytes)):
         try:
-            modified = False
-            cleaned_list: list[object] = []
-            for item in value:
-                clean_item, item_modified = _strip_claude_keys_recursive(item, seen)
-                if item_modified:
-                    modified = True
-                cleaned_list.append(clean_item)
-            return cleaned_list, modified
-        finally:
-            seen.remove(obj_id)
-    return value, False
+            parsed = float(raw_val)
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return None
 
 
 def _normalize_root_timestamp(raw_ts: object, fallback: float) -> float:
     """Normalizes a top-level cache timestamp to a positive finite float."""
-    if raw_ts is None or isinstance(raw_ts, bool):
-        return fallback
-    if isinstance(raw_ts, (int, float)):
-        return float(raw_ts) if math.isfinite(raw_ts) and raw_ts > 0 else fallback
-    if isinstance(raw_ts, (str, bytes)):
-        try:
-            parsed = float(raw_ts)
-            return parsed if math.isfinite(parsed) and parsed > 0 else fallback
-        except (ValueError, TypeError, OverflowError):
-            return fallback
-    return fallback
+    parsed = _coerce_positive_finite_float(raw_ts)
+    return parsed if parsed is not None else fallback
 
 
 def _normalize_cached_at(raw_val: object, fallback: float) -> int | float:
     """Normalizes an account-level cached_at timestamp, preserving valid int/float types."""
-    if raw_val is None or isinstance(raw_val, bool):
+    parsed = _coerce_positive_finite_float(raw_val)
+    if parsed is None:
         return fallback
-    if isinstance(raw_val, (int, float)):
-        return raw_val if math.isfinite(raw_val) and raw_val > 0 else fallback
-    if isinstance(raw_val, (str, bytes)):
-        try:
-            parsed = float(raw_val)
-            return parsed if math.isfinite(parsed) and parsed > 0 else fallback
-        except (ValueError, TypeError, OverflowError):
-            return fallback
-    return fallback
+    if isinstance(raw_val, int) and not isinstance(raw_val, bool):
+        return raw_val
+    return parsed
 
 
 def _sanitize_groups_list(raw_groups: object) -> tuple[list[object] | None, bool]:
@@ -932,6 +992,36 @@ class QuotaClient:
         """Strips legacy 'claude' keys and retains only valid 'gemini' quota records."""
         return _sanitize_cache_payload(data, normalize_timestamps=False)
 
+    def _read_and_sanitize_cache_file(
+        self,
+        cache_path: Path,
+        *,
+        persist_sanitized: bool,
+    ) -> dict[str, object]:
+        """Reads and sanitizes a JSON cache file, returning {} on corruption or I/O errors."""
+        try:
+            if not cache_path.is_file():
+                return {}
+            raw_text = cache_path.read_text(encoding="utf-8")
+            loaded: object = json.loads(raw_text)
+            if not isinstance(loaded, dict):
+                return {}
+            sanitized, modified = _sanitize_cache_payload(loaded, normalize_timestamps=False)
+            if modified and persist_sanitized:
+                persisted, _ = _sanitize_cache_payload(
+                    sanitized,
+                    normalize_timestamps=True,
+                    fallback_ts=time.time(),
+                )
+                try:
+                    self.save_cache(persisted, merge=False)
+                except (OSError, TypeError, ValueError, RecursionError, OverflowError):
+                    pass
+                return persisted
+            return sanitized
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError):
+            return {}
+
     def load_cache(self) -> dict[str, Any]:
         """Loads cached quota data from vault cache or legacy fallback.
 
@@ -940,36 +1030,91 @@ class QuotaClient:
         """
         with _CACHE_LOCK:
             cache_path = Path(self.cache_file)
-            if cache_path.is_file():
-                try:
-                    loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-                except Exception:
-                    return {}
-                if not isinstance(loaded, dict):
-                    return {}
-                sanitized, modified = self._sanitize_cache_dict(loaded)
-                if modified:
-                    persisted, _ = _sanitize_cache_payload(
-                        sanitized,
-                        normalize_timestamps=True,
-                        fallback_ts=time.time(),
-                    )
-                    try:
-                        self.save_cache(persisted, merge=False)
-                    except Exception:
-                        pass
-                    return persisted
-                return sanitized
-            legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
-            if legacy_cache.is_file():
-                try:
-                    loaded_legacy = json.loads(legacy_cache.read_text(encoding="utf-8"))
-                    if isinstance(loaded_legacy, dict):
-                        sanitized_legacy, _ = self._sanitize_cache_dict(loaded_legacy)
-                        return sanitized_legacy
-                except Exception:
-                    return {}
-            return {}
+            try:
+                os.lstat(cache_path)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError):
+                return {}
+            else:
+                return self._read_and_sanitize_cache_file(cache_path, persist_sanitized=True)
+
+            try:
+                legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
+                os.lstat(legacy_cache)
+            except (FileNotFoundError, OSError, ValueError, RuntimeError):
+                return {}
+            return self._read_and_sanitize_cache_file(legacy_cache, persist_sanitized=False)
+
+    def _prepare_cache_payload_for_save(
+        self,
+        data: object,
+        *,
+        merge: bool,
+        evict_keys: list[str] | set[str] | None,
+    ) -> dict[str, object]:
+        """Sanitizes incoming quota cache data and merges with existing cache when requested."""
+        if not isinstance(data, dict):
+            return {
+                "timestamp": time.time(),
+                "accounts": {},
+            }
+
+        now_ts = time.time()
+        incoming_clean, _ = _sanitize_cache_payload(
+            data,
+            normalize_timestamps=True,
+            fallback_ts=now_ts,
+        )
+        raw_incoming_accounts = incoming_clean.get("accounts")
+        incoming_valid: dict[str, dict[str, object]] = (
+            raw_incoming_accounts if isinstance(raw_incoming_accounts, dict) else {}
+        )
+        root_ts = incoming_clean["timestamp"]
+
+        if not merge:
+            if evict_keys:
+                for ev in evict_keys:
+                    if isinstance(ev, str):
+                        incoming_valid.pop(ev.strip(), None)
+            return incoming_clean
+
+        current = self.load_cache()
+        fallback = root_ts if isinstance(root_ts, float) else now_ts
+        current_clean, _ = (
+            _sanitize_cache_payload(
+                current,
+                normalize_timestamps=True,
+                fallback_ts=fallback,
+            )
+            if isinstance(current, dict)
+            else ({"accounts": {}}, False)
+        )
+        raw_curr_accounts = current_clean.get("accounts")
+        merged_accounts: dict[str, dict[str, object]] = (
+            dict(raw_curr_accounts) if isinstance(raw_curr_accounts, dict) else {}
+        )
+        for acc_name, incoming_acc in incoming_valid.items():
+            if acc_name in merged_accounts:
+                merged_entry = dict(merged_accounts[acc_name])
+                merged_entry.update(incoming_acc)
+                merged_accounts[acc_name] = merged_entry
+            else:
+                merged_accounts[acc_name] = incoming_acc
+        if evict_keys:
+            for ev in evict_keys:
+                if isinstance(ev, str):
+                    merged_accounts.pop(ev.strip(), None)
+
+        merged_data: dict[str, object] = {
+            k: v for k, v in current_clean.items() if k != "accounts"
+        }
+        for k, v in incoming_clean.items():
+            if k != "accounts":
+                merged_data[k] = v
+        merged_data["accounts"] = merged_accounts
+        merged_data["timestamp"] = root_ts
+        return merged_data
 
     def save_cache(
         self,
@@ -995,86 +1140,44 @@ class QuotaClient:
            preventing EXDEV errors when cache_file is customized.
         """
         with _CACHE_LOCK:
-            cache_target_file = Path(self.cache_file)
-            target_dir = cache_target_file.parent
-            target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                cache_target_file = Path(self.cache_file)
+                target_dir = cache_target_file.parent
+                target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            except (OSError, ValueError) as e:
+                print(f"[QuotaClient] Failed to persist quota cache to {self.cache_file}: {e}", file=sys.stderr)
+                return
             try:
                 os.chmod(target_dir, 0o700)
             except OSError:
                 pass
-            if self.cache_dir != target_dir:
-                self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-                try:
-                    os.chmod(self.cache_dir, 0o700)
-                except OSError:
-                    pass
-
-            if not isinstance(data, dict):
-                data_to_write: dict[str, object] = {
-                    "timestamp": time.time(),
-                    "accounts": {},
-                }
-            else:
-                now_ts = time.time()
-                incoming_clean, _ = _sanitize_cache_payload(
-                    data,
-                    normalize_timestamps=True,
-                    fallback_ts=now_ts,
-                )
-                raw_incoming_accounts = incoming_clean.get("accounts")
-                incoming_valid: dict[str, dict[str, object]] = (
-                    raw_incoming_accounts if isinstance(raw_incoming_accounts, dict) else {}
-                )
-                root_ts = incoming_clean["timestamp"]
-
-                if merge:
-                    current = self.load_cache()
-                    fallback = root_ts if isinstance(root_ts, float) else now_ts
-                    current_clean, _ = (
-                        _sanitize_cache_payload(
-                            current,
-                            normalize_timestamps=True,
-                            fallback_ts=fallback,
-                        )
-                        if isinstance(current, dict)
-                        else ({"accounts": {}}, False)
-                    )
-                    raw_curr_accounts = current_clean.get("accounts")
-                    merged_accounts: dict[str, dict[str, object]] = (
-                        dict(raw_curr_accounts) if isinstance(raw_curr_accounts, dict) else {}
-                    )
-                    for acc_name, incoming_acc in incoming_valid.items():
-                        if acc_name in merged_accounts:
-                            merged_entry = dict(merged_accounts[acc_name])
-                            merged_entry.update(incoming_acc)
-                            merged_accounts[acc_name] = merged_entry
-                        else:
-                            merged_accounts[acc_name] = incoming_acc
-                    if evict_keys:
-                        for ev in evict_keys:
-                            if isinstance(ev, str):
-                                merged_accounts.pop(ev.strip(), None)
-                    merged_data: dict[str, object] = {
-                        k: v for k, v in current_clean.items() if k != "accounts"
-                    }
-                    for k, v in incoming_clean.items():
-                        if k != "accounts":
-                            merged_data[k] = v
-                    merged_data["accounts"] = merged_accounts
-                    merged_data["timestamp"] = root_ts
-                    data_to_write = merged_data
-                else:
-                    if evict_keys:
-                        for ev in evict_keys:
-                            if isinstance(ev, str):
-                                incoming_valid.pop(ev.strip(), None)
-                    data_to_write = incoming_clean
-
-            tmp_file = None
             try:
+                cache_dir_path = Path(self.cache_dir)
+                if cache_dir_path != target_dir:
+                    cache_dir_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    os.chmod(cache_dir_path, 0o700)
+            except (OSError, ValueError):
+                pass
+
+            tmp_file: str | None = None
+            try:
+                data_to_write = self._prepare_cache_payload_for_save(
+                    data,
+                    merge=merge,
+                    evict_keys=evict_keys,
+                )
                 tmp_fd, tmp_file = tempfile.mkstemp(dir=target_dir, prefix="quota-cache-", suffix=".tmp")
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                try:
+                    file_handle = os.fdopen(tmp_fd, "w", encoding="utf-8")
+                except Exception:
+                    try:
+                        os.close(tmp_fd)
+                    except OSError:
+                        pass
+                    raise
+                with file_handle as f:
                     json.dump(data_to_write, f, indent=2)
+                    f.flush()
                 os.chmod(tmp_file, 0o600)
                 os.replace(tmp_file, cache_target_file)
                 try:
@@ -1082,7 +1185,7 @@ class QuotaClient:
                 except OSError:
                     pass
                 tmp_file = None
-            except Exception as e:
+            except (OSError, TypeError, ValueError, RecursionError, OverflowError) as e:
                 print(f"[QuotaClient] Failed to persist quota cache to {self.cache_file}: {e}", file=sys.stderr)
             finally:
                 if tmp_file and os.path.exists(tmp_file):
