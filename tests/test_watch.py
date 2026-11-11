@@ -982,6 +982,145 @@ class TestLogWatcher(unittest.TestCase):
         self.engine_mock.switch_tokens.assert_not_called()
         self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
 
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_truncation_resets_cursor_and_clock_skew(self, mock_sleep):
+        """[WATCH-BOUND-EDGE-003] and [PRE-PROBE-EDGE-002]:
+        1. [WATCH-BOUND-EDGE-003]: File truncation during transcript tailing resets cursor to 0 and resumes tailing.
+        2. [PRE-PROBE-EDGE-002]: Negative elapsed time from backwards clock adjustment resets last_switch_time safely.
+        """
+        # [WATCH-BOUND-EDGE-003]: Verify file truncation (current_size < cursor) resets cursor to 0
+        with self.subTest("WATCH-BOUND-EDGE-003: file truncation resets cursor and resumes tailing"):
+            with tempfile.TemporaryDirectory() as watch_tmpdir:
+                transcript_path = os.path.join(watch_tmpdir, "transcript.jsonl")
+                initial_line = json.dumps({"type": "turn_start", "content": "padding" * 20}) + "\n"
+                initial_content = initial_line * (4096 // len(initial_line) + 2)
+                with open(transcript_path, "w", encoding="utf-8") as fp:
+                    fp.write(initial_content)
+                initial_size = os.path.getsize(transcript_path)
+                self.assertGreaterEqual(initial_size, 4096)
+
+                watcher = LogWatcher(engine=self.engine_mock, log_dirs=[watch_tmpdir])
+                watcher.active_transcript_path = Path(transcript_path)
+                watcher.presence_detector.get_watch_targets = lambda **kw: [transcript_path]
+                watcher.file_cursors[transcript_path] = 4096
+
+                # Antigravity truncates the file to a smaller size with new records
+                new_record = json.dumps({"type": "user", "content": "hello after rotation"}) + "\n"
+                with open(transcript_path, "w", encoding="utf-8") as fp:
+                    fp.write(new_record)
+                new_size = os.path.getsize(transcript_path)
+                self.assertLess(new_size, 4096)
+
+                processed_lines: list[str] = []
+                orig_process_line = watcher.process_line
+                def capture_line(line: str, is_jsonl: bool = False, file_path: str | None = None) -> bool:
+                    processed_lines.append(line)
+                    return orig_process_line(line, is_jsonl=is_jsonl, file_path=file_path)
+                watcher.process_line = capture_line
+
+                switches = watcher.poll_once()
+                self.assertEqual(switches, 0)
+                self.assertEqual(watcher.file_cursors[transcript_path], new_size)
+                self.assertEqual(len(processed_lines), 1)
+                self.assertIn("hello after rotation", processed_lines[0])
+
+                # Truncation to 0 bytes resets cursor and does not impede subsequent tailing
+                watcher.file_cursors[transcript_path] = 4096
+                with open(transcript_path, "w", encoding="utf-8") as fp:
+                    fp.truncate(0)
+                self.assertEqual(os.path.getsize(transcript_path), 0)
+
+                switches_zero = watcher.poll_once()
+                self.assertEqual(switches_zero, 0)
+                self.assertEqual(watcher.file_cursors[transcript_path], 0)
+
+                subsequent_record = json.dumps({"type": "user", "content": "record after zero truncation"}) + "\n"
+                with open(transcript_path, "a", encoding="utf-8") as fp:
+                    fp.write(subsequent_record)
+                subsequent_size = os.path.getsize(transcript_path)
+
+                switches_subsequent = watcher.poll_once()
+                self.assertEqual(switches_subsequent, 0)
+                self.assertEqual(watcher.file_cursors[transcript_path], subsequent_size)
+                self.assertTrue(any("record after zero truncation" in l for l in processed_lines))
+
+                # Truncation followed by quota error triggers failover from beginning without SeekError
+                watcher.file_cursors[transcript_path] = 4096
+                exhaustion_record = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"}) + "\n"
+                with open(transcript_path, "w", encoding="utf-8") as fp:
+                    fp.write(exhaustion_record)
+
+                with patch.object(watcher, "handle_exhaustion", return_value=True) as mock_handle:
+                    switches_exhaust = watcher.poll_once()
+                    self.assertEqual(switches_exhaust, 1)
+                    mock_handle.assert_called_once()
+
+        # [PRE-PROBE-EDGE-002]: Clock skew or negative elapsed time resets last_switch_time safely
+        with self.subTest("PRE-PROBE-EDGE-002: negative elapsed time resets last_switch_time and allows rotation"):
+            cache_dir = Path(self.tmpdir) / "cache_skew"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = cache_dir / "last_known_quota.json"
+            self.engine_mock.cache_dir = cache_dir
+            self.engine_mock.cache_file = cache_file
+
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True, "is_active": True},
+                    {"name": "standby-acc", "valid": True, "is_active": False},
+                ],
+            }
+            cache_file.write_text(
+                json.dumps({
+                    "accounts": {
+                        "primary-acc": {"gemini": {"fraction": 0.10}},
+                        "standby-acc": {"gemini": {"fraction": 0.90}},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            self.engine_mock.switch_tokens.reset_mock()
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+            self.watcher.cooldown_manager.clear_cooldown()
+            self.watcher.damping_seconds = 60.0
+
+            # Clock skew: last_switch_time is in the future relative to current time
+            self.watcher.last_switch_time = 5000.0
+            exhaustion_line = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"})
+
+            with patch("time.time", return_value=1000.0):
+                res = self.watcher.handle_exhaustion(line=exhaustion_line)
+                self.assertTrue(res)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.assertIn("primary-acc", self.watcher.get_cooldowns())
+                self.assertEqual(self.watcher.last_switch_time, 1000.0)
+
+            # Healthy quota probe with clock skew safely resets last_switch_time to 0.0
+            self.watcher.cooldown_manager.clear_cooldown()
+            self.watcher.last_switch_time = 5000.0
+            self.engine_mock.switch_tokens.reset_mock()
+            cache_file.write_text(
+                json.dumps({
+                    "accounts": {
+                        "primary-acc": {"gemini": {"fraction": 0.85}},
+                        "standby-acc": {"gemini": {"fraction": 0.90}},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            with patch("time.time", return_value=1000.0):
+                res_healthy = self.watcher.handle_exhaustion(line=exhaustion_line)
+                self.assertFalse(res_healthy)
+                self.assertEqual(self.watcher.last_switch_time, 0.0)
+
+            # Verify process_line with clock skew also clears last_switch_time
+            self.watcher.last_switch_time = 5000.0
+            with patch("time.time", return_value=1000.0):
+                with patch.object(self.watcher, "handle_exhaustion", return_value=False):
+                    self.watcher.process_line(exhaustion_line)
+                    self.assertEqual(self.watcher.last_switch_time, 0.0)
+
 
 
 class TestPresenceDetectorWatchTargets(unittest.TestCase):
