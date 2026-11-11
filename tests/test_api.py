@@ -729,6 +729,89 @@ class TestSDKFacade(unittest.TestCase):
         self.assertEqual(summary.accounts["acc1"]["quota"], 75)
         self.assertEqual(summary.accounts["acc1"]["gemini"]["quota"], 75)
 
+    def test_get_fleet_quota_summary_gemini_exclusive(self) -> None:
+        """[QUOTA-GEMINI-EDGE-002] & [QUOTA-GEMINI-EDGE-004] Fleet summary filtering and whitespace normalization.
+
+        - [QUOTA-GEMINI-EDGE-004]: normalize_model_name normalizes '  GeMiNi-3.8-PrO  ' to 'gemini'.
+        - [QUOTA-GEMINI-EDGE-002]: get_fleet_quota_summary(model='gemini') filters fleet balances
+          strictly to Gemini model family across 3 registered accounts, stripping non-gemini data.
+        """
+        # [QUOTA-GEMINI-EDGE-004]: Verify normalize_model_name strips whitespace and mixed casing
+        self.assertEqual(api.normalize_model_name("  GeMiNi-3.8-PrO  "), "gemini")
+        self.assertEqual(api.normalize_model_name("   gemini   "), "gemini")
+        self.assertEqual(api.normalize_model_name(" \t gemini-2.5-flash \n "), "gemini")
+
+        # Setup 3 registered accounts in the vault
+        for i in range(1, 4):
+            acc_dir = self.engine.accounts_dir / f"acc{i}"
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(
+                json.dumps(create_sample_token(f"acc{i}@example.com")),
+                encoding="utf-8",
+            )
+        self.engine.set_active_name("acc1")
+
+        # Populate cache with Gemini and legacy Claude entries for all 3 accounts
+        cache_ts = 1700000500.0
+        cache_data = {
+            "timestamp": cache_ts,
+            "accounts": {
+                "acc1": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 85, "reset_time": cache_ts + 1800},
+                    "claude": {"quota": 10, "reset_time": cache_ts + 3600},
+                },
+                "acc2": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 60, "reset_time": cache_ts + 3600},
+                    "claude": {"quota": 40, "reset_time": cache_ts + 7200},
+                },
+                "acc3": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 100, "reset_time": cache_ts + 5400},
+                    "claude": {"quota": 0, "reset_time": cache_ts + 1800},
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        # [QUOTA-GEMINI-EDGE-002]: Invoke get_fleet_quota_summary with model="gemini"
+        summary = api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+
+        self.assertIsInstance(summary, FleetQuotaSummary)
+        self.assertEqual(summary.total_accounts, 3)
+        self.assertEqual(summary.active_account, "acc1")
+        self.assertEqual(summary.model, "gemini")
+        self.assertEqual(summary.timestamp, cache_ts)
+        self.assertEqual(len(summary.accounts), 3)
+
+        expected_quotas = {"acc1": 85, "acc2": 60, "acc3": 100}
+        for acc_name, expected_quota in expected_quotas.items():
+            acc_data = summary.accounts[acc_name]
+            self.assertIn("gemini", acc_data)
+            gemini_data = acc_data["gemini"]
+            self.assertIsInstance(gemini_data, dict)
+            assert isinstance(gemini_data, dict)
+            self.assertEqual(acc_data["quota"], expected_quota)
+            self.assertEqual(gemini_data["quota"], expected_quota)
+            self.assertIsNotNone(gemini_data.get("reset_time"))
+            self.assertIsNotNone(gemini_data.get("remaining_minutes"))
+            rem_m = gemini_data.get("remaining_minutes")
+            self.assertIsInstance(rem_m, int)
+            assert isinstance(rem_m, int)
+            self.assertGreater(rem_m, 0)
+            self.assertNotIn("claude", acc_data)
+
+        # Also verify that whitespace-padded mixed-case model string resolves strictly to gemini
+        summary_padded = api.get_fleet_quota_summary(model="  GeMiNi-3.8-PrO  ", engine=self.engine)
+        self.assertEqual(summary_padded.model, "gemini")
+        self.assertEqual(summary_padded.total_accounts, 3)
+        for acc_name, expected_quota in expected_quotas.items():
+            acc_data = summary_padded.accounts[acc_name]
+            self.assertEqual(acc_data["quota"], expected_quota)
+            self.assertNotIn("claude", acc_data)
+
     def test_get_fleet_quota_summary_network_outage_fallback(self) -> None:
         """[REQ-2-EDGE-002] Telemetry network outage falls back to cached quota with timestamp preserved."""
         acc1_dir = self.engine.accounts_dir / "acc1"

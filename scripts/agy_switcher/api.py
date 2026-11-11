@@ -609,6 +609,16 @@ def get_fleet_quota_summary(
         FleetQuotaSummary dataclass containing fleet capacity and quota distributions.
     """
     resolved_model = model.strip() if (isinstance(model, str) and model.strip()) else "all"
+    if resolved_model.lower() == "all":
+        target_model_key: str | None = None
+        effective_model = "all"
+    else:
+        try:
+            target_model_key = normalize_model_name(resolved_model)
+            effective_model = target_model_key
+        except Exception:
+            target_model_key = resolved_model.lower()
+            effective_model = resolved_model
 
     if engine is None:
         try:
@@ -618,7 +628,7 @@ def get_fleet_quota_summary(
                 total_accounts=0,
                 active_account=None,
                 accounts={},
-                model=resolved_model,
+                model=effective_model,
                 timestamp=time.time(),
             )
 
@@ -652,7 +662,7 @@ def get_fleet_quota_summary(
     if refresh:
         try:
             from agy_switcher.telemetry import run_quota_pipeline
-            target_m = resolved_model if resolved_model != "all" else "gemini"
+            target_m = target_model_key if target_model_key else "gemini"
             run_quota_pipeline(engine=engine, data=engine.list_accounts(), target_model=target_m)
         except Exception:
             pass
@@ -713,15 +723,6 @@ def get_fleet_quota_summary(
         if isinstance(k, str) and k.strip() and k not in all_names:
             all_names.append(k)
     total_accounts = len(all_names)
-
-    norm_model = resolved_model.strip().lower()
-    if norm_model == "all":
-        target_model_key = None
-    else:
-        try:
-            target_model_key = normalize_model_name(norm_model)
-        except Exception:
-            target_model_key = norm_model
 
     fleet_accounts: dict[str, dict[str, Any]] = {}
     for acc_name in all_names:
@@ -787,10 +788,12 @@ def get_fleet_quota_summary(
                 acc_dict.update(model_payload)
                 acc_dict[target_model_key] = model_payload
             elif "quota" in cached_entry and not isinstance(cached_entry["quota"], dict) and target_model_key == "gemini":
-                model_payload = dict(cached_entry)
-                sanitized_r, rem_m = _sanitize_reset_time_and_delta(model_payload.get("reset_time"), current_ts=timestamp)
-                model_payload["reset_time"] = sanitized_r
-                if rem_m is not None and "remaining_minutes" not in model_payload:
+                sanitized_r, rem_m = _sanitize_reset_time_and_delta(cached_entry.get("reset_time"), current_ts=timestamp)
+                model_payload = {
+                    "quota": cached_entry.get("quota"),
+                    "reset_time": sanitized_r,
+                }
+                if rem_m is not None:
                     model_payload["remaining_minutes"] = rem_m
                 acc_dict.update(model_payload)
                 acc_dict["gemini"] = model_payload
@@ -818,13 +821,18 @@ def get_fleet_quota_summary(
             if "cached_at" in cached_entry and "cached_at" not in acc_dict:
                 acc_dict["cached_at"] = cached_entry["cached_at"]
 
+            if target_model_key == "gemini":
+                acc_dict.pop("claude", None)
+                if isinstance(acc_dict.get("gemini"), dict):
+                    acc_dict["gemini"].pop("claude", None)
+
             fleet_accounts[acc_name] = acc_dict
 
     return FleetQuotaSummary(
         total_accounts=total_accounts,
         active_account=active_name,
         accounts=fleet_accounts,
-        model=resolved_model,
+        model=effective_model,
         timestamp=timestamp,
     )
 
@@ -836,6 +844,7 @@ __all__ = [
     "list_accounts",
     "get_accounts",
     "get_fleet_quota_summary",
+    "normalize_model_name",
     "handle_soft_import_rotation",
     "format_fleet_exhaustion_message",
     "format_fleet_exhaustion_notice",
