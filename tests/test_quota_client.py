@@ -649,11 +649,15 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(loaded["accounts"]["acc_mixed"]["gemini"]["quota"], 85)
         self.assertNotIn("claude", loaded["accounts"]["acc_mixed"])
 
-    def test_save_cache_partial_multi_model_preserves_healthy_claude_and_strips_errored_gemini(self):
-        """save_cache strips errored model sub-keys (gemini error) while preserving healthy models (claude)."""
+    def test_save_cache_strips_legacy_claude_and_discards_errored_gemini(self):
+        """[QUOTA-GEMINI-EDGE-001] save_cache strips legacy claude sub-keys and discards accounts lacking valid gemini."""
         incoming = {
             "accounts": {
                 "acc_mixed": {
+                    "gemini": {"quota": 85, "reset_time": 5000},
+                    "claude": {"quota": 90, "reset_time": 6000},
+                },
+                "acc_claude_only": {
                     "gemini": {"error": "Quota error"},
                     "claude": {"quota": 90, "reset_time": 6000},
                 }
@@ -662,9 +666,10 @@ class TestQuotaClient(unittest.TestCase):
         self.client.save_cache(incoming, merge=False)
         loaded = self.client.load_cache()
         self.assertIn("acc_mixed", loaded["accounts"])
-        self.assertIn("claude", loaded["accounts"]["acc_mixed"])
-        self.assertEqual(loaded["accounts"]["acc_mixed"]["claude"]["quota"], 90)
-        self.assertNotIn("gemini", loaded["accounts"]["acc_mixed"])
+        self.assertIn("gemini", loaded["accounts"]["acc_mixed"])
+        self.assertEqual(loaded["accounts"]["acc_mixed"]["gemini"]["quota"], 85)
+        self.assertNotIn("claude", loaded["accounts"]["acc_mixed"])
+        self.assertNotIn("acc_claude_only", loaded["accounts"])
 
     def test_save_cache_custom_cache_file_as_string_path(self):
         """save_cache seamlessly handles cache_file set as a string path."""
@@ -700,8 +705,8 @@ class TestQuotaClient(unittest.TestCase):
         self.assertNotIn("acc_all_fail", loaded["accounts"])
         self.assertIn("acc_healthy", loaded["accounts"])
 
-    def test_save_cache_partial_multi_model_strips_string_and_none_errors(self):
-        """save_cache strips model entries that are raw strings or None while keeping valid models."""
+    def test_save_cache_strips_legacy_claude_and_invalid_model_entries(self):
+        """[QUOTA-GEMINI-EDGE-001] save_cache strips legacy claude/string entries and discards accounts lacking valid gemini."""
         incoming = {
             "accounts": {
                 "acc_str_err": {
@@ -720,9 +725,7 @@ class TestQuotaClient(unittest.TestCase):
         self.assertIn("gemini", loaded["accounts"]["acc_str_err"])
         self.assertNotIn("claude", loaded["accounts"]["acc_str_err"])
 
-        self.assertIn("acc_none_err", loaded["accounts"])
-        self.assertIn("claude", loaded["accounts"]["acc_none_err"])
-        self.assertNotIn("gemini", loaded["accounts"]["acc_none_err"])
+        self.assertNotIn("acc_none_err", loaded["accounts"])
 
 
 
@@ -1183,8 +1186,8 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(_sanitize_expires_in("bad", default=7200), 7200)
         self.assertEqual(_sanitize_expires_in(100000000), 3600)
 
-    def test_save_cache_deep_merge_preserves_claude_when_updating_gemini(self):
-        """save_cache(merge=True) preserves existing cached Claude data when incoming update only has Gemini."""
+    def test_save_cache_deep_merge_strips_claude_when_updating_gemini(self):
+        """[QUOTA-GEMINI-EDGE-001] save_cache(merge=True) strips legacy Claude data when incoming update has Gemini."""
         initial_data = {
             "timestamp": 1000.0,
             "accounts": {
@@ -1213,13 +1216,11 @@ class TestQuotaClient(unittest.TestCase):
         self.assertEqual(acc1["cached_at"], 1100.0)
         self.assertEqual(acc1["gemini"]["quota"], 85)
         self.assertEqual(acc1["gemini"]["reset_time"], 1700005000)
-        # Claude data must be preserved intact
-        self.assertIn("claude", acc1)
-        self.assertEqual(acc1["claude"]["quota"], 50)
-        self.assertEqual(acc1["claude"]["reset_time"], 1700000000)
+        # Claude data must be stripped adhering to Gemini-Exclusive schema
+        self.assertNotIn("claude", acc1)
 
-    def test_save_cache_deep_merge_preserves_gemini_when_updating_claude(self):
-        """save_cache(merge=True) preserves existing cached Gemini data when incoming update only has Claude."""
+    def test_save_cache_deep_merge_ignores_claude_update_and_preserves_gemini(self):
+        """[QUOTA-GEMINI-EDGE-001] save_cache(merge=True) ignores incoming Claude-only update and retains Gemini."""
         initial_data = {
             "timestamp": 1000.0,
             "accounts": {
@@ -1232,7 +1233,7 @@ class TestQuotaClient(unittest.TestCase):
         }
         self.client.save_cache(initial_data, merge=False)
 
-        # Update acc1 with only Claude data
+        # Update acc1 with only Claude data (legacy non-gemini update)
         self.client.save_cache({
             "accounts": {
                 "acc1": {
@@ -1245,10 +1246,8 @@ class TestQuotaClient(unittest.TestCase):
         loaded = self.client.load_cache()
         self.assertIn("acc1", loaded["accounts"])
         acc1 = loaded["accounts"]["acc1"]
-        self.assertEqual(acc1["cached_at"], 1200.0)
-        self.assertEqual(acc1["claude"]["quota"], 65)
-        self.assertEqual(acc1["claude"]["reset_time"], 1700006000)
-        # Gemini data must be preserved intact
+        # Legacy Claude is stripped, Gemini remains intact
+        self.assertNotIn("claude", acc1)
         self.assertIn("gemini", acc1)
         self.assertEqual(acc1["gemini"]["quota"], 80)
         self.assertEqual(acc1["gemini"]["reset_time"], 1700000000)

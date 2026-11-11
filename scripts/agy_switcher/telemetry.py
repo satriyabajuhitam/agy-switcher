@@ -375,6 +375,260 @@ def resolve_quota_endpoint(
     return f"{cleaned}{QUOTA_SUMMARY_PATH}"
 
 
+def _is_claude_key(key: object) -> bool:
+    """Returns True if a dict key represents a retired Claude/Anthropic model entry."""
+    if not isinstance(key, str):
+        return False
+    lowered = key.strip().lower()
+    return "claude" in lowered or "anthropic" in lowered
+
+
+def _strip_claude_keys_recursive(
+    value: object,
+    _seen: set[int] | None = None,
+) -> tuple[object, bool]:
+    """Recursively strips retired Claude/Anthropic keys from nested dicts and lists.
+
+    Callers iterate the top-level 'accounts' mapping separately so account aliases
+    containing 'claude' are not mistakenly deleted.
+    """
+    if isinstance(value, dict):
+        obj_id = id(value)
+        seen = _seen if _seen is not None else set()
+        if obj_id in seen:
+            return {}, True
+        seen.add(obj_id)
+        try:
+            modified = False
+            cleaned: dict[object, object] = {}
+            for k, v in value.items():
+                if _is_claude_key(k):
+                    modified = True
+                    continue
+                clean_v, child_modified = _strip_claude_keys_recursive(v, seen)
+                if child_modified:
+                    modified = True
+                cleaned[k] = clean_v
+            return cleaned, modified
+        finally:
+            seen.remove(obj_id)
+    if isinstance(value, list):
+        obj_id = id(value)
+        seen = _seen if _seen is not None else set()
+        if obj_id in seen:
+            return [], True
+        seen.add(obj_id)
+        try:
+            modified = False
+            cleaned_list: list[object] = []
+            for item in value:
+                clean_item, item_modified = _strip_claude_keys_recursive(item, seen)
+                if item_modified:
+                    modified = True
+                cleaned_list.append(clean_item)
+            return cleaned_list, modified
+        finally:
+            seen.remove(obj_id)
+    return value, False
+
+
+def _normalize_root_timestamp(raw_ts: object, fallback: float) -> float:
+    """Normalizes a top-level cache timestamp to a positive finite float."""
+    if raw_ts is None or isinstance(raw_ts, bool):
+        return fallback
+    if isinstance(raw_ts, (int, float)):
+        return float(raw_ts) if math.isfinite(raw_ts) and raw_ts > 0 else fallback
+    if isinstance(raw_ts, (str, bytes)):
+        try:
+            parsed = float(raw_ts)
+            return parsed if math.isfinite(parsed) and parsed > 0 else fallback
+        except (ValueError, TypeError, OverflowError):
+            return fallback
+    return fallback
+
+
+def _normalize_cached_at(raw_val: object, fallback: float) -> int | float:
+    """Normalizes an account-level cached_at timestamp, preserving valid int/float types."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return fallback
+    if isinstance(raw_val, (int, float)):
+        return raw_val if math.isfinite(raw_val) and raw_val > 0 else fallback
+    if isinstance(raw_val, (str, bytes)):
+        try:
+            parsed = float(raw_val)
+            return parsed if math.isfinite(parsed) and parsed > 0 else fallback
+        except (ValueError, TypeError, OverflowError):
+            return fallback
+    return fallback
+
+
+def _sanitize_groups_list(raw_groups: object) -> tuple[list[object] | None, bool]:
+    """Filters legacy Claude/Anthropic groups from a legacy 'groups' payload."""
+    if not isinstance(raw_groups, list):
+        return None, True
+    filtered: list[object] = []
+    modified = False
+    for group in raw_groups:
+        if isinstance(group, dict):
+            display_name = group.get("displayName")
+            group_id = group.get("group")
+            g_name = (
+                display_name
+                if isinstance(display_name, str) and display_name.strip()
+                else (group_id if isinstance(group_id, str) else "")
+            )
+            g_lower = g_name.lower()
+            if "claude" in g_lower or "anthropic" in g_lower:
+                modified = True
+                continue
+        filtered.append(group)
+    if not filtered:
+        return None, True
+    return filtered, modified
+
+
+def _sanitize_account_entry(
+    acc_val: object,
+    *,
+    root_ts: float | None = None,
+) -> tuple[dict[str, object] | None, bool]:
+    """Sanitizes a single account quota entry, stripping legacy Claude keys and errors."""
+    if not isinstance(acc_val, dict) or not acc_val or acc_val.get("error"):
+        return None, True
+
+    stripped_obj, modified = _strip_claude_keys_recursive(acc_val)
+    if not isinstance(stripped_obj, dict):
+        return None, True
+
+    entry: dict[str, object] = {k: v for k, v in stripped_obj.items() if isinstance(k, str)}
+    if len(entry) != len(stripped_obj):
+        modified = True
+
+    if "gemini" in entry:
+        m_val = entry["gemini"]
+        if isinstance(m_val, dict) and "buckets" in m_val:
+            buckets_val = m_val["buckets"]
+            if isinstance(buckets_val, dict) and not buckets_val and "quota" not in m_val:
+                m_val = {k: v for k, v in m_val.items() if k != "buckets"}
+                entry["gemini"] = m_val
+                modified = True
+        if not isinstance(m_val, dict) or not m_val or m_val.get("error"):
+            del entry["gemini"]
+            modified = True
+
+    for k in list(entry.keys()):
+        if k not in ("cached_at", "timestamp"):
+            v = entry[k]
+            if isinstance(v, dict) and v.get("error"):
+                del entry[k]
+                modified = True
+
+    if "groups" in entry:
+        clean_groups, groups_modified = _sanitize_groups_list(entry["groups"])
+        if clean_groups is None:
+            del entry["groups"]
+            modified = True
+        elif groups_modified:
+            entry["groups"] = clean_groups
+            modified = True
+
+    gemini_val = entry.get("gemini")
+    quota_val = entry.get("quota")
+    groups_val = entry.get("groups")
+    has_model = isinstance(gemini_val, dict) and bool(gemini_val)
+    has_legacy_quota = (
+        "quota" in entry
+        and quota_val is not None
+        and not isinstance(quota_val, bool)
+    )
+    has_legacy_groups = isinstance(groups_val, list) and len(groups_val) > 0
+    if not (has_model or has_legacy_quota or has_legacy_groups):
+        return None, True
+
+    if root_ts is not None:
+        entry["cached_at"] = _normalize_cached_at(entry.get("cached_at"), root_ts)
+
+    return entry, modified
+
+
+def _sanitize_accounts_map(
+    accounts_map: object,
+    *,
+    root_ts: float | None = None,
+) -> tuple[dict[str, dict[str, object]], bool]:
+    """Sanitizes the 'accounts' mapping, removing invalid keys, non-dicts, and Claude data."""
+    if not isinstance(accounts_map, dict):
+        return {}, True
+
+    sanitized_accounts: dict[str, dict[str, object]] = {}
+    modified = False
+    for raw_key, raw_entry in accounts_map.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            modified = True
+            continue
+        clean_key = raw_key.strip()
+        if clean_key != raw_key:
+            modified = True
+
+        clean_entry, entry_modified = _sanitize_account_entry(raw_entry, root_ts=root_ts)
+        if entry_modified:
+            modified = True
+        if clean_entry is None:
+            continue
+
+        if clean_key in sanitized_accounts:
+            merged = dict(sanitized_accounts[clean_key])
+            merged.update(clean_entry)
+            sanitized_accounts[clean_key] = merged
+            modified = True
+        else:
+            sanitized_accounts[clean_key] = clean_entry
+
+    return sanitized_accounts, modified
+
+
+def _sanitize_cache_payload(
+    data: object,
+    *,
+    normalize_timestamps: bool = False,
+    fallback_ts: float | None = None,
+) -> tuple[dict[str, object], bool]:
+    """Sanitizes a full quota cache dict to conform to the Gemini-Exclusive schema."""
+    ts_fallback = fallback_ts if fallback_ts is not None else time.time()
+    if not isinstance(data, dict):
+        if normalize_timestamps:
+            return {"timestamp": ts_fallback, "accounts": {}}, True
+        return {}, False
+
+    root_ts = _normalize_root_timestamp(data.get("timestamp"), ts_fallback) if normalize_timestamps else None
+    sanitized: dict[str, object] = {}
+    modified = False
+
+    for raw_k, raw_v in data.items():
+        if not isinstance(raw_k, str):
+            modified = True
+            continue
+        if raw_k == "accounts":
+            clean_accounts, acc_mod = _sanitize_accounts_map(raw_v, root_ts=root_ts)
+            sanitized["accounts"] = clean_accounts
+            if acc_mod:
+                modified = True
+        elif _is_claude_key(raw_k):
+            modified = True
+        else:
+            clean_v, child_mod = _strip_claude_keys_recursive(raw_v)
+            sanitized[raw_k] = clean_v
+            if child_mod:
+                modified = True
+
+    if normalize_timestamps:
+        sanitized["timestamp"] = root_ts
+        if "accounts" not in sanitized:
+            sanitized["accounts"] = {}
+
+    return sanitized, modified
+
+
 class QuotaClient:
     """Client for fetching and caching quota telemetry from Google CloudCode API."""
 
@@ -463,7 +717,7 @@ class QuotaClient:
             print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
             return None
 
-    def parse_quota_response(self, raw_resp: dict[str, Any]) -> dict[str, Any]:
+    def parse_quota_response(self, raw_resp: object) -> dict[str, Any]:
         """Parses CloudCode response into the standardized Gemini Quota Schema.
 
         Extracts weekly and five-hour quota metrics exclusively for Gemini Models
@@ -479,8 +733,13 @@ class QuotaClient:
         for group in groups:
             if not isinstance(group, dict):
                 continue
-            group_name = group.get("displayName") or group.get("group", "")
-            if not isinstance(group_name, str):
+            display_name = group.get("displayName")
+            group_id = group.get("group")
+            if isinstance(display_name, str) and display_name.strip():
+                group_name = display_name
+            elif isinstance(group_id, str) and group_id.strip():
+                group_name = group_id
+            else:
                 continue
 
             group_name_lower = group_name.lower()
@@ -499,7 +758,10 @@ class QuotaClient:
             for b in buckets_raw:
                 if not isinstance(b, dict):
                     continue
-                raw_bucket_id = str(b.get("bucketId") or "").strip().lower()
+                raw_bucket_obj = b.get("bucketId")
+                if not isinstance(raw_bucket_obj, str):
+                    continue
+                raw_bucket_id = raw_bucket_obj.strip().lower()
                 if any(x in raw_bucket_id for x in ("five_hour", "five_hours", "5h", "rolling_5h", "5_hour", "5-hour")):
                     norm_id = "5h"
                 elif any(x in raw_bucket_id for x in ("weekly", "week", "7d")):
@@ -511,31 +773,39 @@ class QuotaClient:
                     continue
 
                 frac = b.get("remainingFraction")
-                if frac is None:
+                if frac is None or isinstance(frac, bool):
                     frac_val = 0.0
                 else:
                     try:
                         frac_val = float(frac)
-                    except (ValueError, TypeError):
+                        if not math.isfinite(frac_val):
+                            frac_val = 0.0
+                    except (ValueError, TypeError, OverflowError):
                         frac_val = 0.0
                 frac_val = max(0.0, min(1.0, frac_val))
 
                 quota_pct = int(round(frac_val * 100))
 
-                reset_time_str = b.get("resetTime")
+                reset_time_val = b.get("resetTime")
                 reset_time = 0
-                if isinstance(reset_time_str, (int, float)):
-                    reset_time = max(0, int(reset_time_str))
-                elif isinstance(reset_time_str, str) and reset_time_str:
-                    if reset_time_str.isdigit():
-                        reset_time = max(0, int(reset_time_str))
+                if isinstance(reset_time_val, bool):
+                    reset_time = 0
+                elif isinstance(reset_time_val, (int, float)):
+                    if math.isfinite(reset_time_val):
+                        reset_time = max(0, int(reset_time_val))
+                elif isinstance(reset_time_val, str) and reset_time_val.strip():
+                    cleaned_rt = reset_time_val.strip()
+                    if cleaned_rt.isdigit():
+                        reset_time = max(0, int(cleaned_rt))
                     else:
                         try:
-                            rt = reset_time_str.replace("Z", "+00:00")
+                            rt = cleaned_rt.replace("Z", "+00:00")
                             dt = datetime.fromisoformat(rt)
                             if dt.tzinfo is None:
                                 dt = dt.replace(tzinfo=timezone.utc)
-                            reset_time = max(0, int(dt.timestamp()))
+                            ts = dt.timestamp()
+                            if math.isfinite(ts):
+                                reset_time = max(0, int(ts))
                         except Exception:
                             reset_time = 0
 
@@ -657,25 +927,49 @@ class QuotaClient:
 
         return {}
 
+    @staticmethod
+    def _sanitize_cache_dict(data: object) -> tuple[dict[str, Any], bool]:
+        """Strips legacy 'claude' keys and retains only valid 'gemini' quota records."""
+        return _sanitize_cache_payload(data, normalize_timestamps=False)
+
     def load_cache(self) -> dict[str, Any]:
-        """Loads cached quota data from vault cache or legacy fallback."""
-        cache_path = Path(self.cache_file)
-        if cache_path.is_file():
-            try:
-                loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    return loaded
-            except Exception:
-                return {}
-        legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
-        if legacy_cache.is_file():
-            try:
-                loaded_legacy = json.loads(legacy_cache.read_text(encoding="utf-8"))
-                if isinstance(loaded_legacy, dict):
-                    return loaded_legacy
-            except Exception:
-                return {}
-        return {}
+        """Loads cached quota data from vault cache or legacy fallback.
+
+        Automatically sanitizes on-disk cache by stripping legacy 'claude'
+        sub-keys and persisting sanitized cache adhering to Gemini-Exclusive schema.
+        """
+        with _CACHE_LOCK:
+            cache_path = Path(self.cache_file)
+            if cache_path.is_file():
+                try:
+                    loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+                except Exception:
+                    return {}
+                if not isinstance(loaded, dict):
+                    return {}
+                sanitized, modified = self._sanitize_cache_dict(loaded)
+                if modified:
+                    persisted, _ = _sanitize_cache_payload(
+                        sanitized,
+                        normalize_timestamps=True,
+                        fallback_ts=time.time(),
+                    )
+                    try:
+                        self.save_cache(persisted, merge=False)
+                    except Exception:
+                        pass
+                    return persisted
+                return sanitized
+            legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
+            if legacy_cache.is_file():
+                try:
+                    loaded_legacy = json.loads(legacy_cache.read_text(encoding="utf-8"))
+                    if isinstance(loaded_legacy, dict):
+                        sanitized_legacy, _ = self._sanitize_cache_dict(loaded_legacy)
+                        return sanitized_legacy
+                except Exception:
+                    return {}
+            return {}
 
     def save_cache(
         self,
@@ -694,8 +988,8 @@ class QuotaClient:
         4. For valid incoming accounts lacking 'cached_at', 'cached_at' is automatically
            set to root_ts, ensuring independent freshness tracking across all callers.
         5. Invalid or error-laden accounts in incoming data are filtered out
-           without corrupting existing valid cache entries. Errored model sub-keys
-           (e.g. claude: {"error": ...}) are stripped while preserving healthy models.
+           without corrupting existing valid cache entries. Legacy 'claude' keys
+           are stripped and only healthy Gemini models are preserved.
         6. Permissions: cache directory is 0700 and cache file is 0600.
         7. Cross-mount resilience: temporary files are created in cache_file.parent,
            preventing EXDEV errors when cache_file is customized.
@@ -716,81 +1010,38 @@ class QuotaClient:
                     pass
 
             if not isinstance(data, dict):
-                data_to_write = {
+                data_to_write: dict[str, object] = {
                     "timestamp": time.time(),
                     "accounts": {},
                 }
             else:
-                # Determine root timestamp: default to time.time() if absent, bool, or invalid
-                root_ts_val = data.get("timestamp")
-                if root_ts_val is None or isinstance(root_ts_val, bool):
-                    root_ts = time.time()
-                elif isinstance(root_ts_val, (int, float)):
-                    root_ts = float(root_ts_val) if math.isfinite(root_ts_val) and root_ts_val > 0 else time.time()
-                else:
-                    try:
-                        parsed_ts = float(root_ts_val)
-                        root_ts = parsed_ts if math.isfinite(parsed_ts) and parsed_ts > 0 else time.time()
-                    except (ValueError, TypeError, OverflowError):
-                        root_ts = time.time()
-
-                def _sanitize_account_entry(acc_val: Any) -> dict[str, Any] | None:
-                    if not isinstance(acc_val, dict) or not acc_val or acc_val.get("error"):
-                        return None
-                    entry = dict(acc_val)
-                    # Strip errored or invalid model sub-keys (e.g. claude: {"error": ...})
-                    for m_key in ("gemini", "claude"):
-                        if m_key in entry:
-                            m_val = entry[m_key]
-                            if not isinstance(m_val, dict) or m_val.get("error"):
-                                del entry[m_key]
-
-                    # Strip any other sub-dict containing an error key
-                    for k in list(entry.keys()):
-                        if k not in ("cached_at", "timestamp"):
-                            v = entry[k]
-                            if isinstance(v, dict) and v.get("error"):
-                                del entry[k]
-
-                    # Must contain at least one valid model container or valid quota payload
-                    has_model = isinstance(entry.get("gemini"), dict) or isinstance(entry.get("claude"), dict)
-                    has_quota = "quota" in entry or "groups" in entry
-                    if not (has_model or has_quota):
-                        return None
-
-                    # Normalize cached_at timestamp
-                    cached_at_val = entry.get("cached_at")
-                    if cached_at_val is None or isinstance(cached_at_val, bool):
-                        entry["cached_at"] = root_ts
-                    elif isinstance(cached_at_val, (int, float)):
-                        if not math.isfinite(cached_at_val) or cached_at_val <= 0:
-                            entry["cached_at"] = root_ts
-                    else:
-                        try:
-                            p_cat = float(cached_at_val)
-                            entry["cached_at"] = p_cat if math.isfinite(p_cat) and p_cat > 0 else root_ts
-                        except (ValueError, TypeError, OverflowError):
-                            entry["cached_at"] = root_ts
-                    return entry
-
-                def _extract_valid_accounts(accounts_map: Any) -> dict[str, Any]:
-                    valid: dict[str, Any] = {}
-                    if isinstance(accounts_map, dict):
-                        for k, v in accounts_map.items():
-                            if isinstance(k, str) and k.strip():
-                                sanitized = _sanitize_account_entry(v)
-                                if sanitized is not None:
-                                    valid[k.strip()] = sanitized
-                    return valid
-
-                incoming_valid = _extract_valid_accounts(data.get("accounts"))
+                now_ts = time.time()
+                incoming_clean, _ = _sanitize_cache_payload(
+                    data,
+                    normalize_timestamps=True,
+                    fallback_ts=now_ts,
+                )
+                raw_incoming_accounts = incoming_clean.get("accounts")
+                incoming_valid: dict[str, dict[str, object]] = (
+                    raw_incoming_accounts if isinstance(raw_incoming_accounts, dict) else {}
+                )
+                root_ts = incoming_clean["timestamp"]
 
                 if merge:
                     current = self.load_cache()
-                    merged_accounts: dict[str, Any] = (
-                        _extract_valid_accounts(current.get("accounts"))
+                    fallback = root_ts if isinstance(root_ts, float) else now_ts
+                    current_clean, _ = (
+                        _sanitize_cache_payload(
+                            current,
+                            normalize_timestamps=True,
+                            fallback_ts=fallback,
+                        )
                         if isinstance(current, dict)
-                        else {}
+                        else ({"accounts": {}}, False)
+                    )
+                    raw_curr_accounts = current_clean.get("accounts")
+                    merged_accounts: dict[str, dict[str, object]] = (
+                        dict(raw_curr_accounts) if isinstance(raw_curr_accounts, dict) else {}
                     )
                     for acc_name, incoming_acc in incoming_valid.items():
                         if acc_name in merged_accounts:
@@ -801,23 +1052,23 @@ class QuotaClient:
                             merged_accounts[acc_name] = incoming_acc
                     if evict_keys:
                         for ev in evict_keys:
-                            if isinstance(ev, str) and ev.strip() in merged_accounts:
-                                del merged_accounts[ev.strip()]
-                    merged_data = dict(current) if isinstance(current, dict) else {}
-                    for k, v in data.items():
+                            if isinstance(ev, str):
+                                merged_accounts.pop(ev.strip(), None)
+                    merged_data: dict[str, object] = {
+                        k: v for k, v in current_clean.items() if k != "accounts"
+                    }
+                    for k, v in incoming_clean.items():
                         if k != "accounts":
                             merged_data[k] = v
                     merged_data["accounts"] = merged_accounts
                     merged_data["timestamp"] = root_ts
                     data_to_write = merged_data
                 else:
-                    data_to_write = {k: v for k, v in data.items() if k != "accounts"}
                     if evict_keys:
                         for ev in evict_keys:
-                            if isinstance(ev, str) and ev.strip() in incoming_valid:
-                                del incoming_valid[ev.strip()]
-                    data_to_write["accounts"] = incoming_valid
-                    data_to_write["timestamp"] = root_ts
+                            if isinstance(ev, str):
+                                incoming_valid.pop(ev.strip(), None)
+                    data_to_write = incoming_clean
 
             tmp_file = None
             try:

@@ -290,19 +290,74 @@ class TestQuotaClient(unittest.TestCase):
 
     def test_parse_quota_response_missing_or_empty_gemini_group(self) -> None:
         """[QUOTA-GEMINI-ERR-002] parse_quota_response handles missing or empty Gemini group gracefully."""
-        cases: list[dict[str, Any]] = [
+        cases: list[object] = [
             {},
             {"groups": []},
             {"groups": [{"displayName": "Claude Models", "buckets": [{"bucketId": "5h", "remainingFraction": 0.5}]}]},
             {"groups": [{"displayName": "Gemini Models", "buckets": []}]},
             {"groups": [{"displayName": "Gemini Models"}]},
+            {"groups": [{"displayName": "Gemini Models", "buckets": None}]},
+            {"groups": [{"displayName": "Gemini Models", "buckets": "not-a-list"}]},
+            {"groups": [{"displayName": "Gemini Models", "buckets": [None, 123, "bad", {}]}]},
+            {"groups": [{"displayName": "Gemini Models", "buckets": [{"bucketId": {"nested": 1}, "remainingFraction": 0.5}]}]},
+            {"groups": [{"group": None, "displayName": None}]},
             {"groups": [None, 123, "corrupted"]},
+            None,
+            [],
+            "not-a-dict",
         ]
         for case in cases:
             with self.subTest(payload=case):
                 res = self.client.parse_quota_response(case)
                 self.assertEqual(res, {})
                 self.assertNotIn("gemini", res)
+
+    def test_parse_quota_response_malformed_bucket_values_do_not_crash(self) -> None:
+        """[QUOTA-GEMINI-ERR-002] parse_quota_response sanitizes NaN/Inf/bool bucket metrics and non-string displayName."""
+        # Non-finite or bool remainingFraction / resetTime must never crash or inflate quota to 100%
+        nan_inf_bool_payload = {
+            "groups": [
+                {
+                    "displayName": 123,
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": float("nan"), "resetTime": float("nan")},
+                        {"bucketId": "weekly", "remainingFraction": float("inf"), "resetTime": float("inf")},
+                    ],
+                }
+            ]
+        }
+        res_nan = self.client.parse_quota_response(nan_inf_bool_payload)
+        self.assertEqual(res_nan["gemini"]["quota"], 0)
+        self.assertEqual(res_nan["gemini"]["reset_time"], 0)
+        self.assertEqual(res_nan["gemini"]["buckets"]["5h"]["quota"], 0)
+        self.assertEqual(res_nan["gemini"]["buckets"]["weekly"]["quota"], 0)
+
+        bool_payload = {
+            "groups": [
+                {
+                    "displayName": "",
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "5h", "remainingFraction": True, "resetTime": True},
+                    ],
+                }
+            ]
+        }
+        res_bool = self.client.parse_quota_response(bool_payload)
+        self.assertEqual(res_bool["gemini"]["quota"], 0)
+        self.assertEqual(res_bool["gemini"]["reset_time"], 0)
+
+        # Empty Gemini group followed by a valid Gemini group recovers cleanly
+        recovery_payload = {
+            "groups": [
+                {"displayName": "Gemini Models", "buckets": []},
+                {"displayName": "Gemini Models", "buckets": [{"bucketId": "5h", "remainingFraction": 0.6, "resetTime": 1700000000}]},
+            ]
+        }
+        res_rec = self.client.parse_quota_response(recovery_payload)
+        self.assertEqual(res_rec["gemini"]["quota"], 60)
+        self.assertEqual(res_rec["gemini"]["reset_time"], 1700000000)
 
     @patch("urllib.request.urlopen")
     def test_fetch_quota_success(self, mock_urlopen):
@@ -396,6 +451,211 @@ class TestThreadSafeCache(unittest.TestCase):
         for i in range(num_threads):
             self.assertIn(f"acc_{i}", accounts)
             self.assertIn("gemini", accounts[f"acc_{i}"])
+
+    def test_cache_sanitization_strips_claude(self) -> None:
+        """[QUOTA-GEMINI-EDGE-001] load_cache and save_cache strip legacy 'claude' keys and persist sanitized cache."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        legacy_disk_payload = {
+            "timestamp": 1700000000.0,
+            "claude": {"legacy_top_level": True},
+            "accounts": {
+                "acc_mixed": {
+                    "cached_at": 1700000000.0,
+                    "gemini": {
+                        "quota": 85,
+                        "reset_time": 1700005000,
+                        "cached": False,
+                        "buckets": {"5h": {"quota": 85, "reset_time": 1700005000}},
+                    },
+                    "claude": {
+                        "quota": 60,
+                        "reset_time": 1700003000,
+                        "cached": False,
+                        "buckets": {"5h": {"quota": 60, "reset_time": 1700003000}},
+                    },
+                },
+                "acc_claude_only": {
+                    "cached_at": 1700000000.0,
+                    "claude": {
+                        "quota": 50,
+                        "reset_time": 1700002000,
+                        "cached": False,
+                        "buckets": {},
+                    },
+                },
+                "acc_gemini_only": {
+                    "cached_at": 1700000000.0,
+                    "gemini": {
+                        "quota": 90,
+                        "reset_time": 1700006000,
+                        "cached": False,
+                        "buckets": {"weekly": {"quota": 90, "reset_time": 1700006000}},
+                    },
+                },
+            },
+        }
+        self.client.cache_file.write_text(json.dumps(legacy_disk_payload), encoding="utf-8")
+
+        # 1. QuotaClient.load_cache() must strip all legacy 'claude' keys and persist sanitized file to disk
+        loaded = self.client.load_cache()
+        self.assertNotIn("claude", loaded)
+        self.assertIn("acc_mixed", loaded.get("accounts", {}))
+        self.assertNotIn("claude", loaded["accounts"]["acc_mixed"])
+        self.assertIn("gemini", loaded["accounts"]["acc_mixed"])
+        self.assertEqual(loaded["accounts"]["acc_mixed"]["gemini"]["quota"], 85)
+        self.assertIn("acc_gemini_only", loaded["accounts"])
+        self.assertIn("gemini", loaded["accounts"]["acc_gemini_only"])
+        self.assertNotIn("claude", loaded["accounts"].get("acc_claude_only", {}))
+
+        # Check persisted file on disk after load_cache()
+        on_disk_raw = self.client.cache_file.read_text(encoding="utf-8")
+        self.assertNotIn("claude", on_disk_raw)
+        on_disk = json.loads(on_disk_raw)
+        self.assertNotIn("claude", on_disk)
+        self.assertNotIn("claude", on_disk.get("accounts", {}).get("acc_mixed", {}))
+        self.assertIn("gemini", on_disk.get("accounts", {}).get("acc_mixed", {}))
+        self.assertEqual(stat.S_IMODE(self.client.cache_file.stat().st_mode), 0o600)
+
+        # 2. QuotaClient.save_cache() must strip legacy 'claude' keys on write
+        incoming_with_claude = {
+            "timestamp": 1700001000.0,
+            "claude": {"stray": 123},
+            "accounts": {
+                "acc_new": {
+                    "gemini": {"quota": 70, "reset_time": 1700007000},
+                    "claude": {"quota": 40, "reset_time": 1700004000},
+                },
+                "acc_stray_claude": {
+                    "claude": {"quota": 30, "reset_time": 1700001000},
+                },
+            },
+        }
+        self.client.save_cache(incoming_with_claude, merge=True)
+        on_disk_raw2 = self.client.cache_file.read_text(encoding="utf-8")
+        self.assertNotIn("claude", on_disk_raw2)
+        loaded2 = self.client.load_cache()
+        self.assertNotIn("claude", loaded2)
+        self.assertIn("acc_new", loaded2.get("accounts", {}))
+        self.assertIn("gemini", loaded2["accounts"]["acc_new"])
+        self.assertNotIn("claude", loaded2["accounts"]["acc_new"])
+        self.assertEqual(loaded2["accounts"]["acc_new"]["gemini"]["quota"], 70)
+
+    def test_cache_sanitization_strips_claude_deep_nested_case_variants_and_corrupt_entries(self) -> None:
+        """[QUOTA-GEMINI-EDGE-001] Sanitizes case-variant/nested claude keys, invalid accounts, and syncs schema."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        # 1. Missing/invalid timestamp + deeply nested case-variant Claude + non-dict entries + alias named claude
+        dirty_disk_payload = {
+            "timestamp": "corrupt-ts",
+            "Claude": {"top": True},
+            "metadata": {"nested": [{"CLAUDE": 1, "keep": "ok"}]},
+            "accounts": {
+                "acc_valid": {
+                    "Claude": {"quota": 30},
+                    "gemini": {
+                        "quota": 85,
+                        "reset_time": 1700005000,
+                        "claude": {"nested_in_gemini": True},
+                        "buckets": {
+                            "5h": {"quota": 85, "reset_time": 1700005000, "Claude": 10},
+                            "claude_bucket": {"quota": 20},
+                        },
+                    },
+                    "extra_errored": {"error": "stale"},
+                },
+                "claude@example.com": {
+                    "gemini": {"quota": 92, "reset_time": 1700006000},
+                    "claude": {"quota": 15},
+                },
+                "acc_only_nested_claude": {
+                    "gemini": {"Claude": {"quota": 40}},
+                },
+                "acc_non_dict": "corrupt-string",
+                "acc_none": None,
+                "acc_err_legacy": {"error": "Fetch failed", "quota": 50},
+                "acc_legacy_groups": {
+                    "groups": [
+                        {"displayName": "Claude Models", "buckets": [{"bucketId": "5h", "remainingFraction": 0.4}]},
+                        {"displayName": "Gemini Models", "buckets": [{"bucketId": "5h", "remainingFraction": 0.7}]},
+                    ]
+                },
+                "acc_claude_groups_only": {
+                    "groups": [
+                        {"displayName": "Claude and GPT models", "buckets": [{"bucketId": "5h", "remainingFraction": 0.4}]},
+                    ]
+                },
+                "   ": {"gemini": {"quota": 100}},
+            },
+        }
+        self.client.cache_file.write_text(json.dumps(dirty_disk_payload), encoding="utf-8")
+
+        loaded = self.client.load_cache()
+        persisted = json.loads(self.client.cache_file.read_text(encoding="utf-8"))
+
+        # Returned dict must match the exact persisted schema (including generated timestamp and cached_at)
+        self.assertEqual(loaded, persisted)
+        self.assertIsInstance(loaded["timestamp"], float)
+        self.assertGreater(loaded["timestamp"], 0.0)
+        self.assertNotIn("Claude", loaded)
+        self.assertEqual(loaded["metadata"], {"nested": [{"keep": "ok"}]})
+
+        accounts = loaded["accounts"]
+        self.assertIn("acc_valid", accounts)
+        self.assertEqual(accounts["acc_valid"]["cached_at"], loaded["timestamp"])
+        self.assertNotIn("Claude", accounts["acc_valid"])
+        self.assertNotIn("extra_errored", accounts["acc_valid"])
+        self.assertNotIn("claude", accounts["acc_valid"]["gemini"])
+        self.assertEqual(
+            accounts["acc_valid"]["gemini"]["buckets"],
+            {"5h": {"quota": 85, "reset_time": 1700005000}},
+        )
+
+        # Account alias containing 'claude' must be preserved when it has valid Gemini quota
+        self.assertIn("claude@example.com", accounts)
+        self.assertEqual(accounts["claude@example.com"]["gemini"]["quota"], 92)
+        self.assertNotIn("claude", accounts["claude@example.com"])
+
+        # Legacy groups stripped of Claude while keeping Gemini group; Claude-only groups discarded
+        self.assertIn("acc_legacy_groups", accounts)
+        self.assertEqual(len(accounts["acc_legacy_groups"]["groups"]), 1)
+        self.assertEqual(accounts["acc_legacy_groups"]["groups"][0]["displayName"], "Gemini Models")
+        self.assertNotIn("acc_claude_groups_only", accounts)
+
+        # Invalid/corrupt/claude-only entries must be purged from both memory and disk
+        for removed in ("acc_only_nested_claude", "acc_non_dict", "acc_none", "acc_err_legacy", "   "):
+            self.assertNotIn(removed, accounts)
+
+        # 2. Non-dict 'accounts' field on disk is sanitized and persisted cleanly
+        self.client.cache_file.write_text(
+            json.dumps({"timestamp": 1700000000.0, "accounts": "corrupt"}),
+            encoding="utf-8",
+        )
+        loaded_bad_accounts = self.client.load_cache()
+        persisted_bad_accounts = json.loads(self.client.cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(loaded_bad_accounts, persisted_bad_accounts)
+        self.assertEqual(loaded_bad_accounts["accounts"], {})
+
+        # 3. save_cache(merge=True/False) strips nested/case-variant Claude in metadata & accounts
+        self.client.save_cache(
+            {
+                "timestamp": 1700002000.0,
+                "Claude": {"stray": True},
+                "meta": {"CLAUDE": "drop"},
+                "accounts": {
+                    "acc_save_nested": {
+                        "gemini": {
+                            "quota": 75,
+                            "buckets": {"5h": {"quota": 75}, "Claude": {"quota": 10}},
+                        }
+                    }
+                },
+            },
+            merge=True,
+        )
+        saved_disk = json.loads(self.client.cache_file.read_text(encoding="utf-8"))
+        self.assertNotIn("Claude", saved_disk)
+        self.assertEqual(saved_disk["meta"], {})
+        self.assertEqual(saved_disk["accounts"]["acc_save_nested"]["gemini"]["buckets"], {"5h": {"quota": 75}})
 
 
 class TestStandaloneTelemetryHelpers(unittest.TestCase):
