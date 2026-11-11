@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "enabled": true,
-  "command": "python3 -m unittest discover -s tests",
+  "command": "bash scripts/verify-build.sh",
   "timeout": 120
 }
