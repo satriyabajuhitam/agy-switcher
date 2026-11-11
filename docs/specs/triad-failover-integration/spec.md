@@ -26,7 +26,7 @@ Governing decisions and domain standards:
 
 ## Requirements
 ### Requirement: Reactive Mid-Turn Failover Detection in TurnRunner
-The `TurnRunner` module in `agy-telemote` MUST detect model quota exhaustion during active turn execution via dual-inspection detection (JSON stream result event and subprocess non-zero exit code with stderr), dynamically probe for `agy_switcher.api` via safe soft-import, and execute a **Disk-Only Swap** via `auto_rotate_on_exhaustion(model=mapped_model, reload_server=False)` without restarting desktop language server processes.
+The `TurnRunner` module in `agy-telemote` and the In-Process SDK Facade (`scripts/agy_switcher/api.py`) MUST detect model quota exhaustion during active turn execution strictly for the Google Gemini model family, normalize all model identifiers to `"gemini"`, reject non-Gemini model requests with `AgySwitchError`, and execute a **Disk-Only Swap** via `auto_rotate_on_exhaustion(model="gemini", reload_server=False)` without restarting desktop language server processes or checking non-Gemini cooldowns.
 
 #### Scenario: [FAILOVER-DET-001] Dual-inspection detection on JSON stream result event with quota error status
 - GIVEN an active turn executing `agy` subprocess with model `"gemini-3.8-flash"`
@@ -50,20 +50,20 @@ The `TurnRunner` module in `agy-telemote` MUST detect model quota exhaustion dur
 - THEN `TurnRunner` matches the canonical HTTP `429` indicator in stderr
 - AND flags the execution for automatic credential rotation.
 
-#### Scenario: [FAILOVER-DET-004] Safe soft-import of agy_switcher.api succeeds and invokes auto_rotate_on_exhaustion
+#### Scenario: [FAILOVER-DET-004] Safe soft-import of agy_switcher.api succeeds and invokes auto_rotate_on_exhaustion for gemini
 - GIVEN `agy-switcher` is installed in the Python environment
 - AND active account `"primary-acc"` is exhausted for model `"gemini-3.8-flash"`
-- AND standby account `"standby-acc"` has available quota
+- AND standby account `"standby-acc"` has available Gemini quota
 - WHEN `TurnRunner` catches a quota exhaustion failure during prompt execution
 - THEN `TurnRunner` dynamically imports `agy_switcher.api` without hard dependency errors
 - AND invokes `switcher_api.auto_rotate_on_exhaustion(model="gemini", reload_server=False)`
 - AND receives a `RotationResult` indicating `success=True` and `new_account="standby-acc"`.
 
-#### Scenario: [FAILOVER-DET-005] Disk-Only Swap execution passes reload_server=False and mapped model family
-- GIVEN an active turn running with model `"claude-sonnet-4-6"`
+#### Scenario: [FAILOVER-DET-005] Disk-Only Swap execution passes reload_server=False with Gemini-exclusive model
+- GIVEN an active turn running with model `"gemini-3.8-pro"`
 - AND desktop language server processes are running with presence locks present
 - WHEN `TurnRunner` triggers failover upon quota exhaustion
-- THEN it passes `model="claude"` and `reload_server=False` to `auto_rotate_on_exhaustion`
+- THEN it passes `model="gemini"` and `reload_server=False` to `auto_rotate_on_exhaustion`
 - AND the token swap updates `~/.gemini/antigravity-cli/antigravity-oauth-token` atomically
 - AND no desktop language server processes or presence locks are modified or terminated.
 
@@ -115,6 +115,18 @@ The `TurnRunner` module in `agy-telemote` MUST detect model quota exhaustion dur
 - WHEN both turn tasks invoke `switcher_api.auto_rotate_on_exhaustion(reload_server=False)` concurrently
 - THEN the underlying atomic disk swap operations (`os.replace`) serialize safely without race conditions
 - AND the active account transitions cleanly to a standby account without corrupted token files or double-hopping.
+
+#### Scenario: [FAILOVER-ERR-004] Invoking auto_rotate_on_exhaustion with non-Gemini model raises AgySwitchError
+- GIVEN an external caller or agent attempts to invoke `auto_rotate_on_exhaustion(model="claude")`
+- WHEN `auto_rotate_on_exhaustion` validates the model family
+- THEN it rejects the call and raises `AgySwitchError` indicating that non-Gemini models are retired and unsupported
+- AND no account rotation or disk mutation is performed.
+
+#### Scenario: [FAILOVER-EDGE-005] Specific Gemini model variants normalize cleanly to gemini family
+- GIVEN a turn running with specific Gemini model slugs (`"gemini-3.8-flash"`, `"gemini-3.8-pro"`, `"gemini-2.5-flash"`)
+- WHEN `TurnRunner` or `auto_rotate_on_exhaustion` processes the model parameter
+- THEN each model slug is normalized cleanly to `"gemini"`
+- AND rotation heuristics evaluate exclusively the Gemini quota bucket.
 
 ### Requirement: Bounded Retry Loop and Conversation Context Preservation
 The `TurnRunner` retry engine MUST enforce a bounded retry budget of at most 2 attempts (or `min(2, total_accounts - 1)`), preserve the exact conversation ID (`--conversation <id>`) across retries to maintain continuous Antigravity CLI brain transcript history, and emit transient status updates via `ProgressSink.on_status()` during rotation pauses without polluting user chat history.
@@ -362,3 +374,218 @@ The Telegram command interface in `agy-telemote` MUST provide `/quota` and `/swi
 - THEN the first callback switches the account and answers the query
 - AND the second callback detects that `"personal"` is already active
 - AND acknowledges the query with an idempotent `"Akun sudah aktif"` status without duplicate disk writes.
+
+### Requirement: Quota Telemetry and Rotation Heuristics
+The `telemetry.py` and `rotation.py` modules MUST operate under a **Gemini-Exclusive Architecture**, restricting model normalization and quota caching strictly to Google Gemini metrics, removing all Claude/Anthropic group parsing and sub-keys from `last_known_quota.json`, and executing `RotationEngine` evaluation heuristics (`auto_highest`, `imminent_reset`, `drain_window`) exclusively against Gemini quota balances without multi-model branching or cross-model leakage.
+
+#### Scenario: [QUOTA-GEMINI-001] Telemetry normalizes Gemini model variants to gemini key
+- GIVEN model strings `"gemini"`, `"gemini-3.8-flash"`, `"gemini-3.8-pro"`, or `"GEMINI-2.5-FLASH"`
+- WHEN `normalize_model_name()` is invoked
+- THEN it returns `"gemini"` in lowercase
+- AND passes validation without errors.
+
+#### Scenario: [QUOTA-GEMINI-002] QuotaClient parses CloudCode summary retaining exclusively Gemini quota metrics
+- GIVEN CloudCode quota API response containing user quota buckets
+- WHEN `QuotaClient.parse_quota_response()` parses the API payload
+- THEN it extracts weekly and five-hour quota fractions exclusively for Gemini Models under the `"gemini"` key
+- AND completely ignores any third-party or Claude models.
+
+#### Scenario: [QUOTA-GEMINI-003] RotationEngine evaluates standby accounts based strictly on Gemini quota
+- GIVEN active account `"acc1"` with 0% Gemini quota
+- AND standby account `"acc2"` with 80% Gemini quota
+- AND standby account `"acc3"` with 40% Gemini quota
+- WHEN `RotationEngine(model_name="gemini").evaluate()` evaluates candidate accounts
+- THEN it selects `"acc2"` based on highest available Gemini quota
+- AND ignores non-Gemini model state.
+
+#### Scenario: [QUOTA-GEMINI-ERR-001] normalize_model_name raises AgySwitchError on non-Gemini model identifiers
+- GIVEN an unsupported model name such as `"claude"`, `"claude-3-5-sonnet"`, `"gpt-4o"`, or `"anthropic"`
+- WHEN `normalize_model_name(model)` is called
+- THEN it raises `AgySwitchError` with an informative error message stating allowed model is strictly `'gemini'`.
+
+#### Scenario: [QUOTA-GEMINI-ERR-002] CloudCode quota response with missing or corrupt Gemini group yields empty buckets without KeyError
+- GIVEN CloudCode raw API response missing `"Gemini Models"` or containing empty group payload
+- WHEN `QuotaClient.parse_quota_response()` evaluates the payload
+- THEN it handles the missing group gracefully and returns an empty dictionary
+- AND does not throw `KeyError` or crash the caller.
+
+#### Scenario: [QUOTA-GEMINI-ERR-003] Unreadable or corrupted quota cache file during cache load initializes clean cache
+- GIVEN `last_known_quota.json` contains corrupted binary garbage or unparseable JSON
+- WHEN `QuotaClient.load_cache()` is called
+- THEN it catches `json.JSONDecodeError` or `OSError`
+- AND returns an empty dictionary safely without raising uncaught exceptions.
+
+#### Scenario: [QUOTA-GEMINI-EDGE-001] Quota cache persistence strips legacy non-Gemini keys
+- GIVEN an existing `last_known_quota.json` on disk containing legacy `"claude"` entries
+- WHEN `QuotaClient.load_cache()` or `save_cache()` processes the cache file
+- THEN it strips all legacy `"claude"` keys and retains only valid `"gemini"` quota records
+- AND persists a sanitized cache adhering to the Gemini-Exclusive schema.
+
+#### Scenario: [QUOTA-GEMINI-EDGE-002] get_fleet_quota_summary filters strictly to Gemini fleet balances
+- GIVEN a vault with 3 registered accounts
+- WHEN `get_fleet_quota_summary(model="gemini")` is invoked
+- THEN it returns a `FleetQuotaSummary` containing quota balances and reset countdowns solely for the Gemini model family.
+
+#### Scenario: [QUOTA-GEMINI-EDGE-003] Concurrent cache read-modify-write operations serialize under cache lock
+- GIVEN multiple threads in `agy-switch` updating and reading `last_known_quota.json` concurrently
+- WHEN `QuotaClient.save_cache()` and `load_cache()` are invoked simultaneously
+- THEN `_CACHE_LOCK` serializes access, preventing race conditions or truncated cache writes.
+
+#### Scenario: [QUOTA-GEMINI-EDGE-004] Model name with extra whitespace or mixed casing normalizes to gemini
+- GIVEN model string `"  GeMiNi-3.8-PrO  "`
+- WHEN `normalize_model_name()` is invoked
+- THEN it strips whitespace and normalizes to `"gemini"`.
+
+### Requirement: Transcript-Bounded Watching in PresenceDetector & LogWatcher
+The `PresenceDetector` and `LogWatcher` modules MUST strictly bound log monitoring to active structured conversation transcript files (`transcript.jsonl`), completely cease globbing and reading unformatted CLI text log files (`~/.gemini/antigravity-cli/log/*.log`), and enforce strict JSON-first filtering where non-JSON lines and unstructured text are unconditionally discarded, while evaluating quota exhaustion regex patterns exclusively on records with `status == "ERROR"`, `type == "ERROR_MESSAGE"`, or non-empty `error` payloads, maintaining absolute immunity for records with status `DONE` or message type `USER_INPUT`.
+
+#### Scenario: [WATCH-BOUND-001] PresenceDetector.get_watch_targets strictly omits raw CLI log files
+- GIVEN an active Antigravity session with active transcript `brain/<id>/.system_generated/logs/transcript.jsonl`
+- AND directory `~/.gemini/antigravity-cli/log/` contains multiple `cli-*.log` files
+- WHEN `PresenceDetector.get_watch_targets()` is invoked
+- THEN the returned target list contains exclusively the resolved `transcript.jsonl` path
+- AND contains zero paths from `~/.gemini/antigravity-cli/log/`.
+
+#### Scenario: [WATCH-BOUND-002] Structured JSON line with status ERROR and quota pattern triggers exhaustion dispatch
+- GIVEN `LogWatcher` tailing an active `transcript.jsonl`
+- WHEN a new JSON line arrives: `{"status": "ERROR", "error": "Quota exceeded for project: RESOURCE_EXHAUSTED"}`
+- THEN `LogWatcher.process_line()` parses the line as valid JSON
+- AND identifies `status == "ERROR"` with matching quota exhaustion regex
+- AND dispatches exhaustion handling.
+
+#### Scenario: [WATCH-BOUND-003] Structured JSON line with type ERROR_MESSAGE and 429 pattern triggers exhaustion dispatch
+- GIVEN `LogWatcher` processing lines from `transcript.jsonl`
+- WHEN a new JSON line arrives: `{"type": "ERROR_MESSAGE", "message": "googleapi: Error 429: Rate limit exceeded"}`
+- THEN `LogWatcher.process_line()` validates `type == "ERROR_MESSAGE"` and matches HTTP 429
+- AND dispatches exhaustion handling.
+
+#### Scenario: [WATCH-BOUND-004] Immunity for status DONE even when content contains quota exhaustion keywords
+- GIVEN a turn where an agent completed a task reviewing or grepping code containing `"RESOURCE_EXHAUSTED"`
+- WHEN a JSON line arrives in `transcript.jsonl` with `{"status": "DONE", "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase"}`
+- THEN `LogWatcher.process_line()` checks the status field and encounters `"DONE"`
+- AND immediately grants immunity without inspecting content for exhaustion regex
+- AND returns `False` without triggering account rotation.
+
+#### Scenario: [WATCH-BOUND-005] Immunity for type USER_INPUT containing quota exhaustion and 429 references
+- GIVEN a user prompt submitted to Antigravity discussing quota limits: `"How do I handle RESOURCE_EXHAUSTED and code 429?"`
+- WHEN `transcript.jsonl` appends `{"type": "USER_INPUT", "content": "How do I handle RESOURCE_EXHAUSTED and code 429?"}`
+- THEN `LogWatcher.process_line()` identifies `type == "USER_INPUT"`
+- AND immediately suppresses evaluation, returning `False` without switching accounts.
+
+#### Scenario: [WATCH-BOUND-ERR-001] Non-JSON line in transcript or plain text file is unconditionally ignored
+- GIVEN an unformatted plain text line arriving from terminal stdout or corrupted transcript: `"RESOURCE_EXHAUSTED: unit test simulated failure"`
+- WHEN `LogWatcher.process_line(line, is_jsonl=True)` or `LogWatcher.process_line(line, is_jsonl=False)` evaluates the line
+- THEN it detects that the line does not parse as valid JSON or lacks required structured error envelopes
+- AND discards the line immediately, returning `False` without triggering rotation.
+
+#### Scenario: [WATCH-BOUND-ERR-002] Malformed or truncated JSON line does not crash watcher daemon
+- GIVEN a partial or corrupt JSON line appended mid-flush: `{"status": "ERROR", "error": "RESOURCE_EX`
+- WHEN `LogWatcher.process_line()` attempts JSON decoding
+- THEN it catches `json.JSONDecodeError` safely
+- AND ignores the line without throwing an unhandled exception or stopping the tailing loop.
+
+#### Scenario: [WATCH-BOUND-EDGE-001] Deeply nested error payload extracted safely from content object or list
+- GIVEN a JSON line with `{"status": "ERROR", "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted desc = Quota limit reached"}]}`
+- WHEN `LogWatcher.process_line()` evaluates the record
+- THEN it traverses the nested content structure to extract textual tokens
+- AND correctly matches `ResourceExhausted`
+- AND triggers exhaustion handling.
+
+#### Scenario: [WATCH-BOUND-EDGE-002] Missing or unlinked transcript target gracefully yields empty watch targets
+- GIVEN no Antigravity Desktop or CLI presence locks exist on the host
+- AND `PresenceDetector.get_active_transcript_path()` returns `None`
+- WHEN `PresenceDetector.get_watch_targets()` is invoked
+- THEN it returns an empty list `[]` without raising `FileNotFoundError` or inspecting CLI logs.
+
+#### Scenario: [WATCH-BOUND-ERR-003] PermissionError or unreadable transcript file descriptor handled safely without crashing daemon
+- GIVEN an active session transcript file path that becomes unreadable due to filesystem permissions (`EACCES` or `PermissionError`)
+- WHEN `LogWatcher.poll_once()` attempts to open or read from the file
+- THEN it catches `OSError` safely
+- AND skips the target for that polling iteration without raising an unhandled exception or terminating the watcher loop.
+
+#### Scenario: [WATCH-BOUND-EDGE-003] File truncation or rotation during active transcript tailing safely resets file cursor
+- GIVEN `LogWatcher` has read 4096 bytes from an active `transcript.jsonl`
+- WHEN the file is truncated or rotated by Antigravity such that its current size is smaller than the cursor
+- THEN `LogWatcher.poll_once()` detects `current_size < cursor`
+- AND resets the file cursor to 0 to resume tailing cleanly from the beginning without raising `SeekError` or missing newly appended records.
+
+### Requirement: Pre-Switch Quota Probe and Extended Damping in LogWatcher
+The `LogWatcher` module MUST execute a **Pre-Switch Quota Probe** prior to initiating credential rotation upon detecting quota exhaustion, validating whether the active account's Gemini quota fraction exceeds the 25% health threshold via fast telemetry or cached metrics, immediately suppressing rotation and cooldown application if the quota is healthy (>25%), and MUST enforce an extended default damping window of **60.0 seconds** (`damping_seconds = 60.0`) to eliminate chain-switching cascades and rapid-fire switch storms.
+
+#### Scenario: [PRE-PROBE-001] Pre-Switch Quota Probe suppresses rotation when active account has healthy Gemini quota
+- GIVEN active account `"primary-acc"` with cached Gemini quota of 85% (`fraction = 0.85`)
+- AND `LogWatcher` detects a quota exhaustion pattern in an error event
+- WHEN `LogWatcher.handle_exhaustion()` executes the Pre-Switch Quota Probe
+- THEN it evaluates that active account Gemini quota is greater than 25% (`0.85 > 0.25`)
+- AND suppresses account rotation, treating the error as a transient RPC anomaly
+- AND does not add `"primary-acc"` to `cooldown.json`
+- AND returns `False`.
+
+#### Scenario: [PRE-PROBE-002] Pre-Switch Quota Probe authorizes rotation when active account Gemini quota is depleted
+- GIVEN active account `"primary-acc"` with cached Gemini quota of 10% (`fraction = 0.10 <= 0.25`)
+- AND standby account `"standby-acc"` has available quota (90%)
+- WHEN `LogWatcher.handle_exhaustion()` runs the Pre-Switch Quota Probe
+- THEN it validates that `"primary-acc"` Gemini quota is at or below the 25% threshold
+- AND authorizes account rotation
+- AND places `"primary-acc"` into cooldown
+- AND executes `switch_tokens("standby-acc", restart_server=True, force=True)` successfully.
+
+#### Scenario: [PRE-PROBE-003] Extended 60-second damping window suppresses rapid successive error bursts
+- GIVEN `LogWatcher` initialized with default `damping_seconds = 60.0`
+- AND an auto-rotation occurred 25 seconds ago (`elapsed = 25.0s`)
+- WHEN a subsequent quota error arrives in the active transcript
+- THEN `LogWatcher.handle_exhaustion()` checks the elapsed time against `damping_seconds`
+- AND determines `elapsed < 60.0`
+- AND suppresses rotation without placing any account into cooldown.
+
+#### Scenario: [PRE-PROBE-004] Damping window expiration re-arms failover switching
+- GIVEN an auto-rotation occurred 61 seconds ago (`elapsed = 61.0s >= 60.0s`)
+- AND the active account is genuinely depleted (quota <= 25%)
+- WHEN a new quota error arrives
+- THEN `LogWatcher.handle_exhaustion()` verifies the damping window has elapsed
+- AND proceeds to evaluate standby accounts and execute failover.
+
+#### Scenario: [PRE-PROBE-ERR-001] Cache read failure or uninitialized telemetry falls back safely to rotation
+- GIVEN `last_known_quota.json` is missing or unparseable during the Pre-Switch Quota Probe
+- AND no live telemetry can be fetched
+- WHEN `LogWatcher.handle_exhaustion()` assesses active account quota
+- THEN it treats the quota state as unverified rather than assuming healthy
+- AND falls back to standard exhaustion rotation so the agent turn is not permanently blocked.
+
+#### Scenario: [PRE-PROBE-ERR-002] Live telemetry query network failure or timeout during Pre-Switch Quota Probe falls back safely to rotation
+- GIVEN active account `"primary-acc"` encounters a quota error pattern in `transcript.jsonl`
+- AND cached quota is missing or stale
+- AND live CloudCode telemetry request raises `urllib.error.URLError` or socket timeout
+- WHEN `LogWatcher.handle_exhaustion()` executes the Pre-Switch Quota Probe
+- THEN it catches the network exception gracefully without crashing the watcher daemon
+- AND treats the quota state as unverified, authorizing rotation to the next standby account.
+
+#### Scenario: [PRE-PROBE-ERR-003] Burst quota error stream arriving within 60-second damping window triggers zero redundant switches
+- GIVEN an auto-rotation occurred 10 seconds ago (`elapsed = 10.0s < 60.0s`)
+- WHEN 10 consecutive quota exhaustion error lines arrive within 2 seconds
+- THEN each error line is evaluated against the 60.0-second damping window
+- AND all 10 events are suppressed with zero additional token switches or cooldown penalties.
+
+#### Scenario: [PRE-PROBE-EDGE-001] Pre-Switch Quota Probe at exact boundary of 25% quota
+- GIVEN active account `"primary-acc"` has exactly 25.0% Gemini quota remaining (`fraction = 0.25`)
+- WHEN `LogWatcher.handle_exhaustion()` executes the Pre-Switch Quota Probe
+- THEN it evaluates that `fraction <= 0.25` is not healthy (>25%)
+- AND authorizes account rotation to preserve agent operation before zero-token hard cutoff.
+
+#### Scenario: [PRE-PROBE-EDGE-002] Clock skew or negative elapsed time handled safely by damping timer
+- GIVEN system clock was adjusted backwards such that `now - last_switch_time < 0`
+- WHEN `LogWatcher.handle_exhaustion()` checks the damping interval
+- THEN it resets `last_switch_time = 0.0` safely
+- AND prevents permanent suppression of rotation.
+
+#### Scenario: [PRE-PROBE-EDGE-003] Custom damping window configuration respects user parameter
+- GIVEN `LogWatcher` initialized with custom `damping_seconds = 90.0`
+- WHEN an error arrives 75 seconds after a switch
+- THEN `LogWatcher` suppresses rotation in accordance with the configured 90.0-second window.
+
+#### Scenario: [PRE-PROBE-EDGE-004] Pre-Switch Quota Probe at exact 60.0-second damping boundary re-arms switching
+- GIVEN an auto-rotation occurred exactly 60.0 seconds ago (`elapsed = 60.0s`)
+- AND active account has depleted quota (`fraction <= 0.25`)
+- WHEN a new quota error arrives in `transcript.jsonl`
+- THEN `LogWatcher.handle_exhaustion()` evaluates that `elapsed >= damping_seconds` (damping window elapsed)
+- AND allows Pre-Switch Quota Probe and failover to proceed.
