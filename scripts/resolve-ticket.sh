@@ -53,6 +53,7 @@ Options:
   --lean, --lean-summary      Format handoff under Lean 3-Line Summary Protocol
   --stream, --lean-stream     Format handoff under Lean 2-Line Progress Stream Protocol ([LEAN-01])
   --claim                     Claim a ticket atomically (mark in-progress on disk)
+  --unclaim, --reset          Release ticket claim (reset to ready-for-agent on disk)
   --reconcile                 Reconcile ticket status against Git commit evidence on HEAD ([RECON-01])
   --batch                     Batch reconciliation of tickets in Command Center mode ([EDGE-RECON-01], [EDGE-SNTZ-01])
   --emit-briefs               Emit downstream frontier starter briefs (Command Center mode)
@@ -114,7 +115,7 @@ main() {
                 check_dag_completion "${FORWARD_ARGS[@]}"
                 exit $?
                 ;;
-            --claim | --reconcile | --batch | --batch=* | --emit-briefs | --brief | --final-frontier-brief | --final-frontier-worker-brief | \
+            --claim | --unclaim | --reset | --reconcile | --batch | --batch=* | --emit-briefs | --brief | --final-frontier-brief | --final-frontier-worker-brief | \
             --eval-brief | --eval-brief=* | \
             --reject-eval-pr-prompt | --eval-completion-report | --eval-completion-report=* | \
             --circuit-breaker | --circuit-breaker=* | --eval-circuit-breaker | --eval-circuit-breaker=* | \

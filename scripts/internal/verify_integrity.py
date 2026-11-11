@@ -2743,8 +2743,8 @@ class ManifestValidator:
                     )
                 )
 
-            # Specific rules for serve-report.sh, setup-worktree-env.sh, codemod.sh, and verify-spec.sh
-            if sh_path.name in ("serve-report.sh", "setup-worktree-env.sh", "codemod.sh", "verify-spec.sh"):
+            # Specific rules for serve-report.sh, setup-worktree-env.sh, codemod.sh, verify-spec.sh, and verify-research.sh
+            if sh_path.name in ("serve-report.sh", "setup-worktree-env.sh", "codemod.sh", "verify-spec.sh", "verify-research.sh"):
                 mode = sh_path.stat().st_mode & 0o777
                 if mode != 0o755:
                     errors.append(
@@ -2765,7 +2765,7 @@ class ManifestValidator:
                             f"Shell script {sh_path.name} is missing shebang line",
                         )
                     )
-                elif sh_path.name in ("serve-report.sh", "setup-worktree-env.sh", "codemod.sh") and first_line.strip() != "#!/usr/bin/env bash":
+                elif sh_path.name in ("serve-report.sh", "setup-worktree-env.sh", "codemod.sh", "verify-spec.sh", "verify-research.sh") and first_line.strip() != "#!/usr/bin/env bash":
                     errors.append(
                         ValidationError(
                             sh_path,
@@ -3145,6 +3145,70 @@ class ManifestValidator:
                 compile(e_content, str(engine_script), "exec")
             except Exception as exc:
                 errors.append(ValidationError(engine_script, "SPEC_SCRIPT_VIOLATION", f"Syntax error in scripts/internal/verify_spec.py: {exc}"))
+
+        return components_scanned, errors
+
+    def validate_research_engine(self, root_dir: Path) -> tuple[int, list[ValidationError]]:
+        """
+        Validates the mechanical research note validator CLI and internal engine ([CLI-02]):
+        1. scripts/verify-research.sh executable permissions (0755), bash shebang, strict mode, and invocation of verify_research.py.
+        2. scripts/internal/verify_research.py syntax integrity and self-test execution.
+        """
+        errors: list[ValidationError] = []
+        components_scanned = 0
+
+        # --- 1. Executable CLI Script Validation: scripts/verify-research.sh ---
+        verify_script = root_dir / "scripts" / "verify-research.sh"
+        components_scanned += 1
+        if not verify_script.is_file():
+            errors.append(ValidationError(verify_script, "RESEARCH_SCRIPT_VIOLATION", "Missing CLI wrapper 'scripts/verify-research.sh'"))
+        else:
+            st_mode = verify_script.stat().st_mode
+            if not (st_mode & 0o111):
+                errors.append(ValidationError(verify_script, "RESEARCH_SCRIPT_VIOLATION", "scripts/verify-research.sh is not marked executable (+x)"))
+            mode = st_mode & 0o777
+            if mode != 0o755:
+                errors.append(ValidationError(verify_script, "RESEARCH_SCRIPT_VIOLATION", f"scripts/verify-research.sh must have 0755 permissions, got {oct(mode)}"))
+            try:
+                s_lines = verify_script.read_text(encoding="utf-8").splitlines()
+                if not s_lines or not s_lines[0].startswith(("#!/usr/bin/env bash", "#!/bin/bash")):
+                    errors.append(ValidationError(verify_script, "RESEARCH_SCRIPT_VIOLATION", "scripts/verify-research.sh missing '#!/usr/bin/env bash' shebang"))
+                full_script = "\n".join(s_lines)
+                if not re.search(r"set\s+-[^\n]*e", full_script):
+                    errors.append(ValidationError(verify_script, "RESEARCH_SCRIPT_VIOLATION", "scripts/verify-research.sh missing strict error handling (set -euo pipefail)"))
+                if "verify_research.py" not in full_script:
+                    errors.append(ValidationError(verify_script, "RESEARCH_SCRIPT_VIOLATION", "scripts/verify-research.sh must invoke 'verify_research.py'"))
+            except Exception as exc:
+                errors.append(ValidationError(verify_script, "FILE_READ_ERROR", f"Could not read verify-research.sh: {exc}"))
+
+        # --- 2. Python Engine Validation: scripts/internal/verify_research.py ---
+        engine_script = root_dir / "scripts" / "internal" / "verify_research.py"
+        components_scanned += 1
+        if not engine_script.is_file():
+            errors.append(ValidationError(engine_script, "RESEARCH_SCRIPT_VIOLATION", "Missing engine script 'scripts/internal/verify_research.py'"))
+        else:
+            try:
+                e_content = engine_script.read_text(encoding="utf-8")
+                compile(e_content, str(engine_script), "exec")
+            except Exception as exc:
+                errors.append(ValidationError(engine_script, "RESEARCH_SCRIPT_VIOLATION", f"Syntax error in scripts/internal/verify_research.py: {exc}"))
+
+        # --- 3. Self-Test Execution ---
+        components_scanned += 1
+        try:
+            if str(root_dir) not in sys.path:
+                sys.path.insert(0, str(root_dir))
+            internal_dir = root_dir / "scripts" / "internal"
+            if str(internal_dir) not in sys.path:
+                sys.path.insert(0, str(internal_dir))
+            try:
+                from scripts.internal.verify_research import run_self_tests
+            except ImportError:
+                from verify_research import run_self_tests  # type: ignore[import-not-found,no-redef]
+            if not run_self_tests():
+                errors.append(ValidationError(engine_script, "RESEARCH_SELFTEST_FAILURE", "scripts/internal/verify_research.py self-test returned False"))
+        except Exception as exc:
+            errors.append(ValidationError(engine_script, "RESEARCH_SELFTEST_FAILURE", f"Exception during research validator self-test: {exc}"))
 
         return components_scanned, errors
 
@@ -7728,7 +7792,7 @@ Upon completing TDD and compiler verification, report back via send_message adhe
                         else re.escape(t_id_str)
                     )
                     row_match = re.search(
-                        rf"^\s*\|\s*\*{0,2}(?:ticket-|issue-|#)?{id_pattern}\*{0,2}\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|",
+                        rf"^\s*\|\s*\*{{0,2}}(?:\[\*{{0,2}}(?:ticket-|issue-|#)?{id_pattern}\*{{0,2}}\]\([^)]+\)|(?:ticket-|issue-|#)?{id_pattern})\*{{0,2}}\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|",
                         tg_content,
                         re.MULTILINE,
                     )
@@ -7798,10 +7862,43 @@ Upon completing TDD and compiler verification, report back via send_message adhe
             return []
 
         ticket_files: list[Path] = []
-        for p in sorted(issues_dir.glob("*.md")):
-            if p.name.lower() in ("task-graph.md", "spec.md", "session.json", "index.md", "readme.md"):
-                continue
-            ticket_files.append(p)
+        try:
+            if issues_dir.is_dir():
+                for p in sorted(issues_dir.glob("*.md")):
+                    if p.name.lower() in ("task-graph.md", "spec.md", "session.json", "index.md", "readme.md"):
+                        continue
+                    ticket_files.append(p)
+        except OSError as exc:
+            logger.warning("Failed to access issues directory '%s': %s", issues_dir, exc)
+
+        resolved_feat_dir = feature_dir or (
+            issues_dir.parent if issues_dir.name == "issues" else issues_dir
+        )
+        if resolved_feat_dir:
+            tg_path = resolved_feat_dir / "task-graph.md"
+            if tg_path.is_file():
+                try:
+                    tg_content = tg_path.read_text(encoding="utf-8")
+                    for row_match in re.finditer(
+                        r"\[(?P<link_id>[^\]]+)\]\((?P<link_path>[^)]*issues/[^)]+)\)",
+                        tg_content,
+                    ):
+                        link_path = row_match.group("link_path")
+                        if link_path:
+                            clean_lp = link_path.strip()
+                            cand_p = issues_dir / Path(clean_lp).name
+                            existing_names = {p.name for p in ticket_files}
+                            existing_ids = set()
+                            for p in ticket_files:
+                                m = re.match(r"^([0-9]{1,3})", p.stem)
+                                if m:
+                                    existing_ids.add(f"{int(m.group(1)):02d}")
+                            m_cand = re.match(r"^([0-9]{1,3})", cand_p.stem)
+                            cand_id = f"{int(m_cand.group(1)):02d}" if m_cand else None
+                            if cand_p.name not in existing_names and (not cand_id or cand_id not in existing_ids):
+                                ticket_files.append(cand_p)
+                except Exception:
+                    pass
 
         def _sort_key(p: Path) -> tuple[int, str]:
             m = re.match(r"^([0-9]{1,3})", p.stem)
@@ -13067,6 +13164,13 @@ def run_integrity_check(
     all_errors.extend(spec_errors)
     if verbose or not spec_errors:
         reporter.report_success("spec engine, workflow schemas & specification templates", spec_scanned)
+
+    # 3e-2. Research note validator engine & CLI integrity ([CLI-02])
+    res_engine_scanned, res_engine_errors = manifest_validator.validate_research_engine(root_dir)
+    all_errors.extend(res_engine_errors)
+    if verbose or not res_engine_errors:
+        reporter.report_success("research note validator engine & CLI integrity ([CLI-02])", res_engine_scanned)
+
 
     # 3f. Track 12 living specifications & anti-scenario-loss invariants validation
     track12_scanned, track12_errors = manifest_validator.validate_track_12_invariants(root_dir)

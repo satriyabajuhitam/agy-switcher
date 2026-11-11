@@ -1307,9 +1307,11 @@ def format_operator_handoff(
     prefer_paths: bool = True,
     lean_summary: bool = False,
     artifact_path: Path | str | None = None,
+    lean: bool = False,
 ) -> str:
     """
-    [HAND-01] [HAND-02] [API-01] [API-02] Formats operator hand-off and terminal execution recommendations:
+    [HAND-01] [HAND-02] [API-01] [API-02] [ADR-0047] Formats operator hand-off and terminal execution recommendations:
+    - If lean is True, strictly emits standalone 1-line execution command blocks in 4-backtick bash blocks per ADR 0047.
     - If lean_summary is True, strictly outputs the standardized Lean 3-Line Summary Protocol ([API-02], [SUMM-01]).
     - If uncompleted downstream tickets exist, inspects the feature DAG and prints
       a clean copy-pasteable '/implement <NN>' command for the next unblocked frontier ticket,
@@ -1361,7 +1363,7 @@ def format_operator_handoff(
             target_issues_dir = base_path
 
     if dag_complete:
-        if lean_summary:
+        if lean_summary and not lean:
             total_t = len(tg_tickets) if tg_tickets else None
             resolved_t = len(tg_tickets) if tg_tickets else None
             return v.format_chat_handoff(
@@ -1374,15 +1376,55 @@ def format_operator_handoff(
                 task_graph_path=tg_file,
                 phase="Code Review",
             )
-        notice = format_dag_completion_notice(True)
-        try:
-            eval_brief = format_evaluation_brief(
-                "code-review",
+
+        target_f_dir = tg_file.parent if tg_file else (target_issues_dir.parent if target_issues_dir.name == "issues" else target_issues_dir)
+        cr_artifact = target_f_dir / "code-review.md" if target_f_dir else None
+        cr_has_pass = False
+        if cr_artifact and cr_artifact.is_file():
+            try:
+                cr_txt = cr_artifact.read_text(encoding="utf-8").upper()
+                if "PASS" in cr_txt and "FAIL" not in cr_txt:
+                    cr_has_pass = True
+            except Exception:
+                pass
+
+        sa_artifact = target_f_dir / "security-audit.md" if target_f_dir else None
+        sa_has_pass = False
+        if sa_artifact and sa_artifact.is_file():
+            try:
+                sa_txt = sa_artifact.read_text(encoding="utf-8").upper()
+                if "PASS" in sa_txt and "FAIL" not in sa_txt:
+                    sa_has_pass = True
+            except Exception:
+                pass
+
+        if cr_has_pass and not sa_has_pass:
+            target_phase = "security-audit"
+        elif cr_has_pass and sa_has_pass:
+            target_phase = "pr"
+        else:
+            target_phase = "code-review"
+
+        if lean:
+            return format_evaluation_brief(
+                target_phase,
                 tracker_dir_or_feature_dir=target_issues_dir,
                 task_graph_path=tg_file,
                 root_dir=getattr(v, "repo_root", None),
                 validator=v,
-                lean=lean_summary,
+                include_heading=False,
+                lean=True,
+            )
+
+        notice = format_dag_completion_notice(True)
+        try:
+            eval_brief = format_evaluation_brief(
+                target_phase,
+                tracker_dir_or_feature_dir=target_issues_dir,
+                task_graph_path=tg_file,
+                root_dir=getattr(v, "repo_root", None),
+                validator=v,
+                lean=True,
             )
             return f"{notice}\n\n{eval_brief}"
         except Exception:
@@ -1422,7 +1464,7 @@ def format_operator_handoff(
                     if all(b in resolved_ids for b in t["blockers"]):
                         frontier.append(t["id"])
 
-    if lean_summary:
+    if lean_summary and not lean:
         enriched_frontier: list[dict[str, Any]] = []
         for raw_id in frontier:
             clean_id = str(raw_id).strip().lstrip("#")
@@ -1546,6 +1588,21 @@ def format_operator_handoff(
             executable_commands.append(target_cmd)
 
         if executable_commands:
+            if lean:
+                blocks: list[str] = []
+                for cmd_target in executable_commands:
+                    disp_path = str(cmd_target)
+                    if not disp_path.startswith(".scratch/") and target_issues_dir.is_dir():
+                        clean_target_id = Path(disp_path).stem.split("-")[0] if "-" in Path(disp_path).stem else Path(disp_path).stem
+                        matches = sorted(target_issues_dir.glob(f"{clean_target_id}-*.md")) or sorted(target_issues_dir.glob(f"{clean_target_id}.md"))
+                        if matches:
+                            disp_path = _normalize_ticket_display_path(matches[0], root_dir=getattr(v, "repo_root", None))
+                    elif not disp_path.startswith(".scratch/") and tg_file:
+                        slug = tg_file.parent.name
+                        disp_path = f".scratch/{slug}/issues/{cmd_target}.md"
+                    blocks.append(f"````bash\n/implement {disp_path}\n````")
+                return "\n\n".join(blocks)
+
             next_commands = "\n".join(f"  /implement {tid}" for tid in executable_commands)
             return (
                 "\n\nNext Steps:\n"
@@ -1554,7 +1611,10 @@ def format_operator_handoff(
             )
 
         if in_progress_count > 0:
-            return "\n\n> ⏳ Standby: All active frontier tickets are currently in-progress in other sessions."
+            standby_msg = "> ⏳ Standby: All active frontier tickets are currently in-progress in other sessions."
+            if lean:
+                return standby_msg
+            return f"\n\n{standby_msg}"
 
     return ""
 
@@ -1565,6 +1625,7 @@ def format_next_step_guidance(
     dag_complete: bool,
     lean_summary: bool = False,
     artifact_path: Path | str | None = None,
+    lean: bool = False,
 ) -> str:
     """
     [RES-01] [API-01] [API-02] Formats next-step execution commands.
@@ -1576,6 +1637,7 @@ def format_next_step_guidance(
         dag_complete=dag_complete,
         lean_summary=lean_summary,
         artifact_path=artifact_path,
+        lean=lean,
     )
 
 
@@ -1645,14 +1707,20 @@ def _parse_ticket_file_metadata(content: str, filename: str = "") -> dict[str, A
     meta: dict[str, Any] = {}
 
     title_m = re.search(r"^#+\s+(?:[0-9]{1,3}\s*:\s*)?(.+)$", content, re.MULTILINE)
-    meta["title"] = title_m.group(1).strip() if title_m else filename
+    if title_m and title_m.group(1).strip():
+        meta["title"] = title_m.group(1).strip()
+    else:
+        meta["title"] = ""
 
     m_id = re.match(r"^([0-9]{1,3})", filename)
     if m_id:
         meta["id"] = f"{int(m_id.group(1)):02d}"
     else:
         h1_id = re.search(r"^#+\s+([0-9]{1,3})\s*:", content, re.MULTILINE)
-        meta["id"] = f"{int(h1_id.group(1)):02d}" if h1_id else "01"
+        if h1_id:
+            meta["id"] = f"{int(h1_id.group(1)):02d}"
+        else:
+            meta["id"] = ""
 
     for match in re.finditer(
         r"^[ \t]*(?:[-*][ \t]+)?\*\*([A-Za-z0-9_\s-]+?)\s*(?::\*\*|\*\*\s*:)[ \t]*(.*?)$",
@@ -1676,7 +1744,7 @@ def _parse_ticket_file_metadata(content: str, filename: str = "") -> dict[str, A
             pass
 
     return {
-        "id": meta.get("id", "01"),
+        "id": meta.get("id", ""),
         "title": meta.get("title", ""),
         "seam": meta.get("seam", ""),
         "verification": meta.get("verification", ""),
@@ -1690,9 +1758,23 @@ def _parse_ticket_file_metadata(content: str, filename: str = "") -> dict[str, A
 def format_single_starter_prompt(
     ticket: dict[str, Any],
     is_final_frontier: bool = False,
+    lean: bool = False,
 ) -> str:
-    """Formats a single self-contained worker starter prompt enclosed in a markdown code fence."""
+    """Formats a single self-contained worker starter prompt enclosed in a markdown code fence or 4-backtick bash block."""
     target_path = ticket.get("path") or f".scratch/<feature-slug>/issues/{ticket.get('id', 'NN')}.md"
+    if ".scratch" in Path(target_path).parts:
+        target_path = _normalize_ticket_display_path(target_path)
+    elif ticket.get("task_graph_path") and ".scratch" in Path(ticket["task_graph_path"]).parts:
+        tg_parts = Path(ticket["task_graph_path"]).parts
+        s_idx = tg_parts.index(".scratch")
+        if len(tg_parts) > s_idx + 1:
+            slug = tg_parts[s_idx + 1]
+            ticket_filename = Path(target_path).name
+            target_path = f".scratch/{slug}/issues/{ticket_filename}"
+
+    if lean:
+        return f"````bash\n/implement {target_path}\n````"
+
     seam = ticket.get("seam") or "<seam-path-or-public-interface>"
     verification = ticket.get("verification") or "<npm test ... / tsc --noEmit>"
 
@@ -1707,33 +1789,31 @@ def format_single_starter_prompt(
 
     if is_final_frontier:
         completion_rule = (
-            "5. PENTING: Ini adalah tiket terakhir pada DAG. Jangan membuat prompt untuk tiket selanjutnya "
-            "atau memindai tiket berikutnya (downstream frontier calculation is reserved exclusively for the Command Center session). "
-            "Selesaikan giliran dengan Recommend-and-Stop: konfirmasikan bahwa tiket telah selesai dan "
-            "rekomendasikan operator untuk melaporkan bahwa semua tiket telah selesai (\"semua tiket selesai\") "
-            "ke sesi Command Center (CC) guna memulai fase evaluasi lanjutan (seperti /code-review atau /pr)."
+            "5. IMPORTANT: This is the final ticket on the DAG. Do not draft prompts for subsequent tickets "
+            "(jangan membuat prompt untuk tiket selanjutnya, downstream frontier calculation is reserved exclusively for the Command Center session). "
+            "Conclude turn with Recommend-and-Stop: confirm ticket resolution and "
+            "recommend the operator report that all tickets are resolved (\"semua tiket selesai\") "
+            "to the Command Center (CC) session to initiate downstream evaluation phases (fase evaluasi lanjutan, such as /code-review or /pr)."
         )
     else:
         completion_rule = (
-            "5. PENTING: Jangan membuat prompt untuk tiket selanjutnya atau memindai tiket berikutnya "
-            "(downstream frontier calculation is reserved exclusively for the Command Center session). "
-            "Selesaikan giliran dengan Recommend-and-Stop: cukup konfirmasi bahwa tiket telah selesai dan "
-            "rekomendasikan saya untuk melapor kembali ke sesi Command Center (CC)."
+            "5. IMPORTANT: Do not draft prompts for subsequent tickets or scan next tickets "
+            "(jangan membuat prompt untuk tiket selanjutnya, downstream frontier calculation is reserved exclusively for the Command Center session). "
+            "Conclude turn with Recommend-and-Stop: confirm ticket resolution and "
+            "recommend reporting back to the Command Center (CC) session without drafting downstream prompts."
         )
 
     prompt = f"""```markdown
-Saya ingin menyelesaikan tiket berikut menggunakan metodologi agy-matt:
-
 Target Ticket: {target_path}
 Architectural Seam: {seam}
 Spec Scenario Tags: {scenario_tags_val}
 Verification Gate: {verification}
 
-Instruksi Pengerjaan:
+Execution Instructions:
 1. Jalankan /implement {target_path}
-2. Terapkan TDD Red-Green-Refactor dan pastikan skenario spec tercakup.
-3. Jalankan Double-Verification Gate hingga exit code 0.
-4. Lakukan atomic commit to HEAD dan update frontmatter tiket ke Status: resolved serta perbarui {tg_path}.
+2. Apply TDD Red-Green-Refactor and ensure spec scenarios are covered.
+3. Satisfy Double-Verification Gate with exit code 0.
+4. Perform atomic commit to HEAD, update ticket frontmatter to Status: resolved, and update {tg_path}.
 {completion_rule}
 ```"""
     return prompt
@@ -1942,7 +2022,8 @@ def validate_ticket_brief_schema(
                 diag = (
                     f"> ⚠️ Warning: [ERR-BRIEF-01] Malformed ticket '{cand.name or p_val}': "
                     f"Ticket file does not exist or has an unanchored path ('{p_val}'). "
-                    "Prompt generation halted for this ticket."
+                    "Prompt generation halted for this ticket. "
+                    "Please inspect '.scratch/<feature-slug>/issues/' or re-scaffold tickets."
                 )
                 return TicketBriefValidationResult(
                     is_valid=False,
@@ -1958,7 +2039,8 @@ def validate_ticket_brief_schema(
                 err = f"Failed to read ticket file '{cand}': {exc}"
                 diag = (
                     f"> ⚠️ Warning: [ERR-BRIEF-01] Malformed ticket '{cand.name}': "
-                    f"Cannot read ticket file on disk ({exc}). Prompt generation halted for this ticket."
+                    f"Cannot read ticket file on disk ({exc}). Prompt generation halted for this ticket. "
+                    "Please inspect '.scratch/<feature-slug>/issues/' or re-scaffold tickets."
                 )
                 return TicketBriefValidationResult(
                     is_valid=False,
@@ -2001,7 +2083,8 @@ def validate_ticket_brief_schema(
                 diag = (
                     f"> ⚠️ Warning: [ERR-BRIEF-01] Malformed ticket '{cand.name or ticket_input}': "
                     f"Ticket file does not exist or has an unanchored path ('{ticket_input}'). "
-                    "Prompt generation halted for this ticket."
+                    "Prompt generation halted for this ticket. "
+                    "Please inspect '.scratch/<feature-slug>/issues/' or re-scaffold tickets."
                 )
                 return TicketBriefValidationResult(
                     is_valid=False,
@@ -2017,7 +2100,8 @@ def validate_ticket_brief_schema(
                 err = f"Failed to read ticket file '{cand}': {exc}"
                 diag = (
                     f"> ⚠️ Warning: [ERR-BRIEF-01] Malformed ticket '{cand.name}': "
-                    f"Cannot read ticket file on disk ({exc}). Prompt generation halted for this ticket."
+                    f"Cannot read ticket file on disk ({exc}). Prompt generation halted for this ticket. "
+                    "Please inspect '.scratch/<feature-slug>/issues/' or re-scaffold tickets."
                 )
                 return TicketBriefValidationResult(
                     is_valid=False,
@@ -2050,7 +2134,7 @@ def validate_ticket_brief_schema(
                 except Exception as exc:
                     err = f"Unparseable YAML frontmatter: {exc}"
                     diag = (
-                        f"> ⚠️ Warning: [ERR-BRIEF-02] Malformed ticket '{ticket_name}': "
+                        f"> ⚠️ Warning: [ERR-BRIEF-01] [ERR-BRIEF-02] Malformed ticket '{ticket_name}': "
                         f"Boundary schema validation failed due to unparseable metadata lines ({exc}). "
                         "Starter brief emission halted."
                     )
@@ -2116,11 +2200,18 @@ def validate_ticket_brief_schema(
         if "blocked_by" not in found_keys:
             missing_fields.append("Blocked by")
 
+    id_val = str(full_meta.get("id") or "").strip()
+    title_val = str(full_meta.get("title") or "").strip()
+    if not id_val or id_val.lower() in ("nn", "none"):
+        missing_fields.append("Ticket ID")
+    if not title_val:
+        missing_fields.append("Title")
+
     if missing_fields:
         for f in missing_fields:
             errors.append(f"Missing mandatory frontmatter field: '{f}'")
         diag = (
-            f"> ⚠️ Warning: [ERR-BRIEF-02] Malformed ticket '{ticket_name}': "
+            f"> ⚠️ Warning: [ERR-BRIEF-01] [ERR-BRIEF-02] Malformed ticket '{ticket_name}': "
             f"Missing mandatory frontmatter field(s): {', '.join(missing_fields)}. "
             "Boundary schema validation failed; starter brief emission halted."
         )
@@ -2180,6 +2271,7 @@ def format_worker_brief(
     feature_slug: str | None = None,
     include_heading: bool = True,
     is_final_frontier: bool | None = None,
+    lean: bool = False,
 ) -> str:
     """
     [BRIEF-01] [BRIEF-02] [EDGE-BRIEF-01] Synthesizes structured Self-Contained Worker Starter Brief(s)
@@ -2245,14 +2337,24 @@ def format_worker_brief(
                 if _canonical_ticket_id(x) not in canon_cycle_nodes and _canonical_ticket_id(x) not in canon_orphan_ids
             }
             unblocked_tickets: list[dict[str, Any]] = []
+            has_in_progress_frontier = False
             for t in scanned:
                 tid = _canonical_ticket_id(_extract_ticket_id(t))
                 if tid in frontier_set:
-                    unblocked_tickets.append(t)
+                    st = str(t.get("status", ""))
+                    if v._is_status_in_progress(st):
+                        has_in_progress_frontier = True
+                    elif not v._is_status_resolved(st):
+                        unblocked_tickets.append(t)
 
             if not unblocked_tickets:
                 if dag_diagnostics:
                     return "\n\n".join(dag_diagnostics)
+                if has_in_progress_frontier or any(v._is_status_in_progress(str(t.get("status", ""))) for t in scanned):
+                    return (
+                        "> ⏳ Standby: All active frontier tickets are currently in-progress. "
+                        "Awaiting worker completion before calculating downstream unblocked tickets."
+                    )
                 return "> ⏳ Standby: All active frontier tickets are currently in-progress or no unblocked tickets remain."
 
             final_detected = is_final_frontier
@@ -2276,6 +2378,7 @@ def format_worker_brief(
                         feature_slug=feature_slug,
                         include_heading=include_heading,
                         is_final_frontier=False,
+                        lean=lean,
                     )
                     combined_brief = f"{diag}\n\n{sub_briefs}"
                     if dag_diagnostics:
@@ -2289,6 +2392,7 @@ def format_worker_brief(
                 feature_slug=feature_slug,
                 include_heading=include_heading,
                 is_final_frontier=final_detected,
+                lean=lean,
             )
             if dag_diagnostics:
                 return f"{'\n\n'.join(dag_diagnostics)}\n\n{sub_briefs}"
@@ -2344,6 +2448,18 @@ def format_worker_brief(
 
     warnings_prefix = "\n\n".join(warning_diagnostics) if warning_diagnostics else ""
 
+    if not is_ticket_file:
+        ready_tickets = [t for t in normalized_tickets if not v._is_status_in_progress(str(t.get("status", "")))]
+        if normalized_tickets and not ready_tickets:
+            standby_notice = (
+                "> ⏳ Standby: All active frontier tickets are currently in-progress. "
+                "Awaiting worker completion before calculating downstream unblocked tickets."
+            )
+            if warnings_prefix:
+                return f"{warnings_prefix}\n\n{standby_notice}"
+            return standby_notice
+        normalized_tickets = ready_tickets
+
     if not normalized_tickets:
         if warnings_prefix:
             return warnings_prefix
@@ -2359,8 +2475,10 @@ def format_worker_brief(
 
     if len(normalized_tickets) == 1:
         t = normalized_tickets[0]
-        prompt = format_single_starter_prompt(t, is_final_frontier=final_flag)
-        if include_heading:
+        prompt = format_single_starter_prompt(t, is_final_frontier=final_flag, lean=lean)
+        if lean:
+            brief_content = prompt
+        elif include_heading:
             tid = t.get("id", "01")
             title = t.get("title", "")
             brief_content = f"### 🎯 Starter Brief: Ticket {tid} - {title}\n\n{prompt}"
@@ -2375,8 +2493,10 @@ def format_worker_brief(
     for idx, t in enumerate(normalized_tickets, start=1):
         tid = t.get("id", f"{idx:02d}")
         title = t.get("title", f"Ticket {tid}")
-        prompt = format_single_starter_prompt(t, is_final_frontier=final_flag)
-        if include_heading:
+        prompt = format_single_starter_prompt(t, is_final_frontier=final_flag, lean=lean)
+        if lean:
+            brief_blocks.append(prompt)
+        elif include_heading:
             heading = f"### 🎯 Frontier Option {idx}: Ticket {tid} - {title}"
             brief_blocks.append(f"{heading}\n\n{prompt}")
         else:
@@ -2394,6 +2514,7 @@ def format_final_frontier_worker_brief(
     validator: ManifestValidator | None = None,
     feature_slug: str | None = None,
     include_heading: bool = True,
+    lean: bool = False,
 ) -> str:
     """
     [EDGE-BRIEF-01] Synthesizes a specialized Self-Contained Worker Starter Brief for the final frontier ticket
@@ -2409,6 +2530,7 @@ def format_final_frontier_worker_brief(
         feature_slug=feature_slug,
         include_heading=include_heading,
         is_final_frontier=True,
+        lean=lean,
     )
 
 
@@ -3298,7 +3420,7 @@ def recover_malformed_dashboard(
                 include_heading=True,
                 lean=lean,
             )
-            if "[ERR-EVAL-03]" in eval_brief:
+            if any(err in eval_brief for err in ("[ERR-EVAL-03]", "[ERR-LEAN-EVAL-02]", "[ERR-LEAN-EVAL-01]")):
                 chat_stream = (
                     "🎉 Phase 5: Code Review is complete (verdict: PASS)!\n\n"
                     f"{eval_brief}"
@@ -3318,7 +3440,7 @@ def recover_malformed_dashboard(
                 include_heading=True,
                 lean=lean,
             )
-            if "[ERR-EVAL-03]" in eval_brief:
+            if any(err in eval_brief for err in ("[ERR-EVAL-03]", "[ERR-LEAN-EVAL-02]", "[ERR-LEAN-EVAL-01]")):
                 chat_stream = (
                     "🎉 Phase 6: Semantic Security Audit is complete (verdict: PASS)!\n\n"
                     f"{eval_brief}"
@@ -3338,7 +3460,7 @@ def recover_malformed_dashboard(
                 include_heading=True,
                 lean=lean,
             )
-            if "[ERR-EVAL-03]" in eval_brief:
+            if any(err in eval_brief for err in ("[ERR-EVAL-03]", "[ERR-LEAN-EVAL-02]", "[ERR-LEAN-EVAL-01]")):
                 chat_stream = (
                     "🎉 All tickets in the task graph are resolved (100% complete)!\n\n"
                     f"{eval_brief}"
@@ -3516,9 +3638,12 @@ def _normalize_scanned_tickets(
                 parent_issues = p.parent / "issues" if (p.parent / "issues").is_dir() else p.parent
                 scanned_tickets = v.scan_tickets_from_tracker(parent_issues)
             else:
-                t_dict = v._read_ticket_with_retry_and_fallback(p)
-                if t_dict:
-                    scanned_tickets = [t_dict]
+                try:
+                    t_dict = v._read_ticket_with_retry_and_fallback(p)
+                    if t_dict:
+                        scanned_tickets = [t_dict]
+                except Exception:
+                    pass
     elif isinstance(tickets_or_tracker, (list, tuple)):
         for item in tickets_or_tracker:
             if isinstance(item, dict):
@@ -3530,9 +3655,12 @@ def _normalize_scanned_tickets(
                     if cand.exists():
                         p = cand
                 if p.is_file():
-                    t_dict = v._read_ticket_with_retry_and_fallback(p)
-                    if t_dict:
-                        scanned_tickets.append(t_dict)
+                    try:
+                        t_dict = v._read_ticket_with_retry_and_fallback(p)
+                        if t_dict:
+                            scanned_tickets.append(t_dict)
+                    except Exception:
+                        pass
                 elif p.is_dir():
                     scanned_tickets.extend(v.scan_tickets_from_tracker(p))
     elif isinstance(tickets_or_tracker, dict):
@@ -4304,10 +4432,12 @@ def render_task_dashboard(
                 feature_dir_or_target=eval_target,
                 root_dir=base_root,
                 validator=v,
-                include_heading=True,
+                include_heading=False if lean else True,
                 lean=lean,
             )
-            if "[ERR-EVAL-03]" in eval_brief:
+            if lean:
+                chat_stream = eval_brief
+            elif any(err in eval_brief for err in ("[ERR-EVAL-03]", "[ERR-LEAN-EVAL-02]", "[ERR-LEAN-EVAL-01]")):
                 chat_stream = (
                     "🎉 Phase 5: Code Review is complete (verdict: PASS)!\n\n"
                     f"{eval_brief}"
@@ -4324,10 +4454,12 @@ def render_task_dashboard(
                 feature_dir_or_target=eval_target,
                 root_dir=base_root,
                 validator=v,
-                include_heading=True,
+                include_heading=False if lean else True,
                 lean=lean,
             )
-            if "[ERR-EVAL-03]" in eval_brief:
+            if lean:
+                chat_stream = eval_brief
+            elif any(err in eval_brief for err in ("[ERR-EVAL-03]", "[ERR-LEAN-EVAL-02]", "[ERR-LEAN-EVAL-01]")):
                 chat_stream = (
                     "🎉 Phase 6: Semantic Security Audit is complete (verdict: PASS)!\n\n"
                     f"{eval_brief}"
@@ -4344,10 +4476,12 @@ def render_task_dashboard(
                 feature_dir_or_target=eval_target,
                 root_dir=base_root,
                 validator=v,
-                include_heading=True,
+                include_heading=False if lean else True,
                 lean=lean,
             )
-            if "[ERR-EVAL-03]" in eval_brief:
+            if lean:
+                chat_stream = eval_brief
+            elif any(err in eval_brief for err in ("[ERR-EVAL-03]", "[ERR-LEAN-EVAL-02]", "[ERR-LEAN-EVAL-01]")):
                 chat_stream = (
                     "🎉 All tickets in the task graph are resolved (100% complete)!\n\n"
                     f"{eval_brief}"
@@ -4413,6 +4547,7 @@ def render_task_dashboard(
                 feature_slug=detected_slug,
                 include_heading=include_heading,
                 is_final_frontier=is_final,
+                lean=lean,
             )
 
     res = TaskDashboardResult(
@@ -4581,7 +4716,7 @@ class EvaluationPromptRejectionResult:
 
 
 class EvaluationTabPromptRejectionError(ValueError):
-    """[ERR-EVAL-02] Raised when an evaluation session attempts to draft or emit a /pr starter brief."""
+    """[ERR-EVAL-02] [ERR-LEAN-EVAL-03] Raised when an evaluation session attempts to draft or emit a /pr starter brief."""
     pass
 
 
@@ -4595,7 +4730,7 @@ def reject_evaluation_tab_pr_prompt(
     root_dir: Path | str | None = None,
 ) -> EvaluationPromptRejectionResult:
     """
-    [ERR-EVAL-02] Evaluates and rejects attempts by evaluation sessions (/code-review or /security-audit)
+    [ERR-EVAL-02] [ERR-LEAN-EVAL-03] Evaluates and rejects attempts by evaluation sessions (/code-review or /security-audit)
     to draft or emit the contextual /pr starter brief. Directs operator to return to Command Center
     so CC can evaluate release readiness and synthesize the /pr starter brief.
     """
@@ -4608,7 +4743,7 @@ def reject_evaluation_tab_pr_prompt(
         "Operator MUST return to the Command Center (CC) so CC can evaluate release readiness and synthesize the /pr starter brief."
     )
     diagnostic = (
-        f"❌ [ERR-EVAL-02] Evaluation Tab Prompt Emission Rejected: "
+        f"❌ [ERR-EVAL-02] [ERR-LEAN-EVAL-03] Evaluation Tab Prompt Emission Rejected: "
         f"Drafting or emitting the contextual '/{clean_target}' starter brief from an evaluation session ('/{clean_caller}') is strictly prohibited. "
         f"{directive}"
     )
@@ -4767,6 +4902,28 @@ class EvaluationBriefGitError(ValueError):
     pass
 
 
+class EvaluationPhaseValidationError(ValueError):
+    """
+    [ERR-LEAN-EVAL-01] Raised when Command Center attempts to synthesize an evaluation brief
+    with an unrecognized or invalid downstream phase identifier.
+    """
+    pass
+
+
+VALID_EVAL_PHASES: dict[str, str] = {
+    "code-review": "code-review",
+    "review": "code-review",
+    "codereview": "code-review",
+    "security-audit": "security-audit",
+    "security": "security-audit",
+    "audit": "security-audit",
+    "securityaudit": "security-audit",
+    "pr": "pr",
+    "pull-request": "pr",
+    "ship": "pr",
+}
+
+
 def validate_git_diff_state(
     diff_range: str | None = "main...HEAD",
     *,
@@ -4824,31 +4981,79 @@ def validate_git_diff_state(
         base_ref = clean_range or "main"
         target_ref = "HEAD"
 
-    rev_proc = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}"],
-        cwd=str(repo_target),
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if rev_proc.returncode != 0:
-        rev_proc2 = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", base_ref],
+    try:
+        rev_proc = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}"],
             cwd=str(repo_target),
             capture_output=True,
             text=True,
             timeout=5,
         )
-        if rev_proc2.returncode != 0:
+        if rev_proc.returncode != 0:
+            rev_proc2 = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", base_ref],
+                cwd=str(repo_target),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if rev_proc2.returncode != 0:
+                diag = (
+                    f"⚠️ [ERR-LEAN-EVAL-02] [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Git base branch '{base_ref}' does not exist in repository. "
+                    f"Cannot compute diff range '{clean_range}'. "
+                    f"Please verify branch tracking and merge-base (e.g. 'git fetch origin {base_ref}') or checkout a valid feature branch before proceeding."
+                )
+                res = GitDiffStateResult(
+                    False,
+                    diagnostic=diag,
+                    missing_base_branch=True,
+                    diff_range=clean_range,
+                    base_ref=base_ref,
+                    target_ref=target_ref,
+                )
+                if raise_on_error:
+                    raise EvaluationBriefGitError(diag)
+                return res
+
+        sym_proc = subprocess.run(
+            ["git", "symbolic-ref", "-q", "HEAD"],
+            cwd=str(repo_target),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        is_detached = (sym_proc.returncode != 0)
+        if not is_detached:
+            abbrev_proc = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(repo_target),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if abbrev_proc.returncode == 0 and abbrev_proc.stdout.strip() == "HEAD":
+                is_detached = True
+
+        mb_proc = subprocess.run(
+            ["git", "merge-base", base_ref, target_ref],
+            cwd=str(repo_target),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        has_common_ancestor = (mb_proc.returncode == 0 and bool(mb_proc.stdout.strip()))
+
+        if is_detached:
             diag = (
-                f"⚠️ [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Git base branch '{base_ref}' does not exist in repository. "
-                f"Cannot compute diff range '{clean_range}'. "
-                f"Please fetch the base branch (e.g. 'git fetch origin {base_ref}') or checkout a valid feature branch before proceeding."
+                f"⚠️ [ERR-LEAN-EVAL-02] [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Git repository is in a detached HEAD state. "
+                f"Cannot compute diff range '{clean_range}' reliably. "
+                f"Please verify branch tracking and merge-base, fetch the base branch, or checkout a valid feature branch before proceeding."
             )
             res = GitDiffStateResult(
                 False,
                 diagnostic=diag,
-                missing_base_branch=True,
+                is_detached_head=True,
+                zero_common_ancestors=(not has_common_ancestor),
                 diff_range=clean_range,
                 base_ref=base_ref,
                 target_ref=target_ref,
@@ -4857,81 +5062,60 @@ def validate_git_diff_state(
                 raise EvaluationBriefGitError(diag)
             return res
 
-    sym_proc = subprocess.run(
-        ["git", "symbolic-ref", "-q", "HEAD"],
-        cwd=str(repo_target),
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    is_detached = (sym_proc.returncode != 0)
+        if not has_common_ancestor:
+            diag = (
+                f"⚠️ [ERR-LEAN-EVAL-02] [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Zero common ancestors detected "
+                f"between '{base_ref}' and '{target_ref}'. "
+                f"Cannot compute diff range '{clean_range}'. "
+                f"Please verify branch tracking and merge-base, fetch the base branch, or checkout a valid feature branch before proceeding."
+            )
+            res = GitDiffStateResult(
+                False,
+                diagnostic=diag,
+                is_detached_head=is_detached,
+                zero_common_ancestors=True,
+                diff_range=clean_range,
+                base_ref=base_ref,
+                target_ref=target_ref,
+            )
+            if raise_on_error:
+                raise EvaluationBriefGitError(diag)
+            return res
 
-    mb_proc = subprocess.run(
-        ["git", "merge-base", base_ref, target_ref],
-        cwd=str(repo_target),
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    has_common_ancestor = (mb_proc.returncode == 0 and bool(mb_proc.stdout.strip()))
+        diff_proc = subprocess.run(
+            ["git", "diff", "--name-only", clean_range],
+            cwd=str(repo_target),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if diff_proc.returncode != 0:
+            err_msg = diff_proc.stderr.strip()
+            diag = (
+                f"⚠️ [ERR-LEAN-EVAL-02] [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Git diff failed for range '{clean_range}' ({err_msg}). "
+                f"Please verify branch tracking and merge-base, fetch the base branch, or checkout a valid feature branch before proceeding."
+            )
+            res = GitDiffStateResult(
+                False,
+                diagnostic=diag,
+                is_detached_head=is_detached,
+                diff_range=clean_range,
+                base_ref=base_ref,
+                target_ref=target_ref,
+            )
+            if raise_on_error:
+                raise EvaluationBriefGitError(diag)
+            return res
 
-    if is_detached and not has_common_ancestor:
+    except (subprocess.SubprocessError, OSError) as exc:
         diag = (
-            f"⚠️ [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Git repository is in a detached HEAD state "
-            f"with zero common ancestors between '{base_ref}' and '{target_ref}'. "
+            f"⚠️ [ERR-LEAN-EVAL-02] [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Git execution error ({exc}). "
             f"Cannot compute diff range '{clean_range}'. "
-            f"Please fetch the base branch or checkout a valid feature branch before proceeding."
+            f"Please verify branch tracking and merge-base, fetch the base branch, or checkout a valid feature branch before proceeding."
         )
         res = GitDiffStateResult(
             False,
             diagnostic=diag,
-            is_detached_head=True,
-            zero_common_ancestors=True,
-            diff_range=clean_range,
-            base_ref=base_ref,
-            target_ref=target_ref,
-        )
-        if raise_on_error:
-            raise EvaluationBriefGitError(diag)
-        return res
-
-    if not has_common_ancestor:
-        diag = (
-            f"⚠️ [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Zero common ancestors detected "
-            f"between '{base_ref}' and '{target_ref}'. "
-            f"Cannot compute diff range '{clean_range}'. "
-            f"Please fetch the base branch or checkout a valid feature branch before proceeding."
-        )
-        res = GitDiffStateResult(
-            False,
-            diagnostic=diag,
-            is_detached_head=is_detached,
-            zero_common_ancestors=True,
-            diff_range=clean_range,
-            base_ref=base_ref,
-            target_ref=target_ref,
-        )
-        if raise_on_error:
-            raise EvaluationBriefGitError(diag)
-        return res
-
-    diff_proc = subprocess.run(
-        ["git", "diff", "--name-only", clean_range],
-        cwd=str(repo_target),
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if diff_proc.returncode != 0:
-        err_msg = diff_proc.stderr.strip()
-        diag = (
-            f"⚠️ [ERR-EVAL-03] Evaluation Brief Synthesis Failed: Git diff failed for range '{clean_range}' ({err_msg}). "
-            f"Please fetch the base branch or checkout a valid feature branch before proceeding."
-        )
-        res = GitDiffStateResult(
-            False,
-            diagnostic=diag,
-            is_detached_head=is_detached,
             diff_range=clean_range,
             base_ref=base_ref,
             target_ref=target_ref,
@@ -4975,17 +5159,28 @@ def format_evaluation_brief(
     verdict: str | None = None,
     raise_on_rejection: bool = False,
     raise_on_error: bool = False,
-    lean: bool = False,
+    lean: bool = True,
 ) -> str:
     """
-    [EVAL-01] [EVAL-02] [EDGE-EVAL-01] [ERR-EVAL-01] [ERR-EVAL-02] Generates copy-pasteable contextual evaluation starter brief(s)
-    for downstream phases (/code-review and /security-audit) in fresh tabs.
+    [EVAL-01] [EVAL-02] [EDGE-EVAL-01] [LEAN-EVAL-01] [ERR-EVAL-01] [ERR-EVAL-02] [ERR-LEAN-EVAL-03] Generates copy-pasteable contextual evaluation starter brief(s)
+    for downstream phases (/code-review and /security-audit) in fresh tabs, or ultra-lean 1-line command for /pr.
     Embeds target living specification path, delta spec path, exact git diff range,
     attack surface pointers, circuit breaker instructions, and in-session '--fix' remediation instructions.
-    Rejects direct /pr starter brief drafting when requested from an evaluation session tab [ERR-EVAL-02].
+    Rejects direct /pr starter brief drafting when requested from an evaluation session tab [ERR-EVAL-02] [ERR-LEAN-EVAL-03].
     """
-    clean_type = str(eval_type or "").strip().lstrip("/").lower().replace("_", "-")
+    clean_type = str(eval_type or "").strip().strip("/").strip().lower().replace("_", "-")
     base_root = Path(root_dir).resolve() if root_dir else None
+
+    if clean_type not in VALID_EVAL_PHASES:
+        diag = (
+            f"❌ [ERR-LEAN-EVAL-01] Evaluation Phase Validation Failed: Unrecognized phase '{eval_type}'. "
+            f"Valid evaluation targets are: 'code-review', 'security-audit', 'pr'."
+        )
+        if raise_on_error or raise_on_rejection:
+            raise EvaluationPhaseValidationError(diag)
+        return diag
+
+    canonical_type = VALID_EVAL_PHASES[clean_type]
 
     norm_caller = str(caller_phase or session_type or "").strip().lower().lstrip("/")
     is_eval_caller = (
@@ -4994,7 +5189,7 @@ def format_evaluation_brief(
         or any(k in norm_caller for k in ("code-review", "code_review", "security-audit", "security_audit", "evaluation"))
     )
 
-    if is_eval_caller and clean_type in ("pr", "pull-request", "ship"):
+    if is_eval_caller and canonical_type == "pr":
         rejection_res = reject_evaluation_tab_pr_prompt(
             caller_phase=norm_caller or "code-review",
             verdict=verdict or "PASS",
@@ -5021,7 +5216,7 @@ def format_evaluation_brief(
         elif not target_p.exists() and base_root and (base_root / ".scratch" / raw_target).exists():
             target_p = base_root / ".scratch" / raw_target
 
-    feature_dir: Path | None = None
+    feature_dir = None
     tg_file: Path | None = None
 
     if target_p:
@@ -5135,130 +5330,13 @@ def format_evaluation_brief(
             raise EvaluationBriefGitError(diff_state.diagnostic)
         return diff_state.diagnostic
 
-    if lean:
-        cmd_name = "code-review"
-        if clean_type in ("security-audit", "security", "audit", "securityaudit"):
-            cmd_name = "security-audit"
-        elif clean_type in ("pr", "pull-request", "ship"):
-            cmd_name = "pr"
-        return f"````bash\n/{cmd_name}\n````"
-
-    doc_res = evaluate_documentation_diff(
-        changed_files if changed_files is not None else None,
-        diff_range=diff_val,
-        root_dir=base_root,
-        feature_dir=feature_dir,
-    )
-    is_docs_only_diff = doc_res.is_docs_only
-    all_changed_files: list[str] = doc_res.changed_files
-
-    if clean_type in ("security-audit", "security", "audit", "securityaudit"):
-        heading = "### 🛡️ Starter Brief: Security Audit"
-        effective_surfaces = attack_surface_seams if attack_surface_seams is not None else attack_surfaces
-        if effective_surfaces is None:
-            if is_docs_only_diff:
-                attack_surfaces_str = "None (Documentation-only diff - zero executable attack surface seams)"
-            else:
-                detected: list[str] = []
-                v = validator or ManifestValidator()
-                repo_target = base_root or (feature_dir.parent.parent if feature_dir and ".scratch" in feature_dir.parts else REPO_ROOT)
-                if all_changed_files:
-                    _, detected = v.evaluate_trigger_h(all_changed_files, repo_path=repo_target)
-                else:
-                    try:
-                        res = subprocess.run(
-                            ["git", "diff", "--name-only", diff_val],
-                            cwd=str(repo_target),
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if res.returncode == 0 and res.stdout.strip():
-                            changed = [line.strip() for line in res.stdout.splitlines() if line.strip()]
-                            _, detected = v.evaluate_trigger_h(changed, repo_path=repo_target)
-                    except Exception:
-                        detected = []
-
-                if detected:
-                    attack_surfaces_str = ", ".join(detected)
-                else:
-                    attack_surfaces_str = "API routes, authentication handlers, DB schemas, server actions"
-        elif isinstance(effective_surfaces, (list, tuple, set)):
-            attack_surfaces_str = ", ".join(str(s).strip() for s in effective_surfaces if str(s).strip())
-        else:
-            attack_surfaces_str = str(effective_surfaces).strip()
-
-        expedited_line = ""
-        if is_docs_only_diff:
-            expedited_line = "Expedited Verification: Documentation-only diff (zero application code or attack surface seams changed).\n"
-            step1 = "1. Jalankan fast-path /security-audit: verifikasi perubahan dokumentasi dan pastikan tidak ada secret/credential leaks atau executable attack surface seams yang ditambahkan (confirming no unexpected code or credential files were touched)."
-        else:
-            step1 = f"1. Jalankan /security-audit untuk mengevaluasi attack surface seams ({attack_surfaces_str}) terhadap 5 full-stack threat vectors."
-
-        prompt = f"""```markdown
-Saya ingin menjalankan security audit untuk fitur ini menggunakan metodologi agy-matt:
-
-Phase: /security-audit
-Target Spec: {living_display}
-Delta Spec: {delta_display}
-Git Diff Range: {diff_val}
-Attack Surfaces: {attack_surfaces_str}
-{expedited_line}Task Graph: {tg_display}
-
-Instruksi Pengerjaan:
-{step1}
-2. Jika ditemukan kerentanan (FAIL), jalankan /security-audit --fix di sesi ini secara in-session hingga mencapai verdict PASS.
-3. [ERR-EVAL-01] Remediation Circuit Breaker: Jika temuan persist setelah 2 kali percobaan remediasi (fixLoopCount >= 2), segera aktifkan circuit breaker: hentikan remediasi otomatis, catat log ESCALATION_CIRCUIT_BREAKER_TRIGGERED, perbarui status security-audit pada task-graph.md ({tg_display}) menjadi '⚠️ escalated-to-human', dan arahkan operator untuk intervensi manual di Command Center (CC).
-4. Setelah mencapai verdict PASS, perbarui status security-audit pada task-graph.md ({tg_display}).
-5. Selesaikan giliran dengan Recommend-and-Stop: konfirmasikan bahwa security audit telah PASS, perbarui status security-audit pada task-graph.md ({tg_display}), dan arahkan operator untuk melapor kembali ke Command Center (CC) tanpa melanjutkan ke /pr atau mengeluarkan prompt fase berikutnya (without advancing to /pr).
-```"""
-
-    elif clean_type in ("pr", "pull-request"):
-        heading = "### 🚀 Starter Brief: Pull Request"
-        prompt = f"""```markdown
-Saya ingin membuat pull request untuk fitur ini menggunakan metodologi agy-matt:
-
-Phase: /pr
-Target Spec: {living_display}
-Delta Spec: {delta_display}
-Git Diff Range: {diff_val}
-Task Graph: {tg_display}
-
-Instruksi Pengerjaan:
-1. Jalankan /pr untuk merangkum bukti empiris verifikasi dan rekonsiliasi spesifikasi ke {living_display}.
-2. Pastikan seluruh acceptance criteria dan living spec terverifikasi.
-3. Selesaikan giliran dengan Recommend-and-Stop dan laporkan PR link ke Command Center (CC).
-```"""
-
+    if canonical_type == "security-audit":
+        cmd_name = "security-audit --fix"
+    elif canonical_type == "pr":
+        cmd_name = "pr"
     else:
-        heading = "### 🔍 Starter Brief: Code Review"
-        expedited_line = ""
-        if is_docs_only_diff:
-            expedited_line = "Expedited Verification: Documentation-only diff (zero application code or attack surface seams changed).\n"
-            step1 = f"1. Jalankan fast-path /code-review: verifikasi kejelasan dokumentasi pada diff range ({diff_val}) terhadap Living Spec ({living_display}) dan pastikan tidak ada kode aplikasi atau credential files yang terubah secara tak terduga (confirming no unexpected code or credential files were touched)."
-        else:
-            step1 = f"1. Jalankan /code-review untuk mengevaluasi seluruh perubahan pada diff range ({diff_val}) terhadap Standards dan Living Spec ({living_display})."
-
-        prompt = f"""```markdown
-Saya ingin menjalankan code review untuk fitur ini menggunakan metodologi agy-matt:
-
-Phase: /code-review
-Target Spec: {living_display}
-Delta Spec: {delta_display}
-Git Diff Range: {diff_val}
-{expedited_line}Task Graph: {tg_display}
-
-Instruksi Pengerjaan:
-{step1}
-2. Jika hasil audit menemukan temuan (FAIL), jalankan /code-review --fix di sesi ini secara in-session hingga mencapai verdict PASS.
-3. [ERR-EVAL-01] Remediation Circuit Breaker: Jika temuan persist setelah 2 kali percobaan remediasi (fixLoopCount >= 2), segera aktifkan circuit breaker: hentikan remediasi otomatis, catat log ESCALATION_CIRCUIT_BREAKER_TRIGGERED, perbarui status code-review pada task-graph.md ({tg_display}) menjadi '⚠️ escalated-to-human', dan arahkan operator untuk intervensi manual di Command Center (CC).
-4. Setelah mencapai verdict PASS, perbarui status code-review pada task-graph.md ({tg_display}).
-5. Selesaikan giliran dengan Recommend-and-Stop: konfirmasikan bahwa code review telah PASS, perbarui status code-review pada task-graph.md ({tg_display}), dan arahkan operator untuk melapor kembali ke Command Center (CC) tanpa mengeluarkan prompt fase berikutnya (without emitting subsequent phase prompts).
-```"""
-
-    if include_heading:
-        return f"{heading}\n\n{prompt}"
-    return prompt
+        cmd_name = "code-review --fix"
+    return f"````bash\n/{cmd_name}\n````"
 
 
 def update_task_graph_evaluation_status(
@@ -5279,7 +5357,7 @@ def update_task_graph_evaluation_status(
             raise FileNotFoundError(f"Task graph file not found: {path}")
         return False
 
-    clean_type = str(eval_type or "").strip().lstrip("/").lower().replace("_", "-")
+    clean_type = str(eval_type or "").strip().strip("/").strip().lower().replace("_", "-")
     is_security = "security" in clean_type or "audit" in clean_type
 
     try:
@@ -6108,7 +6186,8 @@ def _validate_ticket_concurrency(
             f"⚠️ [ERR-EXCL-03] Concurrency Advisory: Ticket '{canonical_id}' is already 'in-progress' "
             f"(claimed by another session). Worker execution rejected. "
             f"Do not proceed with code modifications or test generation. "
-            f"Return to the Command Center to refresh the active frontier."
+            f"Return to the Command Center to refresh the active frontier, "
+            f"or run './scripts/claim-ticket.sh {canonical_id} --unclaim' if prior session was interrupted."
         )
         return TicketConcurrencyResult(
             False,
@@ -6494,6 +6573,7 @@ def update_task_graph_progress(
             scanned_tickets = []
 
     is_in_progress = "in-progress" in new_status.lower()
+    is_unclaim = any(k in new_status.lower() for k in ("ready", "pending", "unclaim"))
     if scanned_tickets:
         total_tickets = len(scanned_tickets)
         resolved_count = 0
@@ -6501,9 +6581,9 @@ def update_task_graph_progress(
             t_id = str(t.get("id", "")).strip().lstrip("#")
             if t_id.isdigit():
                 t_id = f"{int(t_id):02d}"
-            if not is_in_progress and (t_id == canonical_id or (num_val is not None and t_id == f"{num_val:02d}")):
+            if not is_in_progress and not is_unclaim and (t_id == canonical_id or (num_val is not None and t_id == f"{num_val:02d}")):
                 resolved_count += 1
-            elif v._is_status_resolved(t.get("status", "")):
+            elif v._is_status_resolved(t.get("status", "")) and not (is_unclaim and (t_id == canonical_id or (num_val is not None and t_id == f"{num_val:02d}"))):
                 resolved_count += 1
     else:
         tg_tickets = parse_task_graph_tickets(path)
@@ -6511,12 +6591,12 @@ def update_task_graph_progress(
         resolved_count = 0
         for t in tg_tickets:
             t_id = t.get("id", "")
-            if not is_in_progress and (t_id == canonical_id or (num_val is not None and t_id == f"{num_val:02d}")):
+            if not is_in_progress and not is_unclaim and (t_id == canonical_id or (num_val is not None and t_id == f"{num_val:02d}")):
                 resolved_count += 1
-            elif v._is_status_resolved(t.get("status", "")):
+            elif v._is_status_resolved(t.get("status", "")) and not (is_unclaim and (t_id == canonical_id or (num_val is not None and t_id == f"{num_val:02d}"))):
                 resolved_count += 1
 
-    all_resolved = not is_in_progress and (dag_complete or (total_tickets > 0 and resolved_count >= total_tickets))
+    all_resolved = not is_in_progress and not is_unclaim and (dag_complete or (total_tickets > 0 and resolved_count >= total_tickets))
 
     try:
         content = path.read_text(encoding="utf-8")
@@ -6655,6 +6735,8 @@ def update_task_graph_progress(
                             clean_new = f"✅ {clean_new}"
                         elif not clean_new.startswith("🟡") and "in-progress" in clean_new.lower():
                             clean_new = f"🟡 {clean_new}"
+                        elif not clean_new.startswith("⏳") and any(k in clean_new.lower() for k in ("ready", "pending")):
+                            clean_new = f"⏳ {clean_new}"
                         if has_backticks:
                             cols[effective_status_idx] = f" `{clean_new}` "
                         else:
@@ -6663,6 +6745,8 @@ def update_task_graph_progress(
                         if commit_sha and commit_col_idx is not None and len(cols) > commit_col_idx:
                             clean_commit = re.sub(r"[\r\n|]", "", commit_sha).strip()
                             cols[commit_col_idx] = f" {clean_commit} "
+                        elif is_unclaim and commit_col_idx is not None and len(cols) > commit_col_idx:
+                            cols[commit_col_idx] = " - "
 
                         line = "|".join(cols)
                         table_updated = True
@@ -6690,7 +6774,12 @@ def update_task_graph_progress(
                     label,
                     flags=re.IGNORECASE,
                 ).strip()
-                new_label = f"{clean_label} (In Progress)" if is_in_progress else f"{clean_label} (Resolved)"
+                if is_in_progress:
+                    new_label = f"{clean_label} (In Progress)"
+                elif is_unclaim:
+                    new_label = clean_label
+                else:
+                    new_label = f"{clean_label} (Resolved)"
                 if new_label != label:
                     label = new_label
                     graph_updated = True
@@ -6711,7 +6800,7 @@ def update_task_graph_progress(
             count=1,
             flags=re.MULTILINE,
         )
-    elif is_in_progress and "(100% complete)" in joined_text:
+    elif (is_in_progress or is_unclaim) and "(100% complete)" in joined_text:
         joined_text = re.sub(
             r"^(#\s+Task\s+(?:Dashboard|Graph)[^\r\n]*?)\s*\(100%\s+complete\)",
             r"\1",
@@ -6720,8 +6809,15 @@ def update_task_graph_progress(
         )
 
     if has_clustered_subgraphs:
-        target_subgraph = "S_IN_PROGRESS" if is_in_progress else "S_RESOLVED"
-        new_suffix = "(In Progress)" if is_in_progress else "(Resolved)"
+        if is_in_progress:
+            target_subgraph = "S_IN_PROGRESS"
+            new_suffix = "(In Progress)"
+        elif is_unclaim:
+            target_subgraph = "S_FRONTIER"
+            new_suffix = "(Frontier)"
+        else:
+            target_subgraph = "S_RESOLVED"
+            new_suffix = "(Resolved)"
         migrated_text, did_migrate = _migrate_clustered_subgraph_node(
             joined_text,
             canonical_id=canonical_id,
@@ -7285,6 +7381,116 @@ def claim_ticket(
         )
 
     confirm_msg = f"✅ Ticket '{canonical_id}' claimed on disk (status: 'in-progress')."
+    return ResolutionResult(0, confirm_msg, dispatched=False, suppressed=False)
+
+
+def unclaim_ticket(
+    ticket_ref: str,
+    root_dir: Path | str | None = None,
+    tracker_dir: Path | str | None = None,
+    target_status: str = "ready-for-agent",
+) -> ResolutionResult:
+    """
+    [UNCLAIM-01] [ERR-UNCLAIM-01] Atomically releases an in-progress ticket claim on disk.
+    Resets ticket markdown frontmatter to '**Status:** ready-for-agent' and
+    synchronizes .scratch/<feature-slug>/task-graph.md (row marked '⏳ ready-for-agent',
+    Mermaid node reset to ready state), recovering from stale session crashes or interrupted sessions.
+    """
+    if not ticket_ref or not str(ticket_ref).strip():
+        return ResolutionResult(1, "Error: ticket-id must be a non-empty string.")
+
+    clean_ref = str(ticket_ref).strip()
+    validator = ManifestValidator()
+
+    if tracker_dir and str(tracker_dir).strip():
+        search_dir = Path(tracker_dir).resolve()
+    elif root_dir and str(root_dir).strip():
+        search_dir = Path(root_dir).resolve()
+    else:
+        cwd = Path.cwd().resolve()
+        if (cwd / ".scratch").is_dir() or (cwd / "issues").is_dir() or cwd.name == "issues":
+            search_dir = cwd
+        elif (REPO_ROOT / ".scratch").is_dir() or (REPO_ROOT / "issues").is_dir():
+            search_dir = REPO_ROOT
+        else:
+            search_dir = cwd
+
+    if not search_dir.exists():
+        return ResolutionResult(1, f"Error: Search directory does not exist: {search_dir}")
+
+    try:
+        ticket_path = validator.resolve_ticket_shorthand(search_dir, clean_ref)
+    except FileNotFoundError as fnf_err:
+        return ResolutionResult(1, f"Error: Ticket '{clean_ref}' not found in {search_dir}: {fnf_err}")
+    except Exception as exc:
+        return ResolutionResult(1, f"Error resolving ticket shorthand '{clean_ref}': {exc}")
+
+    m = re.match(r"^(?:ticket-|issue-|#)?([0-9]{1,3})", ticket_path.stem)
+    canonical_id = f"{int(m.group(1)):02d}" if m else ticket_path.stem
+
+    issues_dir = ticket_path.parent
+    feature_dir = issues_dir.parent if issues_dir.name == "issues" else issues_dir
+
+    try:
+        raw_ticket_text = ticket_path.read_text(encoding="utf-8")
+        meta = validator._parse_ticket_markdown(raw_ticket_text, ticket_path.stem)
+        existing_status = meta.get("Status", meta.get("status", "")).strip()
+    except Exception:
+        existing_status = ""
+
+    if validator._is_status_resolved(existing_status):
+        diagnostic = f"⚠️ Cannot unclaim ticket '{canonical_id}' because it is already resolved (status: '{existing_status}')."
+        return ResolutionResult(1, diagnostic, dispatched=False, suppressed=False)
+
+    if not validator._is_status_in_progress(existing_status) and existing_status.lower() in ("ready-for-agent", "pending", "ready"):
+        diagnostic = f"ℹ️ Ticket '{canonical_id}' is already unclaimed (status: '{existing_status}'). Unclaim is idempotent."
+        return ResolutionResult(0, diagnostic, dispatched=False, suppressed=False)
+
+    try:
+        validator.update_ticket_status(ticket_path, target_status)
+    except Exception as exc:
+        return ResolutionResult(1, f"Error updating ticket status on disk for '{ticket_path}': {exc}")
+
+    task_graph_candidates = [
+        feature_dir / "task-graph.md",
+        issues_dir / "task-graph.md",
+        search_dir / "task-graph.md",
+        search_dir / ".scratch" / feature_dir.name / "task-graph.md",
+        REPO_ROOT / ".scratch" / feature_dir.name / "task-graph.md",
+    ]
+
+    seen_tg_paths: set[Path] = set()
+    target_failing = next((c for c in task_graph_candidates if c.is_file()), feature_dir / "task-graph.md")
+    try:
+        for tg_candidate in task_graph_candidates:
+            if tg_candidate.is_file():
+                resolved_tg = tg_candidate.resolve()
+                if resolved_tg not in seen_tg_paths:
+                    seen_tg_paths.add(resolved_tg)
+                    target_failing = tg_candidate
+                    update_task_graph_progress(
+                        resolved_tg,
+                        canonical_id,
+                        f"⏳ {target_status}",
+                        dag_complete=False,
+                        validator=validator,
+                        raise_on_error=True,
+                    )
+    except OSError as exc:
+        try:
+            validator.update_ticket_status(ticket_path, existing_status or "in-progress")
+        except Exception:
+            pass
+        failing_target = _normalize_failing_path(target_failing, exc)
+        return handle_filesystem_io_error(
+            target_path=failing_target,
+            exc=exc,
+            ticket_id=canonical_id,
+            feature_dir=feature_dir,
+            action="unclaim ticket and synchronize task graph on disk",
+        )
+
+    confirm_msg = f"✅ Ticket '{canonical_id}' unclaimed on disk (status reset to '{target_status}')."
     return ResolutionResult(0, confirm_msg, dispatched=False, suppressed=False)
 
 
@@ -8495,6 +8701,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--artifact-path", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--check-dag-only", action="store_true", help="Inspect DAG completion status without resolving")
     parser.add_argument("--claim", action="store_true", help="Claim a ticket atomically (mark in-progress on disk)")
+    parser.add_argument("--unclaim", action="store_true", help="Release a ticket claim atomically (reset to ready-for-agent on disk)")
+    parser.add_argument("--reset", action="store_true", dest="unclaim", help="Alias for --unclaim")
     parser.add_argument("--validate-template", dest="validate_template", action="store_true", help="Validate canonical task graph template contract schema integrity ([TMPL-01], [ERR-TMPL-CORRUPT])")
     parser.add_argument("--client-path", default="", help=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=float, default=15.0, help=argparse.SUPPRESS)
@@ -8547,7 +8755,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 search_target,
                 root_dir=root_arg,
                 validator=validator,
-                lean=bool(getattr(args, "lean_summary", False)),
+                lean=True,
             )
             sys.stdout.write(dash_res.artifact + "\n\n" + dash_res.chat_stream + "\n")
             return 0
@@ -8571,13 +8779,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if getattr(args, "brief", False):
         search_target = args.ticket_id or tracker_arg or root_arg or REPO_ROOT
-        brief_output = format_worker_brief(search_target, root_dir=root_arg, validator=validator)
+        brief_output = format_worker_brief(
+            search_target,
+            root_dir=root_arg,
+            validator=validator,
+            lean=bool(getattr(args, "lean_summary", False)),
+        )
         sys.stdout.write(brief_output + "\n")
         return 0
 
     if getattr(args, "final_frontier_brief", False):
         search_target = args.ticket_id or tracker_arg or root_arg or REPO_ROOT
-        brief_output = format_final_frontier_brief(search_target, root_dir=root_arg, validator=validator)
+        brief_output = format_final_frontier_brief(
+            search_target,
+            root_dir=root_arg,
+            validator=validator,
+            lean=bool(getattr(args, "lean_summary", False)),
+        )
         sys.stdout.write(brief_output + "\n")
         return 0
 
@@ -8604,14 +8822,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if getattr(args, "eval_brief", None):
+        eval_phase = args.eval_brief
         search_target = args.ticket_id or tracker_arg or root_arg or REPO_ROOT
+        clean_eval_type = str(eval_phase).strip().strip("/").strip().lower().replace("_", "-")
+        is_path_target = False
+        p_cand = Path(eval_phase)
+        if p_cand.exists():
+            is_path_target = True
+        elif root_arg and (Path(root_arg) / eval_phase).exists():
+            is_path_target = True
+        elif (REPO_ROOT / eval_phase).exists():
+            is_path_target = True
+        elif (Path(".scratch") / eval_phase).exists():
+            is_path_target = True
+
+        if clean_eval_type not in VALID_EVAL_PHASES and is_path_target:
+            search_target = eval_phase
+            eval_phase = "code-review"
         brief_output = format_evaluation_brief(
-            args.eval_brief,
+            eval_phase,
             search_target,
             root_dir=root_arg,
             validator=validator,
             caller_phase=getattr(args, "caller_phase", None),
-            lean=bool(getattr(args, "lean_summary", False)),
+            lean=True,
         )
         sys.stdout.write(brief_output + "\n")
         return 0
@@ -8703,6 +8937,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             root_dir=root_arg,
             tracker_dir=tracker_arg,
             branch=args.branch,
+        )
+        if res.exit_code == 0:
+            sys.stdout.write(res.message + "\n")
+        else:
+            sys.stderr.write(res.message + "\n")
+        return res.exit_code
+
+    if getattr(args, "unclaim", False):
+        if not args.ticket_id:
+            parser.print_usage(sys.stderr)
+            sys.stderr.write("Error: <ticket-id> is required for --unclaim.\n")
+            return 1
+        res = unclaim_ticket(
+            ticket_ref=args.ticket_id,
+            root_dir=root_arg,
+            tracker_dir=tracker_arg,
         )
         if res.exit_code == 0:
             sys.stdout.write(res.message + "\n")
