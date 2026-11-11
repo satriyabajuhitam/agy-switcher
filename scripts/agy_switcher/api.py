@@ -217,7 +217,9 @@ def auto_rotate_on_exhaustion(
     current_account: str | None = None,
 ) -> RotationResult:
     """Rotates to the optimal account with remaining quota for target model using Disk-Only Swap."""
-    if model and isinstance(model, str) and any(k in model.lower() for k in ("claude", "anthropic")):
+    if model and isinstance(model, str) and any(
+        k in model.lower() for k in ("claude", "anthropic", "gpt", "openai")
+    ):
         raise AgySwitchError(
             f"Non-Gemini model '{model}' is retired and unsupported. Allowed model is strictly 'gemini'."
         )
@@ -278,38 +280,39 @@ def auto_rotate_on_exhaustion(
         # Anti-double-hopping check:
         # If a recent rotation for this vault and model succeeded within a short debounce window (2.0s)
         # and the vault's active account matches the newly rotated account:
+        cached_result = last_rot.get("result") if last_rot else None
         if (
             last_rot is not None
             and (now - float(last_rot.get("timestamp", 0.0)) < 2.0)
             and last_rot.get("model") == model_key
-            and isinstance(last_rot.get("result"), RotationResult)
-            and last_rot["result"].success
+            and isinstance(cached_result, RotationResult)
+            and cached_result.success
             and active_account == last_rot.get("new_account")
         ):
             if current_account is None or current_account == last_rot.get("previous_account"):
-                return last_rot["result"]
+                return cached_result
 
         # Explicit current_account guard: if the caller's turn ran on current_account, but the active
         # account has already transitioned away:
         if current_account and active_account and active_account != current_account:
             # Case A: A recent rotation for this specific model already rotated to active_account
+            cached_res = last_rot.get("result") if last_rot else None
             if (
                 last_rot is not None
                 and last_rot.get("model") == model_key
                 and last_rot.get("new_account") == active_account
-                and isinstance(last_rot.get("result"), RotationResult)
-                and last_rot["result"].success
+                and isinstance(cached_res, RotationResult)
+                and cached_res.success
             ):
                 if last_rot.get("previous_account") == current_account:
-                    return last_rot["result"]
-                res = last_rot["result"]
+                    return cached_res
                 return RotationResult(
                     success=True,
                     previous_account=current_account,
                     new_account=active_account,
                     model=model,
                     message=f"Account already rotated from '{current_account}' to '{active_account}' for model '{model}'.",
-                    quota_remaining=res.quota_remaining,
+                    quota_remaining=cached_res.quota_remaining,
                     reloaded_server=False,
                     active_account=active_account,
                 )
@@ -359,6 +362,20 @@ def auto_rotate_on_exhaustion(
             cooldowns = dict(engine.get_cooldowns())
         except Exception:
             cooldowns = {}
+
+        # Non-Gemini cooldowns are retired and must never penalize Gemini rotation
+        if cooldowns and model_key == "gemini":
+            filtered_cooldowns: dict[str, Any] = {}
+            for acc, rec in cooldowns.items():
+                if isinstance(rec, dict):
+                    m_rec = str(rec.get("model", "")).strip().lower()
+                    r_rec = str(rec.get("reason", "")).strip().lower()
+                    if (m_rec and not m_rec.startswith("gemini")) or any(
+                        non_g in r_rec for non_g in ("claude", "anthropic", "gpt", "openai")
+                    ):
+                        continue
+                filtered_cooldowns[acc] = rec
+            cooldowns = filtered_cooldowns
 
         if current_account:
             cooldowns[current_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
