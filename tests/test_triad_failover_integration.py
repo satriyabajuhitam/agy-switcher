@@ -36,6 +36,7 @@ SCRIPTS_DIR = str(REPO_ROOT / "scripts")
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
+from agy_switcher.exceptions import AgySwitchError
 from agy_switcher.models import RotationResult
 from agy_switcher.vault import AgySwitchEngine
 from agy_switcher.watcher import LogWatcher
@@ -227,12 +228,12 @@ class TestSdkFailoverContract(unittest.TestCase):
             linked_locks=[cli_presence_lock],
         )
 
-        # Telemetry: primary exhausted for claude, standby healthy
+        # Telemetry: primary exhausted for gemini, standby healthy
         cache_data = {
             "timestamp": 1700000000.0,
             "accounts": {
-                "primary-acc": {"claude": {"quota": 0, "reset_time": 1700003600.0}},
-                "standby-acc": {"claude": {"quota": 85, "reset_time": 1700003600.0}},
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 85, "reset_time": 1700003600.0}},
             },
         }
         self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
@@ -249,7 +250,7 @@ class TestSdkFailoverContract(unittest.TestCase):
              patch("os.kill") as mock_os_kill:
 
             result = switcher_api.auto_rotate_on_exhaustion(
-                model="claude",
+                model="gemini",
                 reload_server=False,
                 engine=self.engine,
             )
@@ -315,8 +316,8 @@ class TestSdkFailoverContract(unittest.TestCase):
         cache_data = {
             "timestamp": 1700000000.0,
             "accounts": {
-                "primary-acc": {"claude": {"quota": 0, "reset_time": 1700003600.0}},
-                "standby-acc": {"claude": {"quota": 80, "reset_time": 1700003600.0}},
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 80, "reset_time": 1700003600.0}},
             },
         }
         self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
@@ -324,7 +325,7 @@ class TestSdkFailoverContract(unittest.TestCase):
         # When reload_server=True is passed during an active turn, auto_rotate_on_exhaustion rejects the reload
         with patch("os.kill") as mock_os_kill:
             result = switcher_api.auto_rotate_on_exhaustion(
-                model="claude",
+                model="gemini",
                 reload_server=True,
                 engine=self.engine,
             )
@@ -337,19 +338,19 @@ class TestSdkFailoverContract(unittest.TestCase):
         self.assertEqual(self.engine.get_active_name(), "primary-acc")
 
     def test_failover_det_005_granular_claude_slug_and_direct_switch_account(self) -> None:
-        """[FAILOVER-DET-005] Model 'claude-sonnet-4-6' and direct switch_account adhere to Disk-Only Swap."""
+        """[FAILOVER-DET-005] Model 'gemini-3.8-pro' and direct switch_account adhere to Disk-Only Swap."""
         cache_data = {
             "timestamp": 1700000000.0,
             "accounts": {
-                "primary-acc": {"claude": {"quota": 0, "reset_time": 1700003600.0}},
-                "standby-acc": {"claude": {"quota": 95, "reset_time": 1700003600.0}},
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 95, "reset_time": 1700003600.0}},
             },
         }
         self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
 
-        # Test auto_rotate_on_exhaustion with granular slug 'claude-sonnet-4-6'
+        # Test auto_rotate_on_exhaustion with granular slug 'gemini-3.8-pro'
         res = switcher_api.auto_rotate_on_exhaustion(
-            model="claude-sonnet-4-6",
+            model="gemini-3.8-pro",
             reload_server=False,
             engine=self.engine,
         )
@@ -369,6 +370,200 @@ class TestSdkFailoverContract(unittest.TestCase):
 
         self.assertTrue(swapped)
         self.assertEqual(self.engine.get_active_name(), "primary-acc")
+
+    def test_disk_only_swap_gemini_exclusive_failover_det_004(self) -> None:
+        """[FAILOVER-DET-004] TurnRunner soft-imports agy_switcher.api on gemini-3.8-flash exhaustion and rotates to standby."""
+        # Active account "primary-acc" is exhausted for "gemini-3.8-flash"
+        # Standby account "standby-acc" has available Gemini quota
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 85, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        # WHEN TurnRunner catches a quota exhaustion failure during prompt execution
+        # THEN TurnRunner dynamically imports agy_switcher.api without hard dependency errors
+        try:
+            import agy_switcher.api as dynamic_api
+            import_ok = True
+        except ImportError:
+            dynamic_api = None  # type: ignore[assignment]
+            import_ok = False
+
+        self.assertTrue(import_ok, "Dynamic soft-import of agy_switcher.api must succeed")
+        self.assertIsNotNone(dynamic_api)
+
+        # AND invokes switcher_api.auto_rotate_on_exhaustion(model="gemini", reload_server=False)
+        result: RotationResult = dynamic_api.auto_rotate_on_exhaustion(
+            model="gemini",
+            reload_server=False,
+            engine=self.engine,
+        )
+
+        # AND receives a RotationResult indicating success=True and new_account="standby-acc"
+        self.assertIsInstance(result, RotationResult)
+        self.assertTrue(result.success, f"Expected success=True, got: {result.message}")
+        self.assertEqual(result.previous_account, "primary-acc")
+        self.assertEqual(result.new_account, "standby-acc")
+        self.assertEqual(result.active_account, "standby-acc")
+        self.assertEqual(result.model, "gemini")
+        self.assertFalse(result.reloaded_server)
+        self.assertEqual(result.quota_remaining, 0.85)
+
+        # Verify active pointer in vault transitioned to standby-acc
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+
+        # Verify token swap updated CLI and Desktop token files atomically
+        cli_token = json.loads(self.engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(cli_token["token"]["access_token"], self.standby_token_data["token"]["access_token"])
+        desktop_token = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_token["token"]["access_token"], self.standby_token_data["token"]["access_token"])
+
+    def test_disk_only_swap_gemini_exclusive_failover_det_005(self) -> None:
+        """[FAILOVER-DET-005] Disk-Only Swap on gemini-3.8-pro preserves language server and presence locks."""
+        # Active turn running with model "gemini-3.8-pro"
+        # Desktop language server processes are running with presence locks present
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        desktop_presence_lock = presence_dir / "active-turn.lock"
+        desktop_lock_content = "pid: 46000, turn: turn-gemini-pro\n"
+        desktop_presence_lock.write_text(desktop_lock_content, encoding="utf-8")
+
+        cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        cli_presence_dir.mkdir(parents=True, exist_ok=True)
+        cli_presence_lock = cli_presence_dir / "cli-turn.lock"
+        cli_lock_content = "pid: 46001, session: session-gemini-turn\n"
+        cli_presence_lock.write_text(cli_lock_content, encoding="utf-8")
+
+        server_pid = 46000
+        server_cmdline = b"/opt/antigravity/bin/language_server\x00--standalone\x00"
+        server_proc_dir = self._setup_simulated_process(
+            pid=server_pid,
+            cmdline=server_cmdline,
+            linked_locks=[desktop_presence_lock],
+        )
+
+        cli_pid = 46001
+        cli_proc_dir = self._setup_simulated_process(
+            pid=cli_pid,
+            cmdline=b"antigravity-cli\x00turn-runner\x00",
+            linked_locks=[cli_presence_lock],
+        )
+
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 92, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        # WHEN TurnRunner triggers failover upon quota exhaustion:
+        # Passes model="gemini" and reload_server=False to auto_rotate_on_exhaustion
+        with patch.object(self.engine, "restart_language_server") as mock_engine_restart, \
+             patch.object(self.engine.supervisor, "restart_language_server") as mock_super_restart, \
+             patch.object(self.engine.supervisor, "_send_signal") as mock_send_signal, \
+             patch.object(self.engine.supervisor, "verify_turn_safety") as mock_turn_safety, \
+             patch("os.kill") as mock_os_kill:
+
+            result = switcher_api.auto_rotate_on_exhaustion(
+                model="gemini",
+                reload_server=False,
+                engine=self.engine,
+            )
+
+            # Assert process supervisor hooks and OS signal dispatch were strictly bypassed
+            mock_engine_restart.assert_not_called()
+            mock_super_restart.assert_not_called()
+            mock_send_signal.assert_not_called()
+            mock_turn_safety.assert_not_called()
+            mock_os_kill.assert_not_called()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.new_account, "standby-acc")
+        self.assertFalse(result.reloaded_server)
+        self.assertEqual(result.quota_remaining, 0.92)
+
+        # AND the token swap updates ~/.gemini/antigravity-cli/antigravity-oauth-token atomically
+        cli_token_payload = json.loads(self.engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            cli_token_payload["token"]["access_token"],
+            self.standby_token_data["token"]["access_token"],
+        )
+        self.assertEqual(self.engine.cli_token_file.stat().st_mode & 0o777, 0o600)
+        desktop_token_payload = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            desktop_token_payload["token"]["access_token"],
+            self.standby_token_data["token"]["access_token"],
+        )
+        self.assertEqual(self.engine.desktop_token_file.stat().st_mode & 0o777, 0o600)
+
+        # AND no desktop language server processes or presence locks are modified or terminated
+        self.assertTrue(desktop_presence_lock.is_file())
+        self.assertEqual(desktop_presence_lock.read_text(encoding="utf-8"), desktop_lock_content)
+        self.assertTrue(cli_presence_lock.is_file())
+        self.assertEqual(cli_presence_lock.read_text(encoding="utf-8"), cli_lock_content)
+        self.assertTrue(server_proc_dir.is_dir())
+        self.assertEqual((server_proc_dir / "cmdline").read_bytes(), server_cmdline)
+        self.assertTrue(cli_proc_dir.is_dir())
+
+    def test_disk_only_swap_gemini_exclusive_rejects_non_gemini_models(self) -> None:
+        """[FAILOVER-ERR-004] Invoking auto_rotate_on_exhaustion with non-Gemini model raises AgySwitchError."""
+        for non_gemini_model in ("claude", "claude-3-5-sonnet", "anthropic", "CLAUDE", "gpt-4", "gpt-4o", "openai"):
+            with self.subTest(model=non_gemini_model):
+                with self.assertRaises(AgySwitchError) as ctx:
+                    switcher_api.auto_rotate_on_exhaustion(
+                        model=non_gemini_model,
+                        reload_server=False,
+                        engine=self.engine,
+                    )
+                self.assertIn("non-gemini", str(ctx.exception).lower())
+                self.assertIn("retired and unsupported", str(ctx.exception).lower())
+
+        # Assert no account rotation or disk mutation was performed
+        self.assertEqual(self.engine.get_active_name(), "primary-acc")
+
+    def test_disk_only_swap_gemini_exclusive_ignores_non_gemini_cooldowns(self) -> None:
+        """Disk-Only Swap on Gemini ignores cooldown records belonging to retired non-Gemini models."""
+        cache_data = {
+            "timestamp": 1700000000.0,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600.0}},
+                "standby-acc": {"gemini": {"quota": 90, "reset_time": 1700003600.0}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        # Record cooldowns specifically for retired non-Gemini models on standby-acc
+        cooldown_data = {
+            "standby-acc": {
+                "reason": "RESOURCE_EXHAUSTED",
+                "model": "claude",
+                "cooldown_until": time.time() + 3600,
+            },
+            "primary-acc": {
+                "reason": "RESOURCE_EXHAUSTED",
+                "model": "gpt-4",
+                "cooldown_until": time.time() + 3600,
+            },
+        }
+        cooldown_file = self.engine.cache_dir / "cooldown.json"
+        cooldown_file.write_text(json.dumps(cooldown_data), encoding="utf-8")
+
+        result = switcher_api.auto_rotate_on_exhaustion(
+            model="gemini",
+            reload_server=False,
+            engine=self.engine,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.new_account, "standby-acc")
+        self.assertFalse(result.reloaded_server)
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
 
     def test_failover_model_slug_normalization_tolerance(self) -> None:
         """SDK auto_rotate_on_exhaustion normalizes granular model slugs to canonical families."""
@@ -714,20 +909,17 @@ class TestSoftImportAndConcurrency(unittest.TestCase):
         self.assertNotEqual(self.engine.get_active_name(), "standby-acc-2")
 
     def test_failover_edge_004_heterogeneous_model_concurrency_race(self) -> None:
-        """[FAILOVER-EDGE-004] Concurrent rotations for different models isolate and do not corrupt state."""
+        """[FAILOVER-EDGE-004] Concurrent rotations serialize safely under atomic disk swap."""
         cache_data = {
             "timestamp": 1700000000.0,
             "accounts": {
                 "primary-acc": {
-                    "claude": {"quota": 0, "reset_time": 1700003600.0},
                     "gemini": {"quota": 0, "reset_time": 1700003600.0},
                 },
                 "standby-acc": {
-                    "claude": {"quota": 90, "reset_time": 1700003600.0},
                     "gemini": {"quota": 0, "reset_time": 1700003600.0},
                 },
                 "standby-acc-2": {
-                    "claude": {"quota": 85, "reset_time": 1700003600.0},
                     "gemini": {"quota": 85, "reset_time": 1700003600.0},
                 },
             },
@@ -736,16 +928,16 @@ class TestSoftImportAndConcurrency(unittest.TestCase):
 
         start_event = threading.Event()
 
-        def rotate_claude() -> RotationResult:
+        def rotate_task_1() -> RotationResult:
             start_event.wait(timeout=5.0)
             return switcher_api.auto_rotate_on_exhaustion(
-                model="claude",
+                model="gemini",
                 reload_server=False,
                 engine=self.engine,
                 current_account="primary-acc",
             )
 
-        def rotate_gemini() -> RotationResult:
+        def rotate_task_2() -> RotationResult:
             start_event.wait(timeout=5.0)
             return switcher_api.auto_rotate_on_exhaustion(
                 model="gemini",
@@ -755,23 +947,15 @@ class TestSoftImportAndConcurrency(unittest.TestCase):
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            fut_c = executor.submit(rotate_claude)
-            fut_g = executor.submit(rotate_gemini)
+            fut_1 = executor.submit(rotate_task_1)
+            fut_2 = executor.submit(rotate_task_2)
             start_event.set()
-            res_c = fut_c.result(timeout=10.0)
-            res_g = fut_g.result(timeout=10.0)
+            res_1 = fut_1.result(timeout=10.0)
+            res_2 = fut_2.result(timeout=10.0)
 
-        # Both must succeed
-        self.assertTrue(res_c.success)
-        self.assertTrue(res_g.success)
-
-        # Claude rotated to an account with claude quota (standby-acc or standby-acc-2)
-        self.assertEqual(res_c.model, "claude")
-        self.assertIn(res_c.new_account, ["standby-acc", "standby-acc-2"])
-
-        # Gemini MUST NOT be stranded on standby-acc (which has 0 gemini quota)!
-        self.assertEqual(res_g.model, "gemini")
-        self.assertEqual(res_g.new_account, "standby-acc-2")
+        # Both tasks handle the rotation safely
+        self.assertTrue(res_1.success or res_2.success)
+        self.assertIn(self.engine.get_active_name(), ["standby-acc-2", "primary-acc"])
 
         # The active account in vault must be an account valid for both (standby-acc-2)
         self.assertEqual(self.engine.get_active_name(), "standby-acc-2")

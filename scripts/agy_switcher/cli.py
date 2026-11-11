@@ -132,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default=None,
-        help="Target model family for quota sorting (e.g. gemini, claude)",
+        help="Target model family for quota sorting (strictly gemini)",
     )
 
     # Command: quota
@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default="gemini",
-        help="Target model family for quota sorting (e.g. gemini, claude)",
+        help="Target model family for quota sorting (strictly gemini)",
     )
 
     # Command: status
@@ -179,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     switch_parser.add_argument("--auto", action="store_true", help="Auto-switch to optimal account")
     switch_parser.add_argument(
-        "--model", type=str, default=None, help="Target model for auto-switch (e.g. gemini, claude)"
+        "--model", type=str, default=None, help="Target model for auto-switch (strictly gemini)"
     )
 
     # Command: add
@@ -239,10 +239,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auto_switch_parser.add_argument("state", nargs="?", choices=["on", "off"], help="State (on/off)")
     default_model_parser = config_subparsers.add_parser(
-        "default-model", help="Configure persistent default model (gemini or claude)"
+        "default-model", help="Configure persistent default model (strictly gemini)"
     )
     default_model_parser.add_argument(
-        "model", nargs="?", help="Default model family (gemini or claude)"
+        "model", nargs="?", help="Default model family (strictly gemini)"
     )
     threshold_parser = config_subparsers.add_parser(
         "threshold", help="Configure quota threshold percentage (1-100)"
@@ -535,7 +535,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 target_model = normalize_model_name(cli_model)
             except AgySwitchError:
                 print(
-                    f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.",
+                    f"[agy-switch] Unsupported model '{cli_model}'. Allowed model is strictly 'gemini'.",
                     file=sys.stderr,
                 )
                 return 1
@@ -652,7 +652,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 target_model = normalize_model_name(cli_model)
             except AgySwitchError:
                 print(
-                    f"[agy-switch] Unsupported model '{cli_model}'. Allowed models: 'gemini', 'claude'.",
+                    f"[agy-switch] Unsupported model '{cli_model}'. Allowed model is strictly 'gemini'.",
                     file=sys.stderr,
                 )
                 return 1
@@ -886,7 +886,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 return 0
             except AgySwitchError:
                 print(
-                    f"[agy-switch] Unsupported model '{model_arg}'. Allowed models: 'gemini', 'claude'.",
+                    f"[agy-switch] Unsupported model '{model_arg}'. Allowed model is strictly 'gemini'.",
                     file=sys.stderr,
                 )
                 return 1

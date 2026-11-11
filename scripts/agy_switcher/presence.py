@@ -57,9 +57,10 @@ def append_secure_log_entry(log_file: Path | str, message: str) -> None:
                 os.chmod(path.parent, 0o700)
             except OSError:
                 pass
-        log_fd = _open_secure_log_file(path)
+        opened_fd = _open_secure_log_file(path)
+        log_fd: int | None = opened_fd
         try:
-            with open(log_fd, "a", encoding="utf-8", closefd=True) as f:
+            with open(opened_fd, "a", encoding="utf-8", closefd=True) as f:
                 log_fd = None
                 f.write(message)
                 f.flush()
@@ -317,40 +318,20 @@ class PresenceDetector:
         """
         Returns list of active log targets to watch:
         - Active transcript.jsonl if resolved and existing on disk.
-        - Existing CLI logs in antigravity-cli/log/*.log.
-        Omits non-existent paths and deduplicates targets.
+        Strictly bounds watch targets to transcript.jsonl, omitting raw CLI log files.
+        Yields empty list [] when no active transcript exists.
         """
-        targets: list[Path] = []
         active_transcript = self.get_active_transcript_path(session_id=session_id)
         if active_transcript is not None:
             try:
                 if active_transcript.is_file():
-                    targets.append(active_transcript)
+                    if as_str:
+                        return [str(active_transcript)]
+                    return [active_transcript]
             except OSError:
                 pass
 
-        try:
-            if self.cli_log_dir.is_dir():
-                for cli_log in sorted(self.cli_log_dir.glob("*.log")):
-                    try:
-                        if cli_log.is_file():
-                            targets.append(cli_log)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-
-        seen: set[str] = set()
-        deduped: list[Path] = []
-        for target in targets:
-            key = str(target)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(target)
-
-        if as_str:
-            return [str(p) for p in deduped]
-        return deduped
+        return []
 
 
 

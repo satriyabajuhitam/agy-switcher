@@ -167,7 +167,8 @@ class TestHeadlessLifecycleE2E(unittest.TestCase):
         self.assertIsNone(watcher.active_session_id)
         self.assertIsNone(watcher.active_transcript_path)
         self.assertNotIn(str(desktop_transcript_2), targets_idle)
-        self.assertIn(str(runner_log), targets_idle)
+        self.assertNotIn(str(runner_log), targets_idle)
+        self.assertEqual(targets_idle, [])
         self.assertNotIn(str(desktop_transcript_2), watcher.file_cursors)
         self.assertEqual(watcher.file_cursors.get(str(runner_log)), 50)
 
@@ -227,11 +228,10 @@ class TestHeadlessLifecycleE2E(unittest.TestCase):
         }), encoding="utf-8")
 
         buf_claude = io.StringIO()
-        with patch("sys.stdout", buf_claude):
+        with patch("sys.stderr", buf_claude):
             exit_code = main(["quota", "--model", "claude"], engine=self.engine)
-        self.assertEqual(exit_code, 0)
-        self.assertIn("CLAUDE QUOTA", buf_claude.getvalue())
-        self.assertIn("25%", buf_claude.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Unsupported model 'claude'", buf_claude.getvalue())
 
         buf_gemini = io.StringIO()
         with patch("sys.stdout", buf_gemini):

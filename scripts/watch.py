@@ -27,7 +27,7 @@ from agy_switcher.exceptions import (
     DaemonError,
     DaemonAlreadyRunningError,
 )
-from agy_switcher.telemetry import QuotaClient
+from agy_switcher.telemetry import QuotaClient, fetch_account_quota
 from agy_switcher.rotation import RotationEngine
 try:
     from agy_switcher.vault import AgySwitchEngine
@@ -40,6 +40,7 @@ from agy_switcher.watcher import (
     DEFAULT_VAULT_DIR,
     DEFAULT_GEMINI_DIR,
     DEFAULT_MAX_CHUNK_BYTES,
+    DEFAULT_DAMPING_SECONDS,
     _open_secure_log_file,
     append_secure_log_entry,
     PresenceDetector,
@@ -54,11 +55,13 @@ __all__ = [
     "DaemonError",
     "DaemonAlreadyRunningError",
     "QuotaClient",
+    "fetch_account_quota",
     "RotationEngine",
     "AgySwitchEngine",
     "DEFAULT_VAULT_DIR",
     "DEFAULT_GEMINI_DIR",
     "DEFAULT_MAX_CHUNK_BYTES",
+    "DEFAULT_DAMPING_SECONDS",
     "_open_secure_log_file",
     "append_secure_log_entry",
     "PresenceDetector",

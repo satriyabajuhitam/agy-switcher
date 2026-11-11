@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError, InvalidTokenError
+from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError, AgySwitchError, InvalidTokenError
 from agy_switcher.models import AccountInfo, RotationResult, FleetQuotaSummary
 from agy_switcher.security import extract_email_from_jwt
 from agy_switcher.vault import AgySwitchEngine
@@ -339,38 +339,26 @@ class TestSDKFacade(unittest.TestCase):
         self.assertIn("All accounts exhausted for model 'gemini'", result.message)
         self.assertEqual(self.engine.get_active_name(), "acc1")
 
-    def test_auto_rotate_on_exhaustion_model_steering_claude(self) -> None:
-        """[REQ-2-SCN-005] auto_rotate_on_exhaustion steers rotation using model-specific telemetry."""
+    def test_auto_rotate_rejects_non_gemini(self) -> None:
+        """[FAILOVER-ERR-004] Invoking auto_rotate_on_exhaustion with non-Gemini model raises AgySwitchError."""
         acc1_dir = self.engine.accounts_dir / "acc1"
         acc1_dir.mkdir(parents=True, exist_ok=True)
-        (acc1_dir / "token.json").write_text(json.dumps(create_sample_token("acc1@example.com")), encoding="utf-8")
-
-        acc2_dir = self.engine.accounts_dir / "acc2"
-        acc2_dir.mkdir(parents=True, exist_ok=True)
-        (acc2_dir / "token.json").write_text(json.dumps(create_sample_token("acc2@example.com")), encoding="utf-8")
-
-        acc3_dir = self.engine.accounts_dir / "acc3"
-        acc3_dir.mkdir(parents=True, exist_ok=True)
-        (acc3_dir / "token.json").write_text(json.dumps(create_sample_token("acc3@example.com")), encoding="utf-8")
-
+        acc1_token = acc1_dir / "token.json"
+        acc1_token_data = create_sample_token("acc1@example.com")
+        acc1_token.write_text(json.dumps(acc1_token_data), encoding="utf-8")
         self.engine.set_active_name("acc1")
 
-        cache_data = {
-            "timestamp": 1700000000,
-            "accounts": {
-                "acc1": {"claude": {"quota": 0}, "gemini": {"quota": 100}},
-                "acc2": {"claude": {"quota": 100}, "gemini": {"quota": 10}},
-                "acc3": {"claude": {"quota": 50}, "gemini": {"quota": 90}},
-            },
-        }
-        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+        active_before = self.engine.get_active_name()
+        token_before = acc1_token.read_text(encoding="utf-8")
 
-        result = api.auto_rotate_on_exhaustion(model="claude", engine=self.engine)
+        for non_gemini in ["claude", "CLAUDE", "claude-3-5-sonnet", "anthropic", "  claude-3-5-sonnet  "]:
+            with self.assertRaises(AgySwitchError) as ctx:
+                api.auto_rotate_on_exhaustion(model=non_gemini, engine=self.engine)
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.new_account, "acc2")
-        self.assertEqual(result.model, "claude")
-        self.assertEqual(self.engine.get_active_name(), "acc2")
+            err_msg = str(ctx.exception).lower()
+            self.assertTrue("retired" in err_msg or "strictly 'gemini'" in err_msg or "unsupported" in err_msg)
+            self.assertEqual(self.engine.get_active_name(), active_before)
+            self.assertEqual(acc1_token.read_text(encoding="utf-8"), token_before)
 
     def test_auto_rotate_on_exhaustion_unsupported_model(self) -> None:
         """[REQ-2-ERR-004] auto_rotate_on_exhaustion handles unsupported model gracefully."""
@@ -740,6 +728,89 @@ class TestSDKFacade(unittest.TestCase):
         # Verify both direct quota key and gemini container key are populated
         self.assertEqual(summary.accounts["acc1"]["quota"], 75)
         self.assertEqual(summary.accounts["acc1"]["gemini"]["quota"], 75)
+
+    def test_get_fleet_quota_summary_gemini_exclusive(self) -> None:
+        """[QUOTA-GEMINI-EDGE-002] & [QUOTA-GEMINI-EDGE-004] Fleet summary filtering and whitespace normalization.
+
+        - [QUOTA-GEMINI-EDGE-004]: normalize_model_name normalizes '  GeMiNi-3.8-PrO  ' to 'gemini'.
+        - [QUOTA-GEMINI-EDGE-002]: get_fleet_quota_summary(model='gemini') filters fleet balances
+          strictly to Gemini model family across 3 registered accounts, stripping non-gemini data.
+        """
+        # [QUOTA-GEMINI-EDGE-004]: Verify normalize_model_name strips whitespace and mixed casing
+        self.assertEqual(api.normalize_model_name("  GeMiNi-3.8-PrO  "), "gemini")
+        self.assertEqual(api.normalize_model_name("   gemini   "), "gemini")
+        self.assertEqual(api.normalize_model_name(" \t gemini-2.5-flash \n "), "gemini")
+
+        # Setup 3 registered accounts in the vault
+        for i in range(1, 4):
+            acc_dir = self.engine.accounts_dir / f"acc{i}"
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(
+                json.dumps(create_sample_token(f"acc{i}@example.com")),
+                encoding="utf-8",
+            )
+        self.engine.set_active_name("acc1")
+
+        # Populate cache with Gemini and legacy Claude entries for all 3 accounts
+        cache_ts = 1700000500.0
+        cache_data = {
+            "timestamp": cache_ts,
+            "accounts": {
+                "acc1": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 85, "reset_time": cache_ts + 1800},
+                    "claude": {"quota": 10, "reset_time": cache_ts + 3600},
+                },
+                "acc2": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 60, "reset_time": cache_ts + 3600},
+                    "claude": {"quota": 40, "reset_time": cache_ts + 7200},
+                },
+                "acc3": {
+                    "cached_at": cache_ts,
+                    "gemini": {"quota": 100, "reset_time": cache_ts + 5400},
+                    "claude": {"quota": 0, "reset_time": cache_ts + 1800},
+                },
+            },
+        }
+        self.engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        # [QUOTA-GEMINI-EDGE-002]: Invoke get_fleet_quota_summary with model="gemini"
+        summary = api.get_fleet_quota_summary(model="gemini", engine=self.engine)
+
+        self.assertIsInstance(summary, FleetQuotaSummary)
+        self.assertEqual(summary.total_accounts, 3)
+        self.assertEqual(summary.active_account, "acc1")
+        self.assertEqual(summary.model, "gemini")
+        self.assertEqual(summary.timestamp, cache_ts)
+        self.assertEqual(len(summary.accounts), 3)
+
+        expected_quotas = {"acc1": 85, "acc2": 60, "acc3": 100}
+        for acc_name, expected_quota in expected_quotas.items():
+            acc_data = summary.accounts[acc_name]
+            self.assertIn("gemini", acc_data)
+            gemini_data = acc_data["gemini"]
+            self.assertIsInstance(gemini_data, dict)
+            assert isinstance(gemini_data, dict)
+            self.assertEqual(acc_data["quota"], expected_quota)
+            self.assertEqual(gemini_data["quota"], expected_quota)
+            self.assertIsNotNone(gemini_data.get("reset_time"))
+            self.assertIsNotNone(gemini_data.get("remaining_minutes"))
+            rem_m = gemini_data.get("remaining_minutes")
+            self.assertIsInstance(rem_m, int)
+            assert isinstance(rem_m, int)
+            self.assertGreater(rem_m, 0)
+            self.assertNotIn("claude", acc_data)
+
+        # Also verify that whitespace-padded mixed-case model string resolves strictly to gemini
+        summary_padded = api.get_fleet_quota_summary(model="  GeMiNi-3.8-PrO  ", engine=self.engine)
+        self.assertEqual(summary_padded.model, "gemini")
+        self.assertEqual(summary_padded.total_accounts, 3)
+        for acc_name, expected_quota in expected_quotas.items():
+            acc_data = summary_padded.accounts[acc_name]
+            self.assertEqual(acc_data["quota"], expected_quota)
+            self.assertNotIn("claude", acc_data)
 
     def test_get_fleet_quota_summary_network_outage_fallback(self) -> None:
         """[REQ-2-EDGE-002] Telemetry network outage falls back to cached quota with timestamp preserved."""

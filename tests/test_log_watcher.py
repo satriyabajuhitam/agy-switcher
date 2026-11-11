@@ -230,7 +230,7 @@ class TestPresenceDetector(unittest.TestCase):
         self.assertIsNone(self.detector.get_active_transcript_path())
 
     def test_watch_targets_aggregates_transcript_and_cli_logs(self):
-        """Returns active transcript path (if existing) and existing antigravity-cli/log/*.log files."""
+        """Returns active transcript path (if existing) and strictly omits antigravity-cli/log/*.log files."""
         uuid = "eeeeeeee-1111-2222-3333-444444444444"
         (self.presence_dir / f"{uuid}.lock").touch()
 
@@ -253,20 +253,19 @@ class TestPresenceDetector(unittest.TestCase):
 
         targets = self.detector.get_watch_targets()
 
-        # Target list must include transcript and cli logs as Paths
-        self.assertIn(transcript_file, targets)
-        self.assertIn(cli_log1, targets)
-        self.assertIn(cli_log2, targets)
+        # Target list must include transcript and omit raw cli logs as Paths
+        self.assertEqual(targets, [transcript_file])
+        self.assertNotIn(cli_log1, targets)
+        self.assertNotIn(cli_log2, targets)
         self.assertNotIn(cli_txt, targets)
         self.assertNotIn(old_invalid_dir / "fake.log", targets)
 
         # Also verify string output support if requested
         str_targets = self.detector.get_watch_targets(as_str=True)
-        self.assertIn(str(transcript_file), str_targets)
-        self.assertIn(str(cli_log1), str_targets)
+        self.assertEqual(str_targets, [str(transcript_file)])
 
     def test_watch_targets_when_transcript_not_created_yet(self):
-        """If session dir exists but transcript.jsonl has not yet been created, omit transcript from targets."""
+        """If session dir exists but transcript.jsonl has not yet been created, omit transcript and return empty."""
         uuid = "ffffffff-1111-2222-3333-444444444444"
         (self.presence_dir / f"{uuid}.lock").touch()
 
@@ -278,7 +277,7 @@ class TestPresenceDetector(unittest.TestCase):
         cli_log.touch()
 
         targets = self.detector.get_watch_targets()
-        self.assertEqual(targets, [cli_log])
+        self.assertEqual(targets, [])
 
     def test_default_init_paths(self):
         """Verify default constructor uses ~/.gemini and /proc."""
@@ -612,7 +611,7 @@ class TestPresenceDetector(unittest.TestCase):
     def test_transcript_targets_deduplication(self):
         """[REQ-2-SCN-006]: GIVEN an active CLI transcript file exists and multiple .log files exist
         in ~/.gemini/antigravity-cli/log/, WHEN PresenceDetector.get_watch_targets() is invoked,
-        THEN the returned list contains the CLI transcript path and existing .log paths with zero duplicates.
+        THEN the returned list contains exclusively the CLI transcript path and omits raw .log files.
         """
         session_id = "cli-dedup-sess"
         cli_dir = self.detector.cli_brain_dir / session_id / ".system_generated" / "logs"
@@ -630,18 +629,12 @@ class TestPresenceDetector(unittest.TestCase):
         log2.write_text("runner log", encoding="utf-8")
 
         targets_path = self.detector.get_watch_targets(as_str=False)
-        self.assertEqual(len(targets_path), 3)
-        self.assertEqual(len(targets_path), len(set(targets_path)))
-        self.assertEqual(targets_path[0], cli_transcript)
-        self.assertIn(log1, targets_path)
-        self.assertIn(log2, targets_path)
+        self.assertEqual(targets_path, [cli_transcript])
+        self.assertNotIn(log1, targets_path)
+        self.assertNotIn(log2, targets_path)
 
         targets_str = self.detector.get_watch_targets(as_str=True)
-        self.assertEqual(len(targets_str), 3)
-        self.assertEqual(len(targets_str), len(set(targets_str)))
-        self.assertIn(str(cli_transcript), targets_str)
-        self.assertIn(str(log1), targets_str)
-        self.assertIn(str(log2), targets_str)
+        self.assertEqual(targets_str, [str(cli_transcript)])
 
     def test_transcript_targets_unreadable_omitted_safely(self):
         """[REQ-2-ERR-002]: GIVEN an active session ID is discovered,
@@ -1275,6 +1268,42 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
         )
 
 
+class _StubSwitchEngine:
+    """External engine stub for testing LogWatcher at its public seam without internal mocking."""
+
+    def __init__(self, cache_dir: Path, vault_dir: Path, gemini_dir: Path) -> None:
+        self.cache_dir = cache_dir
+        self.vault_dir = vault_dir
+        self.gemini_dir = gemini_dir
+        self.active_name_calls = 0
+        self.list_accounts_calls = 0
+        self.switch_calls: list[tuple[str, bool, bool]] = []
+
+    def get_active_name(self) -> str:
+        self.active_name_calls += 1
+        return "acc1"
+
+    def list_accounts(self) -> dict[str, object]:
+        self.list_accounts_calls += 1
+        return {
+            "active": "acc1",
+            "accounts": [
+                {"name": "acc1", "valid": True},
+                {"name": "acc2", "valid": True},
+            ],
+        }
+
+    def switch_tokens(
+        self,
+        target_account: str,
+        *,
+        restart_server: bool = False,
+        force: bool = False,
+    ) -> dict[str, object]:
+        self.switch_calls.append((target_account, restart_server, force))
+        return {"success": True, "active": target_account, "server_restarted": False}
+
+
 class TestLogWatcherProcessing(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -1405,6 +1434,326 @@ class TestLogWatcherProcessing(unittest.TestCase):
         self.assertFalse(res)
         mock_switch.assert_not_called()
 
+    def _build_isolated_watcher(
+        self,
+    ) -> tuple[LogWatcher, _StubSwitchEngine, CooldownManager, Path]:
+        """Builds a LogWatcher wired only to isolated temp files and an external engine stub."""
+        gemini_dir = self.base_dir / ".gemini_immunity"
+        gemini_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({
+                "timestamp": 1700000000.0,
+                "accounts": {
+                    "acc1": {"gemini": {"quota": 0, "reset_time": "2026-11-11T12:00:00Z"}},
+                    "acc2": {"gemini": {"quota": 90, "reset_time": "2026-11-11T12:00:00Z"}},
+                },
+            }),
+            encoding="utf-8",
+        )
+        engine_stub = _StubSwitchEngine(
+            cache_dir=self.cache_dir,
+            vault_dir=self.vault_dir,
+            gemini_dir=gemini_dir,
+        )
+        detector = PresenceDetector(
+            gemini_dir=gemini_dir,
+            proc_dir=self.base_dir / "nonexistent_proc",
+        )
+        cooldown_mgr = CooldownManager(self.cache_dir)
+        watcher = LogWatcher(
+            engine=engine_stub,
+            cooldown_manager=cooldown_mgr,
+            damping_seconds=15.0,
+            presence_detector=detector,
+        )
+        return watcher, engine_stub, cooldown_mgr, gemini_dir
+
+    def test_process_line_immunity_done_and_user_input_done_status(self) -> None:
+        """[WATCH-BOUND-004] Records with status DONE are granted immediate immunity without calling handle_exhaustion."""
+        done_variants: list[dict[str, str]] = [
+            {"status": "DONE", "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase"},
+            {
+                "status": "DONE",
+                "type": "ERROR_MESSAGE",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "message": "429 Too Many Requests",
+                "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase",
+            },
+            {
+                "status": "done",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase",
+            },
+            {
+                "status": " DONE ",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase",
+            },
+        ]
+
+        with patch("shutil.which", return_value=None):
+            for payload in done_variants:
+                line = json.dumps(payload)
+                for is_jsonl in (True, False):
+                    with self.subTest(payload=payload, is_jsonl=is_jsonl):
+                        watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                        self.assertFalse(watcher.process_line(line, is_jsonl=is_jsonl))
+                        self.assertEqual(engine_stub.switch_calls, [])
+                        self.assertEqual(engine_stub.active_name_calls, 0)
+                        self.assertEqual(engine_stub.list_accounts_calls, 0)
+                        self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+                        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_process_line_immunity_done_and_user_input_user_input_type(self) -> None:
+        """[WATCH-BOUND-005] Records with type USER_INPUT are suppressed immediately without calling handle_exhaustion."""
+        user_input_variants: list[dict[str, str]] = [
+            {"type": "USER_INPUT", "content": "How do I handle RESOURCE_EXHAUSTED and code 429?"},
+            {
+                "type": "USER_INPUT",
+                "status": "ERROR",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "message": "Individual quota reached",
+                "content": "How do I handle RESOURCE_EXHAUSTED and code 429?",
+            },
+            {
+                "type": "user_input",
+                "status": "ERROR",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "How do I handle RESOURCE_EXHAUSTED and code 429?",
+            },
+            {
+                "type": " USER_INPUT ",
+                "status": "ERROR",
+                "error": "RESOURCE_EXHAUSTED (code 429)",
+                "content": "How do I handle RESOURCE_EXHAUSTED and code 429?",
+            },
+        ]
+
+        with patch("shutil.which", return_value=None):
+            for payload in user_input_variants:
+                line = json.dumps(payload)
+                for is_jsonl in (True, False):
+                    with self.subTest(payload=payload, is_jsonl=is_jsonl):
+                        watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                        self.assertFalse(watcher.process_line(line, is_jsonl=is_jsonl))
+                        self.assertEqual(engine_stub.switch_calls, [])
+                        self.assertEqual(engine_stub.active_name_calls, 0)
+                        self.assertEqual(engine_stub.list_accounts_calls, 0)
+                        self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+                        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_process_line_immunity_done_and_user_input_transcript_tailing(self) -> None:
+        """[WATCH-BOUND-004][WATCH-BOUND-005] poll_once ignores DONE and USER_INPUT lines before rotating on real ERROR."""
+        watcher, engine_stub, cooldown_mgr, gemini_dir = self._build_isolated_watcher()
+
+        session_id = "immunity-session-01"
+        lock_file = gemini_dir / "antigravity" / "presence" / f"{session_id}.lock"
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_file.touch()
+
+        transcript_file = (
+            gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs" / "transcript.jsonl"
+        )
+        transcript_file.parent.mkdir(parents=True, exist_ok=True)
+        transcript_file.write_text('{"type": "START"}\n', encoding="utf-8")
+
+        watcher.poll_once()
+        initial_cursor = watcher.file_cursors[str(transcript_file)]
+
+        immune_batch = (
+            json.dumps({"status": "DONE", "content": "Found 3 matches for RESOURCE_EXHAUSTED in codebase"}) + "\n"
+            + json.dumps({"type": "USER_INPUT", "content": "How do I handle RESOURCE_EXHAUSTED and code 429?"}) + "\n"
+        )
+        with open(transcript_file, "a", encoding="utf-8") as f:
+            f.write(immune_batch)
+
+        with patch("shutil.which", return_value=None):
+            switches = watcher.poll_once()
+            self.assertEqual(switches, 0)
+            self.assertEqual(engine_stub.switch_calls, [])
+            self.assertEqual(engine_stub.active_name_calls, 0)
+            self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+            self.assertEqual(
+                watcher.file_cursors[str(transcript_file)],
+                initial_cursor + len(immune_batch.encode("utf-8")),
+            )
+
+            error_line = json.dumps({"status": "ERROR", "error": "Quota exceeded: RESOURCE_EXHAUSTED (code 429)"}) + "\n"
+            with open(transcript_file, "a", encoding="utf-8") as f:
+                f.write(error_line)
+
+            switches_after_error = watcher.poll_once()
+            self.assertEqual(switches_after_error, 1)
+            self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+
+    def test_process_line_triggers_on_error_status_resource_exhausted(self) -> None:
+        """[WATCH-BOUND-002] status == 'ERROR' with RESOURCE_EXHAUSTED dispatches exhaustion handling."""
+        line = json.dumps({
+            "status": "ERROR",
+            "error": "Quota exceeded for project: RESOURCE_EXHAUSTED",
+        })
+        with patch.dict(os.environ, {}, clear=True), patch("scripts.watch.shutil.which", return_value=None):
+            for is_jsonl in (True, False):
+                with self.subTest(is_jsonl=is_jsonl):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(line, is_jsonl=is_jsonl))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    cooldowns = cooldown_mgr.get_cooldowns()
+                    self.assertIn("acc1", cooldowns)
+                    self.assertEqual(cooldowns["acc1"]["reason"], "RESOURCE_EXHAUSTED")
+                    self.assertGreater(watcher.last_switch_time, 0.0)
+
+    def test_process_line_triggers_on_error_status_error_message_http_429(self) -> None:
+        """[WATCH-BOUND-003] type == 'ERROR_MESSAGE' with HTTP 429 dispatches exhaustion handling."""
+        line = json.dumps({
+            "type": "ERROR_MESSAGE",
+            "message": "googleapi: Error 429: Rate limit exceeded",
+        })
+        with patch.dict(os.environ, {}, clear=True), patch("scripts.watch.shutil.which", return_value=None):
+            for is_jsonl in (True, False):
+                with self.subTest(is_jsonl=is_jsonl):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(line, is_jsonl=is_jsonl))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    cooldowns = cooldown_mgr.get_cooldowns()
+                    self.assertIn("acc1", cooldowns)
+                    self.assertGreater(watcher.last_switch_time, 0.0)
+
+    def test_process_line_triggers_on_error_status_http_429_variants_and_non_quota_guards(self) -> None:
+        """HTTP 429 structured error variants trigger dispatch while unrelated 429 numbers do not."""
+        triggering_payloads: list[dict[str, object]] = [
+            {"type": "ERROR_MESSAGE", "message": "HTTP 429: Too Many Requests"},
+            {"type": "ERROR_MESSAGE", "message": "HTTP/1.1 429 Too Many Requests"},
+            {"status": "ERROR", "error": {"code": 429, "message": "Rate limit exceeded"}},
+            {"status": "ERROR", "message": "status: 429 rate limited"},
+            {"type": "ERROR_MESSAGE", "message": "429: Rate limit exceeded"},
+            {"type": "ERROR_MESSAGE", "message": "googleapi: Error (429): Rate limit exceeded"},
+            {"status": "ERROR", "error": "status (429) rate limited"},
+            {"type": "ERROR_MESSAGE", "message": "(429) Too Many Requests"},
+            {"type": "ERROR_MESSAGE", "message": "429: Quota exceeded"},
+            {"type": "ERROR_MESSAGE", "message": "Rate limit exceeded (429)"},
+            {"type": "ERROR_MESSAGE", "message": "errorCode: 429"},
+            {"status": "ERROR", "error": "http_status=429 rate limited"},
+            {"status": "ERROR", "error": "rpc error: code = ResourceExhausted desc = Quota limit reached"},
+        ]
+        non_triggering_payloads: list[dict[str, object]] = [
+            {"status": "ERROR", "error": "SyntaxError at line 429: unexpected EOF"},
+            {"status": "ERROR", "error": "Error at line 429: invalid token"},
+            {"type": "ERROR_MESSAGE", "message": "Connection failed on port 4290"},
+            {"type": "ERROR_MESSAGE", "message": "Connection failed on port 429"},
+            {"status": "ERROR", "error": "Processed 429 items before timeout"},
+            {"type": "ERROR_MESSAGE", "message": "Timeout after 429ms waiting for socket"},
+            {"status": "ERROR", "error": "429: invalid JSON syntax"},
+            {"type": "ERROR_MESSAGE", "message": "Error code: 4291"},
+            {"status": "INFO", "code": 429, "message": "Rate limit exceeded"},
+        ]
+
+        with patch.dict(os.environ, {}, clear=True), patch("shutil.which", return_value=None):
+            for payload in triggering_payloads:
+                with self.subTest(triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+
+            for payload in non_triggering_payloads:
+                with self.subTest(non_triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertFalse(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [])
+                    self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+
+    def test_process_line_triggers_on_error_status_nested_payloads_and_envelope_normalization(self) -> None:
+        """Nested dict/list payloads, numeric status codes, and case/whitespace envelopes trigger safely."""
+        triggering_payloads: list[dict[str, object]] = [
+            {"type": "ERROR_MESSAGE", "message": {"detail": "Upstream failed:\nError 429"}},
+            {"type": "ERROR_MESSAGE", "message": {"detail": "Upstream failed:\nError 429: Rate limit exceeded"}},
+            {"type": "ERROR_MESSAGE", "message": {"detail": "Upstream failed:\n429 Too Many Requests"}},
+            {"type": "ERROR_MESSAGE", "message": [{"type": "text", "text": 'HTTP "429" Too Many Requests'}]},
+            {"status": "ERROR", "error": {"details": [{"metadata": {"http_status": "429"}}]}},
+            {"status": "ERROR", "content": {"parts": [{"text": "Upstream:\nError (429): Quota exceeded"}]}},
+            {"status": "ERROR", "error": 429},
+            {"status": "ERROR", "code": 429, "message": "Rate limit exceeded"},
+            {"type": "ERROR_MESSAGE", "http_status": 429, "message": "Rate limit exceeded"},
+            {"status": "error", "message": "googleapi: Error 429: Rate limit exceeded"},
+            {"status": " ERROR ", "content": "RESOURCE_EXHAUSTED"},
+            {"type": "error_message", "message": "googleapi: Error 429: Rate limit exceeded"},
+            {"type": " ERROR_MESSAGE ", "message": "googleapi: Error 429: Rate limit exceeded"},
+        ]
+        non_triggering_payloads: list[dict[str, object]] = [
+            {"status": " done ", "error": "RESOURCE_EXHAUSTED", "code": 429},
+            {"type": " user_input ", "status": "ERROR", "code": 429, "message": "Error 429"},
+            {"status": "ERROR", "line": 429, "error": "SyntaxError"},
+            {"status": "ERROR", "error": {"line": 429, "detail": "Processed 429 items"}},
+            {"status": "ERROR", "error": True},
+        ]
+
+        with patch.dict(os.environ, {}, clear=True), patch("shutil.which", return_value=None):
+            for payload in triggering_payloads:
+                with self.subTest(triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertTrue(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                    self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+
+            for payload in non_triggering_payloads:
+                with self.subTest(non_triggering=payload):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+                    self.assertFalse(watcher.process_line(json.dumps(payload), is_jsonl=True))
+                    self.assertEqual(engine_stub.switch_calls, [])
+                    self.assertEqual(cooldown_mgr.get_cooldowns(), {})
+
+    def test_process_line_triggers_on_error_status_transcript_tailing(self) -> None:
+        """[WATCH-BOUND-002][WATCH-BOUND-003] poll_once dispatches exhaustion for structured transcript lines."""
+        cases = [
+            (
+                "watch-bound-002",
+                {"status": "ERROR", "error": "Quota exceeded for project: RESOURCE_EXHAUSTED"},
+            ),
+            (
+                "watch-bound-003",
+                {"type": "ERROR_MESSAGE", "message": "googleapi: Error 429: Rate limit exceeded"},
+            ),
+        ]
+
+        with patch.dict(os.environ, {}, clear=True), patch("shutil.which", return_value=None):
+            for session_id, payload in cases:
+                with self.subTest(session_id=session_id):
+                    (self.cache_dir / "cooldown.json").unlink(missing_ok=True)
+                    watcher, engine_stub, cooldown_mgr, gemini_dir = self._build_isolated_watcher()
+
+                    lock_file = gemini_dir / "antigravity" / "presence" / f"{session_id}.lock"
+                    lock_file.parent.mkdir(parents=True, exist_ok=True)
+                    lock_file.touch()
+                    try:
+                        transcript_file = (
+                            gemini_dir
+                            / "antigravity"
+                            / "brain"
+                            / session_id
+                            / ".system_generated"
+                            / "logs"
+                            / "transcript.jsonl"
+                        )
+                        transcript_file.parent.mkdir(parents=True, exist_ok=True)
+                        transcript_file.write_text('{"type": "START"}\n', encoding="utf-8")
+
+                        self.assertEqual(watcher.poll_once(), 0)
+                        with open(transcript_file, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(payload) + "\n")
+
+                        self.assertEqual(watcher.poll_once(), 1)
+                        self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+                        self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+                    finally:
+                        lock_file.unlink(missing_ok=True)
+
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
     def test_jsonl_immunity_model_thinking_and_code_view(self, mock_switch):
         """Line representing model thinking or code file inspection DOES NOT trigger rotation."""
@@ -1432,12 +1781,190 @@ class TestLogWatcherProcessing(unittest.TestCase):
         self.assertFalse(self.watcher.process_line("", is_jsonl=True))
 
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
-    def test_raw_cli_log_detects_exhaustion(self, mock_switch):
-        """Raw CLI text line with exhaustion pattern triggers rotation."""
-        line = "2026-10-14 10:00:00 [ERROR] RESOURCE_EXHAUSTED (code 429) received"
-        res = self.watcher.process_line(line, is_jsonl=False)
-        self.assertTrue(res)
-        mock_switch.assert_called_once_with(line=line)
+    def test_process_line_ignores_non_json_plain_text(self, mock_switch):
+        """[WATCH-BOUND-ERR-001] Non-JSON line in transcript or plain text file is unconditionally ignored."""
+        plain_variants = [
+            "RESOURCE_EXHAUSTED: unit test simulated failure",
+            "  RESOURCE_EXHAUSTED: unit test simulated failure\n",
+            "\tRESOURCE_EXHAUSTED: unit test simulated failure\r\n",
+            "\ufeffRESOURCE_EXHAUSTED: unit test simulated failure\n",
+            "\ufeff{\"status\": \"ERROR\", \"error\": \"RESOURCE_EXHAUSTED\"}\n",
+            "2026-10-14 10:00:00 [ERROR] RESOURCE_EXHAUSTED (code 429) received",
+            "   \t\r\n",
+        ]
+        for line in plain_variants:
+            for is_jsonl in (True, False):
+                with self.subTest(line=line, is_jsonl=is_jsonl):
+                    self.assertFalse(self.watcher.process_line(line, is_jsonl=is_jsonl))
+        mock_switch.assert_not_called()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_process_line_ignores_non_json_non_dict_and_missing_envelope(self, mock_switch):
+        """[WATCH-BOUND-ERR-001] Non-dict JSON and JSON dicts lacking required error envelopes are ignored."""
+        non_dict_or_envelope_missing = [
+            json.dumps("RESOURCE_EXHAUSTED"),
+            json.dumps(["RESOURCE_EXHAUSTED"]),
+            json.dumps([{"status": "ERROR", "error": "RESOURCE_EXHAUSTED"}]),
+            json.dumps(123),
+            json.dumps(None),
+            json.dumps(True),
+            json.dumps({}),
+            json.dumps({"text": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"content": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"message": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"status": "INFO", "content": "RESOURCE_EXHAUSTED"}),
+            json.dumps({"status": "ERROR", "error": ""}),
+            json.dumps({"status": "ERROR", "error": None}),
+            json.dumps({"status": "ERROR", "thinking": "RESOURCE_EXHAUSTED"}),
+        ]
+        for line in non_dict_or_envelope_missing:
+            for is_jsonl in (True, False):
+                with self.subTest(line=line, is_jsonl=is_jsonl):
+                    self.assertFalse(self.watcher.process_line(line, is_jsonl=is_jsonl))
+        mock_switch.assert_not_called()
+
+    @patch.object(LogWatcher, "trigger_switch", return_value=True)
+    def test_process_line_ignores_non_json_malformed_truncated(self, mock_switch):
+        """[WATCH-BOUND-ERR-002] Malformed or truncated JSON line does not crash watcher daemon."""
+        partial_line = '{"status": "ERROR", "error": "RESOURCE_EX'
+        self.assertFalse(self.watcher.process_line(partial_line, is_jsonl=True))
+        self.assertFalse(self.watcher.process_line(partial_line, is_jsonl=False))
+        mock_switch.assert_not_called()
+
+        # Additional malformed variations
+        for bad_line in (
+            '{"status": "ERROR", ',
+            "{invalid json",
+            '{"status": "ERROR", "error": "RESOURCE_EX\ufffd',
+            '{"status": "ERROR", "error": "RESOURCE_EXHAUSTED"} trailing',
+            '{"status": "ERROR"}{"error": "RESOURCE_EXHAUSTED"}',
+        ):
+            with self.subTest(bad_line=bad_line):
+                self.assertFalse(self.watcher.process_line(bad_line, is_jsonl=True))
+                self.assertFalse(self.watcher.process_line(bad_line, is_jsonl=False))
+        mock_switch.assert_not_called()
+
+    def test_process_line_ignores_non_json_surrogate_stderr_safety(self):
+        """[WATCH-BOUND-ERR-002] Escaped surrogate in JSON error payload does not raise UnicodeEncodeError on strict stderr."""
+        strict_err = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        line = '{"status": "ERROR", "error": "RESOURCE_EXHAUSTED \\ud800"}'
+        with patch("sys.stderr", strict_err), patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            self.assertTrue(self.watcher.process_line(line, is_jsonl=True))
+            mock_switch.assert_called_once()
+
+    def test_process_line_ignores_non_json_poll_once_survives_corrupt_and_non_utf8(self):
+        """[WATCH-BOUND-ERR-002] Tailing loop survives corrupt/non-UTF8/plain-text lines and processes subsequent valid JSON errors."""
+        test_file = self.base_dir / "corrupt_recovery.transcript.jsonl"
+        test_file.write_bytes(b"")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "corrupt-session"
+        mock_detector.get_active_transcript_path.return_value = test_file
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        self.watcher.presence_detector = mock_detector
+
+        self.watcher.poll_once()
+        self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
+
+        # Tick 1: Write corrupt/truncated JSON, non-UTF8 JSON bytes, plain text, and envelope-missing JSON
+        corrupt_batch = (
+            b'{"status": "ERROR", "error": "RESOURCE_EX\n'
+            b'{"status": "ERROR", \xff\xfe"error": "RESOURCE_EXHAUSTED"}\n'
+            b"RESOURCE_EXHAUSTED: unit test simulated failure\n"
+            b'{"content": "RESOURCE_EXHAUSTED"}\n'
+        )
+        test_file.write_bytes(corrupt_batch)
+
+        def _mock_switch(*args, **kwargs):
+            for f in list(self.watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        self.watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
+            self.assertEqual(self.watcher.poll_once(), 0)
+            mock_switch.assert_not_called()
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(corrupt_batch))
+
+            # Tick 2: Mid-flush partial JSON without newline holds cursor safely
+            partial_mid_flush = b'{"status": "ERROR", "error": "RESOURCE_EX'
+            with open(test_file, "ab") as f:
+                f.write(partial_mid_flush)
+            self.assertEqual(self.watcher.poll_once(), 0)
+            self.assertEqual(self.watcher.file_cursors[str(test_file)], len(corrupt_batch))
+
+            # Tick 3: Flush newline terminating the corrupt line + valid structured JSON error line
+            valid_line = b'\n{"status": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"}\n'
+            with open(test_file, "ab") as f:
+                f.write(valid_line)
+
+            self.assertEqual(self.watcher.poll_once(), 1)
+            mock_switch.assert_called_once()
+            self.assertEqual(
+                self.watcher.file_cursors[str(test_file)],
+                len(corrupt_batch) + len(partial_mid_flush) + len(valid_line),
+            )
+
+        # Verify watch_loop does not crash or stop across corrupt + valid iterations
+        self.watcher.last_switch_time = 0.0
+        with open(test_file, "ab") as f:
+            f.write(b'{"status": "ERROR", "error": "RESOURCE_EX\n')
+        with patch.object(self.watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
+            self.watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            mock_switch.assert_not_called()
+            with open(test_file, "ab") as f:
+                f.write(b'{"status": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"}\n')
+            self.watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            mock_switch.assert_called_once()
+
+    def test_process_line_ignores_non_json_poll_once_oversized_unterminated_line(self):
+        """[WATCH-BOUND-ERR-002] Oversized corrupt line exceeding max_chunk_bytes advances cursor instead of wedging tailer."""
+        test_file = self.base_dir / "oversized_corrupt.transcript.jsonl"
+        test_file.write_bytes(b"")
+
+        bounded_watcher = LogWatcher(
+            engine=self.engine_mock,
+            cooldown_manager=self.cooldown_mgr,
+            damping_seconds=15.0,
+            log_dirs=[str(self.base_dir)],
+            max_chunk_bytes=64,
+        )
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "oversized-session"
+        mock_detector.get_active_transcript_path.return_value = test_file
+        mock_detector.get_watch_targets.return_value = [str(test_file)]
+        bounded_watcher.presence_detector = mock_detector
+
+        bounded_watcher.poll_once()
+
+        oversized_corrupt = b'{"status": "ERROR", "error": "' + (b"X" * 100) + b"\n"
+        valid_error = b'{"status": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"}\n'
+        test_file.write_bytes(oversized_corrupt + valid_error)
+
+        def _mock_switch(*args, **kwargs):
+            for f in list(bounded_watcher.file_cursors.keys()):
+                try:
+                    if os.path.isfile(f):
+                        bounded_watcher.file_cursors[f] = os.path.getsize(f)
+                except OSError:
+                    pass
+            return True
+
+        with patch.object(bounded_watcher, "trigger_switch", side_effect=_mock_switch) as mock_switch:
+            switches = 0
+            for _ in range(5):
+                switches += bounded_watcher.poll_once()
+                if switches:
+                    break
+            self.assertEqual(switches, 1)
+            mock_switch.assert_called_once()
+            self.assertEqual(
+                bounded_watcher.file_cursors[str(test_file)],
+                len(oversized_corrupt) + len(valid_error),
+            )
 
     @patch.object(LogWatcher, "trigger_switch", return_value=True)
     def test_raw_cli_log_ignores_normal_lines(self, mock_switch):
@@ -1798,22 +2325,36 @@ class TestLogWatcherProcessing(unittest.TestCase):
 
     def test_poll_once_multibyte_utf8_split_chunk(self):
         """Splitting multibyte UTF-8 characters across chunk boundaries does not corrupt stream cursor or error detection."""
-        test_file = self.base_dir / "multibyte_test.log"
+        test_file = self.base_dir / "multibyte_test.transcript.jsonl"
         test_file.write_bytes(b"")
 
         mock_detector = MagicMock()
         mock_detector.get_active_session_id.return_value = "multibyte-session"
-        mock_detector.get_active_transcript_path.return_value = None
+        mock_detector.get_active_transcript_path.return_value = test_file
         mock_detector.get_watch_targets.return_value = [str(test_file)]
         self.watcher.presence_detector = mock_detector
 
         self.watcher.poll_once()
         self.assertEqual(self.watcher.file_cursors[str(test_file)], 0)
 
-        # Line 1: Normal line containing 4-byte UTF-8 emoji 🚀 (b'\xf0\x9f\x9a\x80') with newline
-        line1_bytes = "info 🚀 normal operation\n".encode("utf-8")
-        # Line 2 partial: Prefix ending in the FIRST 2 BYTES of 3-byte Japanese char 日本 ('\xe6\x97') without newline
-        line2_partial = "error prefix 日本".encode("utf-8")[: -2]  # cut mid-character
+        # Line 1: Normal JSON line containing 4-byte UTF-8 emoji 🚀 (b'\xf0\x9f\x9a\x80') with newline
+        line1_bytes = (
+            json.dumps({"type": "info", "content": "info 🚀 normal operation"}, ensure_ascii=False).encode("utf-8")
+            + b"\n"
+        )
+        # Line 2: Structured error containing 3-byte Japanese char 日本 ('\xe6\x97\xa5\xe6\x9c\xac')
+        full_line2_bytes = (
+            json.dumps(
+                {"status": "ERROR", "content": "error prefix 日本 RESOURCE_EXHAUSTED (code 429)"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        nihon_idx = full_line2_bytes.index("日本".encode("utf-8"))
+        split_point = nihon_idx + 1  # cut mid-character
+        line2_partial = full_line2_bytes[:split_point]
+        line2_remainder = full_line2_bytes[split_point:]
+
         test_file.write_bytes(line1_bytes + line2_partial)
 
         def _mock_switch(*args, **kwargs):
@@ -1833,35 +2374,33 @@ class TestLogWatcherProcessing(unittest.TestCase):
             self.assertEqual(self.watcher.file_cursors[str(test_file)], len(line1_bytes))
 
             # Tick 2: Append remainder of multibyte character + error keyword + newline
-            line2_remainder = "error prefix 日本".encode("utf-8")[-2:] + b" RESOURCE_EXHAUSTED (code 429)\n"
             with open(test_file, "ab") as f:
                 f.write(line2_remainder)
 
             switches2 = self.watcher.poll_once()
             self.assertEqual(switches2, 1)
             mock_switch.assert_called_once()
-            full_line2_len = len("error prefix 日本 RESOURCE_EXHAUSTED (code 429)\n".encode("utf-8"))
             self.assertEqual(
                 self.watcher.file_cursors[str(test_file)],
-                len(line1_bytes) + full_line2_len,
+                len(line1_bytes) + len(full_line2_bytes),
             )
 
     def test_poll_once_mid_batch_switch_advances_cursor_to_eof(self):
         """When failover triggers under ADR 0010, cursor advances to EOF to prevent restart storms."""
-        test_file = self.base_dir / "batch_test.log"
+        test_file = self.base_dir / "batch_test.transcript.jsonl"
         test_file.write_bytes(b"")
 
         mock_detector = MagicMock()
         mock_detector.get_active_session_id.return_value = "batch-session"
-        mock_detector.get_active_transcript_path.return_value = None
+        mock_detector.get_active_transcript_path.return_value = test_file
         mock_detector.get_watch_targets.return_value = [str(test_file)]
         self.watcher.presence_detector = mock_detector
 
         self.watcher.poll_once()
 
-        line1 = b"line 1: startup normal\n"
-        line2 = b"line 2: RESOURCE_EXHAUSTED (code 429)\n"
-        line3 = b"line 3: subsequent message that must be preserved\n"
+        line1 = json.dumps({"type": "info", "content": "startup normal"}).encode("utf-8") + b"\n"
+        line2 = json.dumps({"status": "ERROR", "content": "RESOURCE_EXHAUSTED (code 429)"}).encode("utf-8") + b"\n"
+        line3 = json.dumps({"type": "info", "content": "subsequent message that must be preserved"}).encode("utf-8") + b"\n"
         test_file.write_bytes(line1 + line2 + line3)
 
         def _mock_switch(*args, **kwargs):
@@ -1885,6 +2424,159 @@ class TestLogWatcherProcessing(unittest.TestCase):
             switches2 = self.watcher.poll_once()
             self.assertEqual(switches2, 0)
             mock_proc.assert_not_called()
+
+    def test_nested_error_payload_and_io_robustness_nested_content_traversal(self) -> None:
+        """[WATCH-BOUND-EDGE-001] GIVEN JSON line with nested content payload,
+        LogWatcher.process_line() extracts tokens, matches ResourceExhausted, and triggers exhaustion.
+        """
+        nested_payloads = [
+            # Exact AC specification line:
+            {"status": "ERROR", "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted desc = Quota limit reached"}]},
+            # Deeply nested content structures:
+            {"status": "ERROR", "content": [{"parts": [{"text": "rpc error: code = ResourceExhausted desc = Quota limit reached"}]}]},
+            {"status": "ERROR", "content": {"details": [{"message": "rpc error: code = ResourceExhausted desc = Quota limit reached"}]}},
+            {"status": "ERROR", "content": [{"type": "text", "text": "resource exhausted: quota exceeded"}]},
+            {"status": "ERROR", "content": [{"code": [429], "desc": "rate limit exceeded"}]},
+        ]
+
+        for payload in nested_payloads:
+            line = json.dumps(payload)
+            with self.subTest(payload=payload):
+                with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+                    res = self.watcher.process_line(line, is_jsonl=True)
+                    self.assertTrue(res)
+                    mock_handle.assert_called_once()
+                    call_kwargs = mock_handle.call_args.kwargs
+                    line_arg = call_kwargs.get("line") or (mock_handle.call_args.args[0] if mock_handle.call_args.args else "")
+                    self.assertTrue(
+                        any(token in line_arg.lower() for token in ("resourceexhausted", "resource exhausted", "429")),
+                        f"Expected exhaustion token in dispatched line, got: {line_arg}",
+                    )
+
+        # End-to-end verification with isolated stub engine
+        watcher, engine_stub, cooldown_mgr, _ = self._build_isolated_watcher()
+        line = json.dumps({
+            "status": "ERROR",
+            "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted desc = Quota limit reached"}],
+        })
+        with patch("scripts.watch.shutil.which", return_value=None):
+            self.assertTrue(watcher.process_line(line, is_jsonl=True))
+            self.assertEqual(engine_stub.switch_calls, [("acc2", True, True)])
+            self.assertIn("acc1", cooldown_mgr.get_cooldowns())
+
+    def test_nested_error_payload_and_io_robustness_unreadable_transcript_io(self) -> None:
+        """[WATCH-BOUND-ERR-003] GIVEN active transcript path unreadable due to filesystem permissions,
+        LogWatcher.poll_once() catches OSError safely and skips target without raising or terminating watcher loop.
+        """
+        transcript_file = self.base_dir / "unreadable_robustness.transcript.jsonl"
+        transcript_file.write_text('{"type": "START"}\n', encoding="utf-8")
+
+        mock_detector = MagicMock()
+        mock_detector.get_active_session_id.return_value = "unreadable-robustness-session"
+        mock_detector.get_active_transcript_path.return_value = transcript_file
+        mock_detector.get_watch_targets.return_value = [str(transcript_file)]
+        self.watcher.presence_detector = mock_detector
+
+        # Initial poll primes cursor
+        self.watcher.poll_once()
+        initial_cursor = self.watcher.file_cursors[str(transcript_file)]
+        self.assertGreater(initial_cursor, 0)
+
+        # Append new exhaustion error record
+        error_line = json.dumps({"status": "ERROR", "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted"}]}) + "\n"
+        with open(transcript_file, "a", encoding="utf-8") as f:
+            f.write(error_line)
+
+        # Scenario A: Real filesystem permission denied (chmod 000)
+        transcript_file.chmod(0o000)
+        try:
+            switches = self.watcher.poll_once()
+            # Must catch OSError and skip target safely without raising
+            self.assertEqual(switches, 0)
+        finally:
+            transcript_file.chmod(0o644)
+
+        # Scenario B: Simulated open PermissionError / EACCES via mock
+        orig_open = open
+
+        def mock_open_permission_denied(path, mode="r", *args, **kwargs):
+            if str(path) == str(transcript_file) and "b" in mode:
+                raise PermissionError(13, "Permission denied")
+            return orig_open(path, mode, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=mock_open_permission_denied):
+            # poll_once must handle PermissionError safely
+            switches = self.watcher.poll_once()
+            self.assertEqual(switches, 0)
+
+            # watch_loop must continue running without terminating on PermissionError
+            self.watcher.watch_loop(poll_interval=0.0, max_iterations=2)
+
+        # Scenario C: Restored readable permissions resumes tailing cleanly
+        with patch.object(self.watcher, "trigger_switch", return_value=True) as mock_switch:
+            switches_resumed = self.watcher.poll_once()
+            self.assertEqual(switches_resumed, 1)
+            mock_switch.assert_called_once()
+
+    def test_nested_error_payload_and_io_robustness_adversarial_edge_cases(self) -> None:
+        """Adversarial stress-testing: non-scalars, cycles, protobuf oneof keys, and scan OSError."""
+        # 1. Non-string types, None, booleans, floats, empty strings
+        adversarial_payload = {
+            "status": "ERROR",
+            "content": [
+                None,
+                True,
+                False,
+                42.5,
+                "",
+                {"details": None, "active": True, "count": 0, "blank": "  "},
+                {"parts": [{"type": "text", "text": "rpc error: code = ResourceExhausted"}]},
+            ],
+        }
+        with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+            self.assertTrue(self.watcher.process_line(json.dumps(adversarial_payload), is_jsonl=True))
+            mock_handle.assert_called_once()
+
+        # 2. Cycle resilience in _extract_text_fragments
+        from agy_switcher.watcher import _extract_text_fragments
+        cyclic_dict: dict[str, object] = {"label": "node"}
+        cyclic_dict["self"] = cyclic_dict
+        cyclic_list: list[object] = ["text fragment"]
+        cyclic_list.append(cyclic_list)
+        cyclic_dict["sublist"] = cyclic_list
+
+        extracted = _extract_text_fragments(cyclic_dict)
+        self.assertIn("node", extracted)
+        self.assertIn("text fragment", extracted)
+
+        # 3. Protobuf / gRPC oneof error keys where values are empty or None
+        oneof_payloads = [
+            {"status": "ERROR", "content": [{"ResourceExhausted": {}}]},
+            {"status": "ERROR", "content": [{"resource_exhausted": None}]},
+        ]
+        for p in oneof_payloads:
+            with self.subTest(oneof=p):
+                with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+                    self.assertTrue(self.watcher.process_line(json.dumps(p), is_jsonl=True))
+                    mock_handle.assert_called_once()
+
+        # 4. Top-level type == "ERROR" and top-level details / detail / reason
+        extended_envelopes = [
+            {"type": "ERROR", "content": [{"type": "text", "text": "rpc error: code = ResourceExhausted"}]},
+            {"status": "ERROR", "details": [{"message": "rpc error: code = ResourceExhausted"}]},
+            {"status": "ERROR", "detail": "429: Too Many Requests"},
+            {"status": "ERROR", "reason": "RESOURCE_EXHAUSTED"},
+        ]
+        for p in extended_envelopes:
+            with self.subTest(envelope=p):
+                with patch.object(self.watcher, "handle_exhaustion", return_value=True) as mock_handle:
+                    self.assertTrue(self.watcher.process_line(json.dumps(p), is_jsonl=True))
+                    mock_handle.assert_called_once()
+
+        # 5. scan_active_targets OSError robustness
+        with patch.object(self.watcher, "scan_active_targets", side_effect=PermissionError(13, "Permission denied")):
+            self.assertEqual(self.watcher.poll_once(), 0)
+
 
 
 class TestDaemonLifecycle(unittest.TestCase):

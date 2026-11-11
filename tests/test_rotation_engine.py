@@ -329,21 +329,15 @@ class TestRotationEngine(unittest.TestCase):
             self.assertEqual(best, "acc2")
 
     def test_init_model_vs_local_directory(self):
-        """RotationEngine('claude') does not misidentify model name as local directory path even if dir exists."""
+        """RotationEngine('gemini') does not misidentify model name as local directory path even if dir exists."""
         import tempfile
         import os
         with tempfile.TemporaryDirectory() as tmpdir:
             old_cwd = os.getcwd()
             try:
                 os.chdir(tmpdir)
-                os.mkdir("claude")
                 os.mkdir("gemini")
-
-                # Must resolve to model 'claude', not vault_dir
-                engine_claude = RotationEngine("claude")
-                self.assertEqual(engine_claude.model_name, "claude")
-                self.assertEqual(engine_claude.target_model_key, "claude")
-                self.assertIsNone(engine_claude.vault_dir)
+                os.mkdir("gemini-3.8-pro")
 
                 # Must resolve to model 'gemini', not vault_dir
                 engine_gemini = RotationEngine("gemini")
@@ -352,9 +346,9 @@ class TestRotationEngine(unittest.TestCase):
                 self.assertIsNone(engine_gemini.vault_dir)
 
                 # Specific slug must resolve to model
-                engine_slug = RotationEngine("claude-3-5-sonnet")
-                self.assertEqual(engine_slug.model_name, "claude-3-5-sonnet")
-                self.assertEqual(engine_slug.target_model_key, "claude")
+                engine_slug = RotationEngine("gemini-3.8-pro")
+                self.assertEqual(engine_slug.model_name, "gemini-3.8-pro")
+                self.assertEqual(engine_slug.target_model_key, "gemini")
                 self.assertIsNone(engine_slug.vault_dir)
 
                 # Explicit relative path must still resolve to vault_dir
@@ -418,6 +412,255 @@ class TestRotationEngine(unittest.TestCase):
             mixed = ["acc1", {"name": "acc2", "quota": {"gemini": {"quota": 95, "reset_time": int(self.base_time.timestamp()) + 3600}}}]
             best = engine.evaluate(mixed, active="acc1", current_time=self.base_time)
             self.assertEqual(best, "acc2")
+
+    def test_evaluate_gemini_exclusive_quota_gemini_003(self):
+        """[QUOTA-GEMINI-003] RotationEngine evaluates standby accounts based strictly on Gemini quota.
+
+        GIVEN active account 'acc1' with 0% Gemini quota (and 100% non-Gemini quota),
+              standby account 'acc2' with 80% Gemini quota (and 10% non-Gemini quota),
+              standby account 'acc3' with 40% Gemini quota (and 95% non-Gemini quota)
+        WHEN RotationEngine(model_name="gemini").evaluate() evaluates candidate accounts
+        THEN it selects 'acc2' based on highest available Gemini quota,
+             and completely ignores non-Gemini model state.
+        """
+        accounts = [
+            {
+                "name": "acc1",
+                "quota": {
+                    "gemini": {"quota": 0, "reset_time": 1700003600},
+                    "claude": {"quota": 100, "reset_time": 1700003600},
+                },
+            },
+            {
+                "name": "acc2",
+                "quota": {
+                    "gemini": {"quota": 80, "reset_time": 1700003600},
+                    "claude": {"quota": 10, "reset_time": 1700003600},
+                },
+            },
+            {
+                "name": "acc3",
+                "quota": {
+                    "gemini": {"quota": 40, "reset_time": 1700003600},
+                    "claude": {"quota": 95, "reset_time": 1700003600},
+                },
+            },
+        ]
+        for model_variant in ("gemini", "GEMINI", "  GeMiNi  "):
+            engine = RotationEngine(model_name=model_variant, active_account_id="acc1")
+            self.assertEqual(engine.target_model_key, "gemini")
+            result = engine.evaluate(accounts, current_active="acc1", current_time=self.base_time)
+            self.assertEqual(result, "acc2")
+
+        accounts_map = {acc["name"]: acc["quota"] for acc in accounts}
+        engine = RotationEngine(model_name="gemini", active_account_id="acc1")
+        self.assertEqual(
+            engine.evaluate(accounts_map, current_active="acc1", target_model="  GeMiNi  ", current_time=self.base_time),
+            "acc2",
+        )
+
+    def test_evaluate_gemini_exclusive_failover_edge_005(self):
+        """[FAILOVER-EDGE-005] Specific Gemini model slugs normalize cleanly to 'gemini' and evaluate exclusively the Gemini quota bucket.
+
+        GIVEN a turn running with specific Gemini model slugs ("gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash")
+        WHEN RotationEngine processes the model parameter via __init__, evaluate, or get_quota_status
+        THEN each model slug is normalized cleanly to "gemini",
+             and rotation heuristics evaluate exclusively the Gemini quota bucket.
+        """
+        from agy_switcher.telemetry import normalize_model_name
+
+        slugs = (
+            "gemini-3.8-flash",
+            "gemini-3.8-pro",
+            "gemini-2.5-flash",
+            "  GeMiNi-3.8-PrO  ",
+            "GEMINI-2.5-FLASH",
+            " \t gemini-3.8-flash \n ",
+        )
+        accounts = [
+            {"name": "acc1", "quota": {"gemini": {"quota": 0, "reset_time": 1700003600}, "claude": {"quota": 100}}},
+            {"name": "acc2", "quota": {"gemini": {"quota": 85, "reset_time": 1700003600}, "claude": {"quota": 5}}},
+            {"name": "acc3", "quota": {"gemini": {"quota": 30, "reset_time": 1700003600}, "claude": {"quota": 99}}},
+        ]
+
+        for slug in slugs:
+            # 1. normalize_model_name verification
+            self.assertEqual(normalize_model_name(slug), "gemini")
+
+            # 2. RotationEngine initialized with slug (kwarg and positional) normalizes target_model_key to 'gemini'
+            engine = RotationEngine(model_name=slug, active_account_id="acc1")
+            self.assertEqual(engine.target_model_key, "gemini")
+            pos_engine = RotationEngine(slug, "acc1")
+            self.assertEqual(pos_engine.target_model_key, "gemini")
+
+            # 3. get_quota_status with slug resolves strictly to the 'gemini' quota bucket
+            q_data = {
+                "gemini": {"quota": 75, "reset_time": 1700003600},
+                "claude": {"quota": 5, "reset_time": 1700003600},
+            }
+            status = engine.get_quota_status(q_data, model_key=slug)
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.remaining_percentage(), 75)
+
+            # 4. evaluate() selects highest Gemini standby account
+            res = engine.evaluate(accounts, current_active="acc1", current_time=self.base_time)
+            self.assertEqual(res, "acc2")
+
+            # 5. evaluate() with explicit target_model=slug normalizes and evaluates Gemini bucket
+            default_engine = RotationEngine(model_name="gemini", active_account_id="acc1")
+            res_explicit = default_engine.evaluate(
+                accounts, current_active="acc1", target_model=slug, current_time=self.base_time
+            )
+            self.assertEqual(res_explicit, "acc2")
+
+    def test_evaluate_gemini_exclusive_no_cross_model_leakage_or_claude_only(self):
+        """Generic cooldowns never inspect non-Gemini quota state, and Claude-only payloads are ignored for Gemini."""
+        engine = RotationEngine(model_name="gemini", active_account_id="acc1")
+        future_reset = int(self.base_time.timestamp()) + 3600
+
+        # 1. Generic cooldown (no model/reason naming claude) must NOT inspect q_data['claude'] for exemption
+        acc2_quota = {
+            "gemini": {"quota": 80, "reset_time": future_reset},
+            "claude": {"quota": 0, "reset_time": future_reset},
+        }
+        generic_cooldown = {"reason": "RESOURCE_EXHAUSTED"}
+        self.assertTrue(
+            engine.is_cooldown_penalized_for_model("gemini", 0.80, generic_cooldown, acc2_quota),
+            "Generic cooldown must remain penalized without leaking claude quota state from q_data",
+        )
+        accounts_with_cooldown = [
+            {"name": "acc1", "quota": {"gemini": {"quota": 0, "reset_time": future_reset}}},
+            {"name": "acc2", "quota": acc2_quota},
+        ]
+        self.assertIsNone(
+            engine.evaluate(
+                accounts_with_cooldown,
+                current_active="acc1",
+                cooldowns={"acc2": generic_cooldown},
+                current_time=self.base_time,
+            )
+        )
+
+        # 2. Accounts with ONLY 'claude' quota are ignored during Gemini evaluation (list, dict, and groups forms)
+        claude_only_list = [
+            {"name": "acc1", "quota": {"gemini": {"quota": 0, "reset_time": future_reset}}},
+            {"name": "acc2", "quota": {"claude": {"quota": 100, "reset_time": future_reset}}},
+        ]
+        self.assertIsNone(engine.evaluate(claude_only_list, current_active="acc1", current_time=self.base_time))
+
+        claude_only_with_gemini_standby = [
+            {"name": "acc1", "quota": {"gemini": {"quota": 0, "reset_time": future_reset}}},
+            {"name": "acc2", "quota": {"claude": {"quota": 100, "reset_time": future_reset}}},
+            {"name": "acc3", "quota": {"gemini": {"quota": 35, "reset_time": future_reset}}},
+        ]
+        self.assertEqual(
+            engine.evaluate(claude_only_with_gemini_standby, current_active="acc1", current_time=self.base_time),
+            "acc3",
+        )
+
+        claude_only_dict = {
+            "acc1": {"gemini": {"quota": 0, "reset_time": future_reset}},
+            "acc2": {"claude": {"quota": 100, "reset_time": future_reset}},
+        }
+        self.assertIsNone(engine.evaluate(claude_only_dict, current_active="acc1", current_time=self.base_time))
+
+        claude_only_groups = {
+            "acc1": {"gemini": {"quota": 0, "reset_time": future_reset}},
+            "acc2": {
+                "groups": [
+                    {
+                        "group": "Claude and GPT models",
+                        "buckets": [{"remainingFraction": 1.0, "resetTime": future_reset}],
+                    }
+                ]
+            },
+        }
+        self.assertIsNone(engine.evaluate(claude_only_groups, current_active="acc1", current_time=self.base_time))
+
+        # 3. Vault cache with Claude-only entry for standby account is ignored during Gemini evaluation
+        import tempfile
+        import json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            v_dir = Path(tmpdir)
+            cache_dir = v_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            (cache_dir / "last_known_quota.json").write_text(
+                json.dumps({
+                    "timestamp": int(self.base_time.timestamp()),
+                    "accounts": {
+                        "acc1": {"gemini": {"quota": 0, "reset_time": future_reset}},
+                        "acc2": {"claude": {"quota": 100, "reset_time": future_reset}},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            cached_engine = RotationEngine(vault_dir=v_dir, model_name="gemini", active_account_id="acc1")
+            self.assertIsNone(cached_engine.evaluate(["acc1", "acc2"], current_active="acc1", current_time=self.base_time))
+            self.assertIsNone(
+                cached_engine.evaluate(
+                    [{"name": "acc1"}, {"name": "acc2"}],
+                    current_active="acc1",
+                    current_time=self.base_time,
+                )
+            )
+
+    def test_evaluate_gemini_exclusive_auto_rotate_granular_slugs(self):
+        """[FAILOVER-EDGE-005] auto_rotate_on_exhaustion normalizes granular slugs cleanly to 'gemini'."""
+        import tempfile
+        import json
+        from agy_switcher.api import auto_rotate_on_exhaustion
+        from agy_switcher.vault import AgySwitchEngine
+
+        slugs = ("gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "  GeMiNi-3.8-PrO  ")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            v_dir = base_path / ".antigravity-vault"
+            proc_dir = base_path / "proc"
+            proc_dir.mkdir(parents=True, exist_ok=True)
+            engine = AgySwitchEngine(
+                vault_dir=v_dir,
+                gemini_dir=base_path / ".gemini",
+                legacy_root=base_path / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+
+            for acc in ("primary-acc", "standby-acc"):
+                acc_dir = v_dir / "accounts" / acc
+                acc_dir.mkdir(parents=True, exist_ok=True)
+                (acc_dir / "token.json").write_text(
+                    json.dumps({
+                        "token": {
+                            "access_token": f"ya29.sample_{acc}",
+                            "refresh_token": f"1//sample_refresh_{acc}",
+                            "token_type": "Bearer",
+                            "expiry": "2030-01-01T00:00:00Z",
+                        },
+                        "auth_method": "oauth",
+                        "id_token": "header.eyJlbWFpbCI6ICJ0ZXN0QGV4YW1wbGUuY29tIn0.sig",
+                    }),
+                    encoding="utf-8",
+                )
+            engine.set_active_name("primary-acc")
+
+            cache_dir = v_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "timestamp": int(self.base_time.timestamp()),
+                "accounts": {
+                    "primary-acc": {"gemini": {"quota": 0, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                    "standby-acc": {"gemini": {"quota": 88, "reset_time": int(self.base_time.timestamp()) + 3600}},
+                },
+            }
+            (cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+
+            for slug in slugs:
+                engine.set_active_name("primary-acc")
+                res = auto_rotate_on_exhaustion(model=slug, reload_server=False, engine=engine)
+                self.assertTrue(res.success, f"auto_rotate_on_exhaustion failed: {res.message}")
+                self.assertEqual(res.new_account, "standby-acc")
+                self.assertEqual(res.quota_remaining, 0.88)
+                self.assertIn("ya29.sample_standby-acc", engine.cli_token_file.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

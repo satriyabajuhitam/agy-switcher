@@ -7,6 +7,7 @@ and Python standard library. Zero external dependencies.
 from __future__ import annotations
 
 import concurrent.futures
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -167,22 +168,19 @@ def _parse_quota_defensive(val: Any) -> int | float:
 
 
 def normalize_model_name(model: str) -> str:
-    """Validates and normalizes model name to 'gemini' or 'claude'.
+    """Validates and normalizes model name strictly to 'gemini'.
 
-    Tolerant of specific slugs like 'gemini-3.8-pro' or 'claude-3-5-sonnet'.
-    Raises AgySwitchError for unsupported models.
+    Tolerant of specific slugs like 'gemini-3.8-pro' or 'gemini-2.5-flash'.
+    Raises AgySwitchError for non-Gemini models (allowed model is strictly 'gemini').
     """
     if not model or not isinstance(model, str):
-        raise AgySwitchError(f"Unsupported model '{model}'. Allowed models: 'gemini', 'claude'.")
+        raise AgySwitchError(f"Unsupported model '{model}'. Allowed model is strictly 'gemini'.")
     m = model.strip().lower()
-    has_gemini = "gemini" in m
-    has_claude = "claude" in m
-    if has_gemini and not has_claude:
+    if m.startswith("gemini") and "claude" not in m and "anthropic" not in m:
         return "gemini"
-    elif has_claude and not has_gemini:
-        return "claude"
-    else:
-        raise AgySwitchError(f"Unsupported model '{model}'. Allowed models: 'gemini', 'claude'.")
+    raise AgySwitchError(
+        f"Unsupported model '{model}'. Allowed model is strictly 'gemini'. Non-Gemini models are retired and unsupported."
+    )
 
 
 def _is_auth_error(error_val: Any, client: Any = None) -> bool:
@@ -311,12 +309,14 @@ def _is_stale_exhausted_cache(
     if status.fraction > 0.0:
         return False
     cached_at_val = cached_entry.get("cached_at")
-    try:
-        c_at = float(cached_at_val)
-        if not math.isfinite(c_at) or c_at <= 0 or isinstance(cached_at_val, bool):
+    c_at = 0.0
+    if cached_at_val is not None and not isinstance(cached_at_val, bool):
+        try:
+            c_at = float(cached_at_val)
+            if not math.isfinite(c_at) or c_at <= 0:
+                c_at = 0.0
+        except (ValueError, TypeError, OverflowError):
             c_at = 0.0
-    except (ValueError, TypeError, OverflowError):
-        c_at = 0.0
 
     is_expired = (c_at <= 0.0) or (now - c_at > ttl_seconds) or (now - c_at < -clock_skew_tolerance)
     try:
@@ -374,6 +374,319 @@ def resolve_quota_endpoint(
     if cleaned.endswith(QUOTA_SUMMARY_PATH):
         return cleaned
     return f"{cleaned}{QUOTA_SUMMARY_PATH}"
+
+
+def _is_claude_key(key: object) -> bool:
+    """Returns True if a dict key represents a retired Claude/Anthropic model entry."""
+    if not isinstance(key, str):
+        return False
+    lowered = key.strip().lower()
+    return "claude" in lowered or "anthropic" in lowered
+
+
+@dataclass(slots=True)
+class _StripFrame:
+    obj: object
+    obj_id: int
+    is_dict: bool
+    pending_dict: list[tuple[object, object]]
+    pending_list: list[object]
+    result_dict: dict[object, object]
+    result_list: list[object]
+    modified: bool = False
+    pending_key: object = None
+
+
+def _make_strip_frame(node: dict[object, object] | list[object]) -> _StripFrame:
+    if isinstance(node, dict):
+        return _StripFrame(
+            obj=node,
+            obj_id=id(node),
+            is_dict=True,
+            pending_dict=list(reversed(node.items())),
+            pending_list=[],
+            result_dict={},
+            result_list=[],
+        )
+    return _StripFrame(
+        obj=node,
+        obj_id=id(node),
+        is_dict=False,
+        pending_dict=[],
+        pending_list=list(reversed(node)),
+        result_dict={},
+        result_list=[],
+    )
+
+
+def _strip_claude_keys_recursive(
+    value: object,
+    _seen: set[int] | None = None,
+) -> tuple[object, bool]:
+    """Iteratively strips retired Claude/Anthropic keys from nested dicts and lists.
+
+    Callers iterate the top-level 'accounts' mapping separately so account aliases
+    containing 'claude' are not mistakenly deleted.
+    """
+    if not isinstance(value, (dict, list)):
+        return value, False
+
+    seen = _seen if _seen is not None else set()
+    root_id = id(value)
+    if root_id in seen:
+        return ({} if isinstance(value, dict) else []), True
+
+    seen.add(root_id)
+    stack: list[_StripFrame] = [_make_strip_frame(value)]
+    try:
+        while stack:
+            top = stack[-1]
+            if top.is_dict:
+                if top.pending_dict:
+                    k, v = top.pending_dict.pop()
+                    if _is_claude_key(k):
+                        top.modified = True
+                        continue
+                    if not isinstance(v, (dict, list)):
+                        top.result_dict[k] = v
+                        continue
+                    v_id = id(v)
+                    if v_id in seen:
+                        top.modified = True
+                        top.result_dict[k] = {} if isinstance(v, dict) else []
+                        continue
+                    top.pending_key = k
+                    seen.add(v_id)
+                    stack.append(_make_strip_frame(v))
+                    continue
+            else:
+                if top.pending_list:
+                    v = top.pending_list.pop()
+                    if not isinstance(v, (dict, list)):
+                        top.result_list.append(v)
+                        continue
+                    v_id = id(v)
+                    if v_id in seen:
+                        top.modified = True
+                        top.result_list.append({} if isinstance(v, dict) else [])
+                        continue
+                    seen.add(v_id)
+                    stack.append(_make_strip_frame(v))
+                    continue
+
+            finished = stack.pop()
+            seen.discard(finished.obj_id)
+            finished_val: object = finished.result_dict if finished.is_dict else finished.result_list
+            if not stack:
+                return finished_val, finished.modified
+            parent = stack[-1]
+            if parent.is_dict:
+                parent.result_dict[parent.pending_key] = finished_val
+            else:
+                parent.result_list.append(finished_val)
+            if finished.modified:
+                parent.modified = True
+    finally:
+        for frame in stack:
+            seen.discard(frame.obj_id)
+
+    return ({} if isinstance(value, dict) else []), False
+
+
+def _coerce_positive_finite_float(raw_val: object) -> float | None:
+    """Coerces a numeric or string timestamp candidate to a positive finite float, or None."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return None
+    if isinstance(raw_val, (int, float, str, bytes)):
+        try:
+            parsed = float(raw_val)
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return None
+
+
+def _normalize_root_timestamp(raw_ts: object, fallback: float) -> float:
+    """Normalizes a top-level cache timestamp to a positive finite float."""
+    parsed = _coerce_positive_finite_float(raw_ts)
+    return parsed if parsed is not None else fallback
+
+
+def _normalize_cached_at(raw_val: object, fallback: float) -> int | float:
+    """Normalizes an account-level cached_at timestamp, preserving valid int/float types."""
+    parsed = _coerce_positive_finite_float(raw_val)
+    if parsed is None:
+        return fallback
+    if isinstance(raw_val, int) and not isinstance(raw_val, bool):
+        return raw_val
+    return parsed
+
+
+def _sanitize_groups_list(raw_groups: object) -> tuple[list[object] | None, bool]:
+    """Filters legacy Claude/Anthropic groups from a legacy 'groups' payload."""
+    if not isinstance(raw_groups, list):
+        return None, True
+    filtered: list[object] = []
+    modified = False
+    for group in raw_groups:
+        if isinstance(group, dict):
+            display_name = group.get("displayName")
+            group_id = group.get("group")
+            g_name = (
+                display_name
+                if isinstance(display_name, str) and display_name.strip()
+                else (group_id if isinstance(group_id, str) else "")
+            )
+            g_lower = g_name.lower()
+            if "claude" in g_lower or "anthropic" in g_lower:
+                modified = True
+                continue
+        filtered.append(group)
+    if not filtered:
+        return None, True
+    return filtered, modified
+
+
+def _sanitize_account_entry(
+    acc_val: object,
+    *,
+    root_ts: float | None = None,
+) -> tuple[dict[str, object] | None, bool]:
+    """Sanitizes a single account quota entry, stripping legacy Claude keys and errors."""
+    if not isinstance(acc_val, dict) or not acc_val or acc_val.get("error"):
+        return None, True
+
+    stripped_obj, modified = _strip_claude_keys_recursive(acc_val)
+    if not isinstance(stripped_obj, dict):
+        return None, True
+
+    entry: dict[str, object] = {k: v for k, v in stripped_obj.items() if isinstance(k, str)}
+    if len(entry) != len(stripped_obj):
+        modified = True
+
+    if "gemini" in entry:
+        m_val = entry["gemini"]
+        if isinstance(m_val, dict) and "buckets" in m_val:
+            buckets_val = m_val["buckets"]
+            if isinstance(buckets_val, dict) and not buckets_val and "quota" not in m_val:
+                m_val = {k: v for k, v in m_val.items() if k != "buckets"}
+                entry["gemini"] = m_val
+                modified = True
+        if not isinstance(m_val, dict) or not m_val or m_val.get("error"):
+            del entry["gemini"]
+            modified = True
+
+    for k in list(entry.keys()):
+        if k not in ("cached_at", "timestamp"):
+            v = entry[k]
+            if isinstance(v, dict) and v.get("error"):
+                del entry[k]
+                modified = True
+
+    if "groups" in entry:
+        clean_groups, groups_modified = _sanitize_groups_list(entry["groups"])
+        if clean_groups is None:
+            del entry["groups"]
+            modified = True
+        elif groups_modified:
+            entry["groups"] = clean_groups
+            modified = True
+
+    gemini_val = entry.get("gemini")
+    quota_val = entry.get("quota")
+    groups_val = entry.get("groups")
+    has_model = isinstance(gemini_val, dict) and bool(gemini_val)
+    has_legacy_quota = (
+        "quota" in entry
+        and quota_val is not None
+        and not isinstance(quota_val, bool)
+    )
+    has_legacy_groups = isinstance(groups_val, list) and len(groups_val) > 0
+    if not (has_model or has_legacy_quota or has_legacy_groups):
+        return None, True
+
+    if root_ts is not None:
+        entry["cached_at"] = _normalize_cached_at(entry.get("cached_at"), root_ts)
+
+    return entry, modified
+
+
+def _sanitize_accounts_map(
+    accounts_map: object,
+    *,
+    root_ts: float | None = None,
+) -> tuple[dict[str, dict[str, object]], bool]:
+    """Sanitizes the 'accounts' mapping, removing invalid keys, non-dicts, and Claude data."""
+    if not isinstance(accounts_map, dict):
+        return {}, True
+
+    sanitized_accounts: dict[str, dict[str, object]] = {}
+    modified = False
+    for raw_key, raw_entry in accounts_map.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            modified = True
+            continue
+        clean_key = raw_key.strip()
+        if clean_key != raw_key:
+            modified = True
+
+        clean_entry, entry_modified = _sanitize_account_entry(raw_entry, root_ts=root_ts)
+        if entry_modified:
+            modified = True
+        if clean_entry is None:
+            continue
+
+        if clean_key in sanitized_accounts:
+            merged = dict(sanitized_accounts[clean_key])
+            merged.update(clean_entry)
+            sanitized_accounts[clean_key] = merged
+            modified = True
+        else:
+            sanitized_accounts[clean_key] = clean_entry
+
+    return sanitized_accounts, modified
+
+
+def _sanitize_cache_payload(
+    data: object,
+    *,
+    normalize_timestamps: bool = False,
+    fallback_ts: float | None = None,
+) -> tuple[dict[str, object], bool]:
+    """Sanitizes a full quota cache dict to conform to the Gemini-Exclusive schema."""
+    ts_fallback = fallback_ts if fallback_ts is not None else time.time()
+    if not isinstance(data, dict):
+        if normalize_timestamps:
+            return {"timestamp": ts_fallback, "accounts": {}}, True
+        return {}, False
+
+    root_ts = _normalize_root_timestamp(data.get("timestamp"), ts_fallback) if normalize_timestamps else None
+    sanitized: dict[str, object] = {}
+    modified = False
+
+    for raw_k, raw_v in data.items():
+        if not isinstance(raw_k, str):
+            modified = True
+            continue
+        if raw_k == "accounts":
+            clean_accounts, acc_mod = _sanitize_accounts_map(raw_v, root_ts=root_ts)
+            sanitized["accounts"] = clean_accounts
+            if acc_mod:
+                modified = True
+        elif _is_claude_key(raw_k):
+            modified = True
+        else:
+            clean_v, child_mod = _strip_claude_keys_recursive(raw_v)
+            sanitized[raw_k] = clean_v
+            if child_mod:
+                modified = True
+
+    if normalize_timestamps:
+        sanitized["timestamp"] = root_ts
+        if "accounts" not in sanitized:
+            sanitized["accounts"] = {}
+
+    return sanitized, modified
 
 
 class QuotaClient:
@@ -464,8 +777,12 @@ class QuotaClient:
             print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
             return None
 
-    def parse_quota_response(self, raw_resp: dict[str, Any]) -> dict[str, Any]:
-        """Parses CloudCode response into the standardized Hybrid Quota Schema."""
+    def parse_quota_response(self, raw_resp: object) -> dict[str, Any]:
+        """Parses CloudCode response into the standardized Gemini Quota Schema.
+
+        Extracts weekly and five-hour quota metrics exclusively for Gemini Models
+        under the 'gemini' key, completely ignoring any third-party or Claude models.
+        """
         if not isinstance(raw_resp, dict):
             return {}
         groups = raw_resp.get("groups")
@@ -476,15 +793,18 @@ class QuotaClient:
         for group in groups:
             if not isinstance(group, dict):
                 continue
-            group_name = group.get("displayName") or group.get("group", "")
-            if not isinstance(group_name, str):
+            display_name = group.get("displayName")
+            group_id = group.get("group")
+            if isinstance(display_name, str) and display_name.strip():
+                group_name = display_name
+            elif isinstance(group_id, str) and group_id.strip():
+                group_name = group_id
+            else:
                 continue
 
             group_name_lower = group_name.lower()
-            if "gemini" in group_name_lower:
+            if "gemini" in group_name_lower and "claude" not in group_name_lower and "anthropic" not in group_name_lower:
                 key = "gemini"
-            elif "claude" in group_name_lower:
-                key = "claude"
             else:
                 continue
 
@@ -498,7 +818,10 @@ class QuotaClient:
             for b in buckets_raw:
                 if not isinstance(b, dict):
                     continue
-                raw_bucket_id = str(b.get("bucketId") or "").strip().lower()
+                raw_bucket_obj = b.get("bucketId")
+                if not isinstance(raw_bucket_obj, str):
+                    continue
+                raw_bucket_id = raw_bucket_obj.strip().lower()
                 if any(x in raw_bucket_id for x in ("five_hour", "five_hours", "5h", "rolling_5h", "5_hour", "5-hour")):
                     norm_id = "5h"
                 elif any(x in raw_bucket_id for x in ("weekly", "week", "7d")):
@@ -510,31 +833,39 @@ class QuotaClient:
                     continue
 
                 frac = b.get("remainingFraction")
-                if frac is None:
+                if frac is None or isinstance(frac, bool):
                     frac_val = 0.0
                 else:
                     try:
                         frac_val = float(frac)
-                    except (ValueError, TypeError):
+                        if not math.isfinite(frac_val):
+                            frac_val = 0.0
+                    except (ValueError, TypeError, OverflowError):
                         frac_val = 0.0
                 frac_val = max(0.0, min(1.0, frac_val))
 
                 quota_pct = int(round(frac_val * 100))
 
-                reset_time_str = b.get("resetTime")
+                reset_time_val = b.get("resetTime")
                 reset_time = 0
-                if isinstance(reset_time_str, (int, float)):
-                    reset_time = max(0, int(reset_time_str))
-                elif isinstance(reset_time_str, str) and reset_time_str:
-                    if reset_time_str.isdigit():
-                        reset_time = max(0, int(reset_time_str))
+                if isinstance(reset_time_val, bool):
+                    reset_time = 0
+                elif isinstance(reset_time_val, (int, float)):
+                    if math.isfinite(reset_time_val):
+                        reset_time = max(0, int(reset_time_val))
+                elif isinstance(reset_time_val, str) and reset_time_val.strip():
+                    cleaned_rt = reset_time_val.strip()
+                    if cleaned_rt.isdigit():
+                        reset_time = max(0, int(cleaned_rt))
                     else:
                         try:
-                            rt = reset_time_str.replace("Z", "+00:00")
+                            rt = cleaned_rt.replace("Z", "+00:00")
                             dt = datetime.fromisoformat(rt)
                             if dt.tzinfo is None:
                                 dt = dt.replace(tzinfo=timezone.utc)
-                            reset_time = max(0, int(dt.timestamp()))
+                            ts = dt.timestamp()
+                            if math.isfinite(ts):
+                                reset_time = max(0, int(ts))
                         except Exception:
                             reset_time = 0
 
@@ -656,21 +987,134 @@ class QuotaClient:
 
         return {}
 
+    @staticmethod
+    def _sanitize_cache_dict(data: object) -> tuple[dict[str, Any], bool]:
+        """Strips legacy 'claude' keys and retains only valid 'gemini' quota records."""
+        return _sanitize_cache_payload(data, normalize_timestamps=False)
+
+    def _read_and_sanitize_cache_file(
+        self,
+        cache_path: Path,
+        *,
+        persist_sanitized: bool,
+    ) -> dict[str, object]:
+        """Reads and sanitizes a JSON cache file, returning {} on corruption or I/O errors."""
+        try:
+            if not cache_path.is_file():
+                return {}
+            raw_text = cache_path.read_text(encoding="utf-8")
+            loaded: object = json.loads(raw_text)
+            if not isinstance(loaded, dict):
+                return {}
+            sanitized, modified = _sanitize_cache_payload(loaded, normalize_timestamps=False)
+            if modified and persist_sanitized:
+                persisted, _ = _sanitize_cache_payload(
+                    sanitized,
+                    normalize_timestamps=True,
+                    fallback_ts=time.time(),
+                )
+                try:
+                    self.save_cache(persisted, merge=False)
+                except (OSError, TypeError, ValueError, RecursionError, OverflowError):
+                    pass
+                return persisted
+            return sanitized
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError):
+            return {}
+
     def load_cache(self) -> dict[str, Any]:
-        """Loads cached quota data from vault cache or legacy fallback."""
-        cache_path = Path(self.cache_file)
-        if cache_path.is_file():
+        """Loads cached quota data from vault cache or legacy fallback.
+
+        Automatically sanitizes on-disk cache by stripping legacy 'claude'
+        sub-keys and persisting sanitized cache adhering to Gemini-Exclusive schema.
+        """
+        with _CACHE_LOCK:
+            cache_path = Path(self.cache_file)
             try:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
-            except Exception:
+                os.lstat(cache_path)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError):
                 return {}
-        legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
-        if legacy_cache.is_file():
+            else:
+                return self._read_and_sanitize_cache_file(cache_path, persist_sanitized=True)
+
             try:
-                return json.loads(legacy_cache.read_text(encoding="utf-8"))
-            except Exception:
+                legacy_cache = Path.home() / ".gemini" / "config" / "skills" / "agy-quota-checker" / "last_known_quota.json"
+                os.lstat(legacy_cache)
+            except (FileNotFoundError, OSError, ValueError, RuntimeError):
                 return {}
-        return {}
+            return self._read_and_sanitize_cache_file(legacy_cache, persist_sanitized=False)
+
+    def _prepare_cache_payload_for_save(
+        self,
+        data: object,
+        *,
+        merge: bool,
+        evict_keys: list[str] | set[str] | None,
+    ) -> dict[str, object]:
+        """Sanitizes incoming quota cache data and merges with existing cache when requested."""
+        if not isinstance(data, dict):
+            return {
+                "timestamp": time.time(),
+                "accounts": {},
+            }
+
+        now_ts = time.time()
+        incoming_clean, _ = _sanitize_cache_payload(
+            data,
+            normalize_timestamps=True,
+            fallback_ts=now_ts,
+        )
+        raw_incoming_accounts = incoming_clean.get("accounts")
+        incoming_valid: dict[str, dict[str, object]] = (
+            raw_incoming_accounts if isinstance(raw_incoming_accounts, dict) else {}
+        )
+        root_ts = incoming_clean["timestamp"]
+
+        if not merge:
+            if evict_keys:
+                for ev in evict_keys:
+                    if isinstance(ev, str):
+                        incoming_valid.pop(ev.strip(), None)
+            return incoming_clean
+
+        current = self.load_cache()
+        fallback = root_ts if isinstance(root_ts, float) else now_ts
+        current_clean, _ = (
+            _sanitize_cache_payload(
+                current,
+                normalize_timestamps=True,
+                fallback_ts=fallback,
+            )
+            if isinstance(current, dict)
+            else ({"accounts": {}}, False)
+        )
+        raw_curr_accounts = current_clean.get("accounts")
+        merged_accounts: dict[str, dict[str, object]] = (
+            dict(raw_curr_accounts) if isinstance(raw_curr_accounts, dict) else {}
+        )
+        for acc_name, incoming_acc in incoming_valid.items():
+            if acc_name in merged_accounts:
+                merged_entry = dict(merged_accounts[acc_name])
+                merged_entry.update(incoming_acc)
+                merged_accounts[acc_name] = merged_entry
+            else:
+                merged_accounts[acc_name] = incoming_acc
+        if evict_keys:
+            for ev in evict_keys:
+                if isinstance(ev, str):
+                    merged_accounts.pop(ev.strip(), None)
+
+        merged_data: dict[str, object] = {
+            k: v for k, v in current_clean.items() if k != "accounts"
+        }
+        for k, v in incoming_clean.items():
+            if k != "accounts":
+                merged_data[k] = v
+        merged_data["accounts"] = merged_accounts
+        merged_data["timestamp"] = root_ts
+        return merged_data
 
     def save_cache(
         self,
@@ -689,136 +1133,51 @@ class QuotaClient:
         4. For valid incoming accounts lacking 'cached_at', 'cached_at' is automatically
            set to root_ts, ensuring independent freshness tracking across all callers.
         5. Invalid or error-laden accounts in incoming data are filtered out
-           without corrupting existing valid cache entries. Errored model sub-keys
-           (e.g. claude: {"error": ...}) are stripped while preserving healthy models.
+           without corrupting existing valid cache entries. Legacy 'claude' keys
+           are stripped and only healthy Gemini models are preserved.
         6. Permissions: cache directory is 0700 and cache file is 0600.
         7. Cross-mount resilience: temporary files are created in cache_file.parent,
            preventing EXDEV errors when cache_file is customized.
         """
         with _CACHE_LOCK:
-            cache_target_file = Path(self.cache_file)
-            target_dir = cache_target_file.parent
-            target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                cache_target_file = Path(self.cache_file)
+                target_dir = cache_target_file.parent
+                target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            except (OSError, ValueError) as e:
+                print(f"[QuotaClient] Failed to persist quota cache to {self.cache_file}: {e}", file=sys.stderr)
+                return
             try:
                 os.chmod(target_dir, 0o700)
             except OSError:
                 pass
-            if self.cache_dir != target_dir:
-                self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-                try:
-                    os.chmod(self.cache_dir, 0o700)
-                except OSError:
-                    pass
-
-            if not isinstance(data, dict):
-                data_to_write = {
-                    "timestamp": time.time(),
-                    "accounts": {},
-                }
-            else:
-                # Determine root timestamp: default to time.time() if absent, bool, or invalid
-                root_ts_val = data.get("timestamp")
-                if root_ts_val is None or isinstance(root_ts_val, bool):
-                    root_ts = time.time()
-                elif isinstance(root_ts_val, (int, float)):
-                    root_ts = float(root_ts_val) if math.isfinite(root_ts_val) and root_ts_val > 0 else time.time()
-                else:
-                    try:
-                        parsed_ts = float(root_ts_val)
-                        root_ts = parsed_ts if math.isfinite(parsed_ts) and parsed_ts > 0 else time.time()
-                    except (ValueError, TypeError, OverflowError):
-                        root_ts = time.time()
-
-                def _sanitize_account_entry(acc_val: Any) -> dict[str, Any] | None:
-                    if not isinstance(acc_val, dict) or not acc_val or acc_val.get("error"):
-                        return None
-                    entry = dict(acc_val)
-                    # Strip errored or invalid model sub-keys (e.g. claude: {"error": ...})
-                    for m_key in ("gemini", "claude"):
-                        if m_key in entry:
-                            m_val = entry[m_key]
-                            if not isinstance(m_val, dict) or m_val.get("error"):
-                                del entry[m_key]
-
-                    # Strip any other sub-dict containing an error key
-                    for k in list(entry.keys()):
-                        if k not in ("cached_at", "timestamp"):
-                            v = entry[k]
-                            if isinstance(v, dict) and v.get("error"):
-                                del entry[k]
-
-                    # Must contain at least one valid model container or valid quota payload
-                    has_model = isinstance(entry.get("gemini"), dict) or isinstance(entry.get("claude"), dict)
-                    has_quota = "quota" in entry or "groups" in entry
-                    if not (has_model or has_quota):
-                        return None
-
-                    # Normalize cached_at timestamp
-                    cached_at_val = entry.get("cached_at")
-                    if cached_at_val is None or isinstance(cached_at_val, bool):
-                        entry["cached_at"] = root_ts
-                    elif isinstance(cached_at_val, (int, float)):
-                        if not math.isfinite(cached_at_val) or cached_at_val <= 0:
-                            entry["cached_at"] = root_ts
-                    else:
-                        try:
-                            p_cat = float(cached_at_val)
-                            entry["cached_at"] = p_cat if math.isfinite(p_cat) and p_cat > 0 else root_ts
-                        except (ValueError, TypeError, OverflowError):
-                            entry["cached_at"] = root_ts
-                    return entry
-
-                def _extract_valid_accounts(accounts_map: Any) -> dict[str, Any]:
-                    valid: dict[str, Any] = {}
-                    if isinstance(accounts_map, dict):
-                        for k, v in accounts_map.items():
-                            if isinstance(k, str) and k.strip():
-                                sanitized = _sanitize_account_entry(v)
-                                if sanitized is not None:
-                                    valid[k.strip()] = sanitized
-                    return valid
-
-                incoming_valid = _extract_valid_accounts(data.get("accounts"))
-
-                if merge:
-                    current = self.load_cache()
-                    merged_accounts: dict[str, Any] = (
-                        _extract_valid_accounts(current.get("accounts"))
-                        if isinstance(current, dict)
-                        else {}
-                    )
-                    for acc_name, incoming_acc in incoming_valid.items():
-                        if acc_name in merged_accounts:
-                            merged_entry = dict(merged_accounts[acc_name])
-                            merged_entry.update(incoming_acc)
-                            merged_accounts[acc_name] = merged_entry
-                        else:
-                            merged_accounts[acc_name] = incoming_acc
-                    if evict_keys:
-                        for ev in evict_keys:
-                            if isinstance(ev, str) and ev.strip() in merged_accounts:
-                                del merged_accounts[ev.strip()]
-                    merged_data = dict(current) if isinstance(current, dict) else {}
-                    for k, v in data.items():
-                        if k != "accounts":
-                            merged_data[k] = v
-                    merged_data["accounts"] = merged_accounts
-                    merged_data["timestamp"] = root_ts
-                    data_to_write = merged_data
-                else:
-                    data_to_write = {k: v for k, v in data.items() if k != "accounts"}
-                    if evict_keys:
-                        for ev in evict_keys:
-                            if isinstance(ev, str) and ev.strip() in incoming_valid:
-                                del incoming_valid[ev.strip()]
-                    data_to_write["accounts"] = incoming_valid
-                    data_to_write["timestamp"] = root_ts
-
-            tmp_file = None
             try:
+                cache_dir_path = Path(self.cache_dir)
+                if cache_dir_path != target_dir:
+                    cache_dir_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    os.chmod(cache_dir_path, 0o700)
+            except (OSError, ValueError):
+                pass
+
+            tmp_file: str | None = None
+            try:
+                data_to_write = self._prepare_cache_payload_for_save(
+                    data,
+                    merge=merge,
+                    evict_keys=evict_keys,
+                )
                 tmp_fd, tmp_file = tempfile.mkstemp(dir=target_dir, prefix="quota-cache-", suffix=".tmp")
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                try:
+                    file_handle = os.fdopen(tmp_fd, "w", encoding="utf-8")
+                except Exception:
+                    try:
+                        os.close(tmp_fd)
+                    except OSError:
+                        pass
+                    raise
+                with file_handle as f:
                     json.dump(data_to_write, f, indent=2)
+                    f.flush()
                 os.chmod(tmp_file, 0o600)
                 os.replace(tmp_file, cache_target_file)
                 try:
@@ -826,7 +1185,7 @@ class QuotaClient:
                 except OSError:
                     pass
                 tmp_file = None
-            except Exception as e:
+            except (OSError, TypeError, ValueError, RecursionError, OverflowError) as e:
                 print(f"[QuotaClient] Failed to persist quota cache to {self.cache_file}: {e}", file=sys.stderr)
             finally:
                 if tmp_file and os.path.exists(tmp_file):
@@ -954,8 +1313,10 @@ def sort_accounts_by_quota(
         if not isinstance(acc, dict):
             return (1, float("inf"), "")
 
-        q_root = acc.get("quota") if isinstance(acc.get("quota"), dict) else {}
-        q_data = q_root.get(model_key) if isinstance(q_root.get(model_key), dict) else {}
+        q_root_val = acc.get("quota")
+        q_root: dict[str, Any] = q_root_val if isinstance(q_root_val, dict) else {}
+        q_data_val = q_root.get(model_key)
+        q_data: dict[str, Any] = q_data_val if isinstance(q_data_val, dict) else {}
 
         quota_val: int | float = -1
         reset_time: float = float("inf")
@@ -1004,7 +1365,7 @@ def run_quota_pipeline(
     # 2. Extract valid quotas and merge into cache
     valid_quotas: dict[str, Any] = {}
     for name, q in raw_quotas.items():
-        if isinstance(q, dict) and not q.get("error") and (q.get("gemini") or q.get("claude")):
+        if isinstance(q, dict) and not q.get("error") and (q.get("gemini")):
             valid_quotas[name] = q
 
     if valid_quotas:
@@ -1026,20 +1387,16 @@ def run_quota_pipeline(
     for acc in accounts:
         acc_name = acc.get("name", "")
         live_q = raw_quotas.get(acc_name)
-        cached_acc = (
-            cached_accounts.get(acc_name)
-            if isinstance(cached_accounts.get(acc_name), dict)
+        cached_acc_val = cached_accounts.get(acc_name)
+        cached_acc: dict[str, Any] = (
+            cached_acc_val
+            if isinstance(cached_acc_val, dict)
             else {}
         )
         has_valid_gemini_cache = (
             isinstance(cached_acc.get("gemini"), dict)
             and not cached_acc["gemini"].get("error")
             and "quota" in cached_acc["gemini"]
-        )
-        has_valid_claude_cache = (
-            isinstance(cached_acc.get("claude"), dict)
-            and not cached_acc["claude"].get("error")
-            and "quota" in cached_acc["claude"]
         )
         has_legacy_cache = (
             "quota" in cached_acc
@@ -1049,19 +1406,18 @@ def run_quota_pipeline(
         has_live_models = (
             isinstance(live_q, dict)
             and not live_q.get("error")
-            and (live_q.get("gemini") or live_q.get("claude"))
+            and (live_q.get("gemini"))
         )
 
         if has_live_models:
-            # Live telemetry succeeded: retain all valid model keys (gemini, claude)
+            # Live telemetry succeeded: retain valid gemini model keys
             new_quota: dict[str, Any] = {}
-            for k in ("gemini", "claude"):
-                if isinstance(live_q.get(k), dict):
-                    m_copy = dict(live_q[k])
-                    m_copy["cached"] = False
-                    new_quota[k] = m_copy
-                elif k in live_q and live_q[k] is not None:
-                    new_quota[k] = live_q[k]
+            if isinstance(live_q.get("gemini"), dict):
+                m_copy = dict(live_q["gemini"])
+                m_copy["cached"] = False
+                new_quota["gemini"] = m_copy
+            elif "gemini" in live_q and live_q["gemini"] is not None:
+                new_quota["gemini"] = live_q["gemini"]
 
             # Preserve cached models if missing from partial live response
             if "gemini" not in new_quota:
@@ -1077,11 +1433,6 @@ def run_quota_pipeline(
                         "buckets": {},
                     }
 
-            if "claude" not in new_quota and has_valid_claude_cache:
-                c_copy = dict(cached_acc["claude"])
-                c_copy["cached"] = True
-                new_quota["claude"] = c_copy
-
             acc["quota"] = new_quota
         else:
             # Live fetch failed or error returned: check cache
@@ -1090,10 +1441,6 @@ def run_quota_pipeline(
                 gemini_copy = dict(cached_acc["gemini"])
                 gemini_copy["cached"] = True
                 fallback_quota["gemini"] = gemini_copy
-            if has_valid_claude_cache:
-                claude_copy = dict(cached_acc["claude"])
-                claude_copy["cached"] = True
-                fallback_quota["claude"] = claude_copy
 
             if not fallback_quota and has_legacy_cache:
                 gemini_copy = {

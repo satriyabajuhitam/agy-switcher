@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Any
 
-from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError
+from agy_switcher.exceptions import AccountNotFoundError, ActiveTurnRunningError, AgySwitchError
 from agy_switcher.formatters import (
     format_fleet_exhaustion_message,
     format_fleet_exhaustion_notice,
@@ -217,6 +217,12 @@ def auto_rotate_on_exhaustion(
     current_account: str | None = None,
 ) -> RotationResult:
     """Rotates to the optimal account with remaining quota for target model using Disk-Only Swap."""
+    if model and isinstance(model, str) and any(
+        k in model.lower() for k in ("claude", "anthropic", "gpt", "openai")
+    ):
+        raise AgySwitchError(
+            f"Non-Gemini model '{model}' is retired and unsupported. Allowed model is strictly 'gemini'."
+        )
     try:
         model_key = normalize_model_name(model)
     except Exception:
@@ -274,38 +280,39 @@ def auto_rotate_on_exhaustion(
         # Anti-double-hopping check:
         # If a recent rotation for this vault and model succeeded within a short debounce window (2.0s)
         # and the vault's active account matches the newly rotated account:
+        cached_result = last_rot.get("result") if last_rot else None
         if (
             last_rot is not None
             and (now - float(last_rot.get("timestamp", 0.0)) < 2.0)
             and last_rot.get("model") == model_key
-            and isinstance(last_rot.get("result"), RotationResult)
-            and last_rot["result"].success
+            and isinstance(cached_result, RotationResult)
+            and cached_result.success
             and active_account == last_rot.get("new_account")
         ):
             if current_account is None or current_account == last_rot.get("previous_account"):
-                return last_rot["result"]
+                return cached_result
 
         # Explicit current_account guard: if the caller's turn ran on current_account, but the active
         # account has already transitioned away:
         if current_account and active_account and active_account != current_account:
             # Case A: A recent rotation for this specific model already rotated to active_account
+            cached_res = last_rot.get("result") if last_rot else None
             if (
                 last_rot is not None
                 and last_rot.get("model") == model_key
                 and last_rot.get("new_account") == active_account
-                and isinstance(last_rot.get("result"), RotationResult)
-                and last_rot["result"].success
+                and isinstance(cached_res, RotationResult)
+                and cached_res.success
             ):
                 if last_rot.get("previous_account") == current_account:
-                    return last_rot["result"]
-                res = last_rot["result"]
+                    return cached_res
                 return RotationResult(
                     success=True,
                     previous_account=current_account,
                     new_account=active_account,
                     model=model,
                     message=f"Account already rotated from '{current_account}' to '{active_account}' for model '{model}'.",
-                    quota_remaining=res.quota_remaining,
+                    quota_remaining=cached_res.quota_remaining,
                     reloaded_server=False,
                     active_account=active_account,
                 )
@@ -355,6 +362,20 @@ def auto_rotate_on_exhaustion(
             cooldowns = dict(engine.get_cooldowns())
         except Exception:
             cooldowns = {}
+
+        # Non-Gemini cooldowns are retired and must never penalize Gemini rotation
+        if cooldowns and model_key == "gemini":
+            filtered_cooldowns: dict[str, object] = {}
+            for acc, rec in cooldowns.items():
+                if isinstance(rec, dict):
+                    m_rec = str(rec.get("model", "")).strip().lower()
+                    r_rec = str(rec.get("reason", "")).strip().lower()
+                    if (m_rec and not m_rec.startswith("gemini")) or any(
+                        non_g in r_rec for non_g in ("claude", "anthropic", "gpt", "openai")
+                    ):
+                        continue
+                filtered_cooldowns[acc] = rec
+            cooldowns = filtered_cooldowns
 
         if current_account:
             cooldowns[current_account] = {"reason": "RESOURCE_EXHAUSTED", "model": model_key}
@@ -605,6 +626,16 @@ def get_fleet_quota_summary(
         FleetQuotaSummary dataclass containing fleet capacity and quota distributions.
     """
     resolved_model = model.strip() if (isinstance(model, str) and model.strip()) else "all"
+    if resolved_model.lower() == "all":
+        target_model_key: str | None = None
+        effective_model = "all"
+    else:
+        try:
+            target_model_key = normalize_model_name(resolved_model)
+            effective_model = target_model_key
+        except Exception:
+            target_model_key = resolved_model.lower()
+            effective_model = resolved_model
 
     if engine is None:
         try:
@@ -614,7 +645,7 @@ def get_fleet_quota_summary(
                 total_accounts=0,
                 active_account=None,
                 accounts={},
-                model=resolved_model,
+                model=effective_model,
                 timestamp=time.time(),
             )
 
@@ -648,7 +679,7 @@ def get_fleet_quota_summary(
     if refresh:
         try:
             from agy_switcher.telemetry import run_quota_pipeline
-            target_m = resolved_model if resolved_model != "all" else "gemini"
+            target_m = target_model_key if target_model_key else "gemini"
             run_quota_pipeline(engine=engine, data=engine.list_accounts(), target_model=target_m)
         except Exception:
             pass
@@ -709,15 +740,6 @@ def get_fleet_quota_summary(
         if isinstance(k, str) and k.strip() and k not in all_names:
             all_names.append(k)
     total_accounts = len(all_names)
-
-    norm_model = resolved_model.strip().lower()
-    if norm_model == "all":
-        target_model_key = None
-    else:
-        try:
-            target_model_key = normalize_model_name(norm_model)
-        except Exception:
-            target_model_key = norm_model
 
     fleet_accounts: dict[str, dict[str, Any]] = {}
     for acc_name in all_names:
@@ -783,10 +805,12 @@ def get_fleet_quota_summary(
                 acc_dict.update(model_payload)
                 acc_dict[target_model_key] = model_payload
             elif "quota" in cached_entry and not isinstance(cached_entry["quota"], dict) and target_model_key == "gemini":
-                model_payload = dict(cached_entry)
-                sanitized_r, rem_m = _sanitize_reset_time_and_delta(model_payload.get("reset_time"), current_ts=timestamp)
-                model_payload["reset_time"] = sanitized_r
-                if rem_m is not None and "remaining_minutes" not in model_payload:
+                sanitized_r, rem_m = _sanitize_reset_time_and_delta(cached_entry.get("reset_time"), current_ts=timestamp)
+                model_payload = {
+                    "quota": cached_entry.get("quota"),
+                    "reset_time": sanitized_r,
+                }
+                if rem_m is not None:
                     model_payload["remaining_minutes"] = rem_m
                 acc_dict.update(model_payload)
                 acc_dict["gemini"] = model_payload
@@ -814,13 +838,18 @@ def get_fleet_quota_summary(
             if "cached_at" in cached_entry and "cached_at" not in acc_dict:
                 acc_dict["cached_at"] = cached_entry["cached_at"]
 
+            if target_model_key == "gemini":
+                acc_dict.pop("claude", None)
+                if isinstance(acc_dict.get("gemini"), dict):
+                    acc_dict["gemini"].pop("claude", None)
+
             fleet_accounts[acc_name] = acc_dict
 
     return FleetQuotaSummary(
         total_accounts=total_accounts,
         active_account=active_name,
         accounts=fleet_accounts,
-        model=resolved_model,
+        model=effective_model,
         timestamp=timestamp,
     )
 
@@ -832,6 +861,7 @@ __all__ = [
     "list_accounts",
     "get_accounts",
     "get_fleet_quota_summary",
+    "normalize_model_name",
     "handle_soft_import_rotation",
     "format_fleet_exhaustion_message",
     "format_fleet_exhaustion_notice",
