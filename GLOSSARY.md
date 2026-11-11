@@ -60,3 +60,11 @@ _Avoid_: Multi-model routing, Claude failover, hybrid family tracking
 An active, high-speed telemetry verification executed before mid-turn failover that validates whether the active account's Gemini quota is genuinely depleted (e.g. <=25%) before allowing account rotation.
 _Avoid_: Blind regex failover, unvalidated switch
 
+**Proactive Threshold Failover**:
+An automated account rotation and language server reload cycle triggered between agent turns when the active account's quota drops below a configured threshold (e.g. <=20%) and healthy standby accounts are available, preempting mid-turn 429 exhaustion errors.
+_Avoid_: Early switch, preemptive rotation, threshold hop
+
+**Safe Turn Boundary**:
+A quiescent operational interval between agent turns—verified by completion markers in transcript.jsonl (e.g. status "DONE" or type "USER_INPUT") and an idle language_server process state—where credential rotation and language server reloads can execute without aborting running tool calls.
+_Avoid_: Turn pause, idle window, prompt gap
+
