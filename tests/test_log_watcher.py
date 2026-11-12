@@ -1703,6 +1703,155 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
                 self.assertTrue(res)
                 self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
 
+    def test_boundary_immunity_001_exact_70_percent_quota_granted_immunity(self):
+        """[COOLDOWN-EDGE-001]: Account with exact 70.0% quota (fraction == 0.70) is granted cooldown immunity."""
+        now = 1700000000.0
+        # GIVEN standby-acc is recorded in cooldown.json with an unexpired cooldown timestamp
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertIn("standby-acc", cooldowns)
+
+        # AND cached telemetry reports exactly 70.0% Gemini quota remaining (fraction = 0.70)
+        quota_data = {
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0}},
+                "standby-acc": {"gemini": {"fraction": 0.70}},
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # WHEN LogWatcher evaluates cooldown immunity
+            # THEN it determines that fraction >= 0.70 is satisfied (not penalized)
+            is_penalized = self.watcher._is_account_cooldown_penalized(
+                "standby-acc", cooldowns, accounts_cache=quota_data["accounts"]
+            )
+            self.assertFalse(is_penalized, "Expected standby-acc with exactly 70.0% quota to receive cooldown immunity")
+
+            # Resolving from disk cache without accounts_cache parameter also grants immunity
+            is_penalized_disk = self.watcher._is_account_cooldown_penalized(
+                "standby-acc", cooldowns, accounts_cache=None
+            )
+            self.assertFalse(is_penalized_disk, "Expected standby-acc with exactly 70.0% quota to resolve from disk cache and receive immunity")
+
+            # AND includes standby-acc as an eligible candidate in reactive failover
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "standby-acc", "valid": True},
+                ],
+            }
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+
+            res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertTrue(res)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+    def test_boundary_immunity_002_multi_account_individual_evaluation_highest_quota(self):
+        """[COOLDOWN-EDGE-002]: In multi-account fleet in cooldown, each evaluated individually; selects highest quota."""
+        now = 1700000000.0
+        # GIVEN vault contains 3 standby accounts in cooldown.json:
+        # acc1 (75% quota), acc2 (65% quota), and acc3 (90% quota)
+        self.cooldown_mgr.set_cooldown("acc1", reset_time=now + 3600.0)
+        self.cooldown_mgr.set_cooldown("acc2", reset_time=now + 3600.0)
+        self.cooldown_mgr.set_cooldown("acc3", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertIn("acc1", cooldowns)
+        self.assertIn("acc2", cooldowns)
+        self.assertIn("acc3", cooldowns)
+
+        quota_data = {
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0}},
+                "acc1": {"gemini": {"quota": 75}},  # 75% quota -> fraction 0.75 >= 0.70 (immune)
+                "acc2": {"gemini": {"quota": 65}},  # 65% quota -> fraction 0.65 < 0.70 (penalized)
+                "acc3": {"gemini": {"quota": 90}},  # 90% quota -> fraction 0.90 >= 0.70 (immune)
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # WHEN LogWatcher filters valid accounts
+            # THEN it grants immunity to acc1 and acc3, while continuing to penalize acc2
+            self.assertFalse(
+                self.watcher._is_account_cooldown_penalized("acc1", cooldowns, accounts_cache=quota_data["accounts"]),
+                "acc1 (75% quota) should be granted immunity"
+            )
+            self.assertTrue(
+                self.watcher._is_account_cooldown_penalized("acc2", cooldowns, accounts_cache=quota_data["accounts"]),
+                "acc2 (65% quota) should remain penalized"
+            )
+            self.assertFalse(
+                self.watcher._is_account_cooldown_penalized("acc3", cooldowns, accounts_cache=quota_data["accounts"]),
+                "acc3 (90% quota) should be granted immunity"
+            )
+
+            # AND selects acc3 as the highest-quota rotation target
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "acc1", "valid": True},
+                    {"name": "acc2", "valid": True},
+                    {"name": "acc3", "valid": True},
+                ],
+            }
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "acc3"}
+
+            res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertTrue(res)
+            # Must strictly switch to acc3 (highest quota: 90% > 75%), never acc1 or acc2
+            self.engine_mock.switch_tokens.assert_called_once_with("acc3", restart_server=True, force=True)
+
+    def test_boundary_immunity_floating_point_and_format_variants(self):
+        """Harden boundary conditions for fraction == 0.70 across floating point math and format variants."""
+        now = 1700000000.0
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+
+        with patch("time.time", return_value=now):
+            # 69.9% (< 70%) must be penalized
+            q_below = {"standby-acc": {"gemini": {"fraction": 0.699}}}
+            self.assertTrue(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_below))
+
+            # 70.0% int quota: 70 must be immune
+            q_int = {"standby-acc": {"gemini": {"quota": 70}}}
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_int))
+
+            # 70.0% float quota: 70.0 must be immune
+            q_float = {"standby-acc": {"gemini": {"quota": 70.0}}}
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_float))
+
+            # String format "70%" must be immune
+            q_str = {"standby-acc": {"gemini": {"quota": "70%"}}}
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_str))
+
+            # Proactive rotation boundary evaluation at exactly 0.70
+            quota_data = {
+                "accounts": {
+                    "primary-acc": {"gemini": {"quota": 10}},  # <= threshold (20%)
+                    "standby-acc": {"gemini": {"fraction": 0.70}},  # exactly 70% in cooldown
+                }
+            }
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.quota_threshold = 0.20
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "standby-acc", "valid": True},
+                ],
+            }
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+            with patch.object(self.watcher, "_is_turn_quiescent", return_value=True):
+                proactive_res = self.watcher._evaluate_proactive_rotation()
+                self.assertTrue(proactive_res)
+                self.engine_mock.switch_tokens.assert_called_with("standby-acc", restart_server=True, force=True)
+
 
 class _StubSwitchEngine:
     """External engine stub for testing LogWatcher at its public seam without internal mocking."""

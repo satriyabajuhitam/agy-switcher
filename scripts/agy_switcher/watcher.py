@@ -729,7 +729,7 @@ class LogWatcher:
             except Exception:
                 pass
 
-        return True if quota_frac is None else (quota_frac < 0.70)
+        return True if quota_frac is None else (round(quota_frac, 6) < 0.70)
 
     def _notify_desktop(
         self,
@@ -874,8 +874,7 @@ class LogWatcher:
         # 2. Direct inspection fallback for flexible cache schemas
         candidate = acc_quota.get(model_name)
         target: Mapping[str, object] = candidate if isinstance(candidate, Mapping) else acc_quota
-        for k in ("fraction", "remaining_fraction", "remainingFraction", "quota"):
-            v = target.get(k)
+        for v in (candidate, *(target.get(k) for k in ("fraction", "remaining_fraction", "remainingFraction", "quota"))):
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 val = float(v)
                 return val / 100.0 if val > 1.0 else max(0.0, val)
@@ -1003,7 +1002,8 @@ class LogWatcher:
             print("[watch] All other valid accounts are in cooldown. Cannot switch.", file=sys.stderr)
             return False
         for acc in valid_accounts:
-            acc["quota"] = accounts_cache.get(acc["name"], {})
+            acc_name = acc.get("name")
+            acc["quota"] = accounts_cache[acc_name] if isinstance(accounts_cache, Mapping) and acc_name in accounts_cache else acc.get("quota", {})
         rot_cls = _get_rotation_engine_class()
         rot_engine = rot_cls(model_name=resolved_model, active_account_id=active_name)
         penalized_cooldowns = {
@@ -1303,7 +1303,7 @@ class LogWatcher:
                     continue
                 acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
                 q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name="gemini")
-                if q_frac is not None and q_frac >= 0.70:
+                if q_frac is not None and round(q_frac, 6) >= 0.70:
                     if q_frac > best_quota:
                         best_quota = q_frac
                         best_standby = acc_name

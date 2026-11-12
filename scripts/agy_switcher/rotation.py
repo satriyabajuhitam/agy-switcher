@@ -180,6 +180,12 @@ class RotationEngine:
                         fraction = float(q_val)
                     else:
                         fraction = 0.0
+                elif isinstance(q_val, str):
+                    try:
+                        s_val = float(q_val.strip().rstrip("%"))
+                        fraction = max(0.0, min(1.0, s_val / 100.0 if s_val > 1.0 else s_val))
+                    except ValueError:
+                        fraction = 0.0
                 else:
                     fraction = 0.0
                 reset_time = self._parse_time(r_val)
