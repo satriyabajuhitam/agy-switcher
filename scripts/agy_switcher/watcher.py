@@ -518,6 +518,21 @@ class LogWatcher:
     def is_exhausted_message(self, line: str) -> bool:
         return bool(line and isinstance(line, str) and self.exhaustion_regex.search(line))
 
+    def get_quota_threshold(self, default: float = 0.25) -> float:
+        """Retrieves configured quota threshold fraction from engine, defaulting safely."""
+        if hasattr(self, "engine") and self.engine is not None:
+            try:
+                thresh_fn = getattr(self.engine, "get_quota_threshold", getattr(self.engine, "quota_threshold", None))
+                if thresh_fn is not None:
+                    raw_val = thresh_fn() if callable(thresh_fn) else thresh_fn
+                    if isinstance(raw_val, (int, float, str)) and not isinstance(raw_val, bool):
+                        val = float(raw_val) / 100.0 if float(raw_val) > 1.0 else float(raw_val)
+                        if 0.0 < val <= 1.0:
+                            return val
+            except Exception:
+                pass
+        return default
+
     def infer_target_model(self, line: str = "", active_account: str | None = None, cache: dict[str, Any] | None = None) -> str:
         line_lower = line.lower() if line else ""
         if "claude" in line_lower or "anthropic" in line_lower:
@@ -616,7 +631,12 @@ class LogWatcher:
         return self.handle_exhaustion(line=line, model_hint=model_hint, file_path=file_path)
 
     def get_cooldowns(self) -> dict[str, dict[str, Any]]:
-        return self.cooldown_manager.get_cooldowns()
+        if hasattr(self, "cooldown_manager") and self.cooldown_manager is not None:
+            try:
+                return self.cooldown_manager.get_cooldowns()
+            except Exception:
+                return {}
+        return {}
 
     def is_in_cooldown(self, account_name: str) -> bool:
         return self.cooldown_manager.is_in_cooldown(account_name)
@@ -692,12 +712,7 @@ class LogWatcher:
                 self.file_cursors.pop(target_file, None)
         self._stagnant_sizes.clear()
 
-    def _is_account_cooldown_penalized(
-        self,
-        acc_name: str,
-        cooldowns: dict[str, Any],
-        accounts_cache: dict[str, Any] | None = None,
-    ) -> bool:
+    def _is_account_cooldown_penalized(self, acc_name: str, cooldowns: dict[str, Any], accounts_cache: dict[str, Any] | None = None) -> bool:
         """Determines if an account in cooldown is penalized or granted immunity (ADR 0016 / COOLDOWN-IMMUNITY)."""
         if not isinstance(cooldowns, dict) or not acc_name:
             return False
@@ -735,13 +750,7 @@ class LogWatcher:
 
         return True if quota_frac is None else (round(quota_frac, 6) < 0.70)
 
-    def _notify_desktop(
-        self,
-        target_account: str,
-        old_account: str | None = None,
-        reason: str = "",
-        reloaded: bool = False,
-    ) -> None:
+    def _notify_desktop(self, target_account: str, old_account: str | None = None, reason: str = "", reloaded: bool = False) -> None:
         """Fires an asynchronous, non-blocking desktop notification via notify-send if installed.
         While the subprocess dispatch of notify-send is non-blocking, a synchronous 1.0s process
         settling delay is enforced on the calling thread when reloaded=True to allow WSL Relay
@@ -838,12 +847,7 @@ class LogWatcher:
         payload = {"event": "auto_rotation", "previous_account": str(prev_acc), "new_account": str(new_acc), "timestamp": ts}
         return self._dispatch_http_post(target_url, json.dumps(payload).encode("utf-8"), "Webhook")
 
-    def _probe_active_quota(
-        self,
-        active_account: str,
-        accounts_cache: Mapping[str, object] | None,
-        model_name: str = "gemini",
-    ) -> float | None:
+    def _probe_active_quota(self, active_account: str, accounts_cache: Mapping[str, object] | None, model_name: str = "gemini") -> float | None:
         """Executes the Pre-Switch Quota Probe for the active account.
         Returns the quota fraction (0.0 to 1.0) if verified from cache or telemetry,
         or None if unverified / unparseable (triggering safe rotation fallback).
@@ -884,15 +888,11 @@ class LogWatcher:
                 return pv
         return None
 
-    def trigger_switch(
-        self, line: str = "", model_hint: str | None = None, file_path: str | None = None
-    ) -> bool:
+    def trigger_switch(self, line: str = "", model_hint: str | None = None, file_path: str | None = None) -> bool:
         """Backward-compatible alias forwarding to handle_exhaustion."""
         return self.handle_exhaustion(line=line, model_hint=model_hint, file_path=file_path)
 
-    def handle_exhaustion(
-        self, line: str = "", model_hint: str | None = None, file_path: str | None = None
-    ) -> bool:
+    def handle_exhaustion(self, line: str = "", model_hint: str | None = None, file_path: str | None = None) -> bool:
         # Check damping window
         now = time.time()
         if self.last_switch_time > 0:
@@ -945,10 +945,11 @@ class LogWatcher:
                 logger.debug("[watch] Pre-Switch Quota Probe live telemetry failure for '%s': %s", active_name, e)
                 active_quota_fraction = None
 
-        if active_quota_fraction is not None and active_quota_fraction > 0.25:
+        threshold = self.get_quota_threshold(default=0.25)
+        if active_quota_fraction is not None and round(active_quota_fraction, 6) > round(threshold, 6):
             print(
                 f"[watch] Pre-Switch Quota Probe: Active account '{active_name}' has healthy quota "
-                f"({active_quota_fraction * 100:.1f}% > 25.0%). Suppressing rotation (transient RPC anomaly).",
+                f"({active_quota_fraction * 100:.1f}% > {threshold * 100:.1f}%). Suppressing rotation (transient RPC anomaly).",
                 file=sys.stderr,
             )
             return False
@@ -1014,19 +1015,9 @@ class LogWatcher:
             self._advance_cursors_to_eof()
             # Fire non-blocking desktop notification (encapsulates 1.0s settling delay when reloaded=True)
             server_restarted = res.get("server_restarted", False) if isinstance(res, dict) else False
-            self._notify_desktop(
-                target_account=target_account,
-                old_account=active_name,
-                reason="quota 429",
-                reloaded=server_restarted,
-            )
+            self._notify_desktop(target_account=target_account, old_account=active_name, reason="quota 429", reloaded=server_restarted)
             ts = datetime.now(timezone.utc).isoformat()
-            self.dispatch_alert(
-                previous_account=active_name,
-                new_account=target_account,
-                model_hint=resolved_model,
-                timestamp=ts,
-            )
+            self.dispatch_alert(previous_account=active_name, new_account=target_account, model_hint=resolved_model, timestamp=ts)
             return True
         except Exception as e:
             print(f"[watch] Error switching accounts: {e}", file=sys.stderr)
@@ -1277,12 +1268,7 @@ class LogWatcher:
             thresh_attr = getattr(self.engine, "get_quota_threshold", getattr(self.engine, "quota_threshold", None))
             if thresh_attr is None:
                 return False
-            threshold = 0.20
-            try:
-                if (val := float(thresh_attr() if callable(thresh_attr) else thresh_attr)) > 0:
-                    threshold = val
-            except Exception:
-                pass
+            threshold = self.get_quota_threshold(default=0.20)
 
             if threshold <= 0.0 or not self._is_turn_quiescent():
                 return False

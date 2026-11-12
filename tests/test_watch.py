@@ -3169,6 +3169,164 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
         )
 
 
+class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
+    """Tests for Configurable Quota Threshold Synchronization and Cooldown Resilience.
+
+    Scenarios:
+    - [PRE-PROBE-SYNC-001]: GIVEN vault configuration has quota_threshold set to 0.20 (20%)
+      AND active account has 22% remaining quota AND a reactive quota error pattern is captured in the transcript
+      WHEN LogWatcher.handle_exhaustion() runs the Pre-Switch Quota Probe
+      THEN it retrieves the configured threshold 0.20 via AgySwitchEngine.get_quota_threshold()
+      AND evaluates that 0.22 > 0.20 constitutes healthy quota
+      AND suppresses rotation, logging a transient RPC anomaly.
+    - [COOLDOWN-ERR-001]: GIVEN cooldown.json is corrupted with malformed JSON syntax or truncated bytes
+      WHEN LogWatcher.get_cooldowns() reads the cooldown file
+      THEN it handles json.JSONDecodeError safely, treating the cooldown mapping as empty
+      AND allows rotation to proceed among healthy accounts without crashing.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-acc", "valid": True},
+            ],
+        }
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-acc",
+            "success": True,
+            "server_restarted": True,
+        }
+
+        self.watcher = LogWatcher(
+            engine=self.engine_mock,
+            log_dirs=[],
+            cooldown_minutes=60,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_threshold_sync_pre_probe_sync_001_configurable_threshold_suppresses_rotation(self, mock_sleep):
+        """[PRE-PROBE-SYNC-001]: LogWatcher.handle_exhaustion retrieves configured threshold from engine
+        and suppresses rotation when active quota (22%) exceeds configured threshold (20%).
+        """
+        # Configure threshold to 20% on the engine
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+
+        # Set up quota cache: primary-acc at 22% (0.22 > 0.20), standby-acc at 85%
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.22}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        error_line = 'Error: RESOURCE_EXHAUSTED (code 429)'
+        res = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
+
+        # Must retrieve configured threshold via engine.get_quota_threshold()
+        self.engine_mock.get_quota_threshold.assert_called()
+
+        # 0.22 > 0.20 constitutes healthy quota: rotation must be suppressed (transient RPC anomaly)
+        self.assertFalse(res, "Active account quota of 22% > configured 20% threshold must suppress rotation")
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertNotIn("primary-acc", self.watcher.get_cooldowns())
+
+        # Boundary check: depleted quota below threshold (18% <= 20%) authorizes rotation
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.18}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        self.watcher.last_switch_time = 0.0
+        res_depleted = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
+        self.assertTrue(res_depleted, "Active account quota of 18% <= configured 20% threshold must authorize rotation")
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+    def test_threshold_sync_cooldown_err_001_malformed_json_syntax_returns_empty_and_allows_rotation(self):
+        """[COOLDOWN-ERR-001]: Corrupted cooldown.json with malformed JSON syntax handles JSONDecodeError
+        safely, treating cooldown mapping as empty and allowing rotation to proceed without crashing.
+        """
+        cooldown_file = self.watcher.cooldown_file
+        cooldown_file.parent.mkdir(parents=True, exist_ok=True)
+        cooldown_file.write_text("{ malformed JSON: truncated ...", encoding="utf-8")
+
+        # Direct read via get_cooldowns() handles json.JSONDecodeError safely
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertEqual(cooldowns, {})
+
+        # Set up depleted active account (10%) and healthy standby (85%)
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        error_line = 'Error: RESOURCE_EXHAUSTED (code 429)'
+        with patch("scripts.watch.time.sleep", return_value=None):
+            res = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
+
+        self.assertTrue(res, "Corrupted cooldown file must not crash daemon and must allow rotation to healthy standby")
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+    def test_threshold_sync_cooldown_err_001_truncated_bytes_returns_empty_and_allows_rotation(self):
+        """[COOLDOWN-ERR-001]: Corrupted cooldown.json with truncated/invalid bytes handles decode errors
+        safely, treating cooldown mapping as empty and allowing rotation to proceed without crashing.
+        """
+        cooldown_file = self.watcher.cooldown_file
+        cooldown_file.parent.mkdir(parents=True, exist_ok=True)
+        cooldown_file.write_bytes(b"\x80\xff\xfe truncated raw bytes")
+
+        # Direct read via get_cooldowns() handles decode error safely
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertEqual(cooldowns, {})
+
+        # Rotation must proceed among healthy accounts without crashing
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        error_line = 'Error: RESOURCE_EXHAUSTED (code 429)'
+        with patch("scripts.watch.time.sleep", return_value=None):
+            res = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
+
+        self.assertTrue(res, "Truncated bytes in cooldown.json must not crash daemon and must allow rotation to healthy standby")
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+
 if __name__ == '__main__':
     unittest.main()
 
