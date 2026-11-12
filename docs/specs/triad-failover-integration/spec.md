@@ -510,7 +510,7 @@ The `PresenceDetector` and `LogWatcher` modules MUST strictly bound log monitori
 - AND resets the file cursor to 0 to resume tailing cleanly from the beginning without raising `SeekError` or missing newly appended records.
 
 ### Requirement: Pre-Switch Quota Probe and Extended Damping in LogWatcher
-The `LogWatcher` module MUST execute a **Pre-Switch Quota Probe** prior to initiating credential rotation upon detecting quota exhaustion, validating whether the active account's Gemini quota fraction exceeds the 25% health threshold via fast telemetry or cached metrics, immediately suppressing rotation and cooldown application if the quota is healthy (>25%), and MUST enforce an extended default damping window of **60.0 seconds** (`damping_seconds = 60.0`) to eliminate chain-switching cascades and rapid-fire switch storms.
+The `LogWatcher` module MUST execute a **Pre-Switch Quota Probe** prior to initiating credential rotation upon detecting quota exhaustion, validating whether the active account's Gemini quota fraction exceeds the configured health threshold (retrieved dynamically from `AgySwitchEngine.get_quota_threshold()`, defaulting to 20% or 25% depending on configuration) via fast telemetry or cached metrics, immediately suppressing rotation and cooldown application if the quota is healthy, and MUST enforce an extended default damping window of **60.0 seconds** (`damping_seconds = 60.0`) shared across both proactive threshold checks and reactive exhaustion failover to eliminate chain-switching cascades and rapid-fire switch storms.
 
 #### Scenario: [PRE-PROBE-001] Pre-Switch Quota Probe suppresses rotation when active account has healthy Gemini quota
 - GIVEN active account `"primary-acc"` with cached Gemini quota of 85% (`fraction = 0.85`)
@@ -589,3 +589,175 @@ The `LogWatcher` module MUST execute a **Pre-Switch Quota Probe** prior to initi
 - WHEN a new quota error arrives in `transcript.jsonl`
 - THEN `LogWatcher.handle_exhaustion()` evaluates that `elapsed >= damping_seconds` (damping window elapsed)
 - AND allows Pre-Switch Quota Probe and failover to proceed.
+
+#### Scenario: [PRE-PROBE-SYNC-001] Pre-Switch Quota Probe dynamically evaluates configured threshold from vault config
+- GIVEN vault configuration has `quota_threshold` set to `0.20` (20%)
+- AND active account has 22% remaining quota
+- AND a reactive quota error pattern is captured in the transcript
+- WHEN `LogWatcher.handle_exhaustion()` runs the Pre-Switch Quota Probe
+- THEN it retrieves the configured threshold `0.20` via `AgySwitchEngine.get_quota_threshold()`
+- AND evaluates that `0.22 > 0.20` constitutes healthy quota
+- AND suppresses rotation, logging a transient RPC anomaly.
+
+#### Scenario: [PRE-PROBE-SYNC-002] Proactive rotation triggers share unified 60-second damping state with reactive failover
+- GIVEN a proactive rotation was triggered at Safe Turn Boundary 30 seconds ago (`elapsed = 30.0s`)
+- WHEN a reactive quota exhaustion error arrives in `transcript.jsonl`
+- THEN `LogWatcher.handle_exhaustion()` checks the unified `last_switch_time` against `damping_seconds = 60.0`
+- AND determines that `elapsed < 60.0`
+- AND suppresses reactive rotation, preventing double-switching cascades.
+
+### Requirement: Proactive Threshold Failover and Safe Turn Boundary in LogWatcher
+The `LogWatcher` daemon MUST actively evaluate the active account's remaining quota in `poll_once()`, trigger proactive credential rotation when the quota falls at or below the configured quota threshold (defaulting to 20% or `AgySwitchEngine.get_quota_threshold()`), ensure candidate standby accounts have healthy quota (>= 70%), evaluate the drain window heuristic (retaining active accounts if reset is within 30 minutes and remaining quota exceeds 5%), and execute account rotation and Language Server reloading (`restart_server=True, force=True`) EXCLUSIVELY at a verified **Safe Turn Boundary** where the structured conversation transcript indicates turn completion (`status == "DONE"` or `type == "USER_INPUT"`) and `ProcessSupervisor.is_server_busy()` confirms the language server is quiescent, guaranteeing that in-flight prompts, streaming inferences, and tool executions are never interrupted.
+
+#### Scenario: [WATCH-PROACTIVE-001] Proactive rotation triggered when active account quota reaches or falls below threshold at Safe Turn Boundary
+- GIVEN active account `"primary-acc"` with remaining Gemini quota at 14% (`fraction = 0.14 <= 0.20`)
+- AND standby account `"standby-acc"` has healthy Gemini quota (85% >= 70%)
+- AND the active transcript `transcript.jsonl` has recorded a completed turn event with `status == "DONE"`
+- AND `ProcessSupervisor.is_server_busy()` returns `False` indicating the Language Server is idle
+- WHEN `LogWatcher.poll_once()` evaluates proactive rotation eligibility
+- THEN it recognizes the Safe Turn Boundary and initiates credential rotation to `"standby-acc"`
+- AND reloads the Language Server via `switch_tokens("standby-acc", restart_server=True, force=True)`
+- AND returns `True` after updating file cursors and resetting damping timer.
+
+#### Scenario: [WATCH-PROACTIVE-002] Proactive rotation deferred while language server is busy or turn is in-flight
+- GIVEN active account `"primary-acc"` has depleted quota at 14% (`<= 20%`)
+- AND standby account `"standby-acc"` has healthy quota at 90%
+- AND the language server is currently executing an agentic turn or `ProcessSupervisor.is_server_busy()` returns `True`
+- WHEN `LogWatcher.poll_once()` evaluates proactive rotation eligibility
+- THEN it detects that the system is not at a Safe Turn Boundary
+- AND defers credential rotation without restarting `language_server` or modifying active tokens
+- AND returns `False` until the turn concludes and the server becomes quiescent.
+
+#### Scenario: [WATCH-PROACTIVE-003] Drain window heuristic retains active account when reset is within 30 minutes and quota exceeds 5%
+- GIVEN active account `"primary-acc"` has remaining quota of 12% (`fraction = 0.12 <= 0.20`)
+- AND the quota reset timestamp is in 18 minutes (`reset_delta = 18.0 <= 30.0`)
+- AND the remaining balance exceeds the absolute floor of 5% (`0.12 > 0.05`)
+- WHEN `LogWatcher.poll_once()` evaluates proactive rotation conditions
+- THEN it applies the drain window preservation heuristic
+- AND suppresses rotation, retaining `"primary-acc"` as active to utilize remaining quota before reset.
+
+#### Scenario: [WATCH-PROACTIVE-004] Standby account qualification requires healthy quota threshold of 70% or higher
+- GIVEN active account `"primary-acc"` has remaining quota of 14%
+- AND standby account `"standby-1"` has only 40% quota remaining (`0.40 < 0.70`)
+- AND standby account `"standby-2"` has 10% quota remaining (`0.10 < 0.70`)
+- WHEN `LogWatcher.poll_once()` searches for eligible proactive rotation targets
+- THEN it evaluates that no standby account meets the 70% healthy standby threshold
+- AND suppresses proactive rotation, retaining `"primary-acc"` until actual exhaustion occurs or healthy standby quota becomes available.
+
+#### Scenario: [WATCH-PROACTIVE-005] Safe Turn Boundary verified via structured transcript record and process supervisor quiescence
+- GIVEN an active transcript tailing loop where the latest record has `type == "USER_INPUT"`
+- AND no open presence locks or active child processes exist in `/proc` for `language_server`
+- WHEN `LogWatcher._is_turn_quiescent()` or `ProcessSupervisor.is_server_busy()` is evaluated
+- THEN it confirms that the agent turn has completed and the system is waiting for user input
+- AND certifies the state as a verified Safe Turn Boundary.
+
+#### Scenario: [WATCH-PROACTIVE-ERR-001] Telemetry fetch failure during proactive quota check retains active account without false rotation
+- GIVEN `LogWatcher.poll_once()` attempts to evaluate active account quota
+- AND `last_known_quota.json` is missing and live CloudCode telemetry raises `urllib.error.URLError`
+- WHEN `LogWatcher` evaluates proactive rotation conditions
+- THEN it catches the network exception gracefully without crashing the daemon
+- AND suppresses proactive rotation, retaining the active account until valid telemetry is retrieved.
+
+#### Scenario: [WATCH-PROACTIVE-ERR-002] Missing transcript or unresolvable active session skips proactive rotation safely
+- GIVEN no Antigravity session transcript is discovered by `PresenceDetector`
+- WHEN `LogWatcher.poll_once()` evaluates proactive rotation
+- THEN it determines that no active session boundary can be verified
+- AND skips proactive rotation evaluation safely without raising exceptions.
+
+#### Scenario: [WATCH-PROACTIVE-ERR-003] Server reload failure on Safe Turn Boundary logged safely without crashing watcher daemon
+- GIVEN `LogWatcher` triggers proactive rotation to standby account `"standby-acc"`
+- AND `switch_tokens` fails to terminate or restart `language_server` due to `ProcessSupervisor` error
+- WHEN `LogWatcher` receives the failed switch result
+- THEN it logs the failure message to `stderr`
+- AND does not advance `last_switch_time`
+- AND continues its polling loop cleanly without unhandled crash.
+
+#### Scenario: [WATCH-PROACTIVE-EDGE-001] Active quota at exact threshold boundary triggers proactive evaluation
+- GIVEN active account `"primary-acc"` has exactly 20.0% Gemini quota remaining (`fraction = 0.20`)
+- AND configured threshold is 20% (`threshold = 0.20`)
+- AND standby account `"standby-acc"` has 85% quota
+- AND the system is at a verified Safe Turn Boundary
+- WHEN `LogWatcher.poll_once()` evaluates proactive rotation
+- THEN it determines that `fraction <= threshold` is satisfied
+- AND initiates rotation to `"standby-acc"`.
+
+#### Scenario: [WATCH-PROACTIVE-EDGE-002] Active quota at or below 5% inside drain window overrides retention and forces rotation
+- GIVEN active account `"primary-acc"` has 4% Gemini quota remaining (`fraction = 0.04 <= 0.05`)
+- AND quota reset is scheduled in 10 minutes (`reset_delta = 10.0 <= 30.0`)
+- AND standby account `"standby-acc"` has 95% quota
+- AND the system is at a verified Safe Turn Boundary
+- WHEN `LogWatcher.poll_once()` evaluates proactive rotation conditions
+- THEN it evaluates that quota is at or below the 5% hard floor (`0.04 <= 0.05`)
+- AND overrides the drain window retention, rotating immediately to `"standby-acc"` to prevent impending 429 exhaustion.
+
+#### Scenario: [WATCH-PROACTIVE-EDGE-003] Damping window enforcement prevents successive proactive switches within 60 seconds
+- GIVEN a proactive account rotation completed 40 seconds ago (`elapsed = 40.0s < 60.0s`)
+- AND newly active account reports quota below threshold
+- WHEN `LogWatcher.poll_once()` checks proactive rotation eligibility
+- THEN it enforces the 60-second damping interval
+- AND suppresses rotation until `elapsed >= 60.0` seconds.
+
+### Requirement: Telemetry-Aware Cooldown Immunity and 5-Hour Duration Clamping
+The `LogWatcher` and `CooldownManager` modules MUST implement **Telemetry-Aware Cooldown Immunity**, eliminating unconditional exclusions of accounts in `cooldown.json` when fresh telemetry or cached data demonstrates quota recovery (>= 70%), and MUST clamp reactive cooldown durations resulting from HTTP 429 quota exhaustion strictly to the 5-hour rolling bucket reset timestamp (or default 30-minute fallback), explicitly prohibiting the application of multi-day weekly reset timestamps to cooldown records.
+
+#### Scenario: [COOLDOWN-IMMUNITY-001] Account in cooldown.json with healthy quota (>= 70%) is exempt from rotation penalty
+- GIVEN standby account `"standby-acc"` is recorded in `cooldown.json` with an unexpired cooldown timestamp
+- AND `last_known_quota.json` or live telemetry reports `"standby-acc"` has recovered to 85% Gemini quota (`0.85 >= 0.70`)
+- WHEN `LogWatcher` filters valid accounts for proactive rotation or reactive failover
+- THEN it evaluates that `"standby-acc"` possesses healthy quota exceeding the 70% immunity threshold
+- AND grants cooldown immunity to `"standby-acc"`, including it in the list of eligible rotation candidates.
+
+#### Scenario: [COOLDOWN-IMMUNITY-002] Account in cooldown.json with depleted quota (< 70%) remains excluded from rotation
+- GIVEN standby account `"standby-acc"` is recorded in `cooldown.json` with an active cooldown
+- AND telemetry reports `"standby-acc"` has only 30% Gemini quota remaining (`0.30 < 0.70`)
+- WHEN `LogWatcher` evaluates eligible rotation candidates
+- THEN it determines that `"standby-acc"` does not qualify for cooldown immunity
+- AND excludes `"standby-acc"` from candidate selection.
+
+#### Scenario: [COOLDOWN-CLAMP-001] Cooldown duration on HTTP 429 clamps strictly to 5-hour rolling reset timestamp
+- GIVEN active account `"primary-acc"` encounters an HTTP 429 `RESOURCE_EXHAUSTED` error
+- AND telemetry for `"primary-acc"` indicates the 5-hour rolling bucket resets in 2 hours (`now + 7200`)
+- AND the weekly bucket resets in 5 days (`now + 432000`)
+- WHEN `LogWatcher.set_cooldown()` calculates the cooldown expiration timestamp
+- THEN it clamps the cooldown expiration strictly to the 5-hour rolling bucket reset timestamp (`now + 7200`)
+- AND records the clamped timestamp in `cooldown.json`.
+
+#### Scenario: [COOLDOWN-CLAMP-002] Fallback 30-minute cooldown applied when rolling bucket reset timestamp is absent or past
+- GIVEN active account `"primary-acc"` triggers an HTTP 429 exhaustion error
+- AND telemetry cache contains no future reset timestamp or reset timestamp is in the past (`reset_time <= now`)
+- WHEN `LogWatcher.set_cooldown()` sets the cooldown duration
+- THEN it applies the default 30-minute fallback interval (`cooldown_until = now + 1800`)
+- AND saves the record without applying unbounded durations.
+
+#### Scenario: [COOLDOWN-CLAMP-003] Weekly bucket reset timestamp strictly rejected as cooldown duration ceiling
+- GIVEN active account `"primary-acc"` encounters quota exhaustion
+- AND quota telemetry contains a weekly reset timestamp 6 days in the future
+- AND no 5-hour rolling bucket timestamp is available
+- WHEN `LogWatcher.set_cooldown()` evaluates candidate reset timestamps
+- THEN it rejects the multi-day weekly reset timestamp
+- AND caps the maximum cooldown duration at 5 hours (18,000 seconds) or the 30-minute fallback.
+
+#### Scenario: [COOLDOWN-ERR-001] Corrupt or unparseable cooldown.json does not prevent rotation of healthy accounts
+- GIVEN `cooldown.json` is corrupted with malformed JSON syntax or truncated bytes
+- WHEN `LogWatcher.get_cooldowns()` reads the cooldown file
+- THEN it handles `json.JSONDecodeError` safely, treating the cooldown mapping as empty
+- AND allows rotation to proceed among healthy accounts without crashing.
+
+#### Scenario: [COOLDOWN-ERR-002] Clock skew resulting in negative reset duration defaults safely to 30-minute cooldown
+- GIVEN telemetry records a reset timestamp that evaluates to a negative delta due to system clock adjustment
+- WHEN `LogWatcher.set_cooldown()` calculates cooldown duration
+- THEN it detects that `reset_delta <= 0`
+- AND defaults to the safe 30-minute duration (`now + 1800.0`).
+
+#### Scenario: [COOLDOWN-EDGE-001] Account at exact 70% quota boundary granted cooldown immunity
+- GIVEN standby account `"standby-acc"` is listed in `cooldown.json`
+- AND cached telemetry reports exactly 70.0% Gemini quota remaining (`fraction = 0.70`)
+- WHEN `LogWatcher` evaluates cooldown immunity
+- THEN it determines that `fraction >= 0.70` is satisfied
+- AND includes `"standby-acc"` as an eligible candidate.
+
+#### Scenario: [COOLDOWN-EDGE-002] Multiple accounts in cooldown evaluated individually based on real-time telemetry
+- GIVEN vault contains 3 standby accounts in `cooldown.json`: `"acc1"` (75% quota), `"acc2"` (65% quota), and `"acc3"` (90% quota)
+- WHEN `LogWatcher` filters valid accounts
+- THEN it grants immunity to `"acc1"` and `"acc3"`, while continuing to penalize `"acc2"`
+- AND selects `"acc3"` as the highest-quota rotation target.

@@ -193,7 +193,8 @@ class ProcessSupervisor:
         if active_locks:
             return True
 
-        if pid is not None:
+        target_pid = pid if pid is not None else self.locate_language_server_pid()
+        if target_pid is not None:
             proc_path = self.proc_dir
             if proc_path.is_dir():
                 try:
@@ -206,7 +207,7 @@ class ProcessSupervisor:
                             rparen = content.rfind(")")
                             if rparen != -1:
                                 rest = content[rparen + 1:].strip().split()
-                                if len(rest) >= 2 and rest[1] == str(pid):
+                                if len(rest) >= 2 and rest[1] == str(target_pid):
                                     if rest[0] == "Z":
                                         continue
                                     return True

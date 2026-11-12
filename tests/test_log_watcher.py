@@ -1267,6 +1267,591 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
             stderr_buf.getvalue(),
         )
 
+    def test_cooldown_clamp_001_strictly_clamps_to_5h_rolling_bucket(self):
+        """[COOLDOWN-CLAMP-001]: On HTTP 429, clamps cooldown strictly to 5h rolling bucket reset timestamp."""
+        now = 1700000000.0
+        rolling_5h_reset = now + 7200.0  # 2 hours in future
+        weekly_reset = now + 432000.0    # 5 days in future
+        quota_data = {
+            "accounts": {
+                "primary-acc": {
+                    "gemini": {
+                        "quota": 0,
+                        "reset_time": weekly_reset,
+                        "buckets": {
+                            "5h": {"quota": 0, "reset_time": rolling_5h_reset},
+                            "weekly": {"quota": 0, "reset_time": weekly_reset},
+                        },
+                    }
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # Check get_reset_time_from_cache prioritizes 5h rolling bucket
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertEqual(cache_reset, rolling_5h_reset)
+
+            # Check set_cooldown clamps to 5h rolling bucket
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record["cooldown_until"], rolling_5h_reset)
+
+            # Verify persisted record in cooldown.json
+            on_disk = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("primary-acc", on_disk)
+            self.assertEqual(on_disk["primary-acc"]["cooldown_until"], rolling_5h_reset)
+
+    def test_fallback_cooldown_clamp_002_absent_or_past_reset_applies_30m_fallback(self):
+        """[COOLDOWN-CLAMP-002]: Fallback 30-minute cooldown applied when rolling bucket reset timestamp is absent or past."""
+        now = 1700000000.0
+
+        with patch("time.time", return_value=now):
+            # Case A: Telemetry cache has no reset timestamp (empty cache)
+            quota_empty = {"accounts": {"primary-acc": {}}}
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_empty), encoding="utf-8")
+
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc")
+            self.assertIsNone(cache_reset)
+
+            record_no_cache = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record_no_cache["cooldown_until"], now + 1800.0)
+
+            on_disk = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("primary-acc", on_disk)
+            self.assertEqual(on_disk["primary-acc"]["cooldown_until"], now + 1800.0)
+            self.assertEqual(on_disk["primary-acc"]["exhausted_at"], now)
+
+            # Case B: Telemetry cache contains past reset timestamp (reset_time <= now)
+            quota_past = {
+                "accounts": {
+                    "primary-acc": {
+                        "gemini": {
+                            "quota": 0,
+                            "reset_time": now - 3600.0,
+                            "buckets": {
+                                "5h": {"quota": 0, "reset_time": now - 600.0},
+                            },
+                        }
+                    }
+                }
+            }
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_past), encoding="utf-8")
+
+            cache_reset_past = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertIsNone(cache_reset_past)
+
+            record_past_cache = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record_past_cache["cooldown_until"], now + 1800.0)
+
+            on_disk = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["primary-acc"]["cooldown_until"], now + 1800.0)
+
+            # Case C: Direct call with reset_time in the past
+            record_direct_past = self.watcher.set_cooldown("primary-acc", reset_time=now - 120.0)
+            self.assertEqual(record_direct_past["cooldown_until"], now + 1800.0)
+
+            # Case D: End-to-end trigger_switch on HTTP 429 when cache has no future reset timestamp
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "secondary-acc", "valid": True},
+                ],
+            }
+            with patch("scripts.watch.time.sleep", return_value=None), patch("scripts.watch.RotationEngine") as mock_rot:
+                mock_inst = MagicMock()
+                mock_inst.evaluate.return_value = "secondary-acc"
+                mock_rot.return_value = mock_inst
+                res = self.watcher.trigger_switch(line="HTTP 429: Resource exhausted")
+                self.assertTrue(res)
+
+            on_disk_final = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk_final["primary-acc"]["cooldown_until"], now + 1800.0)
+
+    def test_fallback_cooldown_err_002_negative_delta_clock_skew_defaults_to_30m(self):
+        """[COOLDOWN-ERR-002]: Clock skew resulting in negative reset duration defaults safely to 30-minute cooldown."""
+        # Baseline: telemetry recorded reset timestamp at t=1700000100.0
+        cached_reset_ts = 1700000100.0
+        # System clock was adjusted forward (or NTP skew), making current time 1700000500.0
+        now_skewed = 1700000500.0
+        # reset_delta = cached_reset_ts - now_skewed = -400.0 <= 0
+
+        quota_skew = {
+            "accounts": {
+                "primary-acc": {
+                    "gemini": {
+                        "quota": 0,
+                        "reset_time": cached_reset_ts,
+                        "buckets": {
+                            "5h": {"quota": 0, "reset_time": cached_reset_ts},
+                        },
+                    }
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_skew), encoding="utf-8")
+
+        with patch("time.time", return_value=now_skewed):
+            # Telemetry cache query detects that reset timestamp is in the past / negative delta
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertIsNone(cache_reset)
+
+            # LogWatcher.set_cooldown() detects reset_delta <= 0 and defaults safely to 30m fallback
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record["cooldown_until"], now_skewed + 1800.0)
+
+            # Persisted record in cooldown.json has 30m fallback
+            on_disk = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("primary-acc", on_disk)
+            self.assertEqual(on_disk["primary-acc"]["cooldown_until"], now_skewed + 1800.0)
+
+            # Direct reset_time call evaluating to negative delta
+            record_direct = self.watcher.set_cooldown("primary-acc", reset_time=cached_reset_ts)
+            self.assertEqual(record_direct["cooldown_until"], now_skewed + 1800.0)
+
+            # Direct reset_time call with reset_delta == 0 (reset_time == now)
+            record_zero_delta = self.watcher.set_cooldown("primary-acc", reset_time=now_skewed)
+            self.assertEqual(record_zero_delta["cooldown_until"], now_skewed + 1800.0)
+
+    def test_cooldown_clamp_003_rejects_weekly_reset_and_caps_at_5h_or_fallback(self):
+        """[COOLDOWN-CLAMP-003]: Rejects multi-day weekly reset and caps duration at 5 hours or 30-min fallback."""
+        now = 1700000000.0
+        weekly_reset = now + 518400.0  # 6 days in future
+        quota_data = {
+            "accounts": {
+                "primary-acc": {
+                    "gemini": {
+                        "quota": 0,
+                        "reset_time": weekly_reset,
+                        "buckets": {
+                            "weekly": {"quota": 0, "reset_time": weekly_reset},
+                        },
+                    }
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # Weekly reset in cache must be rejected as candidate
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertIsNone(cache_reset)
+
+            # When set_cooldown is invoked, it rejects the weekly reset and caps at <= 18000 (30m fallback)
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertNotEqual(record["cooldown_until"], weekly_reset)
+            self.assertLessEqual(record["cooldown_until"] - now, 18000.0)
+            self.assertEqual(record["cooldown_until"], now + 1800.0)
+
+            # Verify persisted record in cooldown.json
+            on_disk = json.loads(self.cooldown_mgr.cooldown_file.read_text(encoding="utf-8"))
+            self.assertIn("primary-acc", on_disk)
+            self.assertNotEqual(on_disk["primary-acc"]["cooldown_until"], weekly_reset)
+            self.assertLessEqual(on_disk["primary-acc"]["cooldown_until"] - now, 18000.0)
+
+            # Even if weekly reset is passed directly as argument, it must be rejected and capped
+            record_direct = self.watcher.set_cooldown("primary-acc", reset_time=weekly_reset)
+            self.assertNotEqual(record_direct["cooldown_until"], weekly_reset)
+            self.assertLessEqual(record_direct["cooldown_until"] - now, 18000.0)
+
+    def test_cooldown_clamp_clock_skew_5h_bucket_clamped_to_5h_ceiling(self):
+        """Probes edge case: 5h rolling bucket with duration exceeding 18000s (e.g. 18050s clock skew) is clamped to 5h ceiling."""
+        now = 1700000000.0
+        rolling_5h_skew = now + 18050.0  # 5 hours and 50 seconds in future
+        quota_data = {
+            "accounts": {
+                "primary-acc": {
+                    "gemini": {
+                        "quota": 0,
+                        "buckets": {
+                            "5h": {"quota": 0, "reset_time": rolling_5h_skew},
+                        },
+                    }
+                }
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # Cache extraction clamps to 18000s ceiling
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertEqual(cache_reset, now + 18000.0)
+
+            # set_cooldown clamps to exactly now + 18000.0 (5h) instead of dropping to 30m
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record["cooldown_until"], now + 18000.0)
+
+    def test_cooldown_clamp_non_weekly_bucket_exceeding_5h_clamped_to_5h_ceiling(self):
+        """Probes edge case: non-weekly bucket or direct reset_time of 6h (21600s) is clamped to 5h ceiling."""
+        now = 1700000000.0
+        six_hours_future = now + 21600.0  # 6 hours in future (non-weekly)
+
+        with patch("time.time", return_value=now):
+            # Direct reset_time of 6 hours must be clamped to 5h ceiling
+            record_direct = self.watcher.set_cooldown("primary-acc", reset_time=six_hours_future)
+            self.assertEqual(record_direct["cooldown_until"], now + 18000.0)
+
+            # In cache, a non-weekly bucket with duration > 18000s is clamped to 18000s
+            quota_data = {
+                "accounts": {
+                    "primary-acc": {
+                        "gemini": {
+                            "quota": 0,
+                            "buckets": [
+                                {"bucketId": "custom_window", "resetTime": six_hours_future}
+                            ],
+                        }
+                    }
+                }
+            }
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+            cache_reset = self.cooldown_mgr.get_reset_time_from_cache("primary-acc", model_hint="gemini")
+            self.assertEqual(cache_reset, now + 18000.0)
+
+            record = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(record["cooldown_until"], now + 18000.0)
+
+    def test_cooldown_clamp_empty_none_or_malformed_buckets_graceful_handling(self):
+        """Probes edge case: buckets is None, empty list, or contains non-dict items."""
+        now = 1700000000.0
+
+        with patch("time.time", return_value=now):
+            # Case 1: buckets is None, flat schema with resetTime (camelCase)
+            q1 = {"accounts": {"primary-acc": {"gemini": {"quota": 0, "buckets": None, "resetTime": now + 7200.0}}}}
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(q1), encoding="utf-8")
+            self.assertEqual(self.cooldown_mgr.get_reset_time_from_cache("primary-acc", "gemini"), now + 7200.0)
+
+            # Case 2: buckets is empty list, no reset_time -> falls back to 30m
+            q2 = {"accounts": {"primary-acc": {"gemini": {"quota": 0, "buckets": []}}}}
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(q2), encoding="utf-8")
+            self.assertIsNone(self.cooldown_mgr.get_reset_time_from_cache("primary-acc", "gemini"))
+            rec2 = self.watcher.set_cooldown("primary-acc")
+            self.assertEqual(rec2["cooldown_until"], now + 1800.0)
+
+            # Case 3: buckets has invalid/corrupted elements [None, 123, "string"]
+            q3 = {"accounts": {"primary-acc": {"gemini": {"quota": 0, "buckets": [None, 123, "string"]}}}}
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(q3), encoding="utf-8")
+            self.assertIsNone(self.cooldown_mgr.get_reset_time_from_cache("primary-acc", "gemini"))
+
+    def test_cooldown_clamp_malformed_past_or_negative_delta_reset_time(self):
+        """Probes edge case: malformed, past, or negative-delta reset_time safely defaults to 30m fallback."""
+        now = 1700000000.0
+
+        with patch("time.time", return_value=now):
+            # Past timestamp
+            rec_past = self.watcher.set_cooldown("primary-acc", reset_time=now - 100.0)
+            self.assertEqual(rec_past["cooldown_until"], now + 1800.0)
+
+            # Exactly now
+            rec_now = self.watcher.set_cooldown("primary-acc", reset_time=now)
+            self.assertEqual(rec_now["cooldown_until"], now + 1800.0)
+
+            # Malformed string
+            rec_malformed = self.watcher.set_cooldown("primary-acc", reset_time="not-a-timestamp")
+            self.assertEqual(rec_malformed["cooldown_until"], now + 1800.0)
+
+            # Negative float
+            rec_neg = self.watcher.set_cooldown("primary-acc", reset_time=-500.0)
+            self.assertEqual(rec_neg["cooldown_until"], now + 1800.0)
+
+    def test_is_account_cooldown_penalized_clean_robustness(self):
+        """Probes _is_account_cooldown_penalized handles None/non-dict and expired cooldown records cleanly."""
+        now = 1700000000.0
+        with patch("time.time", return_value=now):
+            # Non-dict cooldowns
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("acc1", None))  # type: ignore[arg-type]
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("", {"acc1": {}}))
+
+            # Active cooldown
+            self.assertTrue(self.watcher._is_account_cooldown_penalized("acc1", {"acc1": {"cooldown_until": now + 600.0}}))
+
+            # Expired cooldown record
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("acc1", {"acc1": {"cooldown_until": now - 10.0}}))
+
+    def test_cooldown_immunity_001_standby_with_healthy_quota_granted_immunity(self):
+        """[COOLDOWN-IMMUNITY-001]: Standby account in cooldown with healthy quota (>= 70%) is granted immunity."""
+        now = 1700000000.0
+        # Given standby-acc is recorded in cooldown.json with an unexpired cooldown timestamp
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertIn("standby-acc", cooldowns)
+
+        # And last_known_quota.json reports standby-acc has recovered to 85% Gemini quota (0.85 >= 0.70)
+        quota_data = {
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0}},
+                "standby-acc": {"gemini": {"quota": 85}},
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # 1. Direct seam check: _is_account_cooldown_penalized must evaluate healthy quota >= 0.70 and return False
+            is_penalized = self.watcher._is_account_cooldown_penalized(
+                "standby-acc", cooldowns, accounts_cache=quota_data["accounts"]
+            )
+            self.assertFalse(is_penalized, "Expected standby-acc with 85% quota to receive cooldown immunity")
+
+            # 2. When accounts_cache is not passed, resolves from last_known_quota.json disk cache
+            is_penalized_disk = self.watcher._is_account_cooldown_penalized(
+                "standby-acc", cooldowns, accounts_cache=None
+            )
+            self.assertFalse(is_penalized_disk, "Expected standby-acc to resolve from disk cache and receive immunity")
+
+            # 3. In reactive failover, grants immunity and includes standby-acc as eligible rotation candidate
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "standby-acc", "valid": True},
+                ],
+            }
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+
+            res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertTrue(res)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+    def test_cooldown_immunity_002_standby_with_depleted_quota_remains_excluded(self):
+        """[COOLDOWN-IMMUNITY-002]: Standby account in cooldown with depleted quota (< 70%) remains excluded."""
+        now = 1700000000.0
+        # Given standby-acc is recorded in cooldown.json with an active cooldown
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertIn("standby-acc", cooldowns)
+
+        # And telemetry reports standby-acc has only 30% Gemini quota remaining (0.30 < 0.70)
+        quota_data = {
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0}},
+                "standby-acc": {"gemini": {"quota": 30}},
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # 1. Direct seam check: _is_account_cooldown_penalized must determine standby-acc does not qualify for immunity
+            is_penalized = self.watcher._is_account_cooldown_penalized(
+                "standby-acc", cooldowns, accounts_cache=quota_data["accounts"]
+            )
+            self.assertTrue(is_penalized, "Expected standby-acc with 30% quota (< 70%) to remain penalized")
+
+            # 2. In reactive failover, excludes standby-acc from candidate selection and aborts rotation
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "standby-acc", "valid": True},
+                ],
+            }
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertFalse(res)
+            self.engine_mock.switch_tokens.assert_not_called()
+
+    def test_cooldown_immunity_live_telemetry_probes(self):
+        """Probes live telemetry fallback when cache is missing: grants immunity on >= 70%, denies on < 70%."""
+        now = 1700000000.0
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+
+        # No cache file present
+        (self.cache_dir / "last_known_quota.json").unlink(missing_ok=True)
+
+        with patch("time.time", return_value=now):
+            # Mock live telemetry returning 85%
+            with patch("scripts.watch.fetch_account_quota", return_value=("standby-acc", {"gemini": {"quota": 85}})):
+                is_penalized = self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=None)
+                self.assertFalse(is_penalized, "Expected live telemetry 85% to grant cooldown immunity")
+
+            # Mock live telemetry returning 30%
+            with patch("scripts.watch.fetch_account_quota", return_value=("standby-acc", {"gemini": {"quota": 30}})):
+                is_penalized = self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=None)
+                self.assertTrue(is_penalized, "Expected live telemetry 30% to deny cooldown immunity")
+
+    def test_cooldown_immunity_proactive_failover_evaluates_immune_candidate(self):
+        """Proactive rotation considers standby in cooldown if quota >= 70% and switches."""
+        now = 1700000000.0
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        quota_data = {
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 15}},  # <= 20% threshold
+                "standby-acc": {"gemini": {"quota": 85}},  # in cooldown but >= 70%
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.quota_threshold = 0.20
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-acc", "valid": True},
+            ],
+        }
+        self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+
+        with patch("time.time", return_value=now):
+            with patch.object(self.watcher, "_is_turn_quiescent", return_value=True):
+                res = self.watcher._evaluate_proactive_rotation()
+                self.assertTrue(res)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+    def test_boundary_immunity_001_exact_70_percent_quota_granted_immunity(self):
+        """[COOLDOWN-EDGE-001]: Account with exact 70.0% quota (fraction == 0.70) is granted cooldown immunity."""
+        now = 1700000000.0
+        # GIVEN standby-acc is recorded in cooldown.json with an unexpired cooldown timestamp
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertIn("standby-acc", cooldowns)
+
+        # AND cached telemetry reports exactly 70.0% Gemini quota remaining (fraction = 0.70)
+        quota_data = {
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0}},
+                "standby-acc": {"gemini": {"fraction": 0.70}},
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # WHEN LogWatcher evaluates cooldown immunity
+            # THEN it determines that fraction >= 0.70 is satisfied (not penalized)
+            is_penalized = self.watcher._is_account_cooldown_penalized(
+                "standby-acc", cooldowns, accounts_cache=quota_data["accounts"]
+            )
+            self.assertFalse(is_penalized, "Expected standby-acc with exactly 70.0% quota to receive cooldown immunity")
+
+            # Resolving from disk cache without accounts_cache parameter also grants immunity
+            is_penalized_disk = self.watcher._is_account_cooldown_penalized(
+                "standby-acc", cooldowns, accounts_cache=None
+            )
+            self.assertFalse(is_penalized_disk, "Expected standby-acc with exactly 70.0% quota to resolve from disk cache and receive immunity")
+
+            # AND includes standby-acc as an eligible candidate in reactive failover
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "standby-acc", "valid": True},
+                ],
+            }
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+
+            res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertTrue(res)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+    def test_boundary_immunity_002_multi_account_individual_evaluation_highest_quota(self):
+        """[COOLDOWN-EDGE-002]: In multi-account fleet in cooldown, each evaluated individually; selects highest quota."""
+        now = 1700000000.0
+        # GIVEN vault contains 3 standby accounts in cooldown.json:
+        # acc1 (75% quota), acc2 (65% quota), and acc3 (90% quota)
+        self.cooldown_mgr.set_cooldown("acc1", reset_time=now + 3600.0)
+        self.cooldown_mgr.set_cooldown("acc2", reset_time=now + 3600.0)
+        self.cooldown_mgr.set_cooldown("acc3", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+        self.assertIn("acc1", cooldowns)
+        self.assertIn("acc2", cooldowns)
+        self.assertIn("acc3", cooldowns)
+
+        quota_data = {
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0}},
+                "acc1": {"gemini": {"quota": 75}},  # 75% quota -> fraction 0.75 >= 0.70 (immune)
+                "acc2": {"gemini": {"quota": 65}},  # 65% quota -> fraction 0.65 < 0.70 (penalized)
+                "acc3": {"gemini": {"quota": 90}},  # 90% quota -> fraction 0.90 >= 0.70 (immune)
+            }
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+
+        with patch("time.time", return_value=now):
+            # WHEN LogWatcher filters valid accounts
+            # THEN it grants immunity to acc1 and acc3, while continuing to penalize acc2
+            self.assertFalse(
+                self.watcher._is_account_cooldown_penalized("acc1", cooldowns, accounts_cache=quota_data["accounts"]),
+                "acc1 (75% quota) should be granted immunity"
+            )
+            self.assertTrue(
+                self.watcher._is_account_cooldown_penalized("acc2", cooldowns, accounts_cache=quota_data["accounts"]),
+                "acc2 (65% quota) should remain penalized"
+            )
+            self.assertFalse(
+                self.watcher._is_account_cooldown_penalized("acc3", cooldowns, accounts_cache=quota_data["accounts"]),
+                "acc3 (90% quota) should be granted immunity"
+            )
+
+            # AND selects acc3 as the highest-quota rotation target
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "acc1", "valid": True},
+                    {"name": "acc2", "valid": True},
+                    {"name": "acc3", "valid": True},
+                ],
+            }
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "acc3"}
+
+            res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
+            self.assertTrue(res)
+            # Must strictly switch to acc3 (highest quota: 90% > 75%), never acc1 or acc2
+            self.engine_mock.switch_tokens.assert_called_once_with("acc3", restart_server=True, force=True)
+
+    def test_boundary_immunity_floating_point_and_format_variants(self):
+        """Harden boundary conditions for fraction == 0.70 across floating point math and format variants."""
+        now = 1700000000.0
+        self.cooldown_mgr.set_cooldown("standby-acc", reset_time=now + 3600.0)
+        cooldowns = self.watcher.get_cooldowns()
+
+        with patch("time.time", return_value=now):
+            # 69.9% (< 70%) must be penalized
+            q_below = {"standby-acc": {"gemini": {"fraction": 0.699}}}
+            self.assertTrue(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_below))
+
+            # 70.0% int quota: 70 must be immune
+            q_int = {"standby-acc": {"gemini": {"quota": 70}}}
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_int))
+
+            # 70.0% float quota: 70.0 must be immune
+            q_float = {"standby-acc": {"gemini": {"quota": 70.0}}}
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_float))
+
+            # String format "70%" must be immune
+            q_str = {"standby-acc": {"gemini": {"quota": "70%"}}}
+            self.assertFalse(self.watcher._is_account_cooldown_penalized("standby-acc", cooldowns, accounts_cache=q_str))
+
+            # Proactive rotation boundary evaluation at exactly 0.70
+            quota_data = {
+                "accounts": {
+                    "primary-acc": {"gemini": {"quota": 10}},  # <= threshold (20%)
+                    "standby-acc": {"gemini": {"fraction": 0.70}},  # exactly 70% in cooldown
+                }
+            }
+            (self.cache_dir / "last_known_quota.json").write_text(json.dumps(quota_data), encoding="utf-8")
+            self.engine_mock.get_active_name.return_value = "primary-acc"
+            self.engine_mock.quota_threshold = 0.20
+            self.engine_mock.list_accounts.return_value = {
+                "active": "primary-acc",
+                "accounts": [
+                    {"name": "primary-acc", "valid": True},
+                    {"name": "standby-acc", "valid": True},
+                ],
+            }
+            self.engine_mock.switch_tokens.return_value = {"success": True, "active": "standby-acc"}
+            with patch.object(self.watcher, "_is_turn_quiescent", return_value=True):
+                proactive_res = self.watcher._evaluate_proactive_rotation()
+                self.assertTrue(proactive_res)
+                self.engine_mock.switch_tokens.assert_called_with("standby-acc", restart_server=True, force=True)
+
 
 class _StubSwitchEngine:
     """External engine stub for testing LogWatcher at its public seam without internal mocking."""
