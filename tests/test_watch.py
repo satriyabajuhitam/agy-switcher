@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from scripts.watch import LogWatcher, PresenceDetector
 from agy_switcher.supervisor import ProcessSupervisor
+from agy_switcher.models import AccountInfo
 
 class TestLogWatcher(unittest.TestCase):
     def setUp(self):
@@ -2362,6 +2363,346 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         stderr_output = stderr_capture.getvalue()
         self.assertIn("ProcessSupervisor error: SIGKILL escalation timed out", stderr_output)
         self.assertEqual(watcher.last_switch_time, initial_switch_time)
+
+
+class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
+    """Tests for proactive threshold failover trigger at Safe Turn Boundary.
+
+    Covers:
+    - [WATCH-PROACTIVE-001]: Proactive rotation triggered when active account quota reaches or falls below threshold at Safe Turn Boundary.
+    - [WATCH-PROACTIVE-EDGE-001]: Active quota at exact threshold boundary triggers proactive evaluation and rotation.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-acc", "valid": True},
+            ],
+        }
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-acc",
+            "success": True,
+            "server_restarted": True,
+        }
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_session(self, session_id: str = "session-proactive-trigger") -> tuple[Path, Path]:
+        """Helper creating presence lock and active session transcript."""
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / f"{session_id}.lock"
+        lock_file.touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        return lock_file, transcript_path
+
+    def test_proactive_rotation_trigger_at_safe_turn_boundary_001(self):
+        """[WATCH-PROACTIVE-001]: GIVEN active account 'primary-acc' with remaining Gemini quota at 14%
+        (fraction = 0.14 <= 0.20) AND standby account 'standby-acc' has healthy Gemini quota (85% >= 70%)
+        AND the active transcript transcript.jsonl has recorded a completed turn event with status == 'DONE'
+        AND ProcessSupervisor.is_server_busy() returns False indicating the Language Server is idle
+        WHEN LogWatcher.poll_once() evaluates proactive rotation eligibility
+        THEN it recognizes the Safe Turn Boundary and initiates credential rotation to 'standby-acc'
+        AND reloads the Language Server via switch_tokens('standby-acc', restart_server=True, force=True)
+        AND returns True after updating file cursors and resetting damping timer.
+        """
+        lock_file, transcript_path = self._setup_session("session-proactive-001")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Turn execution completed successfully.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertFalse(self.supervisor.is_server_busy(), "Server must be idle")
+        lock_file.touch()
+        self.assertEqual(watcher.last_switch_time, 0.0, "Damping timer must start uninitialized")
+
+        before_poll = time.time()
+        res = watcher.poll_once()
+
+        self.assertTrue(res, "poll_once() must return truthy/True when proactive rotation succeeds")
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-acc", restart_server=True, force=True
+        )
+
+        # File cursors must be updated to EOF
+        transcript_key = str(transcript_path)
+        self.assertIn(transcript_key, watcher.file_cursors)
+        self.assertEqual(watcher.file_cursors[transcript_key], os.path.getsize(transcript_path))
+
+        # Damping timer must be reset to recent timestamp
+        self.assertGreaterEqual(watcher.last_switch_time, before_poll)
+
+        # Subsequent immediate poll within damping window must be suppressed
+        res_damping = watcher.poll_once()
+        self.assertFalse(res_damping, "Subsequent poll within damping window must be suppressed")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+    def test_proactive_rotation_edge_001_exact_threshold_boundary(self):
+        """[WATCH-PROACTIVE-EDGE-001]: GIVEN active account 'primary-acc' has exactly 20.0% Gemini quota remaining
+        (fraction = 0.20) AND configured threshold is 20% (threshold = 0.20) AND standby account 'standby-acc' has 85% quota
+        AND the system is at a verified Safe Turn Boundary
+        WHEN LogWatcher.poll_once() evaluates proactive rotation
+        THEN it determines that fraction <= threshold is satisfied AND initiates rotation to 'standby-acc'.
+        """
+        lock_file, transcript_path = self._setup_session("session-proactive-edge-001")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Execution step finished.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.20}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertFalse(self.supervisor.is_server_busy())
+        lock_file.touch()
+
+        res = watcher.poll_once()
+        self.assertTrue(res, "Active account quota at exact 20.0% threshold must trigger proactive rotation")
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-acc", restart_server=True, force=True
+        )
+
+    def test_proactive_rotation_edge_above_threshold_suppresses_rotation(self):
+        """Active account quota strictly above threshold (e.g. 20.1% > 20.0%) suppresses proactive rotation."""
+        lock_file, transcript_path = self._setup_session("session-proactive-above")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.201}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        res = watcher.poll_once()
+        self.assertFalse(res, "Quota above threshold must not trigger proactive rotation")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+    def test_proactive_rotation_defaults_threshold_on_invalid_engine_threshold(self):
+        """Proactive rotation defaults threshold to 20% when engine threshold raises an exception or is unparseable."""
+        lock_file, transcript_path = self._setup_session("session-proactive-default-thresh")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        # get_quota_threshold raises an exception
+        self.engine_mock.get_quota_threshold.side_effect = ValueError("Invalid threshold config")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        res = watcher.poll_once()
+        self.assertTrue(res, "Invalid engine threshold method must default to 20% and trigger rotation")
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-acc", restart_server=True, force=True
+        )
+
+    def test_proactive_rotation_cursor_advancement_when_evaluated_directly(self):
+        """Direct evaluation of _evaluate_proactive_rotation discovers active transcript and updates cursors."""
+        lock_file, transcript_path = self._setup_session("session-proactive-direct-eval")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Direct step."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Clear active_transcript_path to test dynamic discovery during direct evaluation
+        watcher.active_transcript_path = None
+        self.assertNotIn(str(transcript_path), watcher.file_cursors)
+
+        res = watcher._evaluate_proactive_rotation()
+        self.assertTrue(res)
+        transcript_key = str(transcript_path)
+        self.assertIn(transcript_key, watcher.file_cursors)
+        self.assertEqual(watcher.file_cursors[transcript_key], os.path.getsize(transcript_path))
+        self.assertGreater(watcher.last_switch_time, 0.0)
+
+    def test_proactive_rotation_unexpected_switch_tokens_exception_handled_cleanly(self):
+        """Unexpected switch_tokens exception logs to stderr and leaves damping timer unadvanced."""
+        lock_file, transcript_path = self._setup_session("session-proactive-exc")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        self.engine_mock.switch_tokens.side_effect = RuntimeError("Fatal disk corruption during token switch")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        from io import StringIO
+        stderr_capture = StringIO()
+        with patch("sys.stderr", stderr_capture):
+            res = watcher.poll_once()
+
+        self.assertEqual(res, 0)
+        self.assertEqual(watcher.last_switch_time, 0.0)
+        self.assertIn("Fatal disk corruption during token switch", stderr_capture.getvalue())
+
+    def test_proactive_rotation_handles_accounts_data_as_list_and_objects(self):
+        """Proactive rotation handles accounts_data returned as a raw list of AccountInfo-like objects."""
+        lock_file, transcript_path = self._setup_session("session-proactive-obj-list")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        acc_primary = AccountInfo(name="primary-acc", is_active=True)
+        acc_standby = AccountInfo(name="standby-acc", is_active=False)
+        self.engine_mock.list_accounts.return_value = [acc_primary, acc_standby]
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        res = watcher.poll_once()
+        self.assertTrue(res)
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-acc", restart_server=True, force=True
+        )
 
 
 if __name__ == '__main__':

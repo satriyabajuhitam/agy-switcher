@@ -1118,6 +1118,7 @@ class LogWatcher:
                     p = self.presence_detector.get_active_transcript_path(session_id=self.active_session_id)
                     if p and p.is_file():
                         target_path = p
+                        self.active_transcript_path = p
                 except Exception:
                     target_path = None
 
@@ -1227,29 +1228,22 @@ class LogWatcher:
     def _evaluate_proactive_rotation(self) -> bool:
         """Evaluates proactive rotation eligibility at a Safe Turn Boundary."""
         try:
-            threshold = 0.20
-            if hasattr(self.engine, "get_quota_threshold"):
-                try:
-                    threshold = float(self.engine.get_quota_threshold())
-                except Exception:
-                    pass
-            elif hasattr(self.engine, "quota_threshold"):
-                try:
-                    threshold = float(self.engine.quota_threshold)
-                except Exception:
-                    pass
-            else:
+            threshold_attr = getattr(self.engine, "get_quota_threshold", getattr(self.engine, "quota_threshold", None))
+            if threshold_attr is None:
                 return False
+            threshold = 0.20
+            try:
+                if (val := float(threshold_attr() if callable(threshold_attr) else threshold_attr)) > 0:
+                    threshold = val
+            except Exception:
+                pass
 
-            if not self._is_turn_quiescent():
+            if threshold <= 0.0 or not self._is_turn_quiescent():
                 return False
 
             cache_data: dict[str, Any] = {}
-            client = None
             try:
-                client = _get_quota_client_class()(self.engine)
-                loaded = client.load_cache()
-                if isinstance(loaded, dict):
+                if isinstance(loaded := _get_quota_client_class()(self.engine).load_cache(), dict):
                     cache_data = loaded
             except Exception:
                 pass
@@ -1264,49 +1258,41 @@ class LogWatcher:
 
             now = time.time()
             if self.last_switch_time > 0:
-                elapsed = now - self.last_switch_time
-                if 0 <= elapsed < self.damping_seconds:
+                if 0 <= (now - self.last_switch_time) < self.damping_seconds:
                     return False
-                elif elapsed < 0:
+                elif (now - self.last_switch_time) < 0:
                     self.last_switch_time = 0.0
 
             get_active_fn = getattr(self.engine, "get_active_name", None)
-            if not callable(get_active_fn):
-                return False
-            active_name = get_active_fn()
-            if not active_name or not isinstance(active_name, str):
+            if not callable(get_active_fn) or not isinstance(active_name := get_active_fn(), str) or not active_name:
                 return False
 
             accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
             active_quota_fraction = self._probe_active_quota(
                 active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini"
             )
-            if active_quota_fraction is None:
+            if active_quota_fraction is None or round(active_quota_fraction, 6) > round(threshold, 6):
                 return False
 
-            if active_quota_fraction > threshold:
-                return False
-
-            accounts_data: dict[str, Any] = getattr(self.engine, "list_accounts", lambda: {})()
-            accounts_list = accounts_data.get("accounts") or []
+            raw_accounts: object = getattr(self.engine, "list_accounts", lambda: {})()
+            accounts_list = raw_accounts.get("accounts") if isinstance(raw_accounts, dict) else (raw_accounts if isinstance(raw_accounts, list) else [])
+            accounts_list = accounts_list or []
             cooldowns = self.get_cooldowns() if hasattr(self, "get_cooldowns") else {}
 
-            best_standby = None
-            best_quota = -1.0
+            best_standby, best_quota = None, -1.0
             for acc in accounts_list:
-                acc_name = acc.get("name") if isinstance(acc, dict) else None
+                acc_name = acc.get("name") if isinstance(acc, dict) else getattr(acc, "name", None)
                 if not acc_name or acc_name == active_name:
                     continue
                 if self._is_account_cooldown_penalized(acc_name, cooldowns, accounts_cache if isinstance(accounts_cache, dict) else None):
                     continue
-                if not acc.get("valid", True):
+                if not (acc.get("valid", True) if isinstance(acc, dict) else getattr(acc, "valid", True)):
                     continue
                 acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
                 q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name="gemini")
-                if q_frac is not None and round(q_frac, 6) >= 0.70:
-                    if q_frac > best_quota:
-                        best_quota = q_frac
-                        best_standby = acc_name
+                if q_frac is not None and round(q_frac, 6) >= 0.70 and round(q_frac, 6) > round(best_quota, 6):
+                    best_quota = q_frac
+                    best_standby = acc_name
 
             if not best_standby:
                 return False
@@ -1319,18 +1305,37 @@ class LogWatcher:
             )
             try:
                 res = self.engine.switch_tokens(best_standby, restart_server=True, force=True)
-                if not res or (isinstance(res, dict) and (res.get("success") is False or bool(res.get("error")) or (not res.get("active") and not res.get("success")))):
+                is_dict = isinstance(res, dict)
+                failed = not res or (
+                    is_dict and (
+                        res.get("success") is False or bool(res.get("error"))
+                        or (not res.get("active") and not res.get("success"))
+                        or (bool(res.get("active")) and res.get("active") != best_standby and not res.get("success"))
+                    )
+                )
+                if failed:
                     err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
                     print(f"[watch] Failed to proactively switch accounts to '{best_standby}': {err_msg}", file=sys.stderr)
                     return False
                 self.last_switch_time = time.time()
                 print(f"[watch] Successfully proactively switched to '{best_standby}'.", file=sys.stderr)
+                if not self.active_transcript_path and hasattr(self, "presence_detector") and self.presence_detector is not None:
+                    try:
+                        sid = self.active_session_id or getattr(self.presence_detector, "get_active_session_id", lambda: None)()
+                        if (p := self.presence_detector.get_active_transcript_path(session_id=sid)) and p.is_file():
+                            self.active_transcript_path = p
+                    except Exception:
+                        pass
+                if self.active_transcript_path and (trans_str := str(self.active_transcript_path)) not in self.file_cursors:
+                    self.file_cursors[trans_str] = 0
                 for target_file in list(self.file_cursors.keys()):
                     try:
                         if os.path.isfile(target_file):
                             self.file_cursors[target_file] = os.path.getsize(target_file)
-                    except OSError:
-                        pass
+                        else:
+                            self.file_cursors.pop(target_file, None)
+                    except (OSError, ValueError, TypeError):
+                        self.file_cursors.pop(target_file, None)
                 self._stagnant_sizes.clear()
                 return True
             except Exception as e:
