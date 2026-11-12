@@ -560,17 +560,44 @@ class LogWatcher:
                     return "gemini"
         return "gemini"
 
+    @staticmethod
+    def _is_switch_failed(res: object, target_account: str) -> bool:
+        """Evaluates whether a switch_tokens() return payload indicates failure."""
+        if not res:
+            return True
+        if isinstance(res, dict):
+            return (
+                res.get("success") is False
+                or bool(res.get("error"))
+                or (not res.get("active") and not res.get("success"))
+                or (bool(res.get("active")) and res.get("active") != target_account and not res.get("success"))
+            )
+        return False
+
+    def _is_damping_active(self, now: float | None = None, *, log_suppression: bool = False) -> bool:
+        """Evaluates the unified damping window against self.last_switch_time."""
+        if self.last_switch_time <= 0:
+            return False
+        current_time = time.time() if now is None else now
+        elapsed = current_time - self.last_switch_time
+        if 0 <= elapsed < self.damping_seconds:
+            if log_suppression:
+                print(
+                    f"[watch] Damping window active ({elapsed:.1f}s < {self.damping_seconds}s). "
+                    f"Suppressing rotation.",
+                    file=sys.stderr,
+                )
+            return True
+        if elapsed < 0:
+            self.last_switch_time = 0.0
+        return False
+
     def process_line(self, line: str, is_jsonl: bool = False, file_path: str | None = None) -> bool:
         if not line or not isinstance(line, str):
             return False
         # Anti-thrashing damping window: suppress rotation if within damping window
-        now = time.time()
-        if self.last_switch_time > 0:
-            elapsed = now - self.last_switch_time
-            if 0 <= elapsed < self.damping_seconds:
-                return False
-            elif elapsed < 0:
-                self.last_switch_time = 0.0
+        if self._is_damping_active():
+            return False
         # Structured JSON-First Event Filtering
         line_clean = line.strip()
         if not line_clean.startswith("{"):
@@ -893,19 +920,9 @@ class LogWatcher:
         return self.handle_exhaustion(line=line, model_hint=model_hint, file_path=file_path)
 
     def handle_exhaustion(self, line: str = "", model_hint: str | None = None, file_path: str | None = None) -> bool:
-        # Check damping window
         now = time.time()
-        if self.last_switch_time > 0:
-            elapsed = now - self.last_switch_time
-            if 0 <= elapsed < self.damping_seconds:
-                print(
-                    f"[watch] Damping window active ({elapsed:.1f}s < {self.damping_seconds}s). "
-                    f"Suppressing rotation.",
-                    file=sys.stderr,
-                )
-                return False
-            elif elapsed < 0:
-                self.last_switch_time = 0.0
+        if self._is_damping_active(now, log_suppression=True):
+            return False
         active_name = self.engine.get_active_name()
         if not active_name:
             print("[watch] No active account found. Cannot switch.", file=sys.stderr)
@@ -1003,8 +1020,7 @@ class LogWatcher:
         print(f"[watch] Switching from '{active_name}' to '{target_account}' mid-turn...", file=sys.stderr)
         try:
             res = self.engine.switch_tokens(target_account, restart_server=True, force=True)
-            # Check for failure in return value
-            if not res or (isinstance(res, dict) and (res.get("success") is False or (res.get("error") and not res.get("active")))):
+            if self._is_switch_failed(res, target_account):
                 err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
                 print(f"[watch] Failed to switch accounts to '{target_account}': {err_msg}", file=sys.stderr)
                 return False
@@ -1270,15 +1286,12 @@ class LogWatcher:
                 return False
             threshold = self.get_quota_threshold(default=0.20)
 
-            if threshold <= 0.0 or not self._is_turn_quiescent():
+            if threshold <= 0.0:
                 return False
 
             now = time.time()
-            if self.last_switch_time > 0:
-                if 0 <= (now - self.last_switch_time) < self.damping_seconds:
-                    return False
-                elif (now - self.last_switch_time) < 0:
-                    self.last_switch_time = 0.0
+            if self._is_damping_active(now) or not self._is_turn_quiescent():
+                return False
 
             get_active_fn = getattr(self.engine, "get_active_name", None)
             if not callable(get_active_fn) or not isinstance(active_name := get_active_fn(), str) or not active_name:
@@ -1327,12 +1340,7 @@ class LogWatcher:
             print(f"[watch] Proactive threshold failover: Active account '{active_name}' quota ({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).", file=sys.stderr)
             try:
                 res = self.engine.switch_tokens(best_standby, restart_server=True, force=True)
-                failed = not res or (isinstance(res, dict) and (
-                    res.get("success") is False or bool(res.get("error"))
-                    or (not res.get("active") and not res.get("success"))
-                    or (bool(res.get("active")) and res.get("active") != best_standby and not res.get("success"))
-                ))
-                if failed:
+                if self._is_switch_failed(res, best_standby):
                     err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
                     print(f"[watch] Failed to proactively switch accounts to '{best_standby}': {err_msg}", file=sys.stderr)
                     return False

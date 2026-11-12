@@ -3327,6 +3327,476 @@ class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
         self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
 
 
+class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
+    """Tests for unified proactive and reactive 60-second damping state in LogWatcher.
+
+    Scenarios:
+    - [PRE-PROBE-SYNC-002]: Proactive rotation sets unified last_switch_time and suppresses
+      subsequent reactive quota exhaustion errors within damping_seconds (60.0s).
+    - [WATCH-PROACTIVE-EDGE-003]: Proactive rotation enforces 60-second damping interval against
+      successive proactive rotations until elapsed >= 60.0s.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-acc", "valid": True},
+                {"name": "standby-2", "valid": True},
+            ],
+        }
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-acc",
+            "success": True,
+            "server_restarted": True,
+        }
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def _setup_session(self, session_id: str) -> tuple[Path, Path]:
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / f"{session_id}.lock"
+        lock_file.touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        return lock_file, transcript_path
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_unified_damping_pre_probe_sync_002_proactive_suppresses_reactive_exhaustion(self, mock_sleep):
+        """[PRE-PROBE-SYNC-002]: Proactive rotation sets unified last_switch_time and suppresses
+        reactive exhaustion failover in handle_exhaustion() and poll_once() for elapsed < 60.0s.
+        """
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        _, transcript_path = self._setup_session("session-unified-damping-002")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Turn complete."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.92}},
+                    "standby-2": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+            cooldown_minutes=60,
+        )
+        self.assertEqual(watcher.damping_seconds, 60.0)
+
+        t0 = 1700000000.0
+        with patch("time.time", return_value=t0):
+            proactive_switches = watcher.poll_once()
+
+        self.assertEqual(proactive_switches, 1, "Initial proactive rotation at Safe Turn Boundary must succeed")
+        self.assertEqual(watcher.last_switch_time, t0, "Proactive rotation must update unified last_switch_time")
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # Simulate active account is now standby-acc, with depleted quota so failover would fire if undamped
+        self.engine_mock.get_active_name.return_value = "standby-acc"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-2": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        # Reactive error from an earlier in-flight request arrives in transcript.jsonl at elapsed = 30.0s
+        error_record = {"type": "ERROR", "status": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"}
+        with open(transcript_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(error_record) + "\n")
+
+        t_30 = t0 + 30.0
+        with patch("time.time", return_value=t_30):
+            poll_switches = watcher.poll_once()
+        self.assertEqual(poll_switches, 0, "poll_once() must suppress reactive error burst at elapsed=30.0s < 60.0s")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+        # Direct handle_exhaustion() call at elapsed = 30.0s must also enforce unified 60s damping
+        stderr_buf = StringIO()
+        with patch("time.time", return_value=t_30), redirect_stderr(stderr_buf):
+            res_damped = watcher.handle_exhaustion(line="Error: RESOURCE_EXHAUSTED (code 429)", model_hint="gemini")
+
+        self.assertFalse(res_damped, "handle_exhaustion() must suppress rotation when elapsed=30.0s < 60.0s")
+        self.assertIn("Damping window active (30.0s < 60.0s)", stderr_buf.getvalue())
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+        self.assertNotIn("standby-acc", watcher.get_cooldowns(), "Damped reactive error must not penalize newly active account")
+
+        # Once elapsed >= 60.0s, reactive failover is re-armed
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-2",
+            "success": True,
+            "server_restarted": True,
+        }
+        t_60 = t0 + 60.0
+        with patch("time.time", return_value=t_60):
+            res_allowed = watcher.handle_exhaustion(line="Error: RESOURCE_EXHAUSTED (code 429)", model_hint="gemini")
+
+        self.assertTrue(res_allowed, "handle_exhaustion() must allow rotation once elapsed=60.0s >= 60.0s")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
+        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True)
+        self.assertEqual(watcher.last_switch_time, t_60)
+
+    def test_unified_damping_watch_proactive_edge_003_suppresses_successive_proactive_switches(self):
+        """[WATCH-PROACTIVE-EDGE-003]: Proactive rotation enforces 60-second damping interval
+        when newly active account reports quota below threshold until elapsed >= 60.0s.
+        """
+        lock_file, transcript_path = self._setup_session("session-unified-damping-edge-003")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Step complete."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.92}},
+                    "standby-2": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertEqual(watcher.damping_seconds, 60.0)
+
+        t0 = 1700000000.0
+        with patch("time.time", return_value=t0):
+            first_switches = watcher.poll_once()
+
+        self.assertEqual(first_switches, 1)
+        self.assertEqual(watcher.last_switch_time, t0)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+
+        # Newly active account 'standby-acc' reports cached quota below threshold (15% <= 20%)
+        self.engine_mock.get_active_name.return_value = "standby-acc"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-acc": {"gemini": {"fraction": 0.15}},
+                    "standby-2": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        # At elapsed = 40.0s (< 60.0s), poll_once() must suppress successive proactive rotation
+        lock_file.touch()
+        t_40 = t0 + 40.0
+        with patch("time.time", return_value=t_40):
+            switches_40 = watcher.poll_once()
+        self.assertEqual(switches_40, 0, "Successive proactive switch at elapsed=40.0s (< 60.0s) must be suppressed")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+        self.assertEqual(watcher.last_switch_time, t0)
+
+        # Just before 60s boundary (elapsed = 59.9s < 60.0s) -> still suppressed
+        lock_file.touch()
+        t_59_9 = t0 + 59.9
+        with patch("time.time", return_value=t_59_9):
+            switches_59_9 = watcher.poll_once()
+        self.assertEqual(switches_59_9, 0, "Successive proactive switch at elapsed=59.9s (< 60.0s) must remain suppressed")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+        # At exact 60s boundary (elapsed = 60.0s >= 60.0s) -> rotation permitted
+        lock_file.touch()
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-2",
+            "success": True,
+            "server_restarted": True,
+        }
+        t_60 = t0 + 60.0
+        with patch("time.time", return_value=t_60):
+            switches_60 = watcher.poll_once()
+        self.assertEqual(switches_60, 1, "Proactive rotation must proceed once elapsed=60.0s >= 60.0s")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
+        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True)
+        self.assertEqual(watcher.last_switch_time, t_60)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_unified_damping_reactive_failover_suppresses_proactive_rotation(self, mock_sleep):
+        """Unified damping symmetry: reactive handle_exhaustion() updates last_switch_time and
+        suppresses subsequent proactive rotation in poll_once() until elapsed >= 60.0s.
+        """
+        lock_file, transcript_path = self._setup_session("session-unified-damping-sym")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Turn complete."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.05}},
+                    "standby-acc": {"gemini": {"fraction": 0.15}},
+                    "standby-2": {"gemini": {"fraction": 0.90}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        t0 = 1700000000.0
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-2",
+            "success": True,
+            "server_restarted": True,
+        }
+        with patch("time.time", return_value=t0):
+            reactive_ok = watcher.handle_exhaustion(line="Error: RESOURCE_EXHAUSTED (code 429)", model_hint="gemini")
+
+        self.assertTrue(reactive_ok)
+        self.assertEqual(watcher.last_switch_time, t0)
+
+        # Even if active account reports below threshold at Safe Turn Boundary, proactive rotation is damped for 60s
+        self.engine_mock.get_active_name.return_value = "standby-2"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.95}},
+                    "standby-acc": {"gemini": {"fraction": 0.15}},
+                    "standby-2": {"gemini": {"fraction": 0.12}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        lock_file.touch()
+        with patch("time.time", return_value=t0 + 40.0):
+            switches_damped = watcher.poll_once()
+        self.assertEqual(switches_damped, 0, "Proactive rotation must be suppressed within 60s of reactive failover")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+        lock_file.touch()
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "primary-acc",
+            "success": True,
+            "server_restarted": True,
+        }
+        with patch("time.time", return_value=t0 + 60.0):
+            switches_after = watcher.poll_once()
+        self.assertEqual(switches_after, 1, "Proactive rotation must proceed once 60s damping after reactive failover expires")
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
+        self.assertEqual(watcher.last_switch_time, t0 + 60.0)
+
+    def test_unified_damping_failed_switches_do_not_update_last_switch_time(self):
+        """Failed or no-op switch attempts in either proactive or reactive paths must not
+        update last_switch_time or spuriously arm the 60s damping window.
+        """
+        _, transcript_path = self._setup_session("session-unified-damping-fail")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-acc": {"gemini": {"fraction": 0.92}},
+                    "standby-2": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        failure_payloads: list[tuple[str, object]] = [
+            ("error_with_active_key", {"active": "standby-acc", "error": "ProcessSupervisor error"}),
+            ("mismatched_active_account", {"active": "primary-acc"}),
+            ("explicit_success_false", {"success": False, "error": "Presence lock active"}),
+            ("boolean_false", False),
+        ]
+        for label, payload in failure_payloads:
+            with self.subTest(path="proactive", payload=label):
+                watcher = LogWatcher(
+                    engine=self.engine_mock,
+                    presence_detector=self.detector,
+                    supervisor=self.supervisor,
+                    log_dirs=[],
+                )
+                self.assertEqual(watcher.last_switch_time, 0.0)
+                self.engine_mock.switch_tokens.return_value = payload
+                with patch("time.time", return_value=1700000100.0):
+                    self.assertEqual(watcher.poll_once(), 0)
+                self.assertEqual(watcher.last_switch_time, 0.0)
+
+            with self.subTest(path="reactive", payload=label):
+                watcher = LogWatcher(
+                    engine=self.engine_mock,
+                    presence_detector=self.detector,
+                    supervisor=self.supervisor,
+                    log_dirs=[],
+                )
+                watcher.cooldown_manager.clear_cooldown()
+                self.engine_mock.switch_tokens.return_value = payload
+                with patch("time.time", return_value=1700000200.0):
+                    self.assertFalse(
+                        watcher.handle_exhaustion(line="Error: RESOURCE_EXHAUSTED (code 429)", model_hint="gemini")
+                    )
+                self.assertEqual(watcher.last_switch_time, 0.0)
+
+        # Exception during switch_tokens also preserves last_switch_time
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        watcher.last_switch_time = 1700000000.0
+        self.engine_mock.switch_tokens.side_effect = RuntimeError("Disk I/O error")
+        with patch("time.time", return_value=1700000080.0):
+            self.assertEqual(watcher.poll_once(), 0)
+            self.assertFalse(
+                watcher.handle_exhaustion(line="Error: RESOURCE_EXHAUSTED (code 429)", model_hint="gemini")
+            )
+        self.assertEqual(watcher.last_switch_time, 1700000000.0)
+
+    @patch("scripts.watch.time.sleep", return_value=None)
+    def test_unified_damping_boundary_and_clock_skew_proactive_and_reactive(self, mock_sleep):
+        """Verifies exact sub-millisecond damping boundary (59.999s vs 60.0s), initial 0.0
+        state, and backward clock skew recovery across proactive and reactive paths.
+        """
+        lock_file, transcript_path = self._setup_session("session-unified-damping-bounds")
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            encoding="utf-8",
+        )
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.12}},
+                    "standby-acc": {"gemini": {"fraction": 0.92}},
+                    "standby-2": {"gemini": {"fraction": 0.88}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertEqual(watcher.last_switch_time, 0.0)
+
+        # Initial last_switch_time=0.0 must never be treated as damped
+        t0 = 1700000000.0
+        with patch("time.time", return_value=t0):
+            self.assertEqual(watcher.poll_once(), 1)
+        self.assertEqual(watcher.last_switch_time, t0)
+
+        # At elapsed = 59.999s (< 60.0s), both proactive poll_once() and reactive handle_exhaustion() remain suppressed
+        self.engine_mock.get_active_name.return_value = "standby-acc"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.12}},
+                    "standby-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-2": {"gemini": {"fraction": 0.88}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        lock_file.touch()
+        with patch("time.time", return_value=t0 + 59.999):
+            self.assertEqual(watcher.poll_once(), 0)
+            self.assertFalse(
+                watcher.handle_exhaustion(line="Error: RESOURCE_EXHAUSTED (code 429)", model_hint="gemini")
+            )
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 1)
+
+        # At exact 60.0s boundary, rotation succeeds
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-2",
+            "success": True,
+            "server_restarted": True,
+        }
+        lock_file.touch()
+        with patch("time.time", return_value=t0 + 60.0):
+            self.assertEqual(watcher.poll_once(), 1)
+        self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
+        self.assertEqual(watcher.last_switch_time, t0 + 60.0)
+
+        # Backward clock skew (now < last_switch_time) resets last_switch_time and permits proactive rotation
+        self.engine_mock.get_active_name.return_value = "standby-2"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.95}},
+                    "standby-acc": {"gemini": {"fraction": 0.10}},
+                    "standby-2": {"gemini": {"fraction": 0.11}},
+                }
+            }),
+            encoding="utf-8",
+        )
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "primary-acc",
+            "success": True,
+            "server_restarted": True,
+        }
+        lock_file.touch()
+        skewed_now = t0 - 500.0
+        with patch("time.time", return_value=skewed_now):
+            self.assertEqual(watcher.poll_once(), 1)
+        self.assertEqual(watcher.last_switch_time, skewed_now)
+
+
 if __name__ == '__main__':
     unittest.main()
 
