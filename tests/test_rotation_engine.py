@@ -80,6 +80,56 @@ class TestRotationEngine(unittest.TestCase):
         result = engine.evaluate(accounts, current_active="acc1", target_model="gemini", current_time=self.base_time)
         self.assertIsNone(result)
 
+    def test_drain_window_preservation_active_retained(self):
+        """[WATCH-PROACTIVE-003]: Active account with 12% quota and reset in 18m is retained."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="primary-acc", threshold=0.20)
+        accounts = [
+            {"name": "primary-acc", "quota": self._make_quota(gemini_frac=0.12, gemini_reset=18)},
+            {"name": "standby-acc", "quota": self._make_quota(gemini_frac=0.95, gemini_reset=120)},
+        ]
+        result = engine.evaluate(accounts, current_active="primary-acc", target_model="gemini", current_time=self.base_time)
+        self.assertIsNone(result)
+
+    def test_drain_window_hard_floor_override_rotates(self):
+        """[WATCH-PROACTIVE-EDGE-002]: Active account with 4% quota inside drain window overrides retention and rotates."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="primary-acc", threshold=0.20)
+        accounts = [
+            {"name": "primary-acc", "quota": self._make_quota(gemini_frac=0.04, gemini_reset=10)},
+            {"name": "standby-acc", "quota": self._make_quota(gemini_frac=0.95, gemini_reset=120)},
+        ]
+        result = engine.evaluate(accounts, current_active="primary-acc", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "standby-acc")
+
+    def test_drain_window_exact_5_percent_hard_floor_override(self):
+        """Active account with exact 5% quota overrides drain window retention and rotates."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="primary-acc", threshold=0.20)
+        accounts = [
+            {"name": "primary-acc", "quota": self._make_quota(gemini_frac=0.05, gemini_reset=10)},
+            {"name": "standby-acc", "quota": self._make_quota(gemini_frac=0.95, gemini_reset=120)},
+        ]
+        result = engine.evaluate(accounts, current_active="primary-acc", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "standby-acc")
+
+    def test_drain_window_exact_30_minutes_boundary(self):
+        """Active account with 12% quota and reset in exact 30.0m is retained."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="primary-acc", threshold=0.20)
+        accounts = [
+            {"name": "primary-acc", "quota": self._make_quota(gemini_frac=0.12, gemini_reset=30)},
+            {"name": "standby-acc", "quota": self._make_quota(gemini_frac=0.95, gemini_reset=120)},
+        ]
+        result = engine.evaluate(accounts, current_active="primary-acc", target_model="gemini", current_time=self.base_time)
+        self.assertIsNone(result)
+
+    def test_drain_window_outside_30_minutes_boundary(self):
+        """Active account with 12% quota and reset in 31m (> 30m) is rotated."""
+        engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="primary-acc", threshold=0.20)
+        accounts = [
+            {"name": "primary-acc", "quota": self._make_quota(gemini_frac=0.12, gemini_reset=31)},
+            {"name": "standby-acc", "quota": self._make_quota(gemini_frac=0.95, gemini_reset=120)},
+        ]
+        result = engine.evaluate(accounts, current_active="primary-acc", target_model="gemini", current_time=self.base_time)
+        self.assertEqual(result, "standby-acc")
+
     def test_imminent_reset_priority(self):
         """Standby account nearing reset with healthy quota (>= 25%) is prioritized."""
         engine = RotationEngine(model_name="gemini-1.5-pro", active_account_id="acc1")

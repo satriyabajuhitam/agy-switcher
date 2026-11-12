@@ -131,11 +131,11 @@ class RotationEngine:
             except Exception:
                 return datetime.max.replace(tzinfo=timezone.utc)
         if isinstance(t_val, str):
-            if t_val.isdigit():
-                try:
-                    return datetime.fromtimestamp(int(t_val), tz=timezone.utc)
-                except Exception:
-                    pass
+            try:
+                f_val = float(t_val.strip())
+                return datetime.fromtimestamp(f_val, tz=timezone.utc)
+            except ValueError:
+                pass
             t_str = t_val
             if t_str.endswith("Z"):
                 t_str = t_str[:-1] + "+00:00"
@@ -150,6 +150,7 @@ class RotationEngine:
         self,
         quota_data: Mapping[str, object],
         model_key: str | None = None,
+        current_time: datetime | None = None,
     ) -> QuotaStatus | None:
         """Extracts QuotaStatus for the target model_key from quota payload dictionary."""
         if not quota_data or not isinstance(quota_data, Mapping):
@@ -167,7 +168,19 @@ class RotationEngine:
 
         if target_info is not None:
             q_val = target_info.get("quota") if target_info.get("quota") is not None else target_info.get("fraction")
-            r_val = target_info.get("reset_time")
+            r_val = target_info.get("reset_time") if target_info.get("reset_time") is not None else target_info.get("resetTime")
+            if r_val is None:
+                for delta_key in ("reset_delta", "delta_minutes", "remaining_minutes", "minutes_remaining"):
+                    d_val = target_info.get(delta_key)
+                    if isinstance(d_val, (int, float, str)) and not isinstance(d_val, bool):
+                        try:
+                            d_float = float(d_val)
+                            ref_dt = current_time if current_time is not None else datetime.now(timezone.utc)
+                            from datetime import timedelta
+                            r_val = ref_dt + timedelta(minutes=d_float)
+                            break
+                        except ValueError:
+                            pass
             if q_val is not None:
                 if isinstance(q_val, bool):
                     fraction = 0.0
@@ -484,13 +497,13 @@ class RotationEngine:
 
         if not is_active_in_cooldown:
             # 1. cache_optimized heuristic: retain current active if fraction > self.threshold
-            if active_status is not None and active_status.fraction > self.threshold:
+            if active_status is not None and round(active_status.fraction, 6) > round(self.threshold, 6):
                 return None
 
             # 2. drain_window heuristic: retain current active if fraction > 0.05 and reset in <= 30m
-            if active_status is not None and active_status.fraction > 0.05 and current_active is not None:
+            if active_status is not None and round(active_status.fraction, 6) > 0.05 and current_active is not None:
                 reset_delta = reset_deltas.get(current_active, float("inf"))
-                if 0 <= reset_delta <= 30:
+                if 0.0 <= reset_delta <= 30.0:
                     return None
 
         # 3. Candidate evaluation

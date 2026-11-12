@@ -2705,6 +2705,470 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         )
 
 
+class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
+    """Tests for standby account qualification and telemetry guards during proactive rotation.
+
+    Covers:
+    - [WATCH-PROACTIVE-004]: Standby account qualification requires healthy quota threshold of 70% or higher.
+    - [WATCH-PROACTIVE-ERR-001]: Telemetry fetch failure during proactive quota check retains active account without false rotation.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-1", "valid": True},
+                {"name": "standby-2", "valid": True},
+            ],
+        }
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-1",
+            "success": True,
+            "server_restarted": True,
+        }
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_session(self, session_id: str = "session-standby-qual") -> tuple[Path, Path]:
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / f"{session_id}.lock"
+        lock_file.touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        return lock_file, transcript_path
+
+    def test_standby_qualification_requires_healthy_quota_threshold_004(self):
+        """[WATCH-PROACTIVE-004]: GIVEN active account 'primary-acc' has remaining quota of 14%
+        AND standby account 'standby-1' has only 40% quota remaining (0.40 < 0.70)
+        AND standby account 'standby-2' has 10% quota remaining (0.10 < 0.70)
+        WHEN LogWatcher.poll_once() searches for eligible proactive rotation targets
+        THEN it evaluates that no standby account meets the 70% healthy standby threshold
+        AND suppresses proactive rotation, retaining 'primary-acc' until actual exhaustion occurs
+        or healthy standby quota becomes available.
+        """
+        lock_file, transcript_path = self._setup_session("session-qual-004")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Assistant finished response.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-1": {"gemini": {"fraction": 0.40}},
+                    "standby-2": {"gemini": {"fraction": 0.10}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        res = watcher.poll_once()
+        self.assertEqual(res, 0, "Proactive rotation must be suppressed when no standby meets 70% threshold")
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertEqual(watcher.last_switch_time, 0.0)
+
+        # Directly verify _probe_standby_candidates seam
+        candidates = watcher._probe_standby_candidates(
+            "primary-acc",
+            {"primary-acc": {"fraction": 0.14}, "standby-1": {"fraction": 0.40}, "standby-2": {"fraction": 0.10}},
+        )
+        self.assertEqual(candidates, [], "Candidates must be empty when all standbys have < 70% quota")
+
+    def test_standby_qualification_telemetry_fetch_failure_err_001(self):
+        """[WATCH-PROACTIVE-ERR-001]: GIVEN LogWatcher.poll_once() attempts to evaluate active account quota
+        AND last_known_quota.json is missing and live CloudCode telemetry raises urllib.error.URLError
+        WHEN LogWatcher evaluates proactive rotation conditions
+        THEN it catches the network exception gracefully without crashing the daemon
+        AND suppresses proactive rotation, retaining the active account until valid telemetry is retrieved.
+        """
+        lock_file, transcript_path = self._setup_session("session-err-001")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Turn execution finished.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        if quota_cache_file.exists():
+            quota_cache_file.unlink()
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        from io import StringIO
+        stderr_capture = StringIO()
+        with patch("scripts.watch.fetch_account_quota", side_effect=urllib.error.URLError("Network unreachable")):
+            with patch("sys.stderr", stderr_capture):
+                res = watcher.poll_once()
+
+        self.assertEqual(res, 0, "Daemon must catch URLError gracefully and return 0 (suppressing rotation)")
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertEqual(watcher.last_switch_time, 0.0)
+
+    def test_standby_qualification_qualifying_standby_selected_successfully(self):
+        """Standby account with >= 70% quota qualifies and is selected over depleted accounts."""
+        lock_file, transcript_path = self._setup_session("session-qual-success")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Turn execution completed.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {"gemini": {"fraction": 0.14}},
+                    "standby-1": {"gemini": {"fraction": 0.40}},
+                    "standby-2": {"gemini": {"fraction": 0.85}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Directly verify _probe_standby_candidates seam returns highest qualified candidate first
+        candidates = watcher._probe_standby_candidates(
+            "primary-acc",
+            {
+                "primary-acc": {"gemini": {"fraction": 0.14}},
+                "standby-1": {"gemini": {"fraction": 0.40}},
+                "standby-2": {"gemini": {"fraction": 0.85}},
+            },
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0][0], "standby-2")
+        self.assertAlmostEqual(candidates[0][1], 0.85)
+
+        res = watcher.poll_once()
+        self.assertTrue(res)
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-2", restart_server=True, force=True
+        )
+
+    def test_standby_qualification_live_telemetry_fallback_when_cache_missing(self):
+        """Live CloudCode telemetry fallback resolves active and standby quotas when cache is missing."""
+        lock_file, transcript_path = self._setup_session("session-live-fallback")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Turn execution completed.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        if quota_cache_file.exists():
+            quota_cache_file.unlink()
+
+        def fake_fetch_account_quota(engine, acc_name, client=None):
+            if acc_name == "primary-acc":
+                return acc_name, {"gemini": {"fraction": 0.14}}
+            elif acc_name == "standby-1":
+                return acc_name, {"gemini": {"fraction": 0.40}}
+            elif acc_name == "standby-2":
+                return acc_name, {"gemini": {"fraction": 0.85}}
+            return acc_name, {"error": "unknown account"}
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        with patch("scripts.watch.fetch_account_quota", side_effect=fake_fetch_account_quota):
+            res = watcher.poll_once()
+
+        self.assertTrue(res)
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-2", restart_server=True, force=True
+        )
+
+
+class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
+    """Tests for drain window preservation and 5% hard floor override during proactive rotation.
+
+    Covers:
+    - [WATCH-PROACTIVE-003]: Drain window preservation retains active account when reset in <= 30m and quota > 5%.
+    - [WATCH-PROACTIVE-EDGE-002]: Active quota at or below 5% inside drain window overrides retention and forces rotation.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "active": "primary-acc",
+            "accounts": [
+                {"name": "primary-acc", "valid": True},
+                {"name": "standby-acc", "valid": True},
+            ],
+        }
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-acc",
+            "success": True,
+            "server_restarted": True,
+        }
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_session(self, session_id: str = "session-drain-window") -> tuple[Path, Path]:
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / f"{session_id}.lock"
+        lock_file.touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        return lock_file, transcript_path
+
+    def test_drain_window_preservation_retains_active_account_watch_proactive_003(self):
+        """[WATCH-PROACTIVE-003]: GIVEN active account 'primary-acc' has remaining quota of 12% (0.12 <= 0.20)
+        AND the quota reset timestamp is in 18 minutes (reset_delta = 18.0 <= 30.0)
+        AND the remaining balance exceeds the absolute floor of 5% (0.12 > 0.05)
+        WHEN LogWatcher.poll_once() evaluates proactive rotation conditions
+        THEN it applies the drain window preservation heuristic
+        AND suppresses rotation, retaining 'primary-acc' as active to utilize remaining quota before reset.
+        """
+        lock_file, transcript_path = self._setup_session("session-drain-003")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Step complete.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        now = 1700000000.0
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {
+                        "gemini": {
+                            "fraction": 0.12,
+                            "reset_time": now + (18.0 * 60.0),
+                        }
+                    },
+                    "standby-acc": {"gemini": {"fraction": 0.95}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        with patch("time.time", return_value=now):
+            res = watcher.poll_once()
+
+        self.assertEqual(res, 0, "Drain window must suppress rotation when fraction > 0.05 and reset in <= 30m")
+        self.engine_mock.switch_tokens.assert_not_called()
+
+    def test_drain_window_hard_floor_override_forces_rotation_watch_proactive_edge_002(self):
+        """[WATCH-PROACTIVE-EDGE-002]: GIVEN active account 'primary-acc' has 4% Gemini quota remaining (0.04 <= 0.05)
+        AND quota reset is scheduled in 10 minutes (reset_delta = 10.0 <= 30.0)
+        AND standby account 'standby-acc' has 95% quota
+        AND the system is at a verified Safe Turn Boundary
+        WHEN LogWatcher.poll_once() evaluates proactive rotation conditions
+        THEN it evaluates that quota is at or below the 5% hard floor (0.04 <= 0.05)
+        AND overrides the drain window retention, rotating immediately to 'standby-acc' to prevent impending 429 exhaustion.
+        """
+        lock_file, transcript_path = self._setup_session("session-drain-edge-002")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Step complete.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        now = 1700000000.0
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {
+                        "gemini": {
+                            "fraction": 0.04,
+                            "reset_time": now + (10.0 * 60.0),
+                        }
+                    },
+                    "standby-acc": {"gemini": {"fraction": 0.95}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        with patch("time.time", return_value=now):
+            res = watcher.poll_once()
+
+        self.assertTrue(res, "Hard floor <= 5% must override drain window and force rotation")
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-acc", restart_server=True, force=True
+        )
+
+    def test_drain_window_exact_5_percent_hard_floor_override(self):
+        """Active account at exact 5.0% quota floor overrides drain window and rotates immediately."""
+        lock_file, transcript_path = self._setup_session("session-drain-exact-floor")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Step complete.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        now = 1700000000.0
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {
+                        "gemini": {
+                            "fraction": 0.05,
+                            "reset_time": now + (10.0 * 60.0),
+                        }
+                    },
+                    "standby-acc": {"gemini": {"fraction": 0.95}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        with patch("time.time", return_value=now):
+            res = watcher.poll_once()
+
+        self.assertTrue(res, "Exact 5% floor must override drain window and rotate")
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-acc", restart_server=True, force=True
+        )
+
+    def test_drain_window_outside_30m_rotates_normally(self):
+        """Active account with 12% quota but reset scheduled in 35 minutes (> 30m) rotates normally."""
+        lock_file, transcript_path = self._setup_session("session-drain-outside-window")
+        record = {
+            "type": "MESSAGE",
+            "status": "DONE",
+            "content": "Step complete.",
+        }
+        transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        now = 1700000000.0
+        quota_cache_file = self.cache_dir / "last_known_quota.json"
+        quota_cache_file.write_text(
+            json.dumps({
+                "accounts": {
+                    "primary-acc": {
+                        "gemini": {
+                            "fraction": 0.12,
+                            "reset_time": now + (35.0 * 60.0),
+                        }
+                    },
+                    "standby-acc": {"gemini": {"fraction": 0.95}},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        with patch("time.time", return_value=now):
+            res = watcher.poll_once()
+
+        self.assertTrue(res, "Reset outside 30m window does not qualify for drain window; rotates normally")
+        self.engine_mock.switch_tokens.assert_called_once_with(
+            "standby-acc", restart_server=True, force=True
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
 

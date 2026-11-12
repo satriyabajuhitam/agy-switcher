@@ -121,13 +121,10 @@ def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], _T]) -> _T:
 
 def _get_rotation_engine_class() -> Any:
     return _resolve_symbol("RotationEngine", lambda: __import__("agy_switcher.rotation", fromlist=["RotationEngine"]).RotationEngine)
-
 def _get_quota_client_class() -> Any:
     return _resolve_symbol("QuotaClient", lambda: _RealQuotaClient)
-
 def _get_fetch_account_quota() -> Callable[..., tuple[str, Mapping[str, object] | None]] | None:
     return _resolve_symbol("fetch_account_quota", lambda: _real_fetch_account_quota)
-
 def _get_engine_class() -> Any:
     def _fallback() -> Any:
         for m in ("agy_switcher.vault", "agy_switch", "scripts.agy_switch"):
@@ -136,13 +133,10 @@ def _get_engine_class() -> Any:
             except ImportError:
                 pass
     return _resolve_symbol("AgySwitchEngine", _fallback)
-
 def _get_shutil() -> Any:
     return _resolve_symbol("shutil", lambda: shutil)
-
 def _get_subprocess() -> Any:
     return _resolve_symbol("subprocess", lambda: subprocess)
-
 def _get_time() -> Any:
     return _resolve_symbol("time", lambda: time)
 
@@ -251,42 +245,20 @@ class CooldownManager:
                 else:
                     modified = True
             elif isinstance(val, dict):
-                needs_repair = False
                 try:
-                    exhausted_val = val.get("exhausted_at")
-                    if exhausted_val is not None:
-                        exhausted_at = float(exhausted_val)
-                        if not math.isfinite(exhausted_at):
-                            modified = True
-                            continue
-                    else:
-                        exhausted_at = now
-                        needs_repair = True
-                    cooldown_val = val.get("cooldown_until")
-                    if cooldown_val is not None:
-                        cooldown_until = float(cooldown_val)
-                        if not math.isfinite(cooldown_until):
-                            modified = True
-                            continue
-                    else:
-                        cooldown_until = exhausted_at + self.default_cooldown_seconds
-                        needs_repair = True
-                    reason_val = val.get("reason")
-                    if reason_val is not None and isinstance(reason_val, str) and reason_val.strip():
-                        reason = reason_val.strip()
-                    else:
-                        reason = "RESOURCE_EXHAUSTED"
-                        needs_repair = True
+                    e_raw, c_raw = val.get("exhausted_at"), val.get("cooldown_until")
+                    needs_repair = (e_raw is None) or (c_raw is None) or not val.get("reason")
+                    exhausted_at = now if e_raw is None else float(e_raw)
+                    cooldown_until = (exhausted_at + self.default_cooldown_seconds) if c_raw is None else float(c_raw)
+                    if not (math.isfinite(exhausted_at) and math.isfinite(cooldown_until)):
+                        modified = True
+                        continue
+                    reason = str(val.get("reason") or "RESOURCE_EXHAUSTED").strip() or "RESOURCE_EXHAUSTED"
                     if cooldown_until > now:
-                        active_records[cleaned_name] = {
-                            "cooldown_until": cooldown_until,
-                            "exhausted_at": exhausted_at,
-                            "reason": reason,
-                        }
+                        active_records[cleaned_name] = {"cooldown_until": cooldown_until, "exhausted_at": exhausted_at, "reason": reason}
                         if needs_repair:
                             modified = True
                     else:
-                        # Expired: pruned
                         modified = True
                 except (ValueError, TypeError):
                     modified = True
@@ -688,6 +660,38 @@ class LogWatcher:
                 return Path(d)
         return Path(vd) / "cache" if isinstance(vd := getattr(self.engine, "vault_dir", None), (str, Path)) else None
 
+    def _load_cached_quota_data(self) -> tuple[dict[str, Any], Any]:
+        """Loads cached quota dictionary and client instance if available."""
+        cache_data: dict[str, Any] = {}
+        client = None
+        try:
+            client = _get_quota_client_class()(self.engine)
+            if isinstance(loaded := client.load_cache(), dict):
+                cache_data = loaded
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            logger.warning("[watch] Quota cache load network error: %s", e)
+        except Exception as e:
+            logger.debug("[watch] Quota cache load failure: %s", e)
+        if not cache_data and (c_dir := self._resolve_cache_dir()):
+            try:
+                if (q_path := c_dir / "last_known_quota.json").is_file():
+                    cache_data = json.loads(q_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return cache_data, client
+
+    def _advance_cursors_to_eof(self) -> None:
+        """Advances active file cursors to EOF and clears stagnant size tracking."""
+        for target_file in list(self.file_cursors.keys()):
+            try:
+                if os.path.isfile(target_file):
+                    self.file_cursors[target_file] = os.path.getsize(target_file)
+                else:
+                    self.file_cursors.pop(target_file, None)
+            except (OSError, ValueError, TypeError):
+                self.file_cursors.pop(target_file, None)
+        self._stagnant_sizes.clear()
+
     def _is_account_cooldown_penalized(
         self,
         acc_name: str,
@@ -849,32 +853,8 @@ class LogWatcher:
         acc_quota = accounts_cache.get(active_account)
         if acc_quota is None:
             return None
-        if isinstance(acc_quota, (int, float)) and not isinstance(acc_quota, bool):
-            val = float(acc_quota)
-            return val / 100.0 if val > 1.0 else max(0.0, val)
-        if isinstance(acc_quota, str):
-            try:
-                s_val = float(acc_quota.strip().rstrip("%"))
-                return s_val / 100.0 if s_val > 1.0 else max(0.0, s_val)
-            except ValueError:
-                pass
-        if not isinstance(acc_quota, Mapping):
-            return None
-        # Prefer RotationEngine parser for multi-bucket group structures before flat fallback
-        rot_cls = _get_rotation_engine_class()
-        try:
-            rot = rot_cls(model_name=model_name, active_account_id=active_account)
-            status = rot.get_quota_status(acc_quota, model_key=model_name)
-            if status is not None and hasattr(status, "fraction"):
-                raw_f = status.fraction
-                if isinstance(raw_f, (int, float)) and not isinstance(raw_f, bool):
-                    return float(raw_f)
-        except Exception:
-            pass
-        # 2. Direct inspection fallback for flexible cache schemas
-        candidate = acc_quota.get(model_name)
-        target: Mapping[str, object] = candidate if isinstance(candidate, Mapping) else acc_quota
-        for v in (candidate, *(target.get(k) for k in ("fraction", "remaining_fraction", "remainingFraction", "quota"))):
+
+        def _parse_val(v: object) -> float | None:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 val = float(v)
                 return val / 100.0 if val > 1.0 else max(0.0, val)
@@ -884,6 +864,24 @@ class LogWatcher:
                     return s_val / 100.0 if s_val > 1.0 else max(0.0, s_val)
                 except ValueError:
                     pass
+            return None
+
+        if (pv := _parse_val(acc_quota)) is not None:
+            return pv
+        if not isinstance(acc_quota, Mapping):
+            return None
+        try:
+            rot = _get_rotation_engine_class()(model_name=model_name, active_account_id=active_account)
+            st = rot.get_quota_status(acc_quota, model_key=model_name)
+            if st is not None and hasattr(st, "fraction") and isinstance(rf := st.fraction, (int, float)) and not isinstance(rf, bool):
+                return float(rf)
+        except Exception:
+            pass
+        cand = acc_quota.get(model_name)
+        tgt: Mapping[str, object] = cand if isinstance(cand, Mapping) else acc_quota
+        for v in (cand, *(tgt.get(k) for k in ("fraction", "remaining_fraction", "remainingFraction", "quota"))):
+            if (pv := _parse_val(v)) is not None:
+                return pv
         return None
 
     def trigger_switch(
@@ -912,23 +910,7 @@ class LogWatcher:
         if not active_name:
             print("[watch] No active account found. Cannot switch.", file=sys.stderr)
             return False
-        # Read cache to get quotas first
-        cache_data: dict[str, Any] = {}
-        client = None
-        try:
-            client = _get_quota_client_class()(self.engine)
-            cache_data = client.load_cache()
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            logger.warning("[watch] Pre-Switch Quota Probe cache load network error: %s", e)
-            print(f"[watch] Pre-Switch Quota Probe cache load network error: {e}. Treating quota as unverified.", file=sys.stderr)
-        except Exception as e:
-            logger.debug("[watch] Pre-Switch Quota Probe cache load failure: %s", e)
-        if not cache_data and (c_dir := getattr(self.engine, "cache_dir", None) or getattr(self.cooldown_manager, "cache_dir", None)):
-            try:
-                if (q_path := Path(c_dir) / "last_known_quota.json").is_file():
-                    cache_data = json.loads(q_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+        cache_data, client = self._load_cached_quota_data()
         accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
         resolved_model = model_hint or self.infer_target_model(line=line, active_account=active_name, cache=accounts_cache)
         probe_model = resolved_model if resolved_model in ("gemini", "claude") else "gemini"
@@ -1027,20 +1009,9 @@ class LogWatcher:
                 return False
             self.last_switch_time = time.time()
             print(f"[watch] Successfully switched to '{target_account}'.", file=sys.stderr)
-            # Advance all active targets in self.file_cursors to EOF defensively and reset stagnant sizes
-            if file_path:
-                file_path_str = str(file_path)
-                if file_path_str not in self.file_cursors:
-                    self.file_cursors[file_path_str] = 0
-            for target_file in list(self.file_cursors.keys()):
-                try:
-                    if os.path.isfile(target_file):
-                        self.file_cursors[target_file] = os.path.getsize(target_file)
-                    else:
-                        self.file_cursors.pop(target_file, None)
-                except (OSError, ValueError):
-                    self.file_cursors.pop(target_file, None)
-            self._stagnant_sizes.clear()
+            if file_path and (file_path_str := str(file_path)) not in self.file_cursors:
+                self.file_cursors[file_path_str] = 0
+            self._advance_cursors_to_eof()
             # Fire non-blocking desktop notification (encapsulates 1.0s settling delay when reloaded=True)
             server_restarted = res.get("server_restarted", False) if isinstance(res, dict) else False
             self._notify_desktop(
@@ -1208,52 +1179,112 @@ class LogWatcher:
 
             status = str(record.get("status", "")).strip().upper()
             msg_type = str(record.get("type", "")).strip().upper()
-
-            if status in ("IN_PROGRESS", "RUNNING", "STREAMING"):
+            if (
+                status in ("IN_PROGRESS", "RUNNING", "STREAMING")
+                or bool(record.get("tool_calls"))
+                or (status != "DONE" and msg_type != "USER_INPUT")
+                or self._is_server_busy()
+            ):
                 return False
-
-            if bool(record.get("tool_calls")):
-                return False
-
-            if status != "DONE" and msg_type != "USER_INPUT":
-                return False
-
-            if self._is_server_busy():
-                return False
-
             return True
         except Exception:
             return False
 
+    def _probe_standby_candidates(
+        self,
+        active_account: str,
+        accounts_cache: Mapping[str, object] | None = None,
+        model_name: str = "gemini",
+        accounts_list: list[Any] | None = None,
+    ) -> list[tuple[str, float]]:
+        """Probes standby accounts for proactive rotation eligibility (>= 70% quota)."""
+        if accounts_list is None:
+            raw: object = getattr(self.engine, "list_accounts", lambda: {})()
+            accounts_list = raw.get("accounts") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        accounts_list = accounts_list or []
+        cooldowns = self.get_cooldowns() if hasattr(self, "get_cooldowns") else {}
+
+        candidates: list[tuple[str, float]] = []
+        for acc in accounts_list:
+            acc_name = acc.get("name") if isinstance(acc, dict) else getattr(acc, "name", None)
+            if not acc_name or acc_name == active_account:
+                continue
+            if self._is_account_cooldown_penalized(acc_name, cooldowns, accounts_cache if isinstance(accounts_cache, dict) else None):
+                continue
+            if not (acc.get("valid", True) if isinstance(acc, dict) else getattr(acc, "valid", True)):
+                continue
+
+            acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
+            q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name=model_name)
+            if q_frac is None and hasattr(self, "engine") and (fetch_acc_fn := _get_fetch_account_quota()):
+                try:
+                    _, standby_live = fetch_acc_fn(self.engine, acc_name)
+                    if isinstance(standby_live, Mapping) and not standby_live.get("error"):
+                        q_frac = self._probe_active_quota(acc_name, {acc_name: standby_live}, model_name=model_name)
+                except Exception:
+                    pass
+
+            if q_frac is not None and round(q_frac, 6) >= 0.70:
+                candidates.append((acc_name, q_frac))
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        return candidates
+
+    def _probe_account_reset_delta(
+        self,
+        account_name: str,
+        accounts_cache: Mapping[str, object] | None = None,
+        model_name: str = "gemini",
+        now: float | None = None,
+    ) -> float | None:
+        """Extracts the reset delta in minutes relative to current time for account_name."""
+        now = time.time() if now is None else now
+        curr_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        if isinstance(accounts_cache, Mapping) and isinstance(acc_entry := accounts_cache.get(account_name), Mapping):
+            for src in (acc_entry.get(model_name), acc_entry):
+                if isinstance(src, Mapping):
+                    for k in ("reset_delta", "remaining_minutes", "delta_minutes", "minutes_remaining"):
+                        if (val := src.get(k)) is not None and not isinstance(val, bool):
+                            try:
+                                if math.isfinite(f_val := float(val)):
+                                    return f_val
+                            except ValueError:
+                                pass
+            try:
+                rot = _get_rotation_engine_class()(model_name=model_name, active_account_id=account_name)
+                st = rot.get_quota_status(acc_entry, model_key=model_name, current_time=curr_dt)
+                if hasattr(st, "reset_time") and hasattr(st, "get_reset_delta_minutes") and st.reset_time != datetime.max.replace(tzinfo=timezone.utc):
+                    if math.isfinite(delta := float(st.get_reset_delta_minutes(curr_dt))):
+                        return delta
+            except Exception:
+                pass
+            for src in (acc_entry.get(model_name), acc_entry):
+                if isinstance(src, Mapping) and (rt_raw := src.get("reset_time", src.get("resetTime"))) is not None and not isinstance(rt_raw, bool):
+                    pts = CooldownManager._parse_timestamp(rt_raw)
+                    if math.isfinite(pts) and pts != float("inf"):
+                        return (pts - now) / 60.0
+        if hasattr(self, "cooldown_manager") and self.cooldown_manager is not None:
+            try:
+                if (rt_val := self.cooldown_manager.get_reset_time_from_cache(account_name, model_hint=model_name)) is not None and math.isfinite(rt_val):
+                    return (rt_val - now) / 60.0
+            except Exception:
+                pass
+        return None
+
     def _evaluate_proactive_rotation(self) -> bool:
         """Evaluates proactive rotation eligibility at a Safe Turn Boundary."""
         try:
-            threshold_attr = getattr(self.engine, "get_quota_threshold", getattr(self.engine, "quota_threshold", None))
-            if threshold_attr is None:
+            thresh_attr = getattr(self.engine, "get_quota_threshold", getattr(self.engine, "quota_threshold", None))
+            if thresh_attr is None:
                 return False
             threshold = 0.20
             try:
-                if (val := float(threshold_attr() if callable(threshold_attr) else threshold_attr)) > 0:
+                if (val := float(thresh_attr() if callable(thresh_attr) else thresh_attr)) > 0:
                     threshold = val
             except Exception:
                 pass
 
             if threshold <= 0.0 or not self._is_turn_quiescent():
-                return False
-
-            cache_data: dict[str, Any] = {}
-            try:
-                if isinstance(loaded := _get_quota_client_class()(self.engine).load_cache(), dict):
-                    cache_data = loaded
-            except Exception:
-                pass
-            if not cache_data and (c_dir := self._resolve_cache_dir()):
-                try:
-                    if (q_path := c_dir / "last_known_quota.json").is_file():
-                        cache_data = json.loads(q_path.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
-            if not cache_data:
                 return False
 
             now = time.time()
@@ -1267,59 +1298,61 @@ class LogWatcher:
             if not callable(get_active_fn) or not isinstance(active_name := get_active_fn(), str) or not active_name:
                 return False
 
+            cache_data, client = self._load_cached_quota_data()
             accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
             active_quota_fraction = self._probe_active_quota(
                 active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini"
             )
+
+            live_data_map: Mapping[str, object] | None = None
+            if active_quota_fraction is None:
+                try:
+                    if fetch_acc_fn := _get_fetch_account_quota():
+                        _, live_data = fetch_acc_fn(self.engine, active_name, client=client)
+                        if isinstance(live_data, Mapping) and not live_data.get("error"):
+                            live_data_map = {active_name: live_data}
+                            active_quota_fraction = self._probe_active_quota(
+                                active_name, live_data_map, model_name="gemini"
+                            )
+                except (urllib.error.URLError, TimeoutError, OSError) as e:
+                    logger.warning("[watch] Proactive quota probe live telemetry network error for '%s': %s", active_name, e)
+                    print(f"[watch] Proactive quota probe live telemetry network error for '{active_name}': {e}. Retaining active account.", file=sys.stderr)
+                    return False
+                except Exception as e:
+                    logger.debug("[watch] Proactive quota probe live telemetry failure for '%s': %s", active_name, e)
+                    return False
+
             if active_quota_fraction is None or round(active_quota_fraction, 6) > round(threshold, 6):
                 return False
 
-            raw_accounts: object = getattr(self.engine, "list_accounts", lambda: {})()
-            accounts_list = raw_accounts.get("accounts") if isinstance(raw_accounts, dict) else (raw_accounts if isinstance(raw_accounts, list) else [])
-            accounts_list = accounts_list or []
-            cooldowns = self.get_cooldowns() if hasattr(self, "get_cooldowns") else {}
+            probe_cache = live_data_map if live_data_map is not None else (accounts_cache if isinstance(accounts_cache, Mapping) else None)
+            reset_delta = self._probe_account_reset_delta(active_name, probe_cache, model_name="gemini", now=now)
+            if reset_delta is not None and 0.0 <= reset_delta <= 30.0:
+                if round(active_quota_fraction, 6) > 0.05:
+                    print(f"[watch] Drain window active: '{active_name}' reset in {reset_delta:.1f}m (<= 30.0m) with {active_quota_fraction * 100:.1f}% quota (> 5.0%). Retaining active account.", file=sys.stderr)
+                    return False
+                print(f"[watch] Drain window hard floor override: '{active_name}' has {active_quota_fraction * 100:.1f}% quota (<= 5.0%) inside drain window. Forcing rotation.", file=sys.stderr)
 
-            best_standby, best_quota = None, -1.0
-            for acc in accounts_list:
-                acc_name = acc.get("name") if isinstance(acc, dict) else getattr(acc, "name", None)
-                if not acc_name or acc_name == active_name:
-                    continue
-                if self._is_account_cooldown_penalized(acc_name, cooldowns, accounts_cache if isinstance(accounts_cache, dict) else None):
-                    continue
-                if not (acc.get("valid", True) if isinstance(acc, dict) else getattr(acc, "valid", True)):
-                    continue
-                acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
-                q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name="gemini")
-                if q_frac is not None and round(q_frac, 6) >= 0.70 and round(q_frac, 6) > round(best_quota, 6):
-                    best_quota = q_frac
-                    best_standby = acc_name
-
-            if not best_standby:
+            candidates = self._probe_standby_candidates(active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini")
+            if not candidates:
                 return False
 
-            print(
-                f"[watch] Proactive threshold failover: Active account '{active_name}' quota "
-                f"({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. "
-                f"Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).",
-                file=sys.stderr,
-            )
+            best_standby, best_quota = candidates[0]
+            print(f"[watch] Proactive threshold failover: Active account '{active_name}' quota ({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).", file=sys.stderr)
             try:
                 res = self.engine.switch_tokens(best_standby, restart_server=True, force=True)
-                is_dict = isinstance(res, dict)
-                failed = not res or (
-                    is_dict and (
-                        res.get("success") is False or bool(res.get("error"))
-                        or (not res.get("active") and not res.get("success"))
-                        or (bool(res.get("active")) and res.get("active") != best_standby and not res.get("success"))
-                    )
-                )
+                failed = not res or (isinstance(res, dict) and (
+                    res.get("success") is False or bool(res.get("error"))
+                    or (not res.get("active") and not res.get("success"))
+                    or (bool(res.get("active")) and res.get("active") != best_standby and not res.get("success"))
+                ))
                 if failed:
                     err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
                     print(f"[watch] Failed to proactively switch accounts to '{best_standby}': {err_msg}", file=sys.stderr)
                     return False
                 self.last_switch_time = time.time()
                 print(f"[watch] Successfully proactively switched to '{best_standby}'.", file=sys.stderr)
-                if not self.active_transcript_path and hasattr(self, "presence_detector") and self.presence_detector is not None:
+                if not self.active_transcript_path and getattr(self, "presence_detector", None) is not None:
                     try:
                         sid = self.active_session_id or getattr(self.presence_detector, "get_active_session_id", lambda: None)()
                         if (p := self.presence_detector.get_active_transcript_path(session_id=sid)) and p.is_file():
@@ -1328,15 +1361,7 @@ class LogWatcher:
                         pass
                 if self.active_transcript_path and (trans_str := str(self.active_transcript_path)) not in self.file_cursors:
                     self.file_cursors[trans_str] = 0
-                for target_file in list(self.file_cursors.keys()):
-                    try:
-                        if os.path.isfile(target_file):
-                            self.file_cursors[target_file] = os.path.getsize(target_file)
-                        else:
-                            self.file_cursors.pop(target_file, None)
-                    except (OSError, ValueError, TypeError):
-                        self.file_cursors.pop(target_file, None)
-                self._stagnant_sizes.clear()
+                self._advance_cursors_to_eof()
                 return True
             except Exception as e:
                 print(f"[watch] Error during proactive account rotation: {e}", file=sys.stderr)
@@ -1548,39 +1573,24 @@ class DaemonManager:
             return False
         try:
             os.kill(pid, 0)
-        except (ProcessLookupError, PermissionError):
-            return False
-        except OSError:
+        except (ProcessLookupError, PermissionError, OSError):
             return False
         return self._is_watch_cmdline(pid)
 
     def get_running_pid(self) -> int | None:
-        """
-        Reads and returns running daemon PID from watch.pid if active.
-        Automatically unlinks dead, stale, or corrupted PID files.
-        """
-        if self.pid_file.is_symlink():
-            self._clean_pid_file()
-            return None
-        if not self.pid_file.is_file():
+        """Reads and returns running daemon PID from watch.pid if active. Unlinks dead/stale PID files."""
+        if self.pid_file.is_symlink() or not self.pid_file.is_file():
+            if self.pid_file.is_symlink():
+                self._clean_pid_file()
             return None
         try:
-            content = self.pid_file.read_text(encoding="utf-8").strip()
-            if not content:
-                self._clean_pid_file()
-                return None
-            pid = int(content)
-            if pid <= 1:
-                self._clean_pid_file()
-                return None
+            pid = int(self.pid_file.read_text(encoding="utf-8").strip())
+            if pid > 1 and self.is_process_alive(pid):
+                return pid
         except (OSError, ValueError):
-            self._clean_pid_file()
-            return None
-        if self.is_process_alive(pid):
-            return pid
-        else:
-            self._clean_pid_file()
-            return None
+            pass
+        self._clean_pid_file()
+        return None
 
     def start(self, cooldown: int | None = None) -> int:
         """
@@ -1622,10 +1632,7 @@ class DaemonManager:
                 proc.terminate()
                 proc.wait(timeout=1.0)
             except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                proc.kill()
             raise
         return pid
 
@@ -1648,11 +1655,9 @@ class DaemonManager:
         except PermissionError as e:
             print(f"Error stopping daemon: Permission denied for PID {pid} ({e})", file=sys.stderr)
             return False
-        except ProcessLookupError:
-            self._clean_pid_file()
-            return False
-        except OSError as e:
-            print(f"Error stopping daemon: {e}", file=sys.stderr)
+        except (ProcessLookupError, OSError) as e:
+            if not isinstance(e, ProcessLookupError):
+                print(f"Error stopping daemon: {e}", file=sys.stderr)
             self._clean_pid_file()
             return False
         start_time = time.time()
@@ -1695,26 +1700,13 @@ class DaemonManager:
         Automatically cleans up stale PID files.
         """
         pid = self.get_running_pid()
+        targets: list[str] = []
         if pid is not None:
-            targets: list[str] = []
             try:
-                detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
-                targets = [str(t) for t in detector.get_watch_targets(as_str=True)]
+                targets = [str(t) for t in PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir).get_watch_targets(as_str=True)]
             except Exception:
-                targets = []
-            return {
-                "running": True,
-                "pid": pid,
-                "log_file": str(self.log_file),
-                "targets": targets,
-            }
-        else:
-            return {
-                "running": False,
-                "pid": None,
-                "log_file": str(self.log_file),
-                "targets": [],
-            }
+                pass
+        return {"running": pid is not None, "pid": pid, "log_file": str(self.log_file), "targets": targets}
 
     def generate_systemd(self, target_path: Path | str | None = None) -> str:
         """
