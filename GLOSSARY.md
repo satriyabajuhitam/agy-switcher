@@ -68,3 +68,20 @@ _Avoid_: Early switch, preemptive rotation, threshold hop
 A quiescent operational interval between agent turns—verified by completion markers in transcript.jsonl (e.g. status "DONE" or type "USER_INPUT") and an idle language_server process state—where credential rotation and language server reloads can execute without aborting running tool calls.
 _Avoid_: Turn pause, idle window, prompt gap
 
+**Canonical Launcher**:
+The unified, user-level entrypoint executable located at `~/.local/bin/agy-switch`, ensuring all Antigravity lifecycle hooks (`hooks.json`) and background services reference a single immutable PATH binary rather than transient repository clone directories.
+_Avoid_: Direct script execution, clone path binding, workspace script pointer
+
+**Daemon Mutual Exclusion**:
+A cross-process concurrency control mechanism utilizing file locking (`watch.lock`) and service state inspection (`systemd`) that strictly prevents multiple background watcher daemons (`watch run`) from concurrently monitoring the same vault and racing during account failovers.
+_Avoid_: Unbounded watcher, duplicate daemon, multi-tail race
+
+**Mock Vault Isolation**:
+The mandatory hermetic sandboxing of test suites and build gates into ephemeral temporary directories (`tmp`), strictly prohibiting test fixtures from reading or mutating the user's production vault (`~/.antigravity-vault`) or audit log (`watch.log`).
+_Avoid_: Global fallback, production log leaking, test pollution
+
+**Refresh-Aware Standby Viability**:
+A diagnostic validation standard that evaluates standby accounts by verifying the structural presence of an OAuth `refresh_token`, categorizing accounts with expired 1-hour access tokens as healthy standby rather than issuing premature authentication failure warnings.
+_Avoid_: Blind timestamp expiry, false warning, superficial token check
+
+
