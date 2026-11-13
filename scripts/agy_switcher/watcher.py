@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fcntl
 import glob
 import json
 import logging
@@ -470,6 +471,7 @@ class LogWatcher:
         presence_detector: PresenceDetector | None = None,
         max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
         supervisor: ProcessSupervisor | None = None,
+        daemon_manager: DaemonManager | None = None,
     ):
         self.engine = engine
         if damping_seconds is None:
@@ -514,6 +516,15 @@ class LogWatcher:
                 self.active_transcript_path = self.presence_detector.get_active_transcript_path(session_id=sid)
         except Exception:
             pass
+        if daemon_manager is not None:
+            self.daemon_manager = daemon_manager
+        else:
+            vault_dir = getattr(self.engine, "vault_dir", None)
+            self.daemon_manager = DaemonManager(vault_dir=vault_dir)
+
+    @property
+    def _lock_fd(self) -> int | None:
+        return self.daemon_manager._lock_fd
 
     def is_exhausted_message(self, line: str) -> bool:
         return bool(line and isinstance(line, str) and self.exhaustion_regex.search(line))
@@ -1450,21 +1461,29 @@ class LogWatcher:
         return switches_triggered
 
     def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None) -> None:
+        try:
+            self.daemon_manager._acquire_lock()
+        except (BlockingIOError, IOError):
+            print("Error: Another watcher daemon is already running.", file=sys.stderr)
+            sys.exit(1)
         print("[watch] Daemon started, tailing logs for quota exhaustion...", file=sys.stderr)
         iterations = 0
-        while True:
-            try:
-                self.poll_once()
-                iterations += 1
-                if max_iterations is not None and iterations >= max_iterations:
+        try:
+            while True:
+                try:
+                    self.poll_once()
+                    iterations += 1
+                    if max_iterations is not None and iterations >= max_iterations:
+                        break
+                    time.sleep(poll_interval)
+                except KeyboardInterrupt:
+                    print("\n[watch] Stopping daemon.", file=sys.stderr)
                     break
-                time.sleep(poll_interval)
-            except KeyboardInterrupt:
-                print("\n[watch] Stopping daemon.", file=sys.stderr)
-                break
-            except Exception as e:
-                print(f"[watch] Unhandled exception in loop: {e}", file=sys.stderr)
-                time.sleep(5)
+                except Exception as e:
+                    print(f"[watch] Unhandled exception in loop: {e}", file=sys.stderr)
+                    time.sleep(5)
+        finally:
+            self.daemon_manager._release_lock()
 
 class DaemonManager:
     """
@@ -1491,11 +1510,59 @@ class DaemonManager:
         self.vault_dir = Path(vault_dir).expanduser() if vault_dir else DEFAULT_VAULT_DIR
         self.pid_file = self.vault_dir / "watch.pid"
         self.log_file = self.vault_dir / "watch.log"
+        self.lock_file = self.vault_dir / "watch.lock"
+        self._lock_fd: int | None = None
         self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
         self.python_bin = python_bin or sys.executable
         _canonical_watch = (Path(__file__).resolve().parent.parent / "watch.py").resolve()
         self.watch_script = Path(watch_script).resolve() if watch_script else _canonical_watch
         self.gemini_dir = Path(gemini_dir).expanduser() if gemini_dir else DEFAULT_GEMINI_DIR
+
+    def _acquire_lock(self) -> int:
+        """
+        Acquires an exclusive non-blocking POSIX kernel file lock on watch.lock.
+        Retains the open file descriptor in self._lock_fd.
+        Raises BlockingIOError or IOError if the lock is held by another process.
+        """
+        if self._lock_fd is not None:
+            return self._lock_fd
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
+
+        fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(self.lock_file, 0o600)
+        except OSError:
+            pass
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, IOError):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+        self._lock_fd = fd
+        return fd
+
+    def _release_lock(self) -> None:
+        """Releases the exclusive lock and closes the retained file descriptor."""
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self._lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
 
     def _clean_pid_file(self) -> None:
         """Safely unlinks PID file if it exists or is a symlink."""
@@ -1592,8 +1659,14 @@ class DaemonManager:
         Writes PID to watch.pid with mode 0600.
         Raises DaemonAlreadyRunningError if daemon is already active.
         """
+        try:
+            self._acquire_lock()
+        except (BlockingIOError, IOError):
+            print("Error: Another watcher daemon is already running.", file=sys.stderr)
+            sys.exit(1)
         existing_pid = self.get_running_pid()
         if existing_pid is not None:
+            self._release_lock()
             raise DaemonAlreadyRunningError(existing_pid)
         self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -1627,6 +1700,7 @@ class DaemonManager:
                 proc.wait(timeout=1.0)
             except Exception:
                 proc.kill()
+            self._release_lock()
             raise
         return pid
 
@@ -1653,6 +1727,7 @@ class DaemonManager:
             if not isinstance(e, ProcessLookupError):
                 print(f"Error stopping daemon: {e}", file=sys.stderr)
             self._clean_pid_file()
+            self._release_lock()
             return False
         start_time = time.time()
         poll_interval = 0.05
@@ -1685,6 +1760,7 @@ class DaemonManager:
         if self.is_process_alive(pid):
             return False
         self._clean_pid_file()
+        self._release_lock()
         return True
 
     def status(self) -> dict[str, Any]:

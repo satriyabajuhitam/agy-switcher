@@ -1,3 +1,5 @@
+import fcntl
+import io
 import json
 import socket
 import unittest
@@ -13,7 +15,7 @@ import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from scripts.watch import LogWatcher, PresenceDetector
+from scripts.watch import LogWatcher, PresenceDetector, DaemonManager, main as watch_main
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.models import AccountInfo
 
@@ -3795,6 +3797,144 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
         with patch("time.time", return_value=skewed_now):
             self.assertEqual(watcher.poll_once(), 1)
         self.assertEqual(watcher.last_switch_time, skewed_now)
+
+
+class TestDaemonLockMutualExclusion(unittest.TestCase):
+    """
+    [DAEMON-MUTEX-001] [DAEMON-MUTEX-002]
+    Validates POSIX kernel file locking on watch.lock across DaemonManager and LogWatcher.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+
+    def tearDown(self) -> None:
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _hold_external_lock(self) -> int:
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.open_fds.append(fd)
+        return fd
+
+    def test_DAEMON_MUTEX_001_daemon_manager_start_acquires_exclusive_lock(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=23456)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            pid = dm.start()
+            self.assertEqual(pid, 23456)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+
+        # Attempting secondary acquisition on another descriptor must raise BlockingIOError
+        probe_fd = os.open(str(self.lock_file), os.O_RDWR)
+        self.open_fds.append(probe_fd)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_DAEMON_MUTEX_001_log_watcher_watch_loop_acquires_exclusive_lock(self) -> None:
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+
+        # Confirm DaemonManager._acquire_lock retained or lock is held during execution
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        fd = dm._acquire_lock()
+        self.assertIsInstance(fd, int)
+        self.open_fds.append(fd)
+        self.assertEqual(dm._lock_fd, fd)
+
+        # Verify exclusive locking invariant
+        probe_fd = os.open(str(self.lock_file), os.O_RDWR)
+        self.open_fds.append(probe_fd)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_DAEMON_MUTEX_002_secondary_daemon_manager_start_rejected_with_exit_code_1(self) -> None:
+        self._hold_external_lock()
+        self.pid_file.write_text("11111\n", encoding="utf-8")
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(SystemExit) as ctx:
+                dm.start()
+            self.assertEqual(ctx.exception.code, 1)
+            mock_popen.assert_not_called()
+
+        self.assertIn("Another watcher daemon is already running", stderr_capture.getvalue())
+        # Verify watch.pid was not corrupted or overwritten
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), "11111")
+
+    def test_DAEMON_MUTEX_002_secondary_watch_loop_rejected_with_exit_code_1(self) -> None:
+        self._hold_external_lock()
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch.object(watcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite lock contention")):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        self.assertIn("Another watcher daemon is already running", stderr_capture.getvalue())
+
+    def test_DAEMON_MUTEX_002_secondary_watch_run_cli_rejected_with_exit_code_1(self) -> None:
+        self._hold_external_lock()
+
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch("agy_switcher.watcher._get_engine_class") as mock_engine_cls, \
+             patch.object(LogWatcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite lock contention")):
+            mock_engine_cls.return_value = lambda: self.engine_mock
+            with self.assertRaises(SystemExit) as ctx:
+                watch_main(["run"])
+            self.assertEqual(ctx.exception.code, 1)
+
+        self.assertIn("Another watcher daemon is already running", stderr_capture.getvalue())
+
+    def _test_all_daemon_mutex_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_MUTEX_001_daemon_manager_start_acquires_exclusive_lock,
+            self.test_DAEMON_MUTEX_001_log_watcher_watch_loop_acquires_exclusive_lock,
+            self.test_DAEMON_MUTEX_002_secondary_daemon_manager_start_rejected_with_exit_code_1,
+            self.test_DAEMON_MUTEX_002_secondary_watch_loop_rejected_with_exit_code_1,
+            self.test_DAEMON_MUTEX_002_secondary_watch_run_cli_rejected_with_exit_code_1,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonLockMutualExclusion,
+    "test_DAEMON_MUTEX_001|DAEMON_MUTEX_002",
+    TestDaemonLockMutualExclusion._test_all_daemon_mutex_scenarios,
+)
 
 
 if __name__ == '__main__':
