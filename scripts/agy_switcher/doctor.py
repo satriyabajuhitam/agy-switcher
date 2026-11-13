@@ -498,6 +498,7 @@ class DoctorEngine:
 
         active_account = self.get_active_name()
         corrupt_accounts: list[tuple[str, str]] = []
+        corrupt_secondary: list[tuple[str, str]] = []
         expired_active: list[str] = []
         expired_secondary: list[str] = []
         standby_ready: list[str] = []
@@ -505,36 +506,86 @@ class DoctorEngine:
         for acc in accounts:
             acc_name = acc.name
             token_path = acc / "token.json"
+            is_active = bool(active_account and acc_name == active_account.strip())
+
             if not token_path.is_file():
-                corrupt_accounts.append((acc_name, "token.json does not exist"))
+                if is_active:
+                    corrupt_accounts.append((acc_name, "token.json does not exist"))
+                else:
+                    corrupt_secondary.append((acc_name, "token.json does not exist"))
                 continue
 
             try:
                 raw_text = token_path.read_text(encoding="utf-8")
                 data = json.loads(raw_text)
-                self.validate_token_dict(data)
             except Exception as e:
-                corrupt_accounts.append((acc_name, str(e)))
-                continue
-
-            id_tok = data.get("id_token", "")
-            email = self.extract_email_from_jwt(id_tok)
-            if not email:
-                corrupt_accounts.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
-                continue
-
-            token_obj = data.get("token", {})
-            raw_expiry = token_obj.get("expiry")
-            if not self._is_valid_expiry(raw_expiry):
-                corrupt_accounts.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
-                continue
-
-            if self._is_token_expired(raw_expiry):
-                if active_account and acc_name == active_account.strip():
-                    expired_active.append(acc_name)
+                if is_active:
+                    corrupt_accounts.append((acc_name, str(e)))
                 else:
-                    refresh_token = token_obj.get("refresh_token")
-                    if isinstance(refresh_token, str) and bool(refresh_token.strip()):
+                    corrupt_secondary.append((acc_name, f"Corrupt token JSON: {e}"))
+                continue
+
+            if is_active:
+                try:
+                    self.validate_token_dict(data)
+                except Exception as e:
+                    corrupt_accounts.append((acc_name, str(e)))
+                    continue
+
+                id_tok = data.get("id_token", "")
+                email = self.extract_email_from_jwt(id_tok)
+                if not email:
+                    corrupt_accounts.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
+                    continue
+
+                token_obj = data.get("token", {})
+                raw_expiry = token_obj.get("expiry")
+                if not self._is_valid_expiry(raw_expiry):
+                    corrupt_accounts.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
+                    continue
+
+                if self._is_token_expired(raw_expiry):
+                    expired_active.append(acc_name)
+            else:
+                if not isinstance(data, dict):
+                    corrupt_secondary.append((acc_name, "Token payload must be a JSON object."))
+                    continue
+
+                token_obj = data.get("token")
+                if not isinstance(token_obj, dict):
+                    corrupt_secondary.append((acc_name, "Missing required 'token' object in payload."))
+                    continue
+
+                required_secondary_keys = ("access_token", "token_type", "expiry")
+                missing_keys = [k for k in required_secondary_keys if not token_obj.get(k)]
+                if missing_keys:
+                    corrupt_secondary.append((acc_name, f"Missing required token fields: {', '.join(missing_keys)}"))
+                    continue
+
+                if not data.get("auth_method"):
+                    corrupt_secondary.append((acc_name, "Missing required 'auth_method' field."))
+                    continue
+
+                id_tok = data.get("id_token")
+                if not id_tok or not isinstance(id_tok, str):
+                    corrupt_secondary.append((acc_name, "Missing or invalid 'id_token' JWT field."))
+                    continue
+
+                email = self.extract_email_from_jwt(id_tok)
+                if not email:
+                    corrupt_secondary.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
+                    continue
+
+                raw_expiry = token_obj.get("expiry")
+                if not self._is_valid_expiry(raw_expiry):
+                    corrupt_secondary.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
+                    continue
+
+                refresh_token = token_obj.get("refresh_token")
+                has_valid_refresh = isinstance(refresh_token, str) and bool(refresh_token.strip())
+
+                if self._is_token_expired(raw_expiry):
+                    if has_valid_refresh:
                         standby_ready.append(acc_name)
                     else:
                         expired_secondary.append(acc_name)
@@ -558,12 +609,24 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        if expired_secondary:
+        if corrupt_secondary or expired_secondary:
+            warn_parts: list[str] = []
+            if expired_secondary:
+                warn_parts.append(
+                    f"Secondary account token(s) expired without a valid refresh token "
+                    f"(non-renewable): {', '.join(expired_secondary)}"
+                )
+            if corrupt_secondary:
+                err_details = [f"'{a}': {msg}" for a, msg in corrupt_secondary]
+                warn_parts.append(
+                    f"Secondary account token schema corrupt or invalid: {', '.join(err_details)}"
+                )
+            warn_msg = ". ".join(warn_parts) + ". Re-authenticate with 'agy-switch login <alias>'."
             return DiagnosticItem(
                 category="token_integrity",
                 name="OAuth Token & JWT Identity Integrity",
                 status="WARN",
-                message=f"Secondary account token(s) expired: {', '.join(expired_secondary)}.",
+                message=warn_msg,
                 can_fix=False,
             )
 
