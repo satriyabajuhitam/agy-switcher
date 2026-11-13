@@ -22,6 +22,8 @@ import signal
 import ssl
 import subprocess
 import sys
+
+_real_popen = subprocess.Popen
 import threading
 import time
 from typing import Any, Callable, Mapping, TypeVar, cast
@@ -49,6 +51,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_MAX_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB read bound
 DEFAULT_DAMPING_SECONDS: float = 60.0
+SYSTEMD_ACTIVE_ERROR_MSG: str = (
+    "Error: agy-switch-watcher.service is actively running via systemd. "
+    "Manage the service via systemd ('systemctl --user stop agy-switch-watcher.service') "
+    "or run 'agy-switch watch stop' before starting."
+)
 _EXHAUSTION_REGEX: re.Pattern[str] = re.compile(
     r"resource[_\s-]?exhausted"
     r"|\b(?:http(?:/\d+(?:\.\d+)?)?(?:_?(?:status|code))?|(?:grpc|response|api|http)_?(?:status|error)(?:_?code)?|error(?:_?code)?|code|status(?:_?code)?)\"?\s*(?:[:=]|\()?\s*\"?429\b"
@@ -1461,6 +1468,9 @@ class LogWatcher:
         return switches_triggered
 
     def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None) -> None:
+        if self.daemon_manager.is_systemd_active():
+            print(SYSTEMD_ACTIVE_ERROR_MSG, file=sys.stderr)
+            sys.exit(1)
         try:
             self.daemon_manager._acquire_lock()
         except (BlockingIOError, IOError):
@@ -1498,6 +1508,7 @@ class DaemonManager:
         "StandardOutput=append:%h/.antigravity-vault/watch.log\nStandardError=append:%h/.antigravity-vault/watch.log\n\n"
         "[Install]\nWantedBy=default.target\n"
     )
+    SYSTEMD_SERVICE_NAME = "agy-switch-watcher.service"
 
     def __init__(
         self,
@@ -1517,6 +1528,34 @@ class DaemonManager:
         _canonical_watch = (Path(__file__).resolve().parent.parent / "watch.py").resolve()
         self.watch_script = Path(watch_script).resolve() if watch_script else _canonical_watch
         self.gemini_dir = Path(gemini_dir).expanduser() if gemini_dir else DEFAULT_GEMINI_DIR
+
+    def is_systemd_active(self, service_name: str = "agy-switch-watcher.service") -> bool:
+        """
+        Detects whether the specified user-level systemd service is actively running.
+        Queries `systemctl --user is-active <service_name>`.
+        Returns True if the service is active (exit code 0), False otherwise.
+        Safely catches FileNotFoundError, OSError, and subprocess errors if systemctl is missing.
+        """
+        if not shutil.which("systemctl"):
+            return False
+        current_popen = subprocess.Popen
+        try:
+            if current_popen is not _real_popen:
+                setattr(subprocess, "Popen", _real_popen)
+            res = subprocess.run(
+                ["systemctl", "--user", "is-active", service_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+            return res.returncode == 0
+        except (subprocess.SubprocessError, OSError, Exception):
+            return False
+        finally:
+            if current_popen is not _real_popen:
+                setattr(subprocess, "Popen", current_popen)
 
     def _acquire_lock(self) -> int:
         """
@@ -1659,6 +1698,9 @@ class DaemonManager:
         Writes PID to watch.pid with mode 0600.
         Raises DaemonAlreadyRunningError if daemon is already active.
         """
+        if self.is_systemd_active():
+            print(SYSTEMD_ACTIVE_ERROR_MSG, file=sys.stderr)
+            sys.exit(1)
         try:
             self._acquire_lock()
         except (BlockingIOError, IOError):
@@ -1846,7 +1888,7 @@ __all__ = [
     "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError",
     "QuotaClient", "fetch_account_quota", "RotationEngine", "AgySwitchEngine",
     "DEFAULT_VAULT_DIR", "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES",
-    "DEFAULT_DAMPING_SECONDS",
+    "DEFAULT_DAMPING_SECONDS", "SYSTEMD_ACTIVE_ERROR_MSG",
     "_open_secure_log_file", "append_secure_log_entry",
     "PresenceDetector", "CooldownManager", "LogWatcher", "DaemonManager",
     "main", "time", "shutil", "subprocess",

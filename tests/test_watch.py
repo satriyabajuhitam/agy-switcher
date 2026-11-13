@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch, mock_open
 from pathlib import Path
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -3934,6 +3935,224 @@ setattr(
     TestDaemonLockMutualExclusion,
     "test_DAEMON_MUTEX_001|DAEMON_MUTEX_002",
     TestDaemonLockMutualExclusion._test_all_daemon_mutex_scenarios,
+)
+
+
+class TestDaemonSystemdActiveDetection(unittest.TestCase):
+    """
+    [DAEMON-MUTEX-003] [DAEMON-EDGE-002]
+    Validates user systemd service state detection and graceful fallback in DaemonManager.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+
+    def tearDown(self) -> None:
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_returns_true_when_active(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=0, stdout="active\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc) as mock_run:
+            self.assertTrue(dm.is_systemd_active())
+            mock_run.assert_called_once_with(
+                ["systemctl", "--user", "is-active", "agy-switch-watcher.service"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_inactive(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=3, stdout="inactive\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+
+    def test_DAEMON_MUTEX_003_daemon_manager_start_rejected_when_systemd_active(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch("sys.stderr", stderr_capture), \
+             patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(SystemExit) as ctx:
+                dm.start()
+            self.assertEqual(ctx.exception.code, 1)
+            mock_popen.assert_not_called()
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+        self.assertFalse(self.pid_file.exists())
+        self.assertIsNone(dm._lock_fd)
+
+    def test_DAEMON_MUTEX_003_watch_loop_rejected_when_systemd_active(self) -> None:
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch("sys.stderr", stderr_capture), \
+             patch.object(watcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite systemd service")):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+
+    def test_DAEMON_MUTEX_003_watch_run_cli_rejected_when_systemd_active(self) -> None:
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch("agy_switcher.watcher._get_engine_class") as mock_engine_cls, \
+             patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch.object(LogWatcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite systemd service")):
+            mock_engine_cls.return_value = lambda: self.engine_mock
+            with self.assertRaises(SystemExit) as ctx:
+                watch_main(["run"])
+            self.assertEqual(ctx.exception.code, 1)
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+
+    def test_DAEMON_MUTEX_003_watch_start_cli_rejected_when_systemd_active(self) -> None:
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch("agy_switcher.watcher._get_engine_class") as mock_engine_cls, \
+             patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch("subprocess.Popen") as mock_popen:
+            mock_engine_cls.return_value = lambda: self.engine_mock
+            with self.assertRaises(SystemExit) as ctx:
+                watch_main(["start"])
+            self.assertEqual(ctx.exception.code, 1)
+            mock_popen.assert_not_called()
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+
+    def test_DAEMON_EDGE_002_missing_systemctl_binary_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=54321)
+        with patch("shutil.which", return_value=None), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 54321)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_EDGE_002_systemctl_raises_filenotfound_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=65432)
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", side_effect=FileNotFoundError("No such file or directory: 'systemctl'")), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 65432)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_EDGE_002_systemctl_timeout_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=76543)
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["systemctl"], timeout=5.0)), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 76543)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_EDGE_002_systemctl_raises_oserror_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=87654)
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", side_effect=PermissionError("Permission denied")), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 87654)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_failed(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=4, stdout="failed\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_custom_service_name(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=0, stdout="active\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc) as mock_run:
+            self.assertTrue(dm.is_systemd_active("custom-watcher.service"))
+            mock_run.assert_called_once_with(
+                ["systemctl", "--user", "is-active", "custom-watcher.service"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+
+    def _test_all_systemd_detection_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_MUTEX_003_is_systemd_active_returns_true_when_active,
+            self.test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_inactive,
+            self.test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_failed,
+            self.test_DAEMON_MUTEX_003_is_systemd_active_custom_service_name,
+            self.test_DAEMON_MUTEX_003_daemon_manager_start_rejected_when_systemd_active,
+            self.test_DAEMON_MUTEX_003_watch_loop_rejected_when_systemd_active,
+            self.test_DAEMON_MUTEX_003_watch_run_cli_rejected_when_systemd_active,
+            self.test_DAEMON_MUTEX_003_watch_start_cli_rejected_when_systemd_active,
+            self.test_DAEMON_EDGE_002_missing_systemctl_binary_fallback_gracefully,
+            self.test_DAEMON_EDGE_002_systemctl_raises_filenotfound_fallback_gracefully,
+            self.test_DAEMON_EDGE_002_systemctl_timeout_fallback_gracefully,
+            self.test_DAEMON_EDGE_002_systemctl_raises_oserror_fallback_gracefully,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonSystemdActiveDetection,
+    "test_DAEMON_MUTEX_003|DAEMON_EDGE_002",
+    TestDaemonSystemdActiveDetection._test_all_systemd_detection_scenarios,
 )
 
 
