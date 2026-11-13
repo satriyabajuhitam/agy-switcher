@@ -394,13 +394,32 @@ if not installed:
     import json
     existing = {}
     if hooks_path.is_file():
+        is_corrupt = False
         try:
             content = hooks_path.read_text(encoding='utf-8').strip()
-            if content:
+            if not content:
+                is_corrupt = True
+            else:
                 loaded = json.loads(content)
                 if isinstance(loaded, dict):
                     existing = loaded
+                else:
+                    is_corrupt = True
         except Exception:
+            is_corrupt = True
+
+        if is_corrupt:
+            import datetime, shutil
+            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            bak_path = hooks_path.with_name(f'{hooks_path.name}.bak.{ts}')
+            counter = 1
+            while bak_path.exists():
+                bak_path = hooks_path.with_name(f'{hooks_path.name}.bak.{ts}_{counter}')
+                counter += 1
+            try:
+                shutil.copy2(hooks_path, bak_path)
+            except Exception:
+                pass
             existing = {}
 
     existing['agy-switch-auto-rotate'] = {

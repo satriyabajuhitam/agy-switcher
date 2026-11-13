@@ -425,13 +425,50 @@ class AgySwitchEngine:
 
         existing: dict[str, Any] = {}
         if target_hooks.is_file():
+            is_corrupt = False
+            corruption_reason = ""
             try:
                 content = target_hooks.read_text(encoding="utf-8").strip()
-                if content:
+                if not content:
+                    is_corrupt = True
+                    corruption_reason = "file is empty (0 bytes)"
+                else:
                     loaded = json.loads(content)
                     if isinstance(loaded, dict):
                         existing = loaded
-            except Exception:
+                    else:
+                        is_corrupt = True
+                        corruption_reason = f"root JSON element is {type(loaded).__name__}, expected object"
+            except Exception as exc:
+                is_corrupt = True
+                corruption_reason = str(exc)
+
+            if is_corrupt:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                bak_file = target_hooks.parent / f"{target_hooks.name}.bak.{ts}"
+                counter = 1
+                while bak_file.exists():
+                    bak_file = target_hooks.parent / f"{target_hooks.name}.bak.{ts}_{counter}"
+                    counter += 1
+                backup_succeeded = False
+                try:
+                    shutil.copy2(target_hooks, bak_file)
+                    backup_succeeded = True
+                except OSError as err:
+                    print(
+                        f"[agy-switch] Warning: Failed to backup corrupted hooks file '{target_hooks}' to '{bak_file}': {err}",
+                        file=sys.stderr,
+                    )
+                if backup_succeeded:
+                    print(
+                        f"[agy-switch] Warning: Corrupted hooks file '{target_hooks}' ({corruption_reason}) backed up to '{bak_file.name}' and reset to valid schema.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[agy-switch] Warning: Corrupted hooks file '{target_hooks}' ({corruption_reason}) reset to valid schema without backup.",
+                        file=sys.stderr,
+                    )
                 existing = {}
 
         if launcher_bin is not None:

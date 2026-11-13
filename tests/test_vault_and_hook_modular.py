@@ -778,13 +778,160 @@ class TestBootstrapInstallerAndCanonicalLauncher(unittest.TestCase):
         engine.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
 
         data = json.loads(self.hooks_file.read_text(encoding="utf-8"))
-        # Preserves custom hook
         self.assertIn("custom-security-scan", data)
         self.assertEqual(data["custom-security-scan"]["PreInvocation"][0]["command"], "/bin/sec-scan")
-
-        # Refreshes agy-switch-auto-rotate without duplicates
         self.assertEqual(len(data["agy-switch-auto-rotate"]["PreInvocation"]), 1)
         self.assertEqual(data["agy-switch-auto-rotate"]["PreInvocation"][0]["command"], "~/.local/bin/agy-switch hook-pre-invocation")
+
+    def test_BOOTSTRAP_ERR_002_engine_install_hook_corrupted_json_backup_and_recovery(self):
+        """[BOOTSTRAP-ERR-002] AgySwitchEngine.install_hook creates timestamped backup on corrupt JSON and recovers."""
+        self.hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_content = '{"invalid_json": [truncated'
+        self.hooks_file.write_text(corrupt_content, encoding="utf-8")
+
+        engine = AgySwitchEngine(
+            vault_dir=Path(self.temp_home.name) / ".antigravity-vault",
+            gemini_dir=Path(self.temp_home.name) / ".gemini",
+        )
+        res_path = engine.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
+        self.assertEqual(res_path, self.hooks_file)
+
+        bak_files = list(self.hooks_file.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(bak_files), 1, f"Expected 1 backup file, found: {bak_files}")
+        self.assertEqual(bak_files[0].read_text(encoding="utf-8"), corrupt_content)
+
+        self.assertTrue(self.hooks_file.is_file())
+        data = json.loads(self.hooks_file.read_text(encoding="utf-8"))
+        self.assertIn("agy-switch-auto-rotate", data)
+        self.assertTrue(data["agy-switch-auto-rotate"]["enabled"])
+        cmd = data["agy-switch-auto-rotate"]["PreInvocation"][0]["command"]
+        self.assertEqual(cmd, "~/.local/bin/agy-switch hook-pre-invocation")
+
+    def test_BOOTSTRAP_ERR_002_engine_install_hook_zero_byte_backup_and_recovery(self):
+        """[BOOTSTRAP-ERR-002] AgySwitchEngine.install_hook handles 0-byte hooks.json with backup and recovers."""
+        self.hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        self.hooks_file.write_text("", encoding="utf-8")
+
+        engine = AgySwitchEngine(
+            vault_dir=Path(self.temp_home.name) / ".antigravity-vault",
+            gemini_dir=Path(self.temp_home.name) / ".gemini",
+        )
+        engine.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
+
+        bak_files = list(self.hooks_file.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(bak_files), 1, f"Expected 1 backup file, found: {bak_files}")
+        self.assertEqual(bak_files[0].read_text(encoding="utf-8"), "")
+
+        data = json.loads(self.hooks_file.read_text(encoding="utf-8"))
+        self.assertIn("agy-switch-auto-rotate", data)
+
+    def test_BOOTSTRAP_ERR_002_engine_install_hook_collision_avoidance_on_repeated_runs(self):
+        """[BOOTSTRAP-ERR-002] AgySwitchEngine.install_hook creates distinct non-colliding backup files on rapid invocations."""
+        self.hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        corrupt1 = '{"corrupt": 1'
+        self.hooks_file.write_text(corrupt1, encoding="utf-8")
+
+        engine = AgySwitchEngine(
+            vault_dir=Path(self.temp_home.name) / ".antigravity-vault",
+            gemini_dir=Path(self.temp_home.name) / ".gemini",
+        )
+        engine.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
+
+        bak_files_1 = list(self.hooks_file.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(bak_files_1), 1)
+
+        corrupt2 = '{"corrupt": 2'
+        self.hooks_file.write_text(corrupt2, encoding="utf-8")
+        engine.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
+
+        bak_files_2 = sorted(self.hooks_file.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(bak_files_2), 2, f"Expected 2 distinct backup files, found: {bak_files_2}")
+        backup_contents = [p.read_text(encoding="utf-8") for p in bak_files_2]
+        self.assertIn(corrupt1, backup_contents)
+        self.assertIn(corrupt2, backup_contents)
+
+    def test_BOOTSTRAP_ERR_002_engine_install_hook_backup_permission_error_resilience(self):
+        """[BOOTSTRAP-ERR-002] AgySwitchEngine.install_hook survives backup OSError and safely recovers hooks schema."""
+        self.hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        self.hooks_file.write_text('{"bad": [', encoding="utf-8")
+
+        engine = AgySwitchEngine(
+            vault_dir=Path(self.temp_home.name) / ".antigravity-vault",
+            gemini_dir=Path(self.temp_home.name) / ".gemini",
+        )
+
+        with unittest.mock.patch("shutil.copy2", side_effect=PermissionError("Read-only filesystem: permission denied")):
+            stderr_capture = io.StringIO()
+            with unittest.mock.patch("sys.stderr", stderr_capture):
+                res_path = engine.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
+
+        self.assertEqual(res_path, self.hooks_file)
+        self.assertIn("Warning: Failed to backup corrupted hooks file", stderr_capture.getvalue())
+        self.assertIn("reset to valid schema without backup", stderr_capture.getvalue())
+
+        data = json.loads(self.hooks_file.read_text(encoding="utf-8"))
+        self.assertIn("agy-switch-auto-rotate", data)
+        self.assertTrue(data["agy-switch-auto-rotate"]["enabled"])
+
+    def test_BOOTSTRAP_ERR_002_engine_install_hook_non_dict_json_backup_and_recovery(self):
+        """[BOOTSTRAP-ERR-002] AgySwitchEngine.install_hook detects non-dict root JSON array and recovers."""
+        self.hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_array = '["unsupported", "root", "array"]'
+        self.hooks_file.write_text(corrupt_array, encoding="utf-8")
+
+        engine = AgySwitchEngine(
+            vault_dir=Path(self.temp_home.name) / ".antigravity-vault",
+            gemini_dir=Path(self.temp_home.name) / ".gemini",
+        )
+        engine.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
+
+        bak_files = list(self.hooks_file.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(bak_files), 1)
+        self.assertEqual(bak_files[0].read_text(encoding="utf-8"), corrupt_array)
+
+        data = json.loads(self.hooks_file.read_text(encoding="utf-8"))
+        self.assertIsInstance(data, dict)
+        self.assertIn("agy-switch-auto-rotate", data)
+
+    def test_BOOTSTRAP_ERR_002_doctor_install_hook_corrupted_json_backup_and_recovery(self):
+        """[BOOTSTRAP-ERR-002] DoctorEngine.install_hook creates timestamped backup on corrupt JSON and recovers."""
+        from agy_switcher.doctor import DoctorEngine
+
+        self.hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_content = '{"unclosed": [1, 2, '
+        self.hooks_file.write_text(corrupt_content, encoding="utf-8")
+
+        doctor = DoctorEngine(
+            vault_dir=Path(self.temp_home.name) / ".antigravity-vault",
+            gemini_dir=Path(self.temp_home.name) / ".gemini",
+        )
+        doctor.install_hook(hooks_file=self.hooks_file, launcher_bin="~/.local/bin/agy-switch")
+
+        bak_files = list(self.hooks_file.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(bak_files), 1)
+        self.assertEqual(bak_files[0].read_text(encoding="utf-8"), corrupt_content)
+
+        data = json.loads(self.hooks_file.read_text(encoding="utf-8"))
+        self.assertIn("agy-switch-auto-rotate", data)
+
+    def test_BOOTSTRAP_ERR_002_install_sh_corrupted_json_backup_and_recovery(self):
+        """[BOOTSTRAP-ERR-002] install.sh detects corrupted hooks.json, creates backup, and completes with exit code 0."""
+        self.hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        corrupted_content = "{ this is completely unparseable syntax !!!"
+        self.hooks_file.write_text(corrupted_content, encoding="utf-8")
+
+        res = self.run_installer("--global")
+        self.assertEqual(res.returncode, 0, f"install.sh failed on corrupt hooks.json: {res.stderr}\n{res.stdout}")
+
+        bak_files = list(self.hooks_file.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(bak_files), 1, f"Expected 1 backup file, found: {bak_files}")
+        self.assertEqual(bak_files[0].read_text(encoding="utf-8"), corrupted_content)
+
+        data = json.loads(self.hooks_file.read_text(encoding="utf-8"))
+        self.assertIn("agy-switch-auto-rotate", data)
+        self.assertTrue(data["agy-switch-auto-rotate"]["enabled"])
+        cmd = data["agy-switch-auto-rotate"]["PreInvocation"][0]["command"]
+        self.assertEqual(cmd, "~/.local/bin/agy-switch hook-pre-invocation")
 
 
 def load_tests(
