@@ -4156,6 +4156,179 @@ setattr(
 )
 
 
+class TestDaemonLockHardeningAndSymlinkRejection(unittest.TestCase):
+    """
+    [DAEMON-ERR-001] [DAEMON-ERR-002]
+    Validates watch.lock path hardening, permission denial handling,
+    and symlink traversal rejection across DaemonManager and LogWatcher.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+
+    def tearDown(self) -> None:
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
+        if self.lock_file.exists() or self.lock_file.is_symlink():
+            try:
+                os.chmod(self.lock_file, 0o600)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_DAEMON_ERR_001_lock_file_permission_denied_logs_stderr_and_exits_1(self) -> None:
+        """[DAEMON-ERR-001] Restrictive permissions on watch.lock logs actionable error and exits 1."""
+        self.lock_file.touch(mode=0o400)
+        os.chmod(self.lock_file, 0o400)
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+        self.assertIn(str(self.lock_file), err_output)
+
+    def test_DAEMON_ERR_001_vault_dir_permission_denied_logs_stderr_and_exits_1(self) -> None:
+        """[DAEMON-ERR-001] Restrictive permissions on vault_dir logs actionable error and exits 1."""
+        os.chmod(self.vault_dir, 0o500)
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+
+    def test_DAEMON_ERR_001_watch_loop_permission_denied_logs_stderr_and_exits_1(self) -> None:
+        """[DAEMON-ERR-001] LogWatcher.watch_loop exits cleanly with status 1 on PermissionError."""
+        self.lock_file.touch(mode=0o400)
+        os.chmod(self.lock_file, 0o400)
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+
+    def test_DAEMON_ERR_002_external_symlink_unlinked_safely_and_exits_1(self) -> None:
+        """[DAEMON-ERR-002] watch.lock symlink pointing to external path is unlinked and rejected with exit 1."""
+        external_dir = Path(self.tmpdir) / "external"
+        external_dir.mkdir(parents=True, exist_ok=True)
+        external_target = external_dir / "target.txt"
+        external_target.write_text("sensitive data", encoding="utf-8")
+
+        self.lock_file.symlink_to(external_target)
+        self.assertTrue(self.lock_file.is_symlink())
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("symlink", err_output.lower())
+        self.assertFalse(self.lock_file.is_symlink(), "Symlink must be removed")
+        self.assertTrue(external_target.exists(), "External target must remain intact")
+        self.assertEqual(external_target.read_text(encoding="utf-8"), "sensitive data")
+
+    def test_DAEMON_ERR_002_dangling_symlink_unlinked_safely_and_exits_1(self) -> None:
+        """[DAEMON-ERR-002] Dangling watch.lock symlink is unlinked safely and rejected with exit 1."""
+        nonexistent_target = self.vault_dir / "nonexistent_target.txt"
+        self.lock_file.symlink_to(nonexistent_target)
+        self.assertTrue(self.lock_file.is_symlink())
+        self.assertFalse(self.lock_file.exists())
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("symlink", err_output.lower())
+        self.assertFalse(self.lock_file.is_symlink(), "Dangling symlink must be removed")
+
+    def test_DAEMON_ERR_002_watch_loop_symlink_rejected_with_exit_code_1(self) -> None:
+        """[DAEMON-ERR-002] LogWatcher.watch_loop terminates cleanly with exit code 1 when watch.lock is a symlink."""
+        external_target = Path(self.tmpdir) / "other.txt"
+        external_target.write_text("other data", encoding="utf-8")
+        self.lock_file.symlink_to(external_target)
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("symlink", err_output.lower())
+        self.assertFalse(self.lock_file.is_symlink())
+
+    def test_DAEMON_ERR_002_resolve_lock_path_valid_path_returned(self) -> None:
+        """[DAEMON-ERR-002] _resolve_lock_path returns valid lock file path when clean."""
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        resolved = dm._resolve_lock_path()
+        self.assertEqual(resolved, self.lock_file)
+        self.assertTrue(self.vault_dir.is_dir())
+
+    def _test_all_lock_hardening_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_ERR_001_lock_file_permission_denied_logs_stderr_and_exits_1,
+            self.test_DAEMON_ERR_001_vault_dir_permission_denied_logs_stderr_and_exits_1,
+            self.test_DAEMON_ERR_001_watch_loop_permission_denied_logs_stderr_and_exits_1,
+            self.test_DAEMON_ERR_002_external_symlink_unlinked_safely_and_exits_1,
+            self.test_DAEMON_ERR_002_dangling_symlink_unlinked_safely_and_exits_1,
+            self.test_DAEMON_ERR_002_watch_loop_symlink_rejected_with_exit_code_1,
+            self.test_DAEMON_ERR_002_resolve_lock_path_valid_path_returned,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonLockHardeningAndSymlinkRejection,
+    "test_DAEMON_ERR_001|DAEMON_ERR_002",
+    TestDaemonLockHardeningAndSymlinkRejection._test_all_lock_hardening_scenarios,
+)
+
+
 if __name__ == '__main__':
     unittest.main()
 

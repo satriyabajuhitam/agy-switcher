@@ -1504,8 +1504,7 @@ class DaemonManager:
 
     SYSTEMD_TEMPLATE = (
         "[Unit]\nDescription=Antigravity Account Switcher Log Watcher Daemon\nAfter=network.target\n\n"
-        "[Service]\nType=simple\nExecStart=%h/.local/bin/agy-switch watch run\nRestart=on-failure\nRestartSec=5s\n"
-        "StandardOutput=append:%h/.antigravity-vault/watch.log\nStandardError=append:%h/.antigravity-vault/watch.log\n\n"
+        "[Service]\nType=simple\nExecStart=%h/.local/bin/agy-switch watch run\nRestart=on-failure\nRestartSec=5s\nStandardOutput=append:%h/.antigravity-vault/watch.log\nStandardError=append:%h/.antigravity-vault/watch.log\n\n"
         "[Install]\nWantedBy=default.target\n"
     )
     SYSTEMD_SERVICE_NAME = "agy-switch-watcher.service"
@@ -1557,47 +1556,73 @@ class DaemonManager:
             if current_popen is not _real_popen:
                 setattr(subprocess, "Popen", current_popen)
 
-    def _acquire_lock(self) -> int:
-        """
-        Acquires an exclusive non-blocking POSIX kernel file lock on watch.lock.
-        Retains the open file descriptor in self._lock_fd.
-        Raises BlockingIOError or IOError if the lock is held by another process.
-        """
+    def _resolve_lock_path(self) -> Path:
+        """Resolves watch.lock path, rejecting symlinks and handling permission errors."""
+        if self.vault_dir.exists() and not os.access(self.vault_dir, os.W_OK):
+            print(f"Error: Permission denied accessing vault directory '{self.vault_dir}': Directory is not writeable.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try: os.chmod(self.vault_dir, 0o700)
+            except OSError: pass
+        except (PermissionError, OSError) as e:
+            print(f"Error: Permission denied accessing vault directory '{self.vault_dir}': {e}", file=sys.stderr)
+            sys.exit(1)
+        lock_path = self.lock_file
+        try:
+            if lock_path.is_symlink():
+                try: lock_path.unlink()
+                except OSError: pass
+                print(f"Error: watch.lock at '{lock_path}' is a symlink. Symlink traversal is rejected.", file=sys.stderr)
+                sys.exit(1)
+        except (PermissionError, OSError) as e:
+            print(f"Error: Permission denied accessing lock file '{lock_path}': {e}", file=sys.stderr)
+            sys.exit(1)
+        return lock_path
+
+    def acquire_lock(self) -> int:
+        """Acquires exclusive POSIX file lock on watch.lock, exiting on permission/symlink errors."""
         if self._lock_fd is not None:
             return self._lock_fd
-
-        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = self._resolve_lock_path()
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         try:
-            os.chmod(self.vault_dir, 0o700)
-        except OSError:
-            pass
-
-        fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            os.chmod(self.lock_file, 0o600)
-        except OSError:
-            pass
-
+            fd = os.open(str(lock_path), flags, 0o600)
+        except (PermissionError, OSError) as e:
+            if getattr(e, "errno", None) == 40 or "symlink" in str(e).lower():
+                try: lock_path.unlink()
+                except OSError: pass
+                print(f"Error: watch.lock at '{lock_path}' is a symlink. Symlink traversal is rejected.", file=sys.stderr)
+                sys.exit(1)
+            print(f"Error: Permission denied accessing lock file '{lock_path}': {e}", file=sys.stderr)
+            sys.exit(1)
+        try: os.chmod(lock_path, 0o600)
+        except OSError: pass
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, IOError):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            try: os.close(fd)
+            except OSError: pass
             raise
-
+        except (PermissionError, OSError) as e:
+            try: os.close(fd)
+            except OSError: pass
+            print(f"Error: Permission denied locking '{lock_path}': {e}", file=sys.stderr)
+            sys.exit(1)
         self._lock_fd = fd
         return fd
+
+    def _acquire_lock(self) -> int:
+        return self.acquire_lock()
+
+    def release_lock(self) -> None:
+        self._release_lock()
 
     def _release_lock(self) -> None:
         """Releases the exclusive lock and closes the retained file descriptor."""
         if self._lock_fd is not None:
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
                 os.close(self._lock_fd)
             except OSError:
                 pass
@@ -1641,18 +1666,18 @@ class DaemonManager:
             for arg in args[1:]:
                 if skip_next:
                     skip_next = False
-                    continue
-                if arg == "-m":
+                elif arg == "-m":
                     target_script = "-m"
                     break
-                if arg == "-c":
+                elif arg == "-c":
                     return False
-                if arg.startswith("-"):
+                elif arg.startswith("-"):
                     if arg in ("-w", "-x"):
                         skip_next = True
                     continue
-                target_script = os.path.basename(arg).lower()
-                break
+                else:
+                    target_script = os.path.basename(arg).lower()
+                    break
             if not target_script:
                 return False
             full_cmd = " ".join(args).lower()
@@ -1680,8 +1705,7 @@ class DaemonManager:
     def get_running_pid(self) -> int | None:
         """Reads and returns running daemon PID from watch.pid if active. Unlinks dead/stale PID files."""
         if self.pid_file.is_symlink() or not self.pid_file.is_file():
-            if self.pid_file.is_symlink():
-                self._clean_pid_file()
+            if self.pid_file.is_symlink(): self._clean_pid_file()
             return None
         try:
             pid = int(self.pid_file.read_text(encoding="utf-8").strip())
@@ -1693,11 +1717,7 @@ class DaemonManager:
         return None
 
     def start(self, cooldown: int | None = None) -> int:
-        """
-        Spawns detached background process with start_new_session=True.
-        Writes PID to watch.pid with mode 0600.
-        Raises DaemonAlreadyRunningError if daemon is already active.
-        """
+        """Spawns detached background process with start_new_session=True and mode 0600 PID file."""
         if self.is_systemd_active():
             print(SYSTEMD_ACTIVE_ERROR_MSG, file=sys.stderr)
             sys.exit(1)
@@ -1711,27 +1731,17 @@ class DaemonManager:
             self._release_lock()
             raise DaemonAlreadyRunningError(existing_pid)
         self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            os.chmod(self.vault_dir, 0o700)
-        except OSError:
-            pass
+        try: os.chmod(self.vault_dir, 0o700)
+        except OSError: pass
         log_fd = _open_secure_log_file(self.log_file)
         cmd = [self.python_bin, str(self.watch_script), "run"]
         if cooldown is not None:
             cmd.extend(["--cooldown", str(cooldown)])
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log_fd,
-                stderr=log_fd,
-                start_new_session=True,
-            )
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, start_new_session=True)
         finally:
-            try:
-                os.close(log_fd)
-            except OSError:
-                pass
+            try: os.close(log_fd)
+            except OSError: pass
         self._last_proc = proc
         pid = proc.pid
         try:
@@ -1747,16 +1757,10 @@ class DaemonManager:
         return pid
 
     def stop(self, timeout: float = 5.0) -> bool:
-        """
-        Gracefully terminates the running daemon with SIGTERM.
-        Waits up to timeout seconds (default 5.0s). If still alive, escalates to SIGKILL.
-        Cleans up watch.pid. Returns True if a process was terminated, False otherwise.
-        """
+        """Gracefully terminates running daemon with SIGTERM, escalating to SIGKILL on timeout."""
         if getattr(self, "_last_proc", None) is not None:
-            try:
-                self._last_proc.poll()
-            except Exception:
-                pass
+            try: self._last_proc.poll()
+            except Exception: pass
         pid = self.get_running_pid()
         if pid is None:
             return False
@@ -1780,25 +1784,19 @@ class DaemonManager:
                 break
             _get_time().sleep(poll_interval)
         if not terminated and self.is_process_alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+            try: os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError): pass
             kill_start = time.time()
             while time.time() - kill_start < 1.0:
                 if not self.is_process_alive(pid):
                     break
                 _get_time().sleep(poll_interval)
         if getattr(self, "_last_proc", None) is not None and getattr(self._last_proc, "pid", None) == pid:
-            try:
-                self._last_proc.wait(timeout=0.2)
-            except Exception:
-                pass
+            try: self._last_proc.wait(timeout=0.2)
+            except Exception: pass
         if os.name == "posix":
-            try:
-                os.waitpid(pid, os.WNOHANG)
-            except (ChildProcessError, OSError):
-                pass
+            try: os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, OSError): pass
         if self.is_process_alive(pid):
             return False
         self._clean_pid_file()
@@ -1806,11 +1804,7 @@ class DaemonManager:
         return True
 
     def status(self) -> dict[str, Any]:
-        """
-        Returns status dictionary:
-        {'running': bool, 'pid': int | None, 'log_file': str, 'targets': list[str]}.
-        Automatically cleans up stale PID files.
-        """
+        """Returns status dictionary: {'running': bool, 'pid': int | None, 'log_file': str, 'targets': list[str]}."""
         pid = self.get_running_pid()
         targets: list[str] = []
         if pid is not None:
@@ -1821,9 +1815,7 @@ class DaemonManager:
         return {"running": pid is not None, "pid": pid, "log_file": str(self.log_file), "targets": targets}
 
     def generate_systemd(self, target_path: Path | str | None = None) -> str:
-        """
-        Generates user systemd service definition and optionally writes it to target_path.
-        """
+        """Generates user systemd service definition and optionally writes it to target_path."""
         if target_path is not None:
             target = Path(target_path).expanduser()
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1885,11 +1877,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 __all__ = [
-    "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError",
-    "QuotaClient", "fetch_account_quota", "RotationEngine", "AgySwitchEngine",
-    "DEFAULT_VAULT_DIR", "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES",
-    "DEFAULT_DAMPING_SECONDS", "SYSTEMD_ACTIVE_ERROR_MSG",
-    "_open_secure_log_file", "append_secure_log_entry",
+    "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError", "QuotaClient",
+    "fetch_account_quota", "RotationEngine", "AgySwitchEngine", "DEFAULT_VAULT_DIR",
+    "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES", "DEFAULT_DAMPING_SECONDS",
+    "SYSTEMD_ACTIVE_ERROR_MSG", "_open_secure_log_file", "append_secure_log_entry",
     "PresenceDetector", "CooldownManager", "LogWatcher", "DaemonManager",
     "main", "time", "shutil", "subprocess",
 ]
