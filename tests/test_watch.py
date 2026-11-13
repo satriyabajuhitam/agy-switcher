@@ -5055,27 +5055,97 @@ sys.exit(0)
     test_vault_edge_001_concurrent_test_processes_write_to_independent_vaults = test_VAULT_EDGE_001_concurrent_test_processes_write_to_independent_vaults
 
     def test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination(self) -> None:
-        """[VAULT-EDGE-002] Dynamic mutation of AGY_VAULT_DIR rebinds logging destination hermetically."""
+        """[VAULT-EDGE-002] Dynamic mutation of AGY_VAULT_DIR rebinds logging destination and cleans up handles hermetically."""
         vault_a = Path(self.tmpdir) / "vault_a"
         vault_b = Path(self.tmpdir) / "vault_b"
+        vault_c = Path(self.tmpdir) / "vault_c"
         vault_a.mkdir(parents=True, exist_ok=True, mode=0o700)
         vault_b.mkdir(parents=True, exist_ok=True, mode=0o700)
+        vault_c.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        watcher = LogWatcher(engine=MagicMock(), log_dirs=[self.tmpdir])
-
+        # Step 1: Initial AGY_VAULT_DIR binding
         os.environ["AGY_VAULT_DIR"] = str(vault_a)
+        watcher = LogWatcher(engine=MagicMock(), log_dirs=[self.tmpdir])
+        lock_fd1 = watcher.daemon_manager.acquire_lock()
+        self.assertIsNotNone(lock_fd1)
+        self.assertEqual(watcher.daemon_manager.vault_dir, vault_a)
+        self.assertEqual(watcher.daemon_manager.log_file, vault_a / "watch.log")
+        self.assertEqual(watcher.cooldown_file, vault_a / "cache" / "cooldown.json")
+
         watcher._notify_desktop(target_account="dest_a", reason="step 1")
+        watcher.set_cooldown("acc_a", 9999999999)
+        append_secure_log_entry(vault_a / "watch.log", "direct a\n")
+
         self.assertTrue((vault_a / "watch.log").exists())
-        self.assertIn("dest_a", (vault_a / "watch.log").read_text(encoding="utf-8"))
+        content_a = (vault_a / "watch.log").read_text(encoding="utf-8")
+        self.assertIn("dest_a", content_a)
+        self.assertIn("direct a", content_a)
+        self.assertTrue((vault_a / "cache" / "cooldown.json").exists())
+        self.assertIn("acc_a", (vault_a / "cache" / "cooldown.json").read_text(encoding="utf-8"))
         self.assertFalse((vault_b / "watch.log").exists())
 
+        # Step 2: Dynamic mutation to vault_b rebinds destinations and cleans up old handles
         os.environ["AGY_VAULT_DIR"] = str(vault_b)
-        watcher._notify_desktop(target_account="dest_b", reason="step 2")
-        self.assertTrue((vault_b / "watch.log").exists())
-        self.assertIn("dest_b", (vault_b / "watch.log").read_text(encoding="utf-8"))
-        self.assertNotIn("dest_b", (vault_a / "watch.log").read_text(encoding="utf-8"))
+        self.assertEqual(watcher.daemon_manager.vault_dir, vault_b)
+        self.assertEqual(watcher.daemon_manager.log_file, vault_b / "watch.log")
+        self.assertEqual(watcher.cooldown_file, vault_b / "cache" / "cooldown.json")
 
-    test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination = test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination
+        watcher._notify_desktop(target_account="dest_b", reason="step 2")
+        watcher.set_cooldown("acc_b", 9999999999)
+        append_secure_log_entry("watch.log", "direct b\n")
+        # Passing old path rebinds hermetically to current AGY_VAULT_DIR under test runner
+        append_secure_log_entry(vault_a / "watch.log", "direct old path b\n")
+
+        lock_fd2 = watcher.daemon_manager.acquire_lock()
+        self.assertIsNotNone(lock_fd2)
+        self.assertEqual(watcher.daemon_manager._locked_path, vault_b / "watch.lock")
+
+        # Verify vault_a lock was released and closed (re-lockable), while vault_b is actively locked
+        test_fd_a = os.open(str(vault_a / "watch.lock"), os.O_RDWR)
+        fcntl.flock(test_fd_a, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(test_fd_a)
+
+        test_fd_b = os.open(str(vault_b / "watch.lock"), os.O_RDWR)
+        with self.assertRaises((BlockingIOError, OSError)):
+            fcntl.flock(test_fd_b, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(test_fd_b)
+
+        self.assertTrue((vault_b / "watch.log").exists())
+        content_b = (vault_b / "watch.log").read_text(encoding="utf-8")
+        self.assertIn("dest_b", content_b)
+        self.assertIn("direct b", content_b)
+        self.assertIn("direct old path b", content_b)
+        self.assertTrue((vault_b / "cache" / "cooldown.json").exists())
+        self.assertIn("acc_b", (vault_b / "cache" / "cooldown.json").read_text(encoding="utf-8"))
+
+        # Assert no writes leaked to vault_a
+        content_a_after = (vault_a / "watch.log").read_text(encoding="utf-8")
+        self.assertNotIn("dest_b", content_a_after)
+        self.assertNotIn("direct b", content_a_after)
+        self.assertNotIn("direct old path b", content_a_after)
+        self.assertNotIn("acc_b", (vault_a / "cache" / "cooldown.json").read_text(encoding="utf-8"))
+
+        # Explicit handle cleanup on watcher
+        watcher.close()
+        self.assertIsNone(watcher.daemon_manager._lock_fd)
+
+        # Step 3: Context manager handle lifecycle cleanup on vault_c
+        os.environ["AGY_VAULT_DIR"] = str(vault_c)
+        with LogWatcher(engine=MagicMock(), log_dirs=[self.tmpdir]) as watcher3:
+            watcher3._notify_desktop(target_account="dest_c", reason="step 3")
+            fd3 = watcher3.daemon_manager.acquire_lock()
+            self.assertIsNotNone(fd3)
+            self.assertEqual(watcher3.daemon_manager.vault_dir, vault_c)
+            self.assertIsNotNone(watcher3.daemon_manager._lock_fd)
+
+        # After exiting with block, file descriptor must be released and cleaned up
+        self.assertIsNone(watcher3.daemon_manager._lock_fd)
+        self.assertTrue((vault_c / "watch.log").exists())
+        self.assertIn("dest_c", (vault_c / "watch.log").read_text(encoding="utf-8"))
+        self.assertNotIn("dest_c", (vault_a / "watch.log").read_text(encoding="utf-8"))
+        self.assertNotIn("dest_c", (vault_b / "watch.log").read_text(encoding="utf-8"))
+
+    test_vault_edge_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination = test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination
 
     test_VAULT_ISO_001_redirect_to_agy_vault_dir = test_vault_iso_001_redirect_to_agy_vault_dir
     test_VAULT_ISO_002_mock_engine_prohibits_production_log = test_vault_iso_002_mock_engine_prohibits_production_log
@@ -5087,7 +5157,7 @@ sys.exit(0)
             self.test_vault_iso_003_prod_agy_vault_dir_under_test_prohibits_production_log,
             self.test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully,
             self.test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely,
-            self.test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination,
+            self.test_vault_edge_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination,
         ]
         for scenario in scenarios:
             self.setUp()
@@ -5122,6 +5192,18 @@ sys.exit(0)
                 self.tearDown()
 
 
+    def _test_vault_ticket08_scenarios(self) -> None:
+        scenarios = [
+            self.test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
+
+
 setattr(
     TestVaultLogIsolation,
     "test_VAULT_ISO_001|VAULT_ISO_002",
@@ -5136,6 +5218,11 @@ setattr(
     TestVaultLogIsolation,
     "test_VAULT_ERR_003|VAULT_EDGE_001",
     TestVaultLogIsolation._test_vault_ticket07_scenarios,
+)
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_EDGE_002_ticket08_gate",
+    TestVaultLogIsolation._test_vault_ticket08_scenarios,
 )
 
 

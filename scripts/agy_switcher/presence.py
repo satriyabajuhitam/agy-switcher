@@ -98,7 +98,7 @@ def _resolve_vault_log_path(
                 candidate = Path(cleaned).expanduser()
                 if _is_test_runner() and _is_prod_vault_path(candidate):
                     return None
-                return candidate / file_name if (is_default_vault or raw_path is None) else raw_path
+                return candidate / file_name if (is_default_vault or raw_path is None or file_name == "watch.log") else raw_path
 
             # Empty or whitespace AGY_VAULT_DIR: reject without falling back to DEFAULT_VAULT_DIR
             if engine is not None:

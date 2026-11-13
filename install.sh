@@ -15,6 +15,7 @@ Options:
   -a, --all             Install or uninstall both local and global installations
   -c, --copy            Copy files physically instead of symlinking (default is symlink)
   -s, --symlink         Explicitly force symlink installation (default behavior)
+  --systemd             Install systemd user service unit (agy-switch-watcher.service)
   -u, --uninstall       Remove installed plugin and clean up launcher
   -h, --help            Show this usage information
 
@@ -267,6 +268,7 @@ INSTALL_MODE="symlink"
 TARGET=""
 UNINSTALL=0
 INTERACTIVE=0
+INSTALL_SYSTEMD=0
 
 # Determine script directory robustly
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -309,6 +311,7 @@ else
             -a|--all) TARGET="all" ;;
             -c|--copy) INSTALL_MODE="copy" ;;
             -s|--symlink) INSTALL_MODE="symlink" ;;
+            --systemd) INSTALL_SYSTEMD=1 ;;
             -u|--uninstall) UNINSTALL=1 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown parameter passed: $1"; usage; exit 1 ;;
@@ -321,6 +324,8 @@ if [ -z "$TARGET" ]; then
     if [ "$UNINSTALL" -eq 1 ]; then
         # Default uninstall without explicit target cleans up both to prevent orphaned files
         TARGET="all"
+    elif [ "$INSTALL_SYSTEMD" -eq 1 ]; then
+        TARGET="global"
     else
         echo "Error: Must specify --local, --global, or --all (or use interactive menu)."
         exit 1
@@ -513,6 +518,38 @@ install_target() {
     echo "Installation complete."
 }
 
+install_systemd_service() {
+    local unit_dir="${HOME}/.config/systemd/user"
+    local unit_file="$unit_dir/agy-switch-watcher.service"
+    mkdir -p "$unit_dir"
+    cat <<'EOF' > "$unit_file"
+[Unit]
+Description=Antigravity Account Switcher Log Watcher Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agy-switch watch run
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:%h/.antigravity-vault/watch.log
+StandardError=append:%h/.antigravity-vault/watch.log
+
+[Install]
+WantedBy=default.target
+EOF
+    echo "Installed systemd user service: $unit_file"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl --user daemon-reload 2>/dev/null; then
+            echo "Warning: Failed to reload systemd daemon via 'systemctl --user daemon-reload'." >&2
+            echo "If D-Bus session bus or user lingering is disabled, enable lingering via: loginctl enable-linger" >&2
+        fi
+    else
+        echo "Warning: systemctl command not found. If D-Bus session bus or user lingering is disabled, enable lingering via: loginctl enable-linger" >&2
+    fi
+}
+
 if [ "$UNINSTALL" -eq 1 ]; then
     if [ "$TARGET" = "local" ]; then
         uninstall_target "$(get_local_dest)"
@@ -524,6 +561,20 @@ if [ "$UNINSTALL" -eq 1 ]; then
         # Final pass to ensure launcher is gone if TARGET was all
         manage_launcher "uninstall" ""
     fi
+    if [ "$INSTALL_SYSTEMD" -eq 1 ]; then
+        local unit_file="${HOME}/.config/systemd/user/agy-switch-watcher.service"
+        if [ -f "$unit_file" ]; then
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user stop agy-switch-watcher.service 2>/dev/null || true
+                systemctl --user disable agy-switch-watcher.service 2>/dev/null || true
+            fi
+            rm -f "$unit_file"
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user daemon-reload 2>/dev/null || true
+            fi
+            echo "Removed systemd user service: $unit_file"
+        fi
+    fi
     echo "Uninstall complete. (Note: ~/.antigravity-vault/ is intentionally kept untouched)."
 else
     if [ "$TARGET" = "local" ]; then
@@ -533,5 +584,9 @@ else
     elif [ "$TARGET" = "all" ]; then
         install_target "$(get_local_dest)"
         install_target "$(get_global_dest)"
+    fi
+
+    if [ "$INSTALL_SYSTEMD" -eq 1 ]; then
+        install_systemd_service
     fi
 fi

@@ -1,46 +1,20 @@
-"""Log Watcher & Detached Daemon Engine.
-
+"""Log Watcher & Detached Daemon Engine. Pure Python 3.10+ standard library.
 Layer 2 Domain Engine: Depends on Layer 0 (exceptions, models) and Layer 1 (telemetry, supervisor, formatters).
-Zero external dependencies. Pure Python 3.10+ standard library.
 Strictly acyclic DAG: Does NOT import vault.py, rotation.py, doctor.py, hook.py, or cli.py at the module level.
 """
 
 from __future__ import annotations
 
-import argparse
-from datetime import datetime, timezone
-import errno
-import fcntl
-import glob
-import json
-import logging
-import math
-import os
-from pathlib import Path
-import re
-import shutil
-import signal
-import ssl
-import subprocess
-import sys
-
+import argparse, errno, fcntl, glob, json, logging, math, os, re, shutil, signal, ssl, subprocess, sys, threading, time
 _real_popen = subprocess.Popen
-import threading
-import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar, cast
-import urllib.error
-import urllib.request
+import urllib.error, urllib.request
 
-from agy_switcher.exceptions import (
-    AgySwitchError,
-    DaemonError,
-    DaemonAlreadyRunningError,
-)
+from agy_switcher.exceptions import AgySwitchError, DaemonError, DaemonAlreadyRunningError
 from agy_switcher.supervisor import ProcessSupervisor
-from agy_switcher.telemetry import (
-    QuotaClient as _RealQuotaClient,
-    fetch_account_quota as _real_fetch_account_quota,
-)
+from agy_switcher.telemetry import QuotaClient as _RealQuotaClient, fetch_account_quota as _real_fetch_account_quota
 
 RotationEngine: type[object] | None = None
 QuotaClient: type[object] | None = None
@@ -52,11 +26,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_MAX_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB read bound
 DEFAULT_DAMPING_SECONDS: float = 60.0
-SYSTEMD_ACTIVE_ERROR_MSG: str = (
-    "Error: agy-switch-watcher.service is actively running via systemd. "
-    "Manage the service via systemd ('systemctl --user stop agy-switch-watcher.service') "
-    "or run 'agy-switch watch stop' before starting."
-)
+SYSTEMD_ACTIVE_ERROR_MSG: str = "Error: agy-switch-watcher.service is actively running via systemd. Manage the service via systemd ('systemctl --user stop agy-switch-watcher.service') or run 'agy-switch watch stop' before starting."
 _EXHAUSTION_REGEX: re.Pattern[str] = re.compile(
     r"resource[_\s-]?exhausted"
     r"|\b(?:http(?:/\d+(?:\.\d+)?)?(?:_?(?:status|code))?|(?:grpc|response|api|http)_?(?:status|error)(?:_?code)?|error(?:_?code)?|code|status(?:_?code)?)\"?\s*(?:[:=]|\()?\s*\"?429\b"
@@ -142,10 +112,8 @@ def _get_fetch_account_quota() -> Callable[..., tuple[str, Mapping[str, object] 
 def _get_engine_class() -> Any:
     def _fallback() -> Any:
         for m in ("agy_switcher.vault", "agy_switch", "scripts.agy_switch"):
-            try:
-                return __import__(m, fromlist=["AgySwitchEngine"]).AgySwitchEngine
-            except ImportError:
-                pass
+            try: return __import__(m, fromlist=["AgySwitchEngine"]).AgySwitchEngine
+            except ImportError: pass
     return _resolve_symbol("AgySwitchEngine", _fallback)
 def _get_shutil() -> Any:
     return _resolve_symbol("shutil", lambda: shutil)
@@ -364,19 +332,15 @@ class CooldownManager:
         max_rolling_window = 18000.0  # 5 hours
         max_daily_window = 86400.0    # 24 hours (multi-day boundary)
         raw_buckets = target_dict.get("buckets")
-
         def _is_weekly(identifier: str) -> bool:
             return any(x in identifier for x in ("weekly", "week", "7d", "wk"))
-
         def _is_5h_rolling(identifier: str) -> bool:
             return any(x in identifier for x in ("5h", "five_hour", "five_hours", "5_hour", "5-hour", "rolling_5h"))
-
         bucket_items: list[tuple[str, dict[str, Any]]] = []
         if isinstance(raw_buckets, dict):
             bucket_items = [(str(k).strip().lower(), b) for k, b in raw_buckets.items() if isinstance(b, dict)]
         elif isinstance(raw_buckets, list):
             bucket_items = [(str(b.get("bucketId", "")).strip().lower(), b) for b in raw_buckets if isinstance(b, dict)]
-
         if bucket_items:
             for ident, b in bucket_items:
                 if _is_5h_rolling(ident):
@@ -392,12 +356,10 @@ class CooldownManager:
                         return min(rt_val, now + max_rolling_window)
             if any(_is_weekly(ident) for ident, _ in bucket_items):
                 return None
-
         if (top_rt := target_dict.get("reset_time", target_dict.get("resetTime"))) is not None:
             rt_val = self._parse_timestamp(top_rt)
             if math.isfinite(rt_val) and 0 < rt_val - now <= max_daily_window:
                 return min(rt_val, now + max_rolling_window)
-
         return None
 
     def get_reset_time_from_cache(self, account_name: str, model_hint: str | None = None) -> float | None:
@@ -469,20 +431,8 @@ class LogWatcher:
         self.presence_detector = presence_detector or PresenceDetector(gemini_dir=getattr(self.engine, "gemini_dir", None))
         self.log_dirs = log_dirs if log_dirs is not None else [str(self.presence_detector.cli_log_dir)]
         self.cooldown_minutes = cooldown_minutes
-        if cooldown_manager is not None:
-            self.cooldown_manager = cooldown_manager
-        else:
-            cache_dir = getattr(self.engine, "cache_dir", None)
-            if not isinstance(cache_dir, (str, Path)) or _is_mock_object(cache_dir):
-                vault_dir = getattr(self.engine, "vault_dir", None)
-                if isinstance(vault_dir, (str, Path)) and not _is_mock_object(vault_dir):
-                    cache_dir = Path(vault_dir) / "cache"
-                elif (env_v := os.environ.get("AGY_VAULT_DIR", "").strip()):
-                    cache_dir = Path(env_v).expanduser() / "cache"
-                else:
-                    cache_dir = Path.home() / ".antigravity-vault" / "cache"
-            self.cooldown_manager = CooldownManager(cache_dir=cache_dir, default_cooldown_seconds=cooldown_minutes * 60)
-        self.cooldown_file = getattr(self.cooldown_manager, "cooldown_file", getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json")
+        self._explicit_cooldown_manager = cooldown_manager
+        self._cooldown_manager: CooldownManager | None = cooldown_manager
         self.exhaustion_regex = _EXHAUSTION_REGEX
         if supervisor is not None:
             self.supervisor = supervisor
@@ -509,6 +459,35 @@ class LogWatcher:
     @property
     def _lock_fd(self) -> int | None:
         return self.daemon_manager._lock_fd
+
+    @property
+    def cooldown_manager(self) -> CooldownManager:
+        if self._explicit_cooldown_manager is not None:
+            return self._explicit_cooldown_manager
+        current_cache_dir = self._resolve_cache_dir()
+        if self._cooldown_manager is None or (current_cache_dir and getattr(self._cooldown_manager, "cache_dir", None) != current_cache_dir):
+            self._cooldown_manager = CooldownManager(cache_dir=current_cache_dir, default_cooldown_seconds=self.cooldown_minutes * 60)
+        return self._cooldown_manager
+
+    @cooldown_manager.setter
+    def cooldown_manager(self, mgr: CooldownManager | None) -> None:
+        self._cooldown_manager = mgr
+        if mgr is not None:
+            self._explicit_cooldown_manager = mgr
+
+    @property
+    def cooldown_file(self) -> Path:
+        return getattr(self.cooldown_manager, "cooldown_file", getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json")
+    @cooldown_file.setter
+    def cooldown_file(self, val: Path) -> None: pass
+
+    def close(self) -> None:
+        if getattr(self, "daemon_manager", None) is not None:
+            try: self.daemon_manager.close()
+            except Exception: pass
+
+    def __enter__(self) -> "LogWatcher": return self
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None: self.close()
 
     def is_exhausted_message(self, line: str) -> bool:
         return bool(line and isinstance(line, str) and self.exhaustion_regex.search(line))
@@ -675,7 +654,6 @@ class LogWatcher:
         """
         now = time.time()
         max_cd, fallback_cd, max_daily = 18000.0, 1800.0, 86400.0
-
         def _get_cached() -> float:
             try:
                 crt = self.cooldown_manager.get_reset_time_from_cache(account_name, model_hint=model_hint)
@@ -684,23 +662,28 @@ class LogWatcher:
             except Exception:
                 pass
             return now + fallback_cd
-
         if reset_time is not None and not isinstance(reset_time, bool) and math.isfinite(parsed_rt := self.cooldown_manager._parse_timestamp(reset_time)):
             reset_delta = parsed_rt - now
             is_weekly = "weekly" in str(reason).lower() or reset_delta > max_daily
             effective_reset = (now + fallback_cd) if reset_delta <= 0 else (_get_cached() if is_weekly else min(parsed_rt, now + max_cd))
         else:
             effective_reset = _get_cached()
-
         return self.cooldown_manager.set_cooldown(
             account_name, reset_time=effective_reset, reason=reason
         )
 
-    def _resolve_cache_dir(self) -> Path | None:
-        for obj, attr in ((getattr(self, "cooldown_manager", None), "cache_dir"), (self.engine, "cache_dir")):
-            if isinstance(d := getattr(obj, attr, None), (str, Path)):
-                return Path(d)
-        return Path(vd) / "cache" if isinstance(vd := getattr(self.engine, "vault_dir", None), (str, Path)) else None
+    def _resolve_cache_dir(self) -> Path:
+        if self._explicit_cooldown_manager is not None and hasattr(self._explicit_cooldown_manager, "cache_dir"):
+            return Path(self._explicit_cooldown_manager.cache_dir)
+        cache_dir = getattr(self.engine, "cache_dir", None)
+        if isinstance(cache_dir, (str, Path)) and not _is_mock_object(cache_dir):
+            return Path(cache_dir)
+        vault_dir = getattr(self.engine, "vault_dir", None)
+        if isinstance(vault_dir, (str, Path)) and not _is_mock_object(vault_dir):
+            return Path(vault_dir) / "cache"
+        if (env_v := os.environ.get("AGY_VAULT_DIR", "").strip()):
+            return Path(env_v).expanduser() / "cache"
+        return Path.home() / ".antigravity-vault" / "cache"
 
     def _load_cached_quota_data(self) -> tuple[dict[str, Any], Any]:
         """Loads cached quota dictionary and client instance if available."""
@@ -741,19 +724,16 @@ class LogWatcher:
         clean_name = acc_name.strip() if isinstance(acc_name, str) else ""
         if not clean_name or clean_name not in cooldowns:
             return False
-
         now = time.time()
         rec = cooldowns.get(clean_name)
         cd_until = rec.get("cooldown_until") if isinstance(rec, dict) else rec
         if isinstance(cd_until, (int, float)) and cd_until <= now:
             return False
-
         # Account is in active cooldown. Probe for Telemetry-Aware Cooldown Immunity (>= 70%)
         quota_frac: float | None = None
         if isinstance(accounts_cache, Mapping):
             acc_map = accounts_cache.get("accounts", accounts_cache) if isinstance(accounts_cache.get("accounts"), Mapping) else accounts_cache
             quota_frac = self._probe_active_quota(clean_name, acc_map, model_name="gemini")
-
         if quota_frac is None and (c_dir := self._resolve_cache_dir()) and (q_file := c_dir / "last_known_quota.json").is_file():
             try:
                 raw = json.loads(q_file.read_text(encoding="utf-8"))
@@ -761,7 +741,6 @@ class LogWatcher:
                 quota_frac = self._probe_active_quota(clean_name, acc_map, model_name="gemini") if isinstance(acc_map, Mapping) else None
             except Exception:
                 pass
-
         if quota_frac is None and hasattr(self, "engine") and (fetch_acc_fn := _get_fetch_account_quota()):
             try:
                 _, live_data = fetch_acc_fn(self.engine, clean_name)
@@ -769,7 +748,6 @@ class LogWatcher:
                     quota_frac = self._probe_active_quota(clean_name, {clean_name: live_data}, model_name="gemini")
             except Exception:
                 pass
-
         return True if quota_frac is None else (round(quota_frac, 6) < 0.70)
 
     def _notify_desktop(self, target_account: str, old_account: str | None = None, reason: str = "", reloaded: bool = False) -> None:
@@ -915,7 +893,6 @@ class LogWatcher:
         acc_quota = accounts_cache.get(active_account)
         if acc_quota is None:
             return None
-
         def _parse_val(v: object) -> float | None:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 val = float(v)
@@ -927,7 +904,6 @@ class LogWatcher:
                 except ValueError:
                     pass
             return None
-
         if (pv := _parse_val(acc_quota)) is not None:
             return pv
         if not isinstance(acc_quota, Mapping):
@@ -992,7 +968,6 @@ class LogWatcher:
             except Exception as e:
                 logger.debug("[watch] Pre-Switch Quota Probe live telemetry failure for '%s': %s", active_name, e)
                 active_quota_fraction = None
-
         threshold = self.get_quota_threshold(default=0.25)
         if active_quota_fraction is not None and round(active_quota_fraction, 6) > round(threshold, 6):
             print(
@@ -1130,42 +1105,33 @@ class LogWatcher:
                         self.active_transcript_path = p
                 except Exception:
                     target_path = None
-
         if not target_path or not target_path.is_file():
             return None
-
         try:
             size = target_path.stat().st_size
             if size == 0:
                 return None
-
             # Bounded expanding backward window to accommodate large prompts/responses (>64KB)
             max_read = 4 * 1024 * 1024
             chunk_size = min(size, 65536)
-
             with open(target_path, "rb") as f:
                 while True:
                     f.seek(max(0, size - chunk_size))
                     data = f.read(min(chunk_size, size))
                     lines = data.splitlines()
-
                     last_line_str: str | None = None
                     for line in reversed(lines):
                         s = line.strip().decode("utf-8", errors="replace")
                         if s:
                             last_line_str = s
                             break
-
                     if not last_line_str:
                         return None
-
                     if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
                         chunk_size = min(size, chunk_size * 4, max_read)
                         continue
-
                     if not last_line_str.startswith("{"):
                         return None
-
                     try:
                         parsed = json.loads(last_line_str)
                         if isinstance(parsed, dict):
@@ -1201,11 +1167,9 @@ class LogWatcher:
         try:
             if getattr(self, "supervisor", None) is None and not hasattr(self.engine, "is_server_busy"):
                 return False
-
             record = self._get_latest_transcript_record(transcript_path)
             if not record:
                 return False
-
             status = str(record.get("status", "")).strip().upper()
             msg_type = str(record.get("type", "")).strip().upper()
             if (
@@ -1232,7 +1196,6 @@ class LogWatcher:
             accounts_list = raw.get("accounts") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
         accounts_list = accounts_list or []
         cooldowns = self.get_cooldowns() if hasattr(self, "get_cooldowns") else {}
-
         candidates: list[tuple[str, float]] = []
         for acc in accounts_list:
             acc_name = acc.get("name") if isinstance(acc, dict) else getattr(acc, "name", None)
@@ -1242,7 +1205,6 @@ class LogWatcher:
                 continue
             if not (acc.get("valid", True) if isinstance(acc, dict) else getattr(acc, "valid", True)):
                 continue
-
             acc_q = accounts_cache.get(acc_name, {}) if isinstance(accounts_cache, Mapping) else {}
             q_frac = self._probe_active_quota(acc_name, {acc_name: acc_q}, model_name=model_name)
             if q_frac is None and hasattr(self, "engine") and (fetch_acc_fn := _get_fetch_account_quota()):
@@ -1252,10 +1214,8 @@ class LogWatcher:
                         q_frac = self._probe_active_quota(acc_name, {acc_name: standby_live}, model_name=model_name)
                 except Exception:
                     pass
-
             if q_frac is not None and round(q_frac, 6) >= 0.70:
                 candidates.append((acc_name, q_frac))
-
         candidates.sort(key=lambda item: item[1], reverse=True)
         return candidates
 
@@ -1307,24 +1267,19 @@ class LogWatcher:
             if thresh_attr is None:
                 return False
             threshold = self.get_quota_threshold(default=0.20)
-
             if threshold <= 0.0:
                 return False
-
             now = time.time()
             if self._is_damping_active(now) or not self._is_turn_quiescent():
                 return False
-
             get_active_fn = getattr(self.engine, "get_active_name", None)
             if not callable(get_active_fn) or not isinstance(active_name := get_active_fn(), str) or not active_name:
                 return False
-
             cache_data, client = self._load_cached_quota_data()
             accounts_cache = cache_data.get("accounts", cache_data) if isinstance(cache_data.get("accounts"), dict) else cache_data
             active_quota_fraction = self._probe_active_quota(
                 active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini"
             )
-
             live_data_map: Mapping[str, object] | None = None
             if active_quota_fraction is None:
                 try:
@@ -1342,10 +1297,8 @@ class LogWatcher:
                 except Exception as e:
                     logger.debug("[watch] Proactive quota probe live telemetry failure for '%s': %s", active_name, e)
                     return False
-
             if active_quota_fraction is None or round(active_quota_fraction, 6) > round(threshold, 6):
                 return False
-
             probe_cache = live_data_map if live_data_map is not None else (accounts_cache if isinstance(accounts_cache, Mapping) else None)
             reset_delta = self._probe_account_reset_delta(active_name, probe_cache, model_name="gemini", now=now)
             if reset_delta is not None and 0.0 <= reset_delta <= 30.0:
@@ -1353,11 +1306,9 @@ class LogWatcher:
                     print(f"[watch] Drain window active: '{active_name}' reset in {reset_delta:.1f}m (<= 30.0m) with {active_quota_fraction * 100:.1f}% quota (> 5.0%). Retaining active account.", file=sys.stderr)
                     return False
                 print(f"[watch] Drain window hard floor override: '{active_name}' has {active_quota_fraction * 100:.1f}% quota (<= 5.0%) inside drain window. Forcing rotation.", file=sys.stderr)
-
             candidates = self._probe_standby_candidates(active_name, accounts_cache if isinstance(accounts_cache, Mapping) else None, model_name="gemini")
             if not candidates:
                 return False
-
             best_standby, best_quota = candidates[0]
             print(f"[watch] Proactive threshold failover: Active account '{active_name}' quota ({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).", file=sys.stderr)
             try:
@@ -1517,22 +1468,41 @@ class DaemonManager:
         python_bin: str | None = None,
         gemini_dir: Path | str | None = None,
     ) -> None:
-        if vault_dir is not None and not _is_mock_object(vault_dir) and isinstance(vault_dir, (str, Path)):
-            self.vault_dir = Path(vault_dir).expanduser()
-        elif (env_vault := os.environ.get("AGY_VAULT_DIR")) and env_vault.strip():
-            self.vault_dir = Path(env_vault.strip()).expanduser()
-        else:
-            self.vault_dir = DEFAULT_VAULT_DIR
-        self.pid_file = self.vault_dir / "watch.pid"
-        self.log_file = self.vault_dir / "watch.log"
-        self.lock_file = self.vault_dir / "watch.lock"
+        self._explicit_vault_dir: Path | None = None
+        if vault_dir is not None and not _is_mock_object(vault_dir) and isinstance(vault_dir, (str, Path)) and str(vault_dir).strip():
+            self._explicit_vault_dir = Path(vault_dir).expanduser()
         self._lock_fd: int | None = None
+        self._locked_path: Path | None = None
         self._start_lock = threading.RLock()
         self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
         self.python_bin = python_bin or sys.executable
         _canonical_watch = (Path(__file__).resolve().parent.parent / "watch.py").resolve()
         self.watch_script = Path(watch_script).resolve() if watch_script else _canonical_watch
         self.gemini_dir = Path(gemini_dir).expanduser() if gemini_dir else DEFAULT_GEMINI_DIR
+
+    @property
+    def vault_dir(self) -> Path:
+        if self._explicit_vault_dir is not None:
+            return self._explicit_vault_dir
+        if (env_vault := os.environ.get("AGY_VAULT_DIR")) and env_vault.strip():
+            return Path(env_vault.strip()).expanduser()
+        return DEFAULT_VAULT_DIR
+    @vault_dir.setter
+    def vault_dir(self, val: Path | str | None) -> None:
+        self._explicit_vault_dir = Path(val).expanduser() if (val is not None and not _is_mock_object(val) and isinstance(val, (str, Path)) and str(val).strip()) else None
+
+    @property
+    def pid_file(self) -> Path: return self.vault_dir / "watch.pid"
+    @pid_file.setter
+    def pid_file(self, val: Path) -> None: pass
+    @property
+    def log_file(self) -> Path: return self.vault_dir / "watch.log"
+    @log_file.setter
+    def log_file(self, val: Path) -> None: pass
+    @property
+    def lock_file(self) -> Path: return self.vault_dir / "watch.lock"
+    @lock_file.setter
+    def lock_file(self, val: Path) -> None: pass
 
     def is_systemd_active(self, service_name: str = "agy-switch-watcher.service") -> bool:
         """Detects whether the specified user-level systemd service is actively running."""
@@ -1583,9 +1553,11 @@ class DaemonManager:
 
     def acquire_lock(self) -> int:
         """Acquires exclusive POSIX file lock on watch.lock, exiting on permission/symlink errors."""
-        if self._lock_fd is not None:
-            return self._lock_fd
         lock_path = self._resolve_lock_path()
+        if self._lock_fd is not None:
+            if self._locked_path == lock_path:
+                return self._lock_fd
+            self._release_lock()
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(str(lock_path), flags, 0o600)
@@ -1609,6 +1581,7 @@ class DaemonManager:
             print(f"Error: Permission denied locking '{lock_path}': {e}", file=sys.stderr)
             sys.exit(1)
         self._lock_fd = fd
+        self._locked_path = lock_path
         return fd
 
     def _acquire_lock(self) -> int:
@@ -1626,6 +1599,11 @@ class DaemonManager:
             except OSError:
                 pass
             self._lock_fd = None
+            self._locked_path = None
+
+    def close(self) -> None:
+        """Closes all retained file handles and releases locks."""
+        self._release_lock()
 
     def _clean_pid_file(self) -> None:
         """Safely unlinks PID file if it exists or is a symlink."""
@@ -1830,6 +1808,28 @@ class DaemonManager:
             target.write_text(self.SYSTEMD_TEMPLATE, encoding="utf-8")
         return self.SYSTEMD_TEMPLATE
 
+    def reload_systemd(self) -> bool:
+        """Executes 'systemctl --user daemon-reload', issuing advisory on linger failure."""
+        if not shutil.which("systemctl"):
+            print("Warning: systemctl command not found. If D-Bus session bus or user lingering is disabled, enable lingering via: loginctl enable-linger", file=sys.stderr)
+            return False
+        try:
+            res = subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=5.0)
+            if res.returncode != 0:
+                print(f"Warning: Failed to reload systemd daemon via 'systemctl --user daemon-reload' ({res.stderr.strip()}). If D-Bus session bus or user lingering is disabled, enable lingering via: loginctl enable-linger", file=sys.stderr)
+                return False
+            return True
+        except Exception as e:
+            print(f"Warning: Exception executing daemon-reload ({e}). If D-Bus session bus or user lingering is disabled, enable lingering via: loginctl enable-linger", file=sys.stderr)
+            return False
+
+    def install_systemd(self, target_path: Path | str | None = None) -> str:
+        """Installs the systemd user service unit and reloads the user daemon."""
+        target = Path(target_path).expanduser() if target_path is not None else Path.home() / ".config" / "systemd" / "user" / self.SYSTEMD_SERVICE_NAME
+        unit = self.generate_systemd(target_path=target)
+        self.reload_systemd()
+        return unit
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="watch.py", description="Antigravity Account Switcher Log Watcher & Daemon")
     parser.add_argument("action", nargs="?", choices=["run", "start", "stop", "status"], default="run", help="Daemon action")
@@ -1841,7 +1841,7 @@ def main(argv: list[str] | None = None) -> int:
     dm = DaemonManager(vault_dir=engine.vault_dir)
     if args.generate_systemd or args.install_systemd:
         target = Path.home() / ".config" / "systemd" / "user" / "agy-switch-watcher.service" if args.install_systemd else None
-        unit = dm.generate_systemd(target_path=target)
+        unit = dm.install_systemd(target_path=target) if args.install_systemd else dm.generate_systemd(target_path=target)
         sys.stdout.write(unit)
         sys.stdout.flush()
         return 0
@@ -1851,46 +1851,38 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[watch] Daemon started in background (PID: {pid}).\n  - Log: {dm.log_file}\n  - PID: {dm.pid_file}")
             return 0
         except DaemonAlreadyRunningError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+            print(f"Error: {e}", file=sys.stderr); return 1
         except Exception as e:
-            print(f"Error starting daemon: {e}", file=sys.stderr)
-            return 1
+            print(f"Error starting daemon: {e}", file=sys.stderr); return 1
     if args.action == "stop":
         try:
             stopped = dm.stop()
             print("[watch] Daemon stopped successfully." if stopped else "[watch] Daemon was not running.")
             return 0
         except Exception as e:
-            print(f"Error stopping daemon: {e}", file=sys.stderr)
-            return 1
+            print(f"Error stopping daemon: {e}", file=sys.stderr); return 1
     if args.action == "status":
         st = dm.status()
         if st["running"]:
             print(f"[watch] Daemon is running (PID: {st['pid']}).\n  - Log: {st['log_file']}")
             if st.get("targets"):
                 print("  - Monitored targets:")
-                for t in st["targets"]:
-                    print(f"    * {t}")
+                for t in st["targets"]: print(f"    * {t}")
         else:
             print(f"[watch] Daemon is stopped.\n  - Log: {st['log_file']}")
         return 0
     if args.action == "run":
-        try:
-            signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-        except Exception:
-            pass
+        try: signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+        except Exception: pass
         LogWatcher(engine, cooldown_minutes=args.cooldown).watch_loop()
         return 0
     return 0
 
 __all__ = [
-    "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError", "QuotaClient",
-    "fetch_account_quota", "RotationEngine", "AgySwitchEngine", "DEFAULT_VAULT_DIR",
-    "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES", "DEFAULT_DAMPING_SECONDS",
-    "SYSTEMD_ACTIVE_ERROR_MSG", "_open_secure_log_file", "_resolve_vault_log_path", "append_secure_log_entry",
-    "PresenceDetector", "CooldownManager", "LogWatcher", "DaemonManager",
-    "main", "time", "shutil", "subprocess",
+    "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError", "QuotaClient", "fetch_account_quota",
+    "RotationEngine", "AgySwitchEngine", "DEFAULT_VAULT_DIR", "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES",
+    "DEFAULT_DAMPING_SECONDS", "SYSTEMD_ACTIVE_ERROR_MSG", "_open_secure_log_file", "_resolve_vault_log_path",
+    "append_secure_log_entry", "PresenceDetector", "CooldownManager", "LogWatcher", "DaemonManager", "main", "time", "shutil", "subprocess",
 ]
 
 if __name__ == "__main__":
