@@ -44,6 +44,99 @@ for arg in "$@"; do
     esac
 done
 
+# Determine script directory robustly if available
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BOOSTER_ROOT="$SCRIPT_DIR"
+else
+    SCRIPT_DIR=""
+    BOOSTER_ROOT=""
+fi
+
+matches_dest() {
+    local path="$1"
+    local prefix="$2"
+    [ -n "$prefix" ] && case "$path" in "$prefix"*) return 0 ;; esac
+    return 1
+}
+
+matches_agy() {
+    local path="$1"
+    case "$path" in
+        *"/agy-switch/"*|*"/agy_switch.py"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_foreign_binary() {
+    local link="$1"
+    # Non-existent paths or symlinks are safe to install/refresh
+    if [ ! -e "$link" ] || [ -L "$link" ]; then
+        return 1
+    fi
+    # Non-symlink regular files or foreign executables
+    if [ -f "$link" ]; then
+        if grep -q "agy_switch" "$link" 2>/dev/null || grep -q "agy-switch" "$link" 2>/dev/null; then
+            return 1
+        fi
+        return 0
+    fi
+    # Any other non-symlink filesystem object (e.g. dir, socket)
+    return 0
+}
+
+verify_prerequisites() {
+    # 1. Verify git is installed
+    if ! command -v git >/dev/null 2>&1; then
+        if [ "${IS_BOOTSTRAP:-0}" -eq 1 ]; then
+            echo "Error: git is required for remote installation." >&2
+        else
+            echo "Error: git is required to install agy-switch but is not installed or not in PATH." >&2
+            echo "Please install git and try again." >&2
+        fi
+        return 1
+    fi
+
+    # 2. Verify python3 is installed
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Error: python3 (>= 3.10) is required to install agy-switch but is not installed or not in PATH." >&2
+        echo "Please install python3 and try again." >&2
+        return 1
+    fi
+
+    # 3. Verify python3 version >= 3.10
+    if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1; then
+        local py_ver
+        py_ver="$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null || true)"
+        echo "Error: python3 version 3.10 or higher is required to install agy-switch (detected Python ${py_ver:-unknown})." >&2
+        echo "Please upgrade python3 and try again." >&2
+        return 1
+    fi
+
+    # 4. Check for launcher collision (skip if uninstalling)
+    local is_uninstall=0
+    for arg in "$@"; do
+        case "$arg" in
+            -u|--uninstall)
+                is_uninstall=1
+                ;;
+        esac
+    done
+
+    if [ "$is_uninstall" -eq 0 ]; then
+        local bin_dir="${HOME}/.local/bin"
+        local bin_link="$bin_dir/agy-switch"
+        if is_foreign_binary "$bin_link"; then
+            echo "Error: Existing foreign file or executable already exists at '$bin_link' that was not created by agy-switch." >&2
+            echo "Refusing to silently overwrite foreign binaries without user confirmation." >&2
+            echo "Please backup, move, or remove '$bin_link' and run installer again." >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # ---------------------------------------------------------
 # Execution Mode Detection (Local Mode vs Bootstrap Mode)
 # ---------------------------------------------------------
@@ -56,11 +149,12 @@ fi
 if [ "$IS_BOOTSTRAP" -eq 1 ]; then
     echo "==> agy-switch Remote Bootstrap Installer"
     export GIT_TERMINAL_PROMPT=0
+fi
 
-    if ! command -v git >/dev/null 2>&1; then
-        echo "Error: git is required for remote installation." >&2
-        exit 1
-    fi
+# Run pre-flight prerequisites and foreign binary collision check
+verify_prerequisites "$@" || exit 1
+
+if [ "$IS_BOOTSTRAP" -eq 1 ]; then
 
     TARGET_DIR="${AGY_SWITCH_HOME:-$HOME/agy-switcher}"
     while [ "$TARGET_DIR" != "/" ] && [ "${TARGET_DIR%/}" != "$TARGET_DIR" ]; do
@@ -247,21 +341,6 @@ get_global_dest() {
     echo "${HOME}/.gemini/config/plugins/agy-switch"
 }
 
-matches_dest() {
-    local path="$1"
-    local prefix="$2"
-    [ -n "$prefix" ] && case "$path" in "$prefix"*) return 0 ;; esac
-    return 1
-}
-
-matches_agy() {
-    local path="$1"
-    case "$path" in
-        *"/agy-switch/"*|*"/agy_switch.py"*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 manage_launcher() {
     local action="$1"
     local target_dest="${2:-}"
@@ -269,6 +348,17 @@ manage_launcher() {
     local bin_link="$bin_dir/agy-switch"
 
     if [ "$action" = "install" ]; then
+        if is_foreign_binary "$bin_link"; then
+            echo "Error: Existing foreign file or executable already exists at '$bin_link' that was not created by agy-switch." >&2
+            echo "Refusing to silently overwrite foreign binaries without user confirmation." >&2
+            echo "Please backup, move, or remove '$bin_link' and run installer again." >&2
+            exit 1
+        fi
+        if [ -e "$bin_link" ] || [ -L "$bin_link" ]; then
+            # Unlink verified existing launcher symlink before replacing
+            rm -f "$bin_link"
+        fi
+
         mkdir -p "$bin_dir"
         local script_target="$target_dest/scripts/agy_switch.py"
         # Ensure executable
