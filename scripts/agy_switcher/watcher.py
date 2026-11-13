@@ -1851,29 +1851,35 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[watch] Daemon started in background (PID: {pid}).\n  - Log: {dm.log_file}\n  - PID: {dm.pid_file}")
             return 0
         except DaemonAlreadyRunningError as e:
-            print(f"Error: {e}", file=sys.stderr); return 1
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
         except Exception as e:
-            print(f"Error starting daemon: {e}", file=sys.stderr); return 1
+            print(f"Error starting daemon: {e}", file=sys.stderr)
+            return 1
     if args.action == "stop":
         try:
             stopped = dm.stop()
             print("[watch] Daemon stopped successfully." if stopped else "[watch] Daemon was not running.")
             return 0
         except Exception as e:
-            print(f"Error stopping daemon: {e}", file=sys.stderr); return 1
+            print(f"Error stopping daemon: {e}", file=sys.stderr)
+            return 1
     if args.action == "status":
         st = dm.status()
         if st["running"]:
             print(f"[watch] Daemon is running (PID: {st['pid']}).\n  - Log: {st['log_file']}")
             if st.get("targets"):
                 print("  - Monitored targets:")
-                for t in st["targets"]: print(f"    * {t}")
+                for t in st["targets"]:
+                    print(f"    * {t}")
         else:
             print(f"[watch] Daemon is stopped.\n  - Log: {st['log_file']}")
         return 0
     if args.action == "run":
-        try: signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-        except Exception: pass
+        try:
+            signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+        except Exception:
+            pass
         LogWatcher(engine, cooldown_minutes=args.cooldown).watch_loop()
         return 0
     return 0

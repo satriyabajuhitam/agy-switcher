@@ -17,7 +17,7 @@ import shutil
 import stat
 import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from agy_switcher.exceptions import InvalidTokenError
 from agy_switcher.models import DiagnosticItem, DiagnosticReport
@@ -297,7 +297,8 @@ class DoctorEngine:
         if self.hook_installer is not None:
             return self.hook_installer(hooks_file)
         if self.engine is not None and hasattr(self.engine, "install_hook"):
-            return self.engine.install_hook(hooks_file, launcher_bin=launcher_bin)
+            res = self.engine.install_hook(hooks_file, launcher_bin=launcher_bin)
+            return Path(res) if isinstance(res, (Path, str)) else cast(Path, res)
 
         target_hooks = Path(hooks_file or (self.gemini_dir / "config" / "hooks.json")).expanduser()
         target_hooks.parent.mkdir(parents=True, exist_ok=True)
@@ -360,7 +361,6 @@ class DoctorEngine:
             if any(p.is_file() or p.is_symlink() for p in canonical_candidates):
                 hook_cmd = "~/.local/bin/agy-switch hook-pre-invocation"
             else:
-                # Resolve launcher path
                 launcher_path = Path(__file__).resolve().parent.parent / "agy_switch.py"
                 hook_cmd = f"python3 {shlex.quote(str(launcher_path))} hook-pre-invocation"
 
@@ -384,10 +384,12 @@ class DoctorEngine:
         return extract_email_from_jwt(id_token)
 
     @staticmethod
-    def _extract_refresh_token(token_obj: Any, data: Any = None) -> str | None:
+    def _extract_refresh_token(token_obj: object, data: object = None) -> str | None:
         """Extracts and strips a refresh token from string, nested wrapper dict, or container."""
-        raw: Any = None
-        if isinstance(token_obj, dict):
+        raw: object = None
+        if isinstance(token_obj, str):
+            raw = token_obj
+        elif isinstance(token_obj, dict):
             raw = token_obj.get("refresh_token")
         if (raw is None or raw == "") and isinstance(data, dict):
             raw = data.get("refresh_token")
@@ -644,7 +646,6 @@ class DoctorEngine:
             token_path = acc / "token.json"
             is_active = bool(active_account and acc_name == active_account.strip())
 
-            # Check directory traversability / permissions
             try:
                 os.scandir(acc).close()
             except PermissionError as e:
