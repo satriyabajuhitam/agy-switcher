@@ -116,6 +116,8 @@ from agy_switcher.presence import (
     _is_prod_vault_path,
     _is_test_runner,
     _open_secure_log_file,
+    _resolve_log_file_target,
+    _resolve_vault_log_path,
     _write_atomic_file_secure,
     append_secure_log_entry,
 )
@@ -791,17 +793,14 @@ class LogWatcher:
                 pass
         self._append_audit_log(target_account=target_account, old_account=old_account, reason=reason, reloaded=reloaded, clean_reason=clean_reason)
 
+    def _resolve_vault_log_path(self, log_file: Path | str | None = None) -> Path | None:
+        """Resolves isolated vault log file path for this watcher instance."""
+        return _resolve_vault_log_path(log_file=log_file, engine=getattr(self, "engine", None))
+
     def _resolve_audit_log_dir(self) -> Path | None:
         """Dynamically resolves isolated vault directory for audit logging without caching."""
-        if (env_vault := os.environ.get("AGY_VAULT_DIR")) and env_vault.strip():
-            candidate = Path(env_vault.strip()).expanduser()
-            return None if _is_test_runner() and _is_prod_vault_path(candidate) else candidate
-        if (engine := getattr(self, "engine", None)) is not None:
-            v = getattr(engine, "vault_dir", None)
-            if v is not None and not _is_mock_object(v) and isinstance(v, (str, Path)) and str(v).strip():
-                candidate = Path(str(v).strip()).expanduser()
-                return None if _is_test_runner() and _is_prod_vault_path(candidate) else candidate
-        return None if _is_test_runner() else DEFAULT_VAULT_DIR
+        target = self._resolve_vault_log_path()
+        return target.parent if target is not None else None
 
     def _append_audit_log(
         self,
@@ -1878,7 +1877,7 @@ __all__ = [
     "AgySwitchError", "DaemonError", "DaemonAlreadyRunningError", "QuotaClient",
     "fetch_account_quota", "RotationEngine", "AgySwitchEngine", "DEFAULT_VAULT_DIR",
     "DEFAULT_GEMINI_DIR", "DEFAULT_MAX_CHUNK_BYTES", "DEFAULT_DAMPING_SECONDS",
-    "SYSTEMD_ACTIVE_ERROR_MSG", "_open_secure_log_file", "append_secure_log_entry",
+    "SYSTEMD_ACTIVE_ERROR_MSG", "_open_secure_log_file", "_resolve_vault_log_path", "append_secure_log_entry",
     "PresenceDetector", "CooldownManager", "LogWatcher", "DaemonManager",
     "main", "time", "shutil", "subprocess",
 ]

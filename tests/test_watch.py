@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import io
 import json
@@ -17,7 +18,16 @@ import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from scripts.watch import LogWatcher, PresenceDetector, DaemonManager, DEFAULT_VAULT_DIR, main as watch_main
+from scripts.watch import (
+    LogWatcher,
+    PresenceDetector,
+    DaemonManager,
+    DEFAULT_VAULT_DIR,
+    main as watch_main,
+    _open_secure_log_file,
+    _resolve_vault_log_path,
+    append_secure_log_entry,
+)
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.models import AccountInfo
 
@@ -4766,7 +4776,7 @@ class TestVaultLogIsolation(unittest.TestCase):
         watcher_prod._notify_desktop(target_account=tag_prod_eng, reason="prod eng test")
         self._assert_prod_log_untouched(tag_prod_eng)
 
-    def test_vault_err_001_unwriteable_temp_vault_directory_handled_gracefully(self) -> None:
+    def test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully(self) -> None:
         """[VAULT-ERR-001] Read-only isolated vault directory logs error without crashing parent."""
         ro_vault = Path(self.tmpdir) / "ro_vault"
         ro_vault.mkdir(parents=True, exist_ok=True, mode=0o500)
@@ -4779,27 +4789,99 @@ class TestVaultLogIsolation(unittest.TestCase):
         try:
             with patch("sys.stderr", stderr_buf):
                 watcher._notify_desktop(target_account="ro_acc", reason="ro test")
+                append_secure_log_entry(ro_vault / "watch.log", "direct ro write\n")
+            err_output = stderr_buf.getvalue()
+            self.assertTrue(
+                "Failed to write audit log entry" in err_output
+                or "Error appending audit log" in err_output
+                or "Permission denied" in err_output,
+                f"Expected error in stderr but got: {err_output!r}"
+            )
         finally:
             os.chmod(ro_vault, 0o700)
 
-    def test_vault_err_002_empty_or_whitespace_agy_vault_dir_handled_safely(self) -> None:
-        """[VAULT-ERR-002] Empty or whitespace-only AGY_VAULT_DIR falls back safely without writing to prod."""
-        tag_ws = f"err002_ws_{time.time()}"
-        os.environ["AGY_VAULT_DIR"] = "   "
-        mock_engine = MagicMock()
-        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
-        watcher._notify_desktop(target_account=tag_ws, reason="whitespace env test")
-        self._assert_prod_log_untouched(tag_ws)
+        # Test simulated OSError during log append across diverse system error conditions
+        for simulated_errno in (errno.ENOSPC, errno.EACCES, errno.EROFS, errno.EDQUOT, errno.EMFILE):
+            with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(simulated_errno, "simulated error")):
+                stderr_sim = io.StringIO()
+                with patch("sys.stderr", stderr_sim):
+                    append_secure_log_entry(self.isolated_vault / "watch.log", "simulated write\n")
+                self.assertIn("Failed to write audit log entry", stderr_sim.getvalue())
 
-        sandbox_dir = Path(self.tmpdir) / "fallback_sandbox"
-        sandbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        sandbox_engine = MagicMock(vault_dir=sandbox_dir)
-        watcher_sandbox = LogWatcher(engine=sandbox_engine, log_dirs=[self.tmpdir])
-        watcher_sandbox._notify_desktop(target_account=tag_ws, reason="whitespace with engine sandbox")
-        sandbox_log = sandbox_dir / "watch.log"
-        self.assertTrue(sandbox_log.exists())
-        self.assertIn(tag_ws, sandbox_log.read_text(encoding="utf-8"))
-        self._assert_prod_log_untouched(tag_ws)
+        # Test pre-existing read-only file (mode 0400) handling without crashing
+        ro_file = Path(self.tmpdir) / "ro_file_test.log"
+        ro_file.write_text("initial\n", encoding="utf-8")
+        os.chmod(ro_file, 0o400)
+        try:
+            stderr_ro = io.StringIO()
+            with patch("sys.stderr", stderr_ro):
+                append_secure_log_entry(ro_file, "ro append test\n")
+            self.assertIn("Failed to write audit log entry", stderr_ro.getvalue())
+        finally:
+            os.chmod(ro_file, 0o600)
+
+        # Test resilience when stderr itself encounters an error (RuntimeError or BrokenPipeError)
+        for stderr_err in (RuntimeError("Broken stderr stream"), BrokenPipeError(errno.EPIPE, "Broken pipe")):
+            broken_stderr = MagicMock()
+            broken_stderr.write.side_effect = stderr_err
+            with patch("sys.stderr", broken_stderr):
+                with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.EACCES, "denied")):
+                    append_secure_log_entry(self.isolated_vault / "watch.log", "broken stderr test\n")
+
+    test_vault_err_001_unwriteable_temp_vault_directory_handled_gracefully = test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully
+
+    def test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely(self) -> None:
+        """[VAULT-ERR-002] Empty or whitespace-only AGY_VAULT_DIR falls back safely without writing to prod."""
+        for ws_val in ("", "   ", "\t  \n"):
+            os.environ["AGY_VAULT_DIR"] = ws_val
+            tag_ws = f"err002_ws_{time.time()}"
+            mock_engine = MagicMock(spec=[])
+            watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+            watcher._notify_desktop(target_account=tag_ws, reason="whitespace env test")
+            self._assert_prod_log_untouched(tag_ws)
+
+            # Direct append_secure_log_entry should not touch prod
+            append_secure_log_entry(self.prod_vault / "watch.log", f"{tag_ws}_direct\n")
+            self._assert_prod_log_untouched(f"{tag_ws}_direct")
+
+            # Direct _resolve_vault_log_path rejects empty/whitespace without fallback to DEFAULT_VAULT_DIR under test
+            self.assertIsNone(_resolve_vault_log_path())
+            self.assertIsNone(_resolve_vault_log_path(""))
+            self.assertIsNone(_resolve_vault_log_path("   "))
+            self.assertIsNone(_resolve_vault_log_path(Path("")))
+            self.assertIsNone(_resolve_vault_log_path(self.prod_vault / "watch.log"))
+            self.assertIsNone(watcher._resolve_vault_log_path())
+            self.assertIsNone(watcher._resolve_vault_log_path(""))
+            self.assertIsNone(watcher._resolve_vault_log_path("   "))
+            self.assertIsNone(watcher._resolve_audit_log_dir())
+
+            # Direct append_secure_log_entry with empty/whitespace suppresses without creating stray files
+            append_secure_log_entry("", "direct empty string write\n")
+            append_secure_log_entry("   ", "direct whitespace write\n")
+            self.assertFalse(Path("   ").exists())
+
+            # Low-level _open_secure_log_file rejects invalid empty/whitespace paths with ValueError
+            with self.assertRaises(ValueError):
+                _open_secure_log_file("")
+            with self.assertRaises(ValueError):
+                _open_secure_log_file("   ")
+
+            # When engine provides an isolated sandbox vault_dir, it safely redirects to sandbox
+            sandbox_dir = Path(self.tmpdir) / f"fallback_sandbox_{abs(hash(ws_val))}"
+            sandbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            sandbox_engine = MagicMock(vault_dir=sandbox_dir)
+            watcher_sandbox = LogWatcher(engine=sandbox_engine, log_dirs=[self.tmpdir])
+            self.assertEqual(watcher_sandbox._resolve_audit_log_dir(), sandbox_dir)
+            self.assertEqual(watcher_sandbox._resolve_vault_log_path(), sandbox_dir / "watch.log")
+            self.assertEqual(_resolve_vault_log_path(engine=sandbox_engine), sandbox_dir / "watch.log")
+
+            watcher_sandbox._notify_desktop(target_account=tag_ws, reason="whitespace with engine sandbox")
+            sandbox_log = sandbox_dir / "watch.log"
+            self.assertTrue(sandbox_log.exists())
+            self.assertIn(tag_ws, sandbox_log.read_text(encoding="utf-8"))
+            self._assert_prod_log_untouched(tag_ws)
+
+    test_vault_err_002_empty_or_whitespace_agy_vault_dir_handled_safely = test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely
 
     def test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination(self) -> None:
         """[VAULT-EDGE-001] Dynamic mutation of AGY_VAULT_DIR rebinds logging destination hermetically."""
@@ -4830,9 +4912,21 @@ class TestVaultLogIsolation(unittest.TestCase):
             self.test_vault_iso_001_redirect_to_agy_vault_dir,
             self.test_vault_iso_002_mock_engine_prohibits_production_log,
             self.test_vault_iso_003_prod_agy_vault_dir_under_test_prohibits_production_log,
-            self.test_vault_err_001_unwriteable_temp_vault_directory_handled_gracefully,
-            self.test_vault_err_002_empty_or_whitespace_agy_vault_dir_handled_safely,
+            self.test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully,
+            self.test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely,
             self.test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
+
+    def _test_vault_error_scenarios(self) -> None:
+        scenarios = [
+            self.test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully,
+            self.test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely,
         ]
         for scenario in scenarios:
             self.setUp()
@@ -4846,6 +4940,11 @@ setattr(
     TestVaultLogIsolation,
     "test_VAULT_ISO_001|VAULT_ISO_002",
     TestVaultLogIsolation._test_all_vault_isolation_scenarios,
+)
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_ERR_001|VAULT_ERR_002",
+    TestVaultLogIsolation._test_vault_error_scenarios,
 )
 
 

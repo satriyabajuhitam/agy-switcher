@@ -63,22 +63,77 @@ def _is_prod_vault_path(path: Path | str) -> bool:
     )
 
 
-def _resolve_log_file_target(log_file: Path | str) -> Path | None:
-    raw_path = Path(log_file).expanduser()
-    is_default_vault = _is_prod_vault_path(raw_path)
+def _resolve_vault_log_path(
+    log_file: Path | str | None = None,
+    engine: object | None = None,
+) -> Path | None:
+    """Safely resolves isolated vault log path, rejecting invalid or production paths under test runners.
 
-    env_vault = os.environ.get("AGY_VAULT_DIR")
-    if env_vault is not None and env_vault.strip():
-        cleaned_dir = Path(env_vault.strip()).expanduser()
-        target = cleaned_dir / raw_path.name if is_default_vault else raw_path
-        if _is_test_runner() and _is_prod_vault_path(target):
+    - If AGY_VAULT_DIR is set in the environment:
+        * If non-empty and non-whitespace: validates candidate path. Under test runners,
+          returns None if pointing to production vault; otherwise returns target log path.
+        * If empty "" or whitespace "   ": rejected as invalid vault path without falling back
+          to DEFAULT_VAULT_DIR. Under test runners, suppresses writes (returns None) unless
+          engine specifies an isolated sandbox vault_dir. Outside test runners, falls back to DEFAULT_VAULT_DIR.
+    - If AGY_VAULT_DIR is unset:
+        * Checks engine.vault_dir if provided. Under test runners, returns None if pointing to prod.
+        * Under test runners, suppresses writes for default vault paths (returns None).
+        * Outside test runners, falls back to DEFAULT_VAULT_DIR.
+    """
+    try:
+        if log_file is not None and str(log_file).strip() and str(log_file).strip() != ".":
+            raw_path = Path(str(log_file).strip()).expanduser()
+            is_default_vault = _is_prod_vault_path(raw_path)
+            file_name = raw_path.name
+        else:
+            raw_path = None
+            is_default_vault = True
+            file_name = "watch.log"
+
+        env_vault = os.environ.get("AGY_VAULT_DIR")
+        if env_vault is not None:
+            cleaned = env_vault.strip()
+            if cleaned:
+                candidate = Path(cleaned).expanduser()
+                if _is_test_runner() and _is_prod_vault_path(candidate):
+                    return None
+                return candidate / file_name if (is_default_vault or raw_path is None) else raw_path
+
+            # Empty or whitespace AGY_VAULT_DIR: reject without falling back to DEFAULT_VAULT_DIR
+            if engine is not None:
+                v = getattr(engine, "vault_dir", None)
+                if v is not None and not _is_mock_object(v) and isinstance(v, (str, Path)) and str(v).strip():
+                    candidate = Path(str(v).strip()).expanduser()
+                    if not (_is_test_runner() and _is_prod_vault_path(candidate)):
+                        return candidate / file_name if (is_default_vault or raw_path is None) else raw_path
+            if not is_default_vault and raw_path is not None:
+                return raw_path
+            if _is_test_runner():
+                return None
+            return DEFAULT_VAULT_DIR / file_name if (is_default_vault or raw_path is None) else raw_path
+
+        # AGY_VAULT_DIR is unset
+        if engine is not None:
+            v = getattr(engine, "vault_dir", None)
+            if v is not None and not _is_mock_object(v) and isinstance(v, (str, Path)) and str(v).strip():
+                candidate = Path(str(v).strip()).expanduser()
+                if _is_test_runner() and _is_prod_vault_path(candidate):
+                    return None
+                return candidate / file_name if (is_default_vault or raw_path is None) else raw_path
+
+        if not is_default_vault and raw_path is not None:
+            return raw_path
+        if is_default_vault and _is_test_runner():
             return None
-        return target
+        return DEFAULT_VAULT_DIR / file_name if (is_default_vault or raw_path is None) else raw_path
+    except Exception:
+        return None if _is_test_runner() else (DEFAULT_VAULT_DIR / "watch.log")
 
-    if is_default_vault and _is_test_runner():
-        return None
 
-    return raw_path
+def _resolve_log_file_target(log_file: Path | str) -> Path | None:
+    if not str(log_file).strip() or str(log_file).strip() == ".":
+        return None if _is_test_runner() else (DEFAULT_VAULT_DIR / "watch.log")
+    return _resolve_vault_log_path(log_file=log_file)
 
 
 def _open_secure_log_file(log_file: Path | str) -> int:
@@ -89,6 +144,8 @@ def _open_secure_log_file(log_file: Path | str) -> int:
     Returns the opened file descriptor.
     """
     path = Path(log_file)
+    if not str(path).strip() or str(path).strip() == ".":
+        raise ValueError("Cannot open empty or current directory path as log file")
     if path.parent and not path.parent.is_dir():
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -406,6 +463,8 @@ class PresenceDetector:
 
 
 __all__ = [
+    "_resolve_vault_log_path",
+    "_resolve_log_file_target",
     "_open_secure_log_file",
     "append_secure_log_entry",
     "_write_atomic_file_secure",
