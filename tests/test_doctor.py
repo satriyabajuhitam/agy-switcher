@@ -13,6 +13,7 @@ import stat
 import sys
 import tempfile
 import time
+from typing import Any, Callable
 import unittest
 
 # Ensure scripts directory is in sys.path
@@ -458,6 +459,130 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         self.test_DOCTOR_ERR_002_whitespace_only_or_non_string_refresh_token_flagged_warn()
 
     locals()["test_DOCTOR_ERR_001|DOCTOR_ERR_002"] = _run_doctor_err_001_and_002
+
+    def test_DOCTOR_ERR_003_unreadable_account_directory_handled_gracefully(self) -> None:
+        """[DOCTOR-ERR-003] Unreadable account directory or permission error in vault handled gracefully."""
+        self._setup_pristine_environment()
+        restricted_dir = self.vault_dir / "accounts" / "standby-restricted"
+        restricted_dir.mkdir(parents=True, exist_ok=True)
+        token_path = restricted_dir / "token.json"
+        sample_token = create_sample_token(
+            email="restricted@example.com",
+            expiry_offset_hours=-2,
+            refresh_token="1//sample_refresh_token",
+        )
+        token_path.write_text(json.dumps(sample_token), encoding="utf-8")
+
+        # Test Case 1: Directory itself has 0000 permissions
+        try:
+            os.chmod(restricted_dir, 0o000)
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("standby-restricted", direct_item.message)
+            self.assertIn("permission", direct_item.message.lower())
+
+            report = self.engine.run_diagnostics()
+            token_item = next(it for it in report.items if it.category == "token_integrity")
+            self.assertEqual(token_item.status, "FAIL")
+            self.assertFalse(token_item.can_fix)
+            self.assertIn("standby-restricted", token_item.message)
+        finally:
+            os.chmod(restricted_dir, 0o700)
+
+        # Test Case 2: Directory is 0700 but token.json has 0000 permissions
+        try:
+            os.chmod(token_path, 0o000)
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("standby-restricted", direct_item.message)
+            self.assertIn("permission", direct_item.message.lower())
+
+            report = self.engine.run_diagnostics()
+            token_item = next(it for it in report.items if it.category == "token_integrity")
+            self.assertEqual(token_item.status, "FAIL")
+            self.assertFalse(token_item.can_fix)
+            self.assertIn("standby-restricted", token_item.message)
+        finally:
+            os.chmod(token_path, 0o600)
+
+    def test_DOCTOR_EDGE_001_non_standard_refresh_token_payload_schema_handled_gracefully(self) -> None:
+        """[DOCTOR-EDGE-001] Account with non-standard refresh token payload schema handled gracefully."""
+        def mod_whitespace(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = "  \n\t  1//valid_refresh_token  \r\n "
+
+        def mod_extra(tok: dict[str, Any]) -> None:
+            tok["token"]["extra_field"] = "custom_metadata"
+            tok["extra_root_prop"] = {"nested": True, "count": 42}
+
+        def mod_nested_token(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"token": "  1//valid_nested_token  "}
+
+        def mod_nested_value(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"value": "  1//valid_nested_value  "}
+
+        def mod_nested_refresh(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"refresh_token": "1//valid_nested_refresh"}
+
+        def mod_nested_secret(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"secret": "1//valid_nested_secret"}
+
+        def mod_root_level(tok: dict[str, Any]) -> None:
+            tok["refresh_token"] = "1//valid_root_token"
+            tok["token"].pop("refresh_token", None)
+
+        cases: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
+            ("whitespace_padding", mod_whitespace),
+            ("extra_attributes", mod_extra),
+            ("nested_dict_token_key", mod_nested_token),
+            ("nested_dict_value_key", mod_nested_value),
+            ("nested_dict_refresh_token_key", mod_nested_refresh),
+            ("nested_dict_secret_key", mod_nested_secret),
+            ("root_level_refresh_token", mod_root_level),
+        ]
+
+        for case_name, modifier in cases:
+            with self.subTest(case=case_name):
+                self._setup_pristine_environment()
+                sec_dir = self.vault_dir / "accounts" / "acc_standby_nonstandard"
+                sec_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(sec_dir, 0o700)
+                sec_token = create_sample_token(
+                    email="nonstandard@example.com",
+                    expiry_offset_hours=-2,
+                    refresh_token="1//initial_refresh_token",
+                )
+                modifier(sec_token)
+                (sec_dir / "token.json").write_text(json.dumps(sec_token), encoding="utf-8")
+                os.chmod(sec_dir / "token.json", 0o600)
+
+                # Direct seam verification
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(
+                    direct_item.status,
+                    "PASS",
+                    f"Expected PASS for case '{case_name}', got {direct_item.status}: {direct_item.message}",
+                )
+                self.assertFalse(direct_item.can_fix)
+                self.assertIn("standby ready", direct_item.message)
+
+                # Full diagnostic engine report
+                report = self.engine.run_diagnostics()
+                token_item = next(it for it in report.items if it.category == "token_integrity")
+                self.assertEqual(
+                    token_item.status,
+                    "PASS",
+                    f"Expected token_integrity item PASS for case '{case_name}', got {token_item.status}: {token_item.message}",
+                )
+                self.assertFalse(token_item.can_fix)
+                self.assertIn("standby ready", token_item.message)
+
+    def _run_doctor_err_003_and_edge_001(self) -> None:
+        self.test_DOCTOR_ERR_003_unreadable_account_directory_handled_gracefully()
+        self.test_DOCTOR_EDGE_001_non_standard_refresh_token_payload_schema_handled_gracefully()
+
+    locals()["test_DOCTOR_ERR_003|DOCTOR_EDGE_001"] = _run_doctor_err_003_and_edge_001
 
     def test_layer2_expired_secondary_token_with_valid_refresh_token(self):
         """Expired non-active secondary account token with valid refresh token passes as Standby Ready."""

@@ -15,6 +15,7 @@ from pathlib import Path
 import shlex
 import shutil
 import stat
+import sys
 import time
 from typing import Any, Callable
 
@@ -303,13 +304,50 @@ class DoctorEngine:
 
         existing: dict[str, Any] = {}
         if target_hooks.is_file():
+            is_corrupt = False
+            corruption_reason = ""
             try:
                 content = target_hooks.read_text(encoding="utf-8").strip()
-                if content:
+                if not content:
+                    is_corrupt = True
+                    corruption_reason = "file is empty (0 bytes)"
+                else:
                     loaded = json.loads(content)
                     if isinstance(loaded, dict):
                         existing = loaded
-            except Exception:
+                    else:
+                        is_corrupt = True
+                        corruption_reason = f"root JSON element is {type(loaded).__name__}, expected object"
+            except Exception as exc:
+                is_corrupt = True
+                corruption_reason = str(exc)
+
+            if is_corrupt:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                bak_file = target_hooks.parent / f"{target_hooks.name}.bak.{ts}"
+                counter = 1
+                while bak_file.exists():
+                    bak_file = target_hooks.parent / f"{target_hooks.name}.bak.{ts}_{counter}"
+                    counter += 1
+                backup_succeeded = False
+                try:
+                    shutil.copy2(target_hooks, bak_file)
+                    backup_succeeded = True
+                except OSError as err:
+                    print(
+                        f"[agy-switch] Warning: Failed to backup corrupted hooks file '{target_hooks}' to '{bak_file}': {err}",
+                        file=sys.stderr,
+                    )
+                if backup_succeeded:
+                    print(
+                        f"[agy-switch] Warning: Corrupted hooks file '{target_hooks}' ({corruption_reason}) backed up to '{bak_file.name}' and reset to valid schema.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[agy-switch] Warning: Corrupted hooks file '{target_hooks}' ({corruption_reason}) reset to valid schema without backup.",
+                        file=sys.stderr,
+                    )
                 existing = {}
 
         if launcher_bin is not None:
@@ -345,8 +383,57 @@ class DoctorEngine:
         """Decodes JWT payload to extract user email."""
         return extract_email_from_jwt(id_token)
 
+    @staticmethod
+    def _extract_refresh_token(token_obj: Any, data: Any = None) -> str | None:
+        """Extracts and strips a refresh token from string, nested wrapper dict, or container."""
+        raw: Any = None
+        if isinstance(token_obj, dict):
+            raw = token_obj.get("refresh_token")
+        if (raw is None or raw == "") and isinstance(data, dict):
+            raw = data.get("refresh_token")
+
+        if isinstance(raw, str):
+            cleaned = raw.strip()
+            return cleaned if cleaned else None
+
+        if isinstance(raw, dict):
+            for candidate_key in ("token", "value", "refresh_token", "secret", "key", "token_value"):
+                val = raw.get(candidate_key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+                if isinstance(val, dict):
+                    nested = DoctorEngine._extract_refresh_token(val)
+                    if nested:
+                        return nested
+            for val in raw.values():
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+                if isinstance(val, dict):
+                    nested = DoctorEngine._extract_refresh_token(val)
+                    if nested:
+                        return nested
+            return None
+
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+                if isinstance(item, dict):
+                    nested = DoctorEngine._extract_refresh_token(item)
+                    if nested:
+                        return nested
+            return None
+
+        return None
+
     def validate_token_dict(self, data: Any) -> dict[str, Any]:
         """Validates token schema dictionary."""
+        if isinstance(data, dict):
+            token_obj = data.get("token")
+            if isinstance(token_obj, dict):
+                extracted = self._extract_refresh_token(token_obj, data)
+                if extracted is not None:
+                    token_obj["refresh_token"] = extracted
         return validate_token_dict(data)
 
     def validate_token_file(self, token_path: Path) -> dict[str, Any]:
@@ -430,11 +517,17 @@ class DoctorEngine:
 
         files_to_check: list[Path] = []
         if self.accounts_dir.is_dir():
-            for acc in self.accounts_dir.iterdir():
-                if acc.is_dir() and not acc.name.startswith("."):
-                    for f in acc.iterdir():
-                        if f.is_file():
-                            files_to_check.append(f)
+            try:
+                for acc in self.accounts_dir.iterdir():
+                    if acc.is_dir() and not acc.name.startswith("."):
+                        try:
+                            for f in acc.iterdir():
+                                if f.is_file():
+                                    files_to_check.append(f)
+                        except (PermissionError, OSError):
+                            pass
+            except (PermissionError, OSError):
+                pass
         if self.active_file.is_file():
             files_to_check.append(self.active_file)
         if self.cache_dir.is_dir():
@@ -486,7 +579,17 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        accounts = sorted([p for p in self.accounts_dir.iterdir() if p.is_dir() and not p.name.startswith(".")])
+        try:
+            accounts = sorted([p for p in self.accounts_dir.iterdir() if p.is_dir() and not p.name.startswith(".")])
+        except PermissionError as e:
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=f"Inaccessible vault accounts directory due to filesystem permissions: '{self.accounts_dir}' ({e}).",
+                can_fix=False,
+            )
+
         if not accounts:
             return DiagnosticItem(
                 category="token_integrity",
@@ -497,6 +600,7 @@ class DoctorEngine:
             )
 
         active_account = self.get_active_name()
+        permission_denied_accounts: list[tuple[str, str, str]] = []
         corrupt_accounts: list[tuple[str, str]] = []
         corrupt_secondary: list[tuple[str, str]] = []
         expired_active: list[str] = []
@@ -508,16 +612,44 @@ class DoctorEngine:
             token_path = acc / "token.json"
             is_active = bool(active_account and acc_name == active_account.strip())
 
-            if not token_path.is_file():
+            # Check directory traversability / permissions
+            try:
+                os.scandir(acc).close()
+            except PermissionError as e:
+                permission_denied_accounts.append((acc_name, str(acc), str(e)))
+                continue
+
+            try:
+                token_stat = token_path.stat()
+            except PermissionError as e:
+                permission_denied_accounts.append((acc_name, str(token_path), str(e)))
+                continue
+            except FileNotFoundError:
                 if is_active:
                     corrupt_accounts.append((acc_name, "token.json does not exist"))
                 else:
                     corrupt_secondary.append((acc_name, "token.json does not exist"))
                 continue
+            except OSError as e:
+                if is_active:
+                    corrupt_accounts.append((acc_name, f"Filesystem error: {e}"))
+                else:
+                    corrupt_secondary.append((acc_name, f"Filesystem error: {e}"))
+                continue
+
+            if not stat.S_ISREG(token_stat.st_mode):
+                if is_active:
+                    corrupt_accounts.append((acc_name, "token.json is not a regular file"))
+                else:
+                    corrupt_secondary.append((acc_name, "token.json is not a regular file"))
+                continue
 
             try:
                 raw_text = token_path.read_text(encoding="utf-8")
                 data = json.loads(raw_text)
+            except PermissionError as e:
+                permission_denied_accounts.append((acc_name, str(token_path), str(e)))
+                continue
             except Exception as e:
                 if is_active:
                     corrupt_accounts.append((acc_name, str(e)))
@@ -581,14 +713,26 @@ class DoctorEngine:
                     corrupt_secondary.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
                     continue
 
-                refresh_token = token_obj.get("refresh_token")
-                has_valid_refresh = isinstance(refresh_token, str) and bool(refresh_token.strip())
+                refresh_token = self._extract_refresh_token(token_obj, data)
+                if refresh_token is not None:
+                    token_obj["refresh_token"] = refresh_token
+                has_valid_refresh = refresh_token is not None
 
                 if self._is_token_expired(raw_expiry):
                     if has_valid_refresh:
                         standby_ready.append(acc_name)
                     else:
                         expired_secondary.append(acc_name)
+
+        if permission_denied_accounts:
+            err_details = [f"'{a}' ({path}): {msg}" for a, path, msg in permission_denied_accounts]
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=f"Inaccessible account directory due to filesystem permissions: {', '.join(err_details)}.",
+                can_fix=False,
+            )
 
         if corrupt_accounts:
             err_details = [f"'{a}': {msg}" for a, msg in corrupt_accounts]
