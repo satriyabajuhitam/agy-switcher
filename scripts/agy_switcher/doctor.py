@@ -590,6 +590,39 @@ class DoctorEngine:
                 can_fix=False,
             )
 
+        active_account = self.get_active_name()
+        if active_account:
+            active_path = self.accounts_dir / active_account
+            is_valid_active = (
+                Path(active_account).name == active_account
+                and not active_account.startswith(".")
+                and active_path.is_dir()
+            )
+            if not is_valid_active:
+                return DiagnosticItem(
+                    category="token_integrity",
+                    name="OAuth Token & JWT Identity Integrity",
+                    status="FAIL",
+                    message=(
+                        f"Configured active account '{active_account}' is missing from the vault. "
+                        "Select a valid active account with 'agy-switch switch <alias>' or "
+                        "register one with 'agy-switch login <alias>'."
+                    ),
+                    can_fix=False,
+                )
+        elif self.active_file.is_file():
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=(
+                    "Active account pointer file does not specify a valid account alias. "
+                    "Select a valid active account with 'agy-switch switch <alias>' or "
+                    "register one with 'agy-switch login <alias>'."
+                ),
+                can_fix=False,
+            )
+
         if not accounts:
             return DiagnosticItem(
                 category="token_integrity",
@@ -599,7 +632,6 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        active_account = self.get_active_name()
         permission_denied_accounts: list[tuple[str, str, str]] = []
         corrupt_accounts: list[tuple[str, str]] = []
         corrupt_secondary: list[tuple[str, str]] = []

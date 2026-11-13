@@ -584,6 +584,41 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
 
     locals()["test_DOCTOR_ERR_003|DOCTOR_EDGE_001"] = _run_doctor_err_003_and_edge_001
 
+    def test_DOCTOR_EDGE_002_active_account_pointer_missing_from_vault_fails(self) -> None:
+        """[DOCTOR-EDGE-002] Active account pointer referencing non-existent account directory flagged as [FAIL]."""
+        self._setup_pristine_environment()
+        missing_alias = "missing-acc"
+        (self.vault_dir / "active").write_text(f"{missing_alias}\n", encoding="utf-8")
+        self.assertFalse((self.vault_dir / "accounts" / missing_alias).exists())
+
+        # Direct seam verification
+        direct_item = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_item.status, "FAIL")
+        self.assertFalse(direct_item.can_fix)
+        self.assertIn(missing_alias, direct_item.message)
+        self.assertIn("missing", direct_item.message.lower())
+        self.assertTrue(
+            "switch" in direct_item.message.lower() or "select" in direct_item.message.lower(),
+            f"Expected remediation advice to select/switch account, got: {direct_item.message}",
+        )
+
+        # Full diagnostic report verification
+        report = self.engine.run_diagnostics()
+        token_item = next(it for it in report.items if it.category == "token_integrity")
+        self.assertEqual(token_item.status, "FAIL")
+        self.assertFalse(token_item.can_fix)
+        self.assertIn(missing_alias, token_item.message)
+        self.assertIn("missing", token_item.message.lower())
+
+        # Edge case: accounts directory is completely empty and active pointer specifies missing alias
+        shutil.rmtree(self.vault_dir / "accounts")
+        (self.vault_dir / "accounts").mkdir(parents=True, exist_ok=True)
+        direct_empty = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_empty.status, "FAIL")
+        self.assertFalse(direct_empty.can_fix)
+        self.assertIn(missing_alias, direct_empty.message)
+
+
     def test_layer2_expired_secondary_token_with_valid_refresh_token(self):
         """Expired non-active secondary account token with valid refresh token passes as Standby Ready."""
         self._setup_pristine_environment()
