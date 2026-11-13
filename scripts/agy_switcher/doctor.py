@@ -287,12 +287,16 @@ class DoctorEngine:
         _atomic_write_file(self.desktop_token_file, payload_str, mode=0o600)
         _atomic_write_file(self.cli_token_file, payload_str, mode=0o600)
 
-    def install_hook(self, hooks_file: Path | None = None) -> Path:
+    def install_hook(
+        self,
+        hooks_file: Path | None = None,
+        launcher_bin: Path | str | None = None,
+    ) -> Path:
         """Installs the PreInvocation lifecycle hook into hooks.json via deep merge."""
         if self.hook_installer is not None:
             return self.hook_installer(hooks_file)
         if self.engine is not None and hasattr(self.engine, "install_hook"):
-            return self.engine.install_hook(hooks_file)
+            return self.engine.install_hook(hooks_file, launcher_bin=launcher_bin)
 
         target_hooks = Path(hooks_file or (self.gemini_dir / "config" / "hooks.json")).expanduser()
         target_hooks.parent.mkdir(parents=True, exist_ok=True)
@@ -308,9 +312,19 @@ class DoctorEngine:
             except Exception:
                 existing = {}
 
-        # Resolve launcher path
-        launcher_path = Path(__file__).resolve().parent.parent / "agy_switch.py"
-        hook_cmd = f"python3 {shlex.quote(str(launcher_path))} hook-pre-invocation"
+        if launcher_bin is not None:
+            hook_cmd = f"{launcher_bin} hook-pre-invocation"
+        else:
+            canonical_candidates = [
+                Path.home() / ".local" / "bin" / "agy-switch",
+                self.gemini_dir.parent / ".local" / "bin" / "agy-switch",
+            ]
+            if any(p.is_file() or p.is_symlink() for p in canonical_candidates):
+                hook_cmd = "~/.local/bin/agy-switch hook-pre-invocation"
+            else:
+                # Resolve launcher path
+                launcher_path = Path(__file__).resolve().parent.parent / "agy_switch.py"
+                hook_cmd = f"python3 {shlex.quote(str(launcher_path))} hook-pre-invocation"
 
         hook_def = {
             "enabled": True,
@@ -486,6 +500,7 @@ class DoctorEngine:
         corrupt_accounts: list[tuple[str, str]] = []
         expired_active: list[str] = []
         expired_secondary: list[str] = []
+        standby_ready: list[str] = []
 
         for acc in accounts:
             acc_name = acc.name
@@ -518,7 +533,11 @@ class DoctorEngine:
                 if active_account and acc_name == active_account.strip():
                     expired_active.append(acc_name)
                 else:
-                    expired_secondary.append(acc_name)
+                    refresh_token = token_obj.get("refresh_token")
+                    if isinstance(refresh_token, str) and bool(refresh_token.strip()):
+                        standby_ready.append(acc_name)
+                    else:
+                        expired_secondary.append(acc_name)
 
         if corrupt_accounts:
             err_details = [f"'{a}': {msg}" for a, msg in corrupt_accounts]
@@ -535,7 +554,7 @@ class DoctorEngine:
                 category="token_integrity",
                 name="OAuth Token & JWT Identity Integrity",
                 status="FAIL",
-                message=f"Active account '{expired_active[0]}' token is expired.",
+                message=f"Active account '{expired_active[0]}' token is expired and requires refresh.",
                 can_fix=False,
             )
 
@@ -548,11 +567,16 @@ class DoctorEngine:
                 can_fix=False,
             )
 
+        if standby_ready:
+            msg = f"All {len(accounts)} account tokens valid (active unexpired, {len(standby_ready)} standby ready)."
+        else:
+            msg = f"All {len(accounts)} account tokens valid and unexpired."
+
         return DiagnosticItem(
             category="token_integrity",
             name="OAuth Token & JWT Identity Integrity",
             status="PASS",
-            message=f"All {len(accounts)} account tokens valid and unexpired.",
+            message=msg,
             can_fix=False,
         )
 
