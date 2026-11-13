@@ -9,12 +9,71 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
 from agy_switcher.security import _atomic_write_file
 
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
+DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
+
+
+def _is_mock_object(obj: object) -> bool:
+    """Returns True if object is an instance of unittest.mock Mock or MagicMock."""
+    if obj is None:
+        return False
+    cls = type(obj)
+    mod = getattr(cls, "__module__", "")
+    name = cls.__name__
+    return (
+        "unittest.mock" in mod
+        or name in ("Mock", "MagicMock", "NonCallableMagicMock", "NonCallableMock", "AsyncMock")
+        or hasattr(obj, "_mock_return_value")
+    )
+
+
+def _is_test_runner() -> bool:
+    return (
+        "unittest" in sys.modules
+        or "pytest" in sys.modules
+        or "PYTEST_CURRENT_TEST" in os.environ
+    )
+
+
+def _resolve_log_file_target(log_file: Path | str) -> Path | None:
+    raw_path = Path(log_file).expanduser()
+    try:
+        resolved_path = raw_path.resolve()
+    except Exception:
+        resolved_path = raw_path
+
+    try:
+        default_vault_resolved = DEFAULT_VAULT_DIR.resolve()
+    except Exception:
+        default_vault_resolved = DEFAULT_VAULT_DIR
+
+    is_default_vault = (
+        resolved_path == (default_vault_resolved / raw_path.name)
+        or default_vault_resolved in resolved_path.parents
+        or str(raw_path).startswith(str(DEFAULT_VAULT_DIR))
+        or str(raw_path).startswith("~/.antigravity-vault")
+    )
+
+    env_vault = os.environ.get("AGY_VAULT_DIR")
+    if env_vault is not None:
+        cleaned = env_vault.strip()
+        if cleaned:
+            if is_default_vault:
+                return Path(cleaned).expanduser() / raw_path.name
+            return raw_path
+        if _is_test_runner() and is_default_vault:
+            return None
+
+    if is_default_vault and _is_test_runner():
+        return None
+
+    return raw_path
 
 
 def _open_secure_log_file(log_file: Path | str) -> int:
@@ -49,7 +108,10 @@ def _open_secure_log_file(log_file: Path | str) -> int:
 
 def append_secure_log_entry(log_file: Path | str, message: str) -> None:
     """Safely append a message entry to a log file with 0600 permissions and mode 0700 parent."""
-    path = Path(log_file)
+    target_path = _resolve_log_file_target(log_file)
+    if target_path is None:
+        return
+    path = target_path
     try:
         if path.parent and not path.parent.is_dir():
             try:

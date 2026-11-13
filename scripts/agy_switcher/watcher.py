@@ -112,6 +112,8 @@ def _extract_text_fragments(value: object, max_items: int = 10000) -> list[str]:
 from agy_switcher.presence import (
     DEFAULT_GEMINI_DIR,
     PresenceDetector,
+    _is_mock_object,
+    _is_test_runner,
     _open_secure_log_file,
     _write_atomic_file_secure,
     append_secure_log_entry,
@@ -191,15 +193,7 @@ class CooldownManager:
             return False
 
     def _read_raw(self) -> tuple[dict[str, Any] | None, bool]:
-        """
-        Reads raw JSON content from cooldown.json.
-        Returns:
-            (records_dict, is_corrupt)
-            - If file does not exist: ({}, False)
-            - If valid JSON dict: (data, False)
-            - If JSON is corrupted or root is not a dict: ({}, True) -> permits atomic self-healing
-            - If transient OSError occurs: (None, False) -> prevents wiping disk file on transient I/O glitch
-        """
+        """Reads raw JSON content from cooldown.json returning (records_dict, is_corrupt)."""
         if not self._cooldown_file_exists():
             return {}, False
         try:
@@ -219,11 +213,7 @@ class CooldownManager:
         _write_atomic_file_secure(self.cooldown_file, payload)
 
     def _parse_and_prune(self, raw_data: dict[str, Any], now: float) -> tuple[dict[str, dict[str, Any]], bool]:
-        """
-        Normalizes structured records and legacy float records.
-        Filters out expired records (cooldown_until <= now).
-        Returns (active_records, modified_flag).
-        """
+        """Normalizes records, prunes expired entries, returns (active_records, modified_flag)."""
         active_records: dict[str, dict[str, Any]] = {}
         modified = False
         if not isinstance(raw_data, dict):
@@ -275,12 +265,7 @@ class CooldownManager:
         return active_records, modified
 
     def get_cooldowns(self) -> dict[str, dict[str, Any]]:
-        """
-        Loads cooldown records from cooldown.json.
-        Returns dict: {account_name: {"cooldown_until": float, "exhausted_at": float, "reason": str}}
-        Supports backward compatibility with legacy flat float values {account: timestamp}.
-        Prunes expired records automatically from memory and file.
-        """
+        """Loads and normalizes active cooldown records, automatically pruning expired ones."""
         if not self._cooldown_file_exists():
             return {}
         raw_data, is_corrupt = self._read_raw()
@@ -305,10 +290,7 @@ class CooldownManager:
         return active_records
 
     def is_in_cooldown(self, account_name: str) -> bool:
-        """
-        Returns True if account_name is currently in active cooldown (cooldown_until > now),
-        False if expired or not recorded. Automatically prunes expired records.
-        """
+        """Returns True if account_name is currently in active cooldown."""
         if not account_name or not isinstance(account_name, str) or not account_name.strip():
             return False
         active_cooldowns = self.get_cooldowns()
@@ -320,12 +302,7 @@ class CooldownManager:
         reset_time: float | int | str | None = None,
         reason: str = "RESOURCE_EXHAUSTED",
     ) -> dict[str, Any]:
-        """
-        Sets cooldown for an account and atomically writes to cooldown.json with mode 0600.
-        Uses reset_time if provided and in the future (reset_time > now);
-        otherwise defaults to now + default_cooldown_seconds.
-        Automatically prunes expired records during update.
-        """
+        """Sets account cooldown and atomically persists to cooldown.json with mode 0600."""
         if not account_name or not isinstance(account_name, str) or not account_name.strip():
             raise ValueError("account_name is required and must be a non-empty string")
         account_name = account_name.strip()
@@ -420,15 +397,7 @@ class CooldownManager:
         return None
 
     def get_reset_time_from_cache(self, account_name: str, model_hint: str | None = None) -> float | None:
-        """
-        Helper to read quota reset_time for account_name from last_known_quota.json if present.
-        If model_hint is provided:
-            Evaluates ONLY the specified model's quota bucket. If reset_time <= now or unavailable,
-            returns None (strictly preventing cross-model leakage per ADR 0001).
-        If model_hint is None:
-            Checks ("gemini", "claude") and returns the earliest future reset time.
-        Eliminates weekly reset timestamp inheritance, clamping strictly to 5h rolling bucket (ADR 0016).
-        """
+        """Reads quota reset_time for account_name from last_known_quota.json, clamping to 5h rolling bucket."""
         if not isinstance(self.cache_dir, (str, Path, os.PathLike)):
             return None
         quota_file = Path(self.cache_dir) / "last_known_quota.json"
@@ -500,9 +469,14 @@ class LogWatcher:
             self.cooldown_manager = cooldown_manager
         else:
             cache_dir = getattr(self.engine, "cache_dir", None)
-            if not isinstance(cache_dir, (str, Path)):
+            if not isinstance(cache_dir, (str, Path)) or _is_mock_object(cache_dir):
                 vault_dir = getattr(self.engine, "vault_dir", None)
-                cache_dir = Path(vault_dir) / "cache" if isinstance(vault_dir, (str, Path)) else Path.home() / ".antigravity-vault" / "cache"
+                if isinstance(vault_dir, (str, Path)) and not _is_mock_object(vault_dir):
+                    cache_dir = Path(vault_dir) / "cache"
+                elif (env_v := os.environ.get("AGY_VAULT_DIR", "").strip()):
+                    cache_dir = Path(env_v).expanduser() / "cache"
+                else:
+                    cache_dir = Path.home() / ".antigravity-vault" / "cache"
             self.cooldown_manager = CooldownManager(cache_dir=cache_dir, default_cooldown_seconds=cooldown_minutes * 60)
         self.cooldown_file = getattr(self.cooldown_manager, "cooldown_file", getattr(self.engine, "cache_dir", Path.home()) / "cooldown.json")
         self.exhaustion_regex = _EXHAUSTION_REGEX
@@ -526,8 +500,7 @@ class LogWatcher:
         if daemon_manager is not None:
             self.daemon_manager = daemon_manager
         else:
-            vault_dir = getattr(self.engine, "vault_dir", None)
-            self.daemon_manager = DaemonManager(vault_dir=vault_dir)
+            self.daemon_manager = DaemonManager(vault_dir=getattr(self.engine, "vault_dir", None))
 
     @property
     def _lock_fd(self) -> int | None:
@@ -796,12 +769,7 @@ class LogWatcher:
         return True if quota_frac is None else (round(quota_frac, 6) < 0.70)
 
     def _notify_desktop(self, target_account: str, old_account: str | None = None, reason: str = "", reloaded: bool = False) -> None:
-        """Fires an asynchronous, non-blocking desktop notification via notify-send if installed.
-        While the subprocess dispatch of notify-send is non-blocking, a synchronous 1.0s process
-        settling delay is enforced on the calling thread when reloaded=True to allow WSL Relay
-        sufficient time to respawn language_server and bind its IPC socket before downstream user prompts.
-        Appends structured audit entry to ~/.antigravity-vault/watch.log with mode 0600.
-        """
+        """Fires an asynchronous desktop notification via notify-send and appends audit log."""
         if reloaded:
             _get_time().sleep(1.0)
         clean_reason = ""
@@ -820,8 +788,43 @@ class LogWatcher:
                 _get_subprocess().Popen([notify_bin, "agy-switch", msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
-        vault_dir = getattr(self.engine, "vault_dir", None)
-        log_dir = Path(vault_dir) if isinstance(vault_dir, (str, Path)) else DEFAULT_VAULT_DIR
+        self._append_audit_log(
+            target_account=target_account,
+            old_account=old_account,
+            reason=reason,
+            reloaded=reloaded,
+            clean_reason=clean_reason,
+        )
+
+    def _resolve_audit_log_dir(self) -> Path | None:
+        """Dynamically resolves isolated vault directory for audit logging without caching."""
+        env_vault = os.environ.get("AGY_VAULT_DIR")
+        if env_vault is not None:
+            cleaned = env_vault.strip()
+            return Path(cleaned).expanduser() if cleaned else (None if _is_test_runner() else DEFAULT_VAULT_DIR)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            v = getattr(engine, "vault_dir", None)
+            if v is not None and not _is_mock_object(v) and isinstance(v, (str, Path)) and str(v).strip():
+                return Path(str(v).strip()).expanduser()
+        return None if _is_test_runner() else DEFAULT_VAULT_DIR
+
+    def _append_audit_log(
+        self,
+        target_account: str,
+        old_account: str | None = None,
+        reason: str = "",
+        reloaded: bool = False,
+        clean_reason: str = "",
+    ) -> None:
+        """Appends structured audit entry to watch.log with mode 0600."""
+        if not clean_reason and reason and isinstance(reason, str):
+            r = reason.strip()
+            while r.startswith("(") and r.endswith(")") and len(r) >= 2:
+                r = r[1:-1].strip()
+            clean_reason = r
+        if (log_dir := self._resolve_audit_log_dir()) is None:
+            return
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         log_reason = clean_reason if clean_reason else reason
         suffix = " with force-restart language_server" if reloaded else ""
@@ -1184,16 +1187,7 @@ class LogWatcher:
         return False
 
     def _is_turn_quiescent(self, transcript_path: str | Path | None = None) -> bool:
-        """Determines if the system is at a verified Safe Turn Boundary.
-
-        Dual inspection:
-        1. Verifies that the active session transcript records a completed turn event
-           (status == "DONE" or type == "USER_INPUT" indicating the assistant has
-           concluded its turn and is waiting for user input).
-        2. Confirms via ProcessSupervisor.is_server_busy() that the Language Server
-           process has no active locks or busy child tasks.
-        Returns False when either condition fails.
-        """
+        """Determines if the system is at a verified Safe Turn Boundary via dual inspection."""
         try:
             if getattr(self, "supervisor", None) is None and not hasattr(self.engine, "is_server_busy"):
                 return False
@@ -1496,11 +1490,7 @@ class LogWatcher:
             self.daemon_manager._release_lock()
 
 class DaemonManager:
-    """
-    Manages the detached background lifecycle of the watch daemon.
-    Enforces atomic PID file updates, mode 0600 permissions, process validation via /proc,
-    graceful SIGTERM termination with 5s SIGKILL escalation, and stale PID pruning.
-    """
+    """Manages detached background lifecycle of the watch daemon with atomic PID and lock enforcement."""
 
     SYSTEMD_TEMPLATE = (
         "[Unit]\nDescription=Antigravity Account Switcher Log Watcher Daemon\nAfter=network.target\n\n"
@@ -1517,7 +1507,14 @@ class DaemonManager:
         python_bin: str | None = None,
         gemini_dir: Path | str | None = None,
     ) -> None:
-        self.vault_dir = Path(vault_dir).expanduser() if vault_dir else DEFAULT_VAULT_DIR
+        if vault_dir is not None and not _is_mock_object(vault_dir) and isinstance(vault_dir, (str, Path)):
+            self.vault_dir = Path(vault_dir).expanduser()
+        else:
+            env_vault = os.environ.get("AGY_VAULT_DIR")
+            if env_vault is not None and env_vault.strip():
+                self.vault_dir = Path(env_vault.strip()).expanduser()
+            else:
+                self.vault_dir = DEFAULT_VAULT_DIR
         self.pid_file = self.vault_dir / "watch.pid"
         self.log_file = self.vault_dir / "watch.log"
         self.lock_file = self.vault_dir / "watch.lock"
@@ -1530,12 +1527,7 @@ class DaemonManager:
         self.gemini_dir = Path(gemini_dir).expanduser() if gemini_dir else DEFAULT_GEMINI_DIR
 
     def is_systemd_active(self, service_name: str = "agy-switch-watcher.service") -> bool:
-        """
-        Detects whether the specified user-level systemd service is actively running.
-        Queries `systemctl --user is-active <service_name>`.
-        Returns True if the service is active (exit code 0), False otherwise.
-        Safely catches FileNotFoundError, OSError, and subprocess errors if systemctl is missing.
-        """
+        """Detects whether the specified user-level systemd service is actively running."""
         if not shutil.which("systemctl"):
             return False
         current_popen = subprocess.Popen

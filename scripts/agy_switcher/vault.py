@@ -72,7 +72,14 @@ class AgySwitchEngine:
         proc_dir: Path | str | None = None,
         cli_dir: Path | str | None = None,
     ) -> None:
-        self._vault_dir = Path(vault_dir or DEFAULT_VAULT_DIR).expanduser()
+        if vault_dir is not None:
+            self._vault_dir = Path(vault_dir).expanduser()
+        else:
+            env_vault = os.environ.get("AGY_VAULT_DIR")
+            if env_vault is not None and env_vault.strip():
+                self._vault_dir = Path(env_vault.strip()).expanduser()
+            else:
+                self._vault_dir = Path(DEFAULT_VAULT_DIR).expanduser()
         self._gemini_dir = Path(gemini_dir or DEFAULT_GEMINI_DIR).expanduser()
         self.legacy_root = Path(legacy_root or DEFAULT_LEGACY_ROOT).expanduser()
         self._proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
@@ -407,7 +414,11 @@ class AgySwitchEngine:
         except Exception:
             return {}
 
-    def install_hook(self, hooks_file: Path | None = None) -> Path:
+    def install_hook(
+        self,
+        hooks_file: Path | None = None,
+        launcher_bin: Path | str | None = None,
+    ) -> Path:
         """Installs the PreInvocation lifecycle hook into hooks.json via deep JSON merge."""
         target_hooks = Path(hooks_file or (self.gemini_dir / "config" / "hooks.json")).expanduser()
         target_hooks.parent.mkdir(parents=True, exist_ok=True)
@@ -423,12 +434,19 @@ class AgySwitchEngine:
             except Exception:
                 existing = {}
 
-        launcher_script = Path(__file__).resolve()
-        if launcher_script.name != "agy_switch.py":
-            candidate = launcher_script.parent.parent / "agy_switch.py"
-            if candidate.is_file():
-                launcher_script = candidate
-        hook_cmd = f"python3 {shlex.quote(str(launcher_script))} hook-pre-invocation"
+        if launcher_bin is not None:
+            hook_cmd = f"{launcher_bin} hook-pre-invocation"
+        else:
+            canonical_bin = self.gemini_dir.parent / ".local" / "bin" / "agy-switch"
+            if canonical_bin.is_file() or canonical_bin.is_symlink():
+                hook_cmd = "~/.local/bin/agy-switch hook-pre-invocation"
+            else:
+                launcher_script = Path(__file__).resolve()
+                if launcher_script.name != "agy_switch.py":
+                    candidate = launcher_script.parent.parent / "agy_switch.py"
+                    if candidate.is_file():
+                        launcher_script = candidate
+                hook_cmd = f"python3 {shlex.quote(str(launcher_script))} hook-pre-invocation"
 
         hook_def = {
             "enabled": True,
@@ -444,6 +462,17 @@ class AgySwitchEngine:
         existing["agy-switch-auto-rotate"] = hook_def
         self._atomic_write_json(target_hooks, existing)
         return target_hooks
+
+    def install_pre_invocation_hook(
+        self,
+        hooks_file: Path | None = None,
+        launcher_bin: Path | str | None = None,
+    ) -> Path:
+        """Installs the PreInvocation lifecycle hook referencing canonical launcher."""
+        return self.install_hook(
+            hooks_file=hooks_file,
+            launcher_bin=launcher_bin or "~/.local/bin/agy-switch",
+        )
 
     def get_active_name(self) -> str | None:
         """Returns the name of the currently active account, or None."""

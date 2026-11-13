@@ -17,7 +17,7 @@ import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from scripts.watch import LogWatcher, PresenceDetector, DaemonManager, main as watch_main
+from scripts.watch import LogWatcher, PresenceDetector, DaemonManager, DEFAULT_VAULT_DIR, main as watch_main
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.models import AccountInfo
 
@@ -4627,6 +4627,149 @@ setattr(
     TestDaemonStaleLockAndConcurrentStartup,
     "test_DAEMON_EDGE_001|DAEMON_EDGE_003",
     TestDaemonStaleLockAndConcurrentStartup._test_all_stale_lock_and_concurrent_scenarios,
+)
+
+
+class TestVaultLogIsolation(unittest.TestCase):
+    """
+    [VAULT-ISO-001] [VAULT-ISO-002]
+    Validates hermetic audit log isolation:
+    - Redirection of audit logs to AGY_VAULT_DIR when set in environment.
+    - Prohibition of fallback to DEFAULT_VAULT_DIR (~/.antigravity-vault) under test runner
+      execution or when engine is a Mock / has vault_dir=None.
+    """
+
+    def setUp(self) -> None:
+        self.orig_env = os.environ.get("AGY_VAULT_DIR")
+        self.tmpdir = tempfile.mkdtemp()
+        self.isolated_vault = Path(self.tmpdir) / "iso_vault"
+        self.isolated_vault.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.prod_vault = DEFAULT_VAULT_DIR
+        self.prod_log = self.prod_vault / "watch.log"
+        self.prod_log_exists = self.prod_log.exists()
+        self.prod_log_size = self.prod_log.stat().st_size if self.prod_log_exists else 0
+        self.prod_log_mtime = self.prod_log.stat().st_mtime if self.prod_log_exists else 0.0
+
+    def tearDown(self) -> None:
+        if self.orig_env is not None:
+            os.environ["AGY_VAULT_DIR"] = self.orig_env
+        else:
+            os.environ.pop("AGY_VAULT_DIR", None)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _assert_prod_log_untouched(self, tag: str) -> None:
+        """Verifies that production watch.log was not written to or modified."""
+        if self.prod_log_exists:
+            current_size = self.prod_log.stat().st_size
+            current_mtime = self.prod_log.stat().st_mtime
+            self.assertEqual(
+                current_size,
+                self.prod_log_size,
+                f"Production watch.log size modified during {tag}: {current_size} != {self.prod_log_size}",
+            )
+            self.assertEqual(
+                current_mtime,
+                self.prod_log_mtime,
+                f"Production watch.log mtime modified during {tag}: {current_mtime} != {self.prod_log_mtime}",
+            )
+            content = self.prod_log.read_text(encoding="utf-8", errors="ignore")
+            self.assertNotIn(tag, content, f"Production watch.log contains test tag '{tag}'")
+
+    def test_vault_iso_001_redirect_to_agy_vault_dir(self) -> None:
+        """
+        [VAULT-ISO-001] Audit log writes strictly to isolated directory when AGY_VAULT_DIR is set.
+        GIVEN AGY_VAULT_DIR is set to an isolated temporary directory path in the environment
+        WHEN LogWatcher._notify_desktop() or audit logging writes a rotation event log entry
+        THEN the log entry is written strictly to AGY_VAULT_DIR/watch.log
+        AND no write or modification is made to ~/.antigravity-vault/watch.log.
+        """
+        test_tag = f"iso001_acc_{time.time()}"
+        os.environ["AGY_VAULT_DIR"] = str(self.isolated_vault)
+
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        watcher._notify_desktop(target_account=test_tag, old_account="prior-acc", reason="quota 429", reloaded=False)
+
+        iso_log = self.isolated_vault / "watch.log"
+        self.assertTrue(iso_log.exists(), f"Expected isolated log file at {iso_log}")
+        iso_content = iso_log.read_text(encoding="utf-8")
+        self.assertIn(test_tag, iso_content)
+        self.assertIn("[watch] Switched from 'prior-acc' to", iso_content)
+        self.assertIn("(reason: quota 429)", iso_content)
+
+        # Also verify _append_audit_log if present
+        audit_tag = f"audit_entry_{time.time()}"
+        if hasattr(watcher, "_append_audit_log"):
+            watcher._append_audit_log(target_account=audit_tag, old_account=test_tag, reason="direct audit", reloaded=False)
+            iso_content_after = iso_log.read_text(encoding="utf-8")
+            self.assertIn(audit_tag, iso_content_after)
+
+        self._assert_prod_log_untouched(test_tag)
+        self._assert_prod_log_untouched(audit_tag)
+
+    def test_vault_iso_002_mock_engine_prohibits_production_log(self) -> None:
+        """
+        [VAULT-ISO-002] Test mock engine without vault_dir does not write to production ~/.antigravity-vault/watch.log.
+        GIVEN a test execution where engine is a MagicMock or has vault_dir=None
+        AND AGY_VAULT_DIR is not pointing to ~/.antigravity-vault
+        WHEN LogWatcher._notify_desktop() or audit logging is invoked
+        THEN logging safely redirects to the configured test sandbox or no-ops without writing to ~/.antigravity-vault/watch.log
+        AND production vault files remain pristine and unpolluted.
+        """
+        os.environ.pop("AGY_VAULT_DIR", None)
+
+        # Branch 1: MagicMock engine with default attributes (mock vault_dir)
+        tag_mock = f"iso002_mock_{time.time()}"
+        mock_engine = MagicMock()
+        watcher_mock = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        watcher_mock._notify_desktop(target_account=tag_mock, reason="mock test")
+        if hasattr(watcher_mock, "_append_audit_log"):
+            watcher_mock._append_audit_log(target_account=f"{tag_mock}_audit", reason="mock audit")
+        self._assert_prod_log_untouched(tag_mock)
+        self._assert_prod_log_untouched(f"{tag_mock}_audit")
+
+        # Branch 2: Engine with explicit vault_dir=None
+        tag_none = f"iso002_none_{time.time()}"
+        none_engine = MagicMock(vault_dir=None)
+        watcher_none = LogWatcher(engine=none_engine, log_dirs=[self.tmpdir])
+        watcher_none._notify_desktop(target_account=tag_none, reason="none test")
+        if hasattr(watcher_none, "_append_audit_log"):
+            watcher_none._append_audit_log(target_account=f"{tag_none}_audit", reason="none audit")
+        self._assert_prod_log_untouched(tag_none)
+        self._assert_prod_log_untouched(f"{tag_none}_audit")
+
+        # Branch 3: Mock engine with configured sandbox vault_dir redirects safely to sandbox
+        sandbox_dir = Path(self.tmpdir) / "sandbox_vault"
+        sandbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tag_sandbox = f"iso002_sandbox_{time.time()}"
+        sandbox_engine = MagicMock(vault_dir=sandbox_dir)
+        watcher_sandbox = LogWatcher(engine=sandbox_engine, log_dirs=[self.tmpdir])
+        watcher_sandbox._notify_desktop(target_account=tag_sandbox, reason="sandbox test")
+        sandbox_log = sandbox_dir / "watch.log"
+        self.assertTrue(sandbox_log.exists(), f"Expected sandbox log file at {sandbox_log}")
+        self.assertIn(tag_sandbox, sandbox_log.read_text(encoding="utf-8"))
+        self._assert_prod_log_untouched(tag_sandbox)
+
+    test_VAULT_ISO_001_redirect_to_agy_vault_dir = test_vault_iso_001_redirect_to_agy_vault_dir
+    test_VAULT_ISO_002_mock_engine_prohibits_production_log = test_vault_iso_002_mock_engine_prohibits_production_log
+
+    def _test_all_vault_isolation_scenarios(self) -> None:
+        self.setUp()
+        try:
+            self.test_vault_iso_001_redirect_to_agy_vault_dir()
+        finally:
+            self.tearDown()
+        self.setUp()
+        try:
+            self.test_vault_iso_002_mock_engine_prohibits_production_log()
+        finally:
+            self.tearDown()
+
+
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_ISO_001|VAULT_ISO_002",
+    TestVaultLogIsolation._test_all_vault_isolation_scenarios,
 )
 
 

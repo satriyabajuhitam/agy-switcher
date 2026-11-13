@@ -277,6 +277,61 @@ manage_launcher() {
         # Link
         ln -sf "$script_target" "$bin_link"
         echo "Created launcher symlink: $bin_link -> $script_target"
+
+        # Register PreInvocation hook in ~/.gemini/config/hooks.json for global/all installations
+        if [ "$TARGET" = "global" ] || [ "$TARGET" = "all" ] || [ "$target_dest" = "$(get_global_dest)" ]; then
+            local hooks_dir="${HOME}/.gemini/config"
+            local hooks_file="$hooks_dir/hooks.json"
+            python3 -c "
+import sys, os
+from pathlib import Path
+
+target_dest = sys.argv[1]
+hooks_path = Path(sys.argv[2])
+hooks_path.parent.mkdir(parents=True, exist_ok=True)
+
+installed = False
+try:
+    sys.path.insert(0, os.path.join(target_dest, 'scripts'))
+    from agy_switcher.vault import AgySwitchEngine
+    engine = AgySwitchEngine(gemini_dir=hooks_path.parent.parent)
+    engine.install_hook(hooks_file=hooks_path, launcher_bin='~/.local/bin/agy-switch')
+    installed = True
+except Exception:
+    pass
+
+if not installed:
+    import json
+    existing = {}
+    if hooks_path.is_file():
+        try:
+            content = hooks_path.read_text(encoding='utf-8').strip()
+            if content:
+                loaded = json.loads(content)
+                if isinstance(loaded, dict):
+                    existing = loaded
+        except Exception:
+            existing = {}
+
+    existing['agy-switch-auto-rotate'] = {
+        'enabled': True,
+        'PreInvocation': [
+            {
+                'type': 'command',
+                'command': '~/.local/bin/agy-switch hook-pre-invocation',
+                'timeout': 5,
+            }
+        ],
+    }
+
+    tmp_path = hooks_path.with_name(f'.{hooks_path.name}.tmp.{os.getpid()}')
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(existing, f, indent=2)
+        f.write('\n')
+    os.replace(tmp_path, hooks_path)
+" "$target_dest" "$hooks_file"
+            echo "Registered PreInvocation hook: $hooks_file"
+        fi
     elif [ "$action" = "uninstall" ]; then
         if [ -L "$bin_link" ] || [ -e "$bin_link" ]; then
             local current_target
