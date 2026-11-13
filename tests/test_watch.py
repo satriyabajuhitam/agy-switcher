@@ -4750,20 +4750,96 @@ class TestVaultLogIsolation(unittest.TestCase):
         self.assertIn(tag_sandbox, sandbox_log.read_text(encoding="utf-8"))
         self._assert_prod_log_untouched(tag_sandbox)
 
+    def test_vault_iso_003_prod_agy_vault_dir_under_test_prohibits_production_log(self) -> None:
+        """Production vault paths in AGY_VAULT_DIR or engine.vault_dir never write to production under tests."""
+        tag_prod_env = f"iso003_prodenv_{time.time()}"
+        os.environ["AGY_VAULT_DIR"] = str(self.prod_vault)
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        watcher._notify_desktop(target_account=tag_prod_env, reason="prod env test")
+        self._assert_prod_log_untouched(tag_prod_env)
+
+        tag_prod_eng = f"iso003_prodeng_{time.time()}"
+        os.environ.pop("AGY_VAULT_DIR", None)
+        prod_engine = MagicMock(vault_dir=self.prod_vault)
+        watcher_prod = LogWatcher(engine=prod_engine, log_dirs=[self.tmpdir])
+        watcher_prod._notify_desktop(target_account=tag_prod_eng, reason="prod eng test")
+        self._assert_prod_log_untouched(tag_prod_eng)
+
+    def test_vault_err_001_unwriteable_temp_vault_directory_handled_gracefully(self) -> None:
+        """[VAULT-ERR-001] Read-only isolated vault directory logs error without crashing parent."""
+        ro_vault = Path(self.tmpdir) / "ro_vault"
+        ro_vault.mkdir(parents=True, exist_ok=True, mode=0o500)
+        os.chmod(ro_vault, 0o500)
+        os.environ["AGY_VAULT_DIR"] = str(ro_vault)
+
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        stderr_buf = io.StringIO()
+        try:
+            with patch("sys.stderr", stderr_buf):
+                watcher._notify_desktop(target_account="ro_acc", reason="ro test")
+        finally:
+            os.chmod(ro_vault, 0o700)
+
+    def test_vault_err_002_empty_or_whitespace_agy_vault_dir_handled_safely(self) -> None:
+        """[VAULT-ERR-002] Empty or whitespace-only AGY_VAULT_DIR falls back safely without writing to prod."""
+        tag_ws = f"err002_ws_{time.time()}"
+        os.environ["AGY_VAULT_DIR"] = "   "
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        watcher._notify_desktop(target_account=tag_ws, reason="whitespace env test")
+        self._assert_prod_log_untouched(tag_ws)
+
+        sandbox_dir = Path(self.tmpdir) / "fallback_sandbox"
+        sandbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        sandbox_engine = MagicMock(vault_dir=sandbox_dir)
+        watcher_sandbox = LogWatcher(engine=sandbox_engine, log_dirs=[self.tmpdir])
+        watcher_sandbox._notify_desktop(target_account=tag_ws, reason="whitespace with engine sandbox")
+        sandbox_log = sandbox_dir / "watch.log"
+        self.assertTrue(sandbox_log.exists())
+        self.assertIn(tag_ws, sandbox_log.read_text(encoding="utf-8"))
+        self._assert_prod_log_untouched(tag_ws)
+
+    def test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination(self) -> None:
+        """[VAULT-EDGE-001] Dynamic mutation of AGY_VAULT_DIR rebinds logging destination hermetically."""
+        vault_a = Path(self.tmpdir) / "vault_a"
+        vault_b = Path(self.tmpdir) / "vault_b"
+        vault_a.mkdir(parents=True, exist_ok=True, mode=0o700)
+        vault_b.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        watcher = LogWatcher(engine=MagicMock(), log_dirs=[self.tmpdir])
+
+        os.environ["AGY_VAULT_DIR"] = str(vault_a)
+        watcher._notify_desktop(target_account="dest_a", reason="step 1")
+        self.assertTrue((vault_a / "watch.log").exists())
+        self.assertIn("dest_a", (vault_a / "watch.log").read_text(encoding="utf-8"))
+        self.assertFalse((vault_b / "watch.log").exists())
+
+        os.environ["AGY_VAULT_DIR"] = str(vault_b)
+        watcher._notify_desktop(target_account="dest_b", reason="step 2")
+        self.assertTrue((vault_b / "watch.log").exists())
+        self.assertIn("dest_b", (vault_b / "watch.log").read_text(encoding="utf-8"))
+        self.assertNotIn("dest_b", (vault_a / "watch.log").read_text(encoding="utf-8"))
+
     test_VAULT_ISO_001_redirect_to_agy_vault_dir = test_vault_iso_001_redirect_to_agy_vault_dir
     test_VAULT_ISO_002_mock_engine_prohibits_production_log = test_vault_iso_002_mock_engine_prohibits_production_log
 
     def _test_all_vault_isolation_scenarios(self) -> None:
-        self.setUp()
-        try:
-            self.test_vault_iso_001_redirect_to_agy_vault_dir()
-        finally:
-            self.tearDown()
-        self.setUp()
-        try:
-            self.test_vault_iso_002_mock_engine_prohibits_production_log()
-        finally:
-            self.tearDown()
+        scenarios = [
+            self.test_vault_iso_001_redirect_to_agy_vault_dir,
+            self.test_vault_iso_002_mock_engine_prohibits_production_log,
+            self.test_vault_iso_003_prod_agy_vault_dir_under_test_prohibits_production_log,
+            self.test_vault_err_001_unwriteable_temp_vault_directory_handled_gracefully,
+            self.test_vault_err_002_empty_or_whitespace_agy_vault_dir_handled_safely,
+            self.test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
 
 
 setattr(

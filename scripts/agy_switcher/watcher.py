@@ -113,6 +113,7 @@ from agy_switcher.presence import (
     DEFAULT_GEMINI_DIR,
     PresenceDetector,
     _is_mock_object,
+    _is_prod_vault_path,
     _is_test_runner,
     _open_secure_log_file,
     _write_atomic_file_secure,
@@ -788,25 +789,18 @@ class LogWatcher:
                 _get_subprocess().Popen([notify_bin, "agy-switch", msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
-        self._append_audit_log(
-            target_account=target_account,
-            old_account=old_account,
-            reason=reason,
-            reloaded=reloaded,
-            clean_reason=clean_reason,
-        )
+        self._append_audit_log(target_account=target_account, old_account=old_account, reason=reason, reloaded=reloaded, clean_reason=clean_reason)
 
     def _resolve_audit_log_dir(self) -> Path | None:
         """Dynamically resolves isolated vault directory for audit logging without caching."""
-        env_vault = os.environ.get("AGY_VAULT_DIR")
-        if env_vault is not None:
-            cleaned = env_vault.strip()
-            return Path(cleaned).expanduser() if cleaned else (None if _is_test_runner() else DEFAULT_VAULT_DIR)
-        engine = getattr(self, "engine", None)
-        if engine is not None:
+        if (env_vault := os.environ.get("AGY_VAULT_DIR")) and env_vault.strip():
+            candidate = Path(env_vault.strip()).expanduser()
+            return None if _is_test_runner() and _is_prod_vault_path(candidate) else candidate
+        if (engine := getattr(self, "engine", None)) is not None:
             v = getattr(engine, "vault_dir", None)
             if v is not None and not _is_mock_object(v) and isinstance(v, (str, Path)) and str(v).strip():
-                return Path(str(v).strip()).expanduser()
+                candidate = Path(str(v).strip()).expanduser()
+                return None if _is_test_runner() and _is_prod_vault_path(candidate) else candidate
         return None if _is_test_runner() else DEFAULT_VAULT_DIR
 
     def _append_audit_log(
@@ -818,19 +812,25 @@ class LogWatcher:
         clean_reason: str = "",
     ) -> None:
         """Appends structured audit entry to watch.log with mode 0600."""
-        if not clean_reason and reason and isinstance(reason, str):
-            r = reason.strip()
-            while r.startswith("(") and r.endswith(")") and len(r) >= 2:
-                r = r[1:-1].strip()
-            clean_reason = r
-        if (log_dir := self._resolve_audit_log_dir()) is None:
-            return
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        log_reason = clean_reason if clean_reason else reason
-        suffix = " with force-restart language_server" if reloaded else ""
-        prefix = f"Switched from '{old_account}' to '{target_account}'" if old_account else f"Switched to '{target_account}'"
-        log_line = f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n" if (old_account or reloaded) else f"{ts} [watch] {prefix} ({log_reason})\n"
-        append_secure_log_entry(log_dir / "watch.log", log_line)
+        try:
+            if not clean_reason and reason and isinstance(reason, str):
+                r = reason.strip()
+                while r.startswith("(") and r.endswith(")") and len(r) >= 2:
+                    r = r[1:-1].strip()
+                clean_reason = r
+            if (log_dir := self._resolve_audit_log_dir()) is None:
+                return
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            log_reason = clean_reason or reason
+            suffix = " with force-restart language_server" if reloaded else ""
+            prefix = f"Switched from '{old_account}' to '{target_account}'" if old_account else f"Switched to '{target_account}'"
+            log_line = f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n" if (old_account or reloaded) else f"{ts} [watch] {prefix} ({log_reason})\n"
+            append_secure_log_entry(log_dir / "watch.log", log_line)
+        except Exception as e:
+            try:
+                sys.stderr.write(f"[watch] Error appending audit log: {e}\n")
+            except Exception:
+                pass
 
     def _dispatch_http_post(self, url: str, data: bytes, label: str) -> threading.Thread | None:
         def _send() -> None:
@@ -1509,12 +1509,10 @@ class DaemonManager:
     ) -> None:
         if vault_dir is not None and not _is_mock_object(vault_dir) and isinstance(vault_dir, (str, Path)):
             self.vault_dir = Path(vault_dir).expanduser()
+        elif (env_vault := os.environ.get("AGY_VAULT_DIR")) and env_vault.strip():
+            self.vault_dir = Path(env_vault.strip()).expanduser()
         else:
-            env_vault = os.environ.get("AGY_VAULT_DIR")
-            if env_vault is not None and env_vault.strip():
-                self.vault_dir = Path(env_vault.strip()).expanduser()
-            else:
-                self.vault_dir = DEFAULT_VAULT_DIR
+            self.vault_dir = DEFAULT_VAULT_DIR
         self.pid_file = self.vault_dir / "watch.pid"
         self.log_file = self.vault_dir / "watch.log"
         self.lock_file = self.vault_dir / "watch.lock"

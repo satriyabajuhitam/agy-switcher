@@ -41,34 +41,39 @@ def _is_test_runner() -> bool:
     )
 
 
-def _resolve_log_file_target(log_file: Path | str) -> Path | None:
-    raw_path = Path(log_file).expanduser()
+def _is_prod_vault_path(path: Path | str) -> bool:
     try:
-        resolved_path = raw_path.resolve()
+        p = Path(path).expanduser()
     except Exception:
-        resolved_path = raw_path
-
+        return False
     try:
-        default_vault_resolved = DEFAULT_VAULT_DIR.resolve()
+        default_resolved = DEFAULT_VAULT_DIR.resolve()
     except Exception:
-        default_vault_resolved = DEFAULT_VAULT_DIR
-
-    is_default_vault = (
-        resolved_path == (default_vault_resolved / raw_path.name)
-        or default_vault_resolved in resolved_path.parents
-        or str(raw_path).startswith(str(DEFAULT_VAULT_DIR))
-        or str(raw_path).startswith("~/.antigravity-vault")
+        default_resolved = DEFAULT_VAULT_DIR
+    try:
+        resolved = p.resolve()
+    except Exception:
+        resolved = p
+    return (
+        resolved == default_resolved
+        or resolved == (default_resolved / p.name)
+        or default_resolved in resolved.parents
+        or str(p).startswith(str(DEFAULT_VAULT_DIR))
+        or str(p).startswith("~/.antigravity-vault")
     )
 
+
+def _resolve_log_file_target(log_file: Path | str) -> Path | None:
+    raw_path = Path(log_file).expanduser()
+    is_default_vault = _is_prod_vault_path(raw_path)
+
     env_vault = os.environ.get("AGY_VAULT_DIR")
-    if env_vault is not None:
-        cleaned = env_vault.strip()
-        if cleaned:
-            if is_default_vault:
-                return Path(cleaned).expanduser() / raw_path.name
-            return raw_path
-        if _is_test_runner() and is_default_vault:
+    if env_vault is not None and env_vault.strip():
+        cleaned_dir = Path(env_vault.strip()).expanduser()
+        target = cleaned_dir / raw_path.name if is_default_vault else raw_path
+        if _is_test_runner() and _is_prod_vault_path(target):
             return None
+        return target
 
     if is_default_vault and _is_test_runner():
         return None
@@ -132,8 +137,11 @@ def append_secure_log_entry(log_file: Path | str, message: str) -> None:
                     os.close(log_fd)
                 except OSError:
                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            sys.stderr.write(f"[watch] Failed to write audit log entry to {path}: {e}\n")
+        except Exception:
+            pass
 
 
 def _write_atomic_file_secure(target_file: Path | str, payload: bytes | str) -> None:
