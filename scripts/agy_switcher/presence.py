@@ -7,6 +7,7 @@ Strictly acyclic DAG: Does NOT import vault.py, rotation.py, doctor.py, hook.py,
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 import sys
@@ -150,8 +151,10 @@ def _open_secure_log_file(log_file: Path | str) -> int:
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(path.parent, 0o700)
-        except OSError:
-            pass
+        except OSError as dir_err:
+            if dir_err.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+                raise
+
 
     if path.is_symlink():
         try:
@@ -179,8 +182,9 @@ def append_secure_log_entry(log_file: Path | str, message: str) -> None:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(path.parent, 0o700)
-            except OSError:
-                pass
+            except OSError as dir_err:
+                if dir_err.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+                    raise
         opened_fd = _open_secure_log_file(path)
         log_fd: int | None = opened_fd
         try:
@@ -194,9 +198,26 @@ def append_secure_log_entry(log_file: Path | str, message: str) -> None:
                     os.close(log_fd)
                 except OSError:
                     pass
+    except OSError as e:
+        if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+            try:
+                if sys.stderr is not None:
+                    sys.stderr.write(f"[watch] Disk full (ENOSPC): Failed to write audit log entry to {path}: {e}\n")
+                    sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        try:
+            if sys.stderr is not None:
+                sys.stderr.write(f"[watch] Failed to write audit log entry to {path}: {e}\n")
+                sys.stderr.flush()
+        except Exception:
+            pass
     except Exception as e:
         try:
-            sys.stderr.write(f"[watch] Failed to write audit log entry to {path}: {e}\n")
+            if sys.stderr is not None:
+                sys.stderr.write(f"[watch] Failed to write audit log entry to {path}: {e}\n")
+                sys.stderr.flush()
         except Exception:
             pass
 

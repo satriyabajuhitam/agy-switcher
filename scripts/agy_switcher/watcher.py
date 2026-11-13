@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import errno
 import fcntl
 import glob
 import json
@@ -825,9 +826,19 @@ class LogWatcher:
             prefix = f"Switched from '{old_account}' to '{target_account}'" if old_account else f"Switched to '{target_account}'"
             log_line = f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n" if (old_account or reloaded) else f"{ts} [watch] {prefix} ({log_reason})\n"
             append_secure_log_entry(log_dir / "watch.log", log_line)
+        except OSError as e:
+            msg = f"[watch] Disk full (ENOSPC): Error appending audit log: {e}\n" if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)) else f"[watch] Error appending audit log: {e}\n"
+            try:
+                if sys.stderr is not None:
+                    sys.stderr.write(msg)
+                    sys.stderr.flush()
+            except Exception:
+                pass
         except Exception as e:
             try:
-                sys.stderr.write(f"[watch] Error appending audit log: {e}\n")
+                if sys.stderr is not None:
+                    sys.stderr.write(f"[watch] Error appending audit log: {e}\n")
+                    sys.stderr.flush()
             except Exception:
                 pass
 

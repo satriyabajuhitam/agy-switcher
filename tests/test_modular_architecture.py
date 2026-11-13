@@ -219,6 +219,7 @@ class TestModularArchitectureDAG(unittest.TestCase):
             "contextlib",
             "dataclasses",
             "datetime",
+            "errno",
             "fcntl",
             "functools",
             "glob",

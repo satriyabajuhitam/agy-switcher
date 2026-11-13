@@ -4883,8 +4883,179 @@ class TestVaultLogIsolation(unittest.TestCase):
 
     test_vault_err_002_empty_or_whitespace_agy_vault_dir_handled_safely = test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely
 
-    def test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination(self) -> None:
-        """[VAULT-EDGE-001] Dynamic mutation of AGY_VAULT_DIR rebinds logging destination hermetically."""
+    def test_VAULT_ERR_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully(self) -> None:
+        """[VAULT-ERR-003] Filesystem disk full ENOSPC during log append caught gracefully without crashing."""
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "disk full entry\n")
+            err_output = stderr_buf.getvalue()
+            self.assertIn("Failed to write audit log entry", err_output)
+            self.assertTrue("ENOSPC" in err_output or "Disk full" in err_output, f"Expected ENOSPC alert but got: {err_output!r}")
+
+        class FailingFlushFile(io.StringIO):
+            def flush(self) -> None:
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        failing_file = FailingFlushFile()
+        with patch("agy_switcher.presence._open_secure_log_file", return_value=999), \
+             patch("builtins.open", return_value=failing_file), \
+             patch("os.close"):
+            stderr_flush = io.StringIO()
+            with patch("sys.stderr", stderr_flush):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "flush fail entry\n")
+            flush_err = stderr_flush.getvalue()
+            self.assertIn("Failed to write audit log entry", flush_err)
+            self.assertTrue("ENOSPC" in flush_err or "Disk full" in flush_err, f"Expected ENOSPC alert on flush but got: {flush_err!r}")
+
+        class FailingWriteFile(io.StringIO):
+            def write(self, s: str) -> int:
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        failing_write_file = FailingWriteFile()
+        with patch("agy_switcher.presence._open_secure_log_file", return_value=999), \
+             patch("builtins.open", return_value=failing_write_file), \
+             patch("os.close"):
+            stderr_write = io.StringIO()
+            with patch("sys.stderr", stderr_write):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "write fail entry\n")
+            write_err = stderr_write.getvalue()
+            self.assertIn("Failed to write audit log entry", write_err)
+            self.assertTrue("ENOSPC" in write_err or "Disk full" in write_err, f"Expected ENOSPC alert on write but got: {write_err!r}")
+
+        with patch("pathlib.Path.mkdir", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            stderr_mkdir = io.StringIO()
+            with patch("sys.stderr", stderr_mkdir):
+                append_secure_log_entry(self.isolated_vault / "new_dir" / "watch.log", "mkdir fail entry\n")
+            mkdir_err = stderr_mkdir.getvalue()
+            self.assertIn("Failed to write audit log entry", mkdir_err)
+            self.assertTrue("ENOSPC" in mkdir_err or "Disk full" in mkdir_err, f"Expected ENOSPC alert on mkdir but got: {mkdir_err!r}")
+
+        edquot_errno = getattr(errno, "EDQUOT", errno.ENOSPC)
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(edquot_errno, "Disk quota exceeded")):
+            stderr_quota = io.StringIO()
+            with patch("sys.stderr", stderr_quota):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "edquot entry\n")
+            quota_err = stderr_quota.getvalue()
+            self.assertIn("Failed to write audit log entry", quota_err)
+
+        with patch("sys.stderr", None), \
+             patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            append_secure_log_entry(self.isolated_vault / "watch.log", "none stderr entry\n")
+
+        os.environ["AGY_VAULT_DIR"] = str(self.isolated_vault)
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            stderr_rot = io.StringIO()
+            with patch("sys.stderr", stderr_rot):
+                watcher._notify_desktop(target_account="rotate_acc", reason="disk full rotation test")
+            rot_err = stderr_rot.getvalue()
+            self.assertTrue("Failed to write audit log entry" in rot_err or "Error appending audit log" in rot_err)
+            self.assertTrue("ENOSPC" in rot_err or "Disk full" in rot_err, f"Expected ENOSPC alert on rotation but got: {rot_err!r}")
+
+        broken_stderr = MagicMock()
+        broken_stderr.write.side_effect = BrokenPipeError(errno.EPIPE, "Broken pipe")
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            with patch("sys.stderr", broken_stderr):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "silent broken pipe\n")
+                watcher._notify_desktop(target_account="rotate_acc2", reason="broken stderr rotation")
+
+    test_vault_err_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully = test_VAULT_ERR_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully
+
+    def test_VAULT_EDGE_001_concurrent_test_processes_write_to_independent_vaults(self) -> None:
+        """[VAULT-EDGE-001] Concurrent test processes write to independent temporary vaults without interference."""
+        num_workers = 3
+        worker_dirs: list[Path] = []
+        for i in range(num_workers):
+            wdir = Path(self.tmpdir) / f"worker_vault_{i}"
+            wdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            worker_dirs.append(wdir)
+
+        unique_run_id = f"edge001_{time.time()}"
+        worker_script = """
+import os, sys, time
+from pathlib import Path
+from unittest.mock import MagicMock
+
+repo_root = os.path.abspath(sys.argv[1])
+sys.path.insert(0, repo_root)
+sys.path.insert(0, os.path.join(repo_root, "scripts"))
+
+from scripts.watch import LogWatcher, DaemonManager, append_secure_log_entry
+
+worker_id = sys.argv[2]
+run_id = sys.argv[3]
+vault_dir = Path(os.environ["AGY_VAULT_DIR"])
+
+dm = DaemonManager()
+lock_fd = dm.acquire_lock()
+if lock_fd is None:
+    sys.exit(2)
+
+try:
+    mock_engine = MagicMock()
+    mock_engine.vault_dir = vault_dir
+    watcher = LogWatcher(engine=mock_engine, log_dirs=[str(vault_dir)])
+
+    for j in range(3):
+        watcher._notify_desktop(target_account=f"{run_id}_w{worker_id}_{j}", reason=f"rotation_{j}")
+        append_secure_log_entry(vault_dir / "watch.log", f"direct_{run_id}_w{worker_id}_{j}\\n")
+        time.sleep(0.01)
+finally:
+    dm.release_lock()
+
+sys.exit(0)
+"""
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        procs: list[subprocess.Popen[bytes]] = []
+        for i, wdir in enumerate(worker_dirs):
+            env = dict(os.environ)
+            env["AGY_VAULT_DIR"] = str(wdir)
+            env["PYTHONPATH"] = f"{repo_root}/scripts:{repo_root}"
+            p = subprocess.Popen(
+                [sys.executable, "-c", worker_script, repo_root, str(i), unique_run_id],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            procs.append(p)
+
+        try:
+            for i, p in enumerate(procs):
+                stdout_b, stderr_b = p.communicate(timeout=15.0)
+                self.assertEqual(
+                    p.returncode,
+                    0,
+                    f"Worker {i} failed with returncode {p.returncode}: stdout={stdout_b.decode()!r}, stderr={stderr_b.decode()!r}"
+                )
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    try:
+                        p.kill()
+                        p.wait()
+                    except Exception:
+                        pass
+
+        for i, wdir in enumerate(worker_dirs):
+            log_file = wdir / "watch.log"
+            self.assertTrue(log_file.exists(), f"Log file for worker {i} not found at {log_file}")
+            content = log_file.read_text(encoding="utf-8")
+            for j in range(3):
+                self.assertIn(f"{unique_run_id}_w{i}_{j}", content)
+                self.assertIn(f"direct_{unique_run_id}_w{i}_{j}", content)
+            for other in range(num_workers):
+                if other != i:
+                    self.assertNotIn(f"{unique_run_id}_w{other}_", content)
+                    self.assertNotIn(f"direct_{unique_run_id}_w{other}_", content)
+
+        self._assert_prod_log_untouched(unique_run_id)
+
+    test_vault_edge_001_concurrent_test_processes_write_to_independent_vaults = test_VAULT_EDGE_001_concurrent_test_processes_write_to_independent_vaults
+
+    def test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination(self) -> None:
+        """[VAULT-EDGE-002] Dynamic mutation of AGY_VAULT_DIR rebinds logging destination hermetically."""
         vault_a = Path(self.tmpdir) / "vault_a"
         vault_b = Path(self.tmpdir) / "vault_b"
         vault_a.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -4903,6 +5074,8 @@ class TestVaultLogIsolation(unittest.TestCase):
         self.assertTrue((vault_b / "watch.log").exists())
         self.assertIn("dest_b", (vault_b / "watch.log").read_text(encoding="utf-8"))
         self.assertNotIn("dest_b", (vault_a / "watch.log").read_text(encoding="utf-8"))
+
+    test_vault_edge_001_dynamic_mutation_of_agy_vault_dir_rebinds_destination = test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination
 
     test_VAULT_ISO_001_redirect_to_agy_vault_dir = test_vault_iso_001_redirect_to_agy_vault_dir
     test_VAULT_ISO_002_mock_engine_prohibits_production_log = test_vault_iso_002_mock_engine_prohibits_production_log
@@ -4936,6 +5109,19 @@ class TestVaultLogIsolation(unittest.TestCase):
                 self.tearDown()
 
 
+    def _test_vault_ticket07_scenarios(self) -> None:
+        scenarios = [
+            self.test_VAULT_ERR_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully,
+            self.test_VAULT_EDGE_001_concurrent_test_processes_write_to_independent_vaults,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
+
+
 setattr(
     TestVaultLogIsolation,
     "test_VAULT_ISO_001|VAULT_ISO_002",
@@ -4945,6 +5131,11 @@ setattr(
     TestVaultLogIsolation,
     "test_VAULT_ERR_001|VAULT_ERR_002",
     TestVaultLogIsolation._test_vault_error_scenarios,
+)
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_ERR_003|VAULT_EDGE_001",
+    TestVaultLogIsolation._test_vault_ticket07_scenarios,
 )
 
 
