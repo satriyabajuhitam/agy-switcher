@@ -2,6 +2,7 @@ import fcntl
 import io
 import json
 import socket
+import threading
 import unittest
 from unittest.mock import MagicMock, patch, mock_open
 from pathlib import Path
@@ -4326,6 +4327,306 @@ setattr(
     TestDaemonLockHardeningAndSymlinkRejection,
     "test_DAEMON_ERR_001|DAEMON_ERR_002",
     TestDaemonLockHardeningAndSymlinkRejection._test_all_lock_hardening_scenarios,
+)
+
+
+class TestDaemonStaleLockAndConcurrentStartup(unittest.TestCase):
+    """
+    [DAEMON-EDGE-001] [DAEMON-EDGE-003]
+    Validates stale lock recovery when previous process died unexpectedly without file corruption,
+    and deterministic mutual exclusion when concurrent processes or threads invoke start() at the exact same millisecond.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+        self.active_dms: list[DaemonManager] = []
+
+    def tearDown(self) -> None:
+        for dm in self.active_dms:
+            dm._release_lock()
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_DAEMON_EDGE_001_stale_lock_recovery_with_leftover_lock_file(self) -> None:
+        """
+        [DAEMON-EDGE-001] Stale lock recovery when previous process died unexpectedly.
+        GIVEN a previous watcher daemon terminated abruptly leaving an existing watch.lock and dead PID
+        AND no active process holds a kernel lock on watch.lock
+        WHEN a new watcher daemon process initializes
+        THEN fcntl.flock successfully acquires the exclusive non-blocking lock without deadlock or manual file deletion
+        AND daemon startup proceeds normally.
+        """
+        self.lock_file.write_text("stale-lock-data\n", encoding="utf-8")
+        os.chmod(self.lock_file, 0o600)
+        self.pid_file.write_text("999999\n", encoding="utf-8")
+        os.chmod(self.pid_file, 0o600)
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        self.active_dms.append(dm)
+        mock_proc = MagicMock(pid=34567)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            pid = dm.start()
+            self.assertEqual(pid, 34567)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), "34567")
+
+        # Exclusive lock is held on watch.lock: probe fd fails with BlockingIOError
+        probe_fd = os.open(str(self.lock_file), os.O_RDWR)
+        self.open_fds.append(probe_fd)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_DAEMON_EDGE_001_stale_lock_recovery_watch_loop(self) -> None:
+        """
+        [DAEMON-EDGE-001] Stale lock recovery in LogWatcher.watch_loop without deadlock.
+        """
+        self.lock_file.write_text("stale-watch-lock\n", encoding="utf-8")
+        os.chmod(self.lock_file, 0o600)
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+
+        # After watch_loop completes, a new daemon can acquire the lock cleanly
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        self.active_dms.append(dm)
+        mock_proc = MagicMock(pid=56789)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            pid = dm.start()
+            self.assertEqual(pid, 56789)
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), "56789")
+
+    def test_DAEMON_EDGE_003_rapid_concurrent_startup_race_threads(self) -> None:
+        """
+        [DAEMON-EDGE-003] Rapid concurrent startup race condition resolves deterministically to one daemon.
+        GIVEN two concurrent threads invoke DaemonManager.start() at the exact same millisecond
+        WHEN both processes attempt to acquire an exclusive lock on watch.lock
+        THEN exactly one process successfully acquires the lock and writes its PID
+        AND the second process is rejected immediately upon lock contention and exits cleanly with exit code 1.
+        """
+        barrier = threading.Barrier(2)
+        results: list[tuple[str, int, DaemonManager]] = []
+        threads: list[threading.Thread] = []
+        shared_stderr = io.StringIO()
+        pid_counter = 20000
+        lock = threading.Lock()
+
+        def make_proc(*args: object, **kwargs: object) -> MagicMock:
+            nonlocal pid_counter
+            with lock:
+                pid_counter += 1
+                return MagicMock(pid=pid_counter)
+
+        def worker(thread_idx: int) -> None:
+            dm = DaemonManager(vault_dir=self.vault_dir)
+            barrier.wait()
+            try:
+                res_pid = dm.start()
+                with lock:
+                    results.append(("success", res_pid, dm))
+            except SystemExit as exc:
+                with lock:
+                    results.append(("exit", int(exc.code) if isinstance(exc.code, (int, str)) and str(exc.code).isdigit() else 1, dm))
+
+        with patch("subprocess.Popen", side_effect=make_proc), patch("sys.stderr", shared_stderr):
+            for idx in (1, 2):
+                t = threading.Thread(target=worker, args=(idx,))
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=5.0)
+
+        self.assertEqual(len(results), 2)
+        statuses = [r[0] for r in results]
+        self.assertEqual(statuses.count("success"), 1, f"Expected exactly 1 success, got: {results}")
+        self.assertEqual(statuses.count("exit"), 1, f"Expected exactly 1 exit, got: {results}")
+
+        winner = next(r for r in results if r[0] == "success")
+        loser = next(r for r in results if r[0] == "exit")
+
+        self.active_dms.append(winner[2])
+        self.assertEqual(loser[1], 1, "Contending thread must exit with code 1")
+
+        winning_pid = winner[1]
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), str(winning_pid))
+        self.assertIn("Another watcher daemon is already running", shared_stderr.getvalue())
+
+    def test_DAEMON_EDGE_003_rapid_concurrent_startup_race_processes(self) -> None:
+        """
+        [DAEMON-EDGE-003] Rapid concurrent startup race between two fork processes.
+        """
+        pipe_r, pipe_w = os.pipe()
+        start_r, start_w = os.pipe()
+        done_r, done_w = os.pipe()
+
+        def run_proc(assigned_pid: int) -> None:
+            os.close(pipe_r)
+            os.close(start_w)
+            try:
+                os.read(start_r, 1)
+            except OSError:
+                pass
+            finally:
+                try: os.close(start_r)
+                except OSError: pass
+
+            dm = DaemonManager(vault_dir=self.vault_dir)
+            mock_proc = MagicMock(pid=assigned_pid)
+            with patch("subprocess.Popen", return_value=mock_proc):
+                try:
+                    res = dm.start()
+                    os.write(pipe_w, f"success:{res}\n".encode("utf-8"))
+                    os.close(done_w)
+                    try:
+                        os.read(done_r, 1)
+                    except OSError:
+                        pass
+                    finally:
+                        try: os.close(done_r)
+                        except OSError: pass
+                    os._exit(0)
+                except SystemExit as exc:
+                    code = int(exc.code) if isinstance(exc.code, (int, str)) and str(exc.code).isdigit() else 1
+                    os.write(pipe_w, f"exit:{code}\n".encode("utf-8"))
+                    try:
+                        os.write(done_w, b"x")
+                    except OSError:
+                        pass
+                    finally:
+                        try: os.close(done_w)
+                        except OSError: pass
+                        try: os.close(done_r)
+                        except OSError: pass
+                    os._exit(code)
+
+        with patch.object(DaemonManager, "is_systemd_active", return_value=False):
+            p1 = os.fork()
+            if p1 == 0:
+                run_proc(20001)
+
+            p2 = os.fork()
+            if p2 == 0:
+                run_proc(20002)
+
+            os.close(pipe_w)
+            os.close(start_r)
+
+            # Release both processes simultaneously
+            os.close(start_w)
+
+            _, s1 = os.waitpid(p1, 0)
+            _, s2 = os.waitpid(p2, 0)
+
+        try: os.close(done_r)
+        except OSError: pass
+        try: os.close(done_w)
+        except OSError: pass
+
+        with os.fdopen(pipe_r) as f:
+            lines = [line.strip() for line in f.readlines()]
+
+        self.assertEqual(len(lines), 2)
+        success_lines = [l for l in lines if l.startswith("success:")]
+        exit_lines = [l for l in lines if l.startswith("exit:")]
+        self.assertEqual(len(success_lines), 1, f"Expected 1 success, got: {lines}")
+        self.assertEqual(len(exit_lines), 1, f"Expected 1 exit, got: {lines}")
+        self.assertEqual(exit_lines[0], "exit:1")
+
+        exit_codes = sorted([os.waitstatus_to_exitcode(s1), os.waitstatus_to_exitcode(s2)])
+        self.assertEqual(exit_codes, [0, 1])
+
+        winner_pid = int(success_lines[0].split(":")[1])
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), str(winner_pid))
+
+    def test_DAEMON_EDGE_003_rapid_concurrent_startup_high_contention(self) -> None:
+        """
+        [DAEMON-EDGE-003] 5 concurrent threads attempting startup simultaneously.
+        """
+        concurrency = 5
+        barrier = threading.Barrier(concurrency)
+        results: list[tuple[str, int, DaemonManager]] = []
+        threads: list[threading.Thread] = []
+        shared_stderr = io.StringIO()
+        pid_counter = 40000
+        lock = threading.Lock()
+
+        def make_proc(*args: object, **kwargs: object) -> MagicMock:
+            nonlocal pid_counter
+            with lock:
+                pid_counter += 1
+                return MagicMock(pid=pid_counter)
+
+        def worker(thread_idx: int) -> None:
+            dm = DaemonManager(vault_dir=self.vault_dir)
+            barrier.wait()
+            try:
+                res_pid = dm.start()
+                with lock:
+                    results.append(("success", res_pid, dm))
+            except SystemExit as exc:
+                with lock:
+                    results.append(("exit", int(exc.code) if isinstance(exc.code, (int, str)) and str(exc.code).isdigit() else 1, dm))
+
+        with patch("subprocess.Popen", side_effect=make_proc), patch("sys.stderr", shared_stderr):
+            for idx in range(concurrency):
+                t = threading.Thread(target=worker, args=(idx,))
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=5.0)
+
+        self.assertEqual(len(results), concurrency)
+        statuses = [r[0] for r in results]
+        self.assertEqual(statuses.count("success"), 1, f"Expected 1 winner, got: {results}")
+        self.assertEqual(statuses.count("exit"), concurrency - 1, f"Expected {concurrency - 1} exits, got: {results}")
+
+        winner = next(r for r in results if r[0] == "success")
+        self.active_dms.append(winner[2])
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), str(winner[1]))
+        self.assertIn("Another watcher daemon is already running", shared_stderr.getvalue())
+
+    def _test_all_stale_lock_and_concurrent_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_EDGE_001_stale_lock_recovery_with_leftover_lock_file,
+            self.test_DAEMON_EDGE_001_stale_lock_recovery_watch_loop,
+            self.test_DAEMON_EDGE_003_rapid_concurrent_startup_race_threads,
+            self.test_DAEMON_EDGE_003_rapid_concurrent_startup_race_processes,
+            self.test_DAEMON_EDGE_003_rapid_concurrent_startup_high_contention,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonStaleLockAndConcurrentStartup,
+    "test_DAEMON_EDGE_001|DAEMON_EDGE_003",
+    TestDaemonStaleLockAndConcurrentStartup._test_all_stale_lock_and_concurrent_scenarios,
 )
 
 

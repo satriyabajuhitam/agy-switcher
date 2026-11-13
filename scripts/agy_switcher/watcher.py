@@ -1522,6 +1522,7 @@ class DaemonManager:
         self.log_file = self.vault_dir / "watch.log"
         self.lock_file = self.vault_dir / "watch.lock"
         self._lock_fd: int | None = None
+        self._start_lock = threading.RLock()
         self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
         self.python_bin = python_bin or sys.executable
         _canonical_watch = (Path(__file__).resolve().parent.parent / "watch.py").resolve()
@@ -1600,13 +1601,11 @@ class DaemonManager:
         except OSError: pass
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, IOError):
+        except (BlockingIOError, OSError) as e:
             try: os.close(fd)
             except OSError: pass
-            raise
-        except (PermissionError, OSError) as e:
-            try: os.close(fd)
-            except OSError: pass
+            if isinstance(e, BlockingIOError) or getattr(e, "errno", None) in (11, 35):
+                raise
             print(f"Error: Permission denied locking '{lock_path}': {e}", file=sys.stderr)
             sys.exit(1)
         self._lock_fd = fd
@@ -1721,40 +1720,49 @@ class DaemonManager:
         if self.is_systemd_active():
             print(SYSTEMD_ACTIVE_ERROR_MSG, file=sys.stderr)
             sys.exit(1)
-        try:
-            self._acquire_lock()
-        except (BlockingIOError, IOError):
-            print("Error: Another watcher daemon is already running.", file=sys.stderr)
-            sys.exit(1)
-        existing_pid = self.get_running_pid()
-        if existing_pid is not None:
-            self._release_lock()
-            raise DaemonAlreadyRunningError(existing_pid)
-        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try: os.chmod(self.vault_dir, 0o700)
-        except OSError: pass
-        log_fd = _open_secure_log_file(self.log_file)
-        cmd = [self.python_bin, str(self.watch_script), "run"]
-        if cooldown is not None:
-            cmd.extend(["--cooldown", str(cooldown)])
-        try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, start_new_session=True)
-        finally:
-            try: os.close(log_fd)
-            except OSError: pass
-        self._last_proc = proc
-        pid = proc.pid
-        try:
-            self._write_pid_file(pid)
-        except Exception:
+        with self._start_lock:
+            if self._lock_fd is not None:
+                existing_pid = self.get_running_pid()
+                if existing_pid is not None:
+                    raise DaemonAlreadyRunningError(existing_pid)
+                print("Error: Another watcher daemon is already running.", file=sys.stderr)
+                sys.exit(1)
             try:
-                proc.terminate()
-                proc.wait(timeout=1.0)
+                self._acquire_lock()
+            except (BlockingIOError, IOError):
+                print("Error: Another watcher daemon is already running.", file=sys.stderr)
+                sys.exit(1)
+            try:
+                existing_pid = self.get_running_pid()
+                if existing_pid is not None:
+                    raise DaemonAlreadyRunningError(existing_pid)
+                self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                try: os.chmod(self.vault_dir, 0o700)
+                except OSError: pass
+                log_fd = _open_secure_log_file(self.log_file)
+                cmd = [self.python_bin, str(self.watch_script), "run"]
+                if cooldown is not None:
+                    cmd.extend(["--cooldown", str(cooldown)])
+                try:
+                    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, start_new_session=True)
+                finally:
+                    try: os.close(log_fd)
+                    except OSError: pass
+                self._last_proc = proc
+                pid = proc.pid
+                try:
+                    self._write_pid_file(pid)
+                except Exception:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        proc.kill()
+                    raise
+                return pid
             except Exception:
-                proc.kill()
-            self._release_lock()
-            raise
-        return pid
+                self._release_lock()
+                raise
 
     def stop(self, timeout: float = 5.0) -> bool:
         """Gracefully terminates running daemon with SIGTERM, escalating to SIGKILL on timeout."""
