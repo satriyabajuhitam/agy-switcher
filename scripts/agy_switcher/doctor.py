@@ -234,7 +234,7 @@ class DoctorEngine:
         if self._supervisor is not None:
             return self._supervisor
         if self.engine is not None and hasattr(self.engine, "supervisor") and self.engine.supervisor is not None:
-            return self.engine.supervisor
+            return cast(ProcessSupervisor, self.engine.supervisor)
         return ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
 
     def get_active_name(self) -> str | None:
@@ -242,7 +242,7 @@ class DoctorEngine:
         if self.get_active_account_callback is not None:
             return self.get_active_account_callback()
         if self.engine is not None and hasattr(self.engine, "get_active_name"):
-            return self.engine.get_active_name()
+            return cast(str | None, self.engine.get_active_name())
         if self.active_file.is_file():
             try:
                 content = self.active_file.read_text(encoding="utf-8").strip()
@@ -436,11 +436,11 @@ class DoctorEngine:
                 extracted = self._extract_refresh_token(token_obj, data)
                 if extracted is not None:
                     token_obj["refresh_token"] = extracted
-        return validate_token_dict(data)
+        return cast(dict[str, Any], validate_token_dict(data))
 
     def validate_token_file(self, token_path: Path) -> dict[str, Any]:
         """Reads and validates token file from disk."""
-        return validate_token_file(token_path)
+        return cast(dict[str, Any], validate_token_file(token_path))
 
     def _is_valid_expiry(self, raw_expiry: Any) -> bool:
         """Validates that expiry is a recognizable positive timestamp or ISO string."""

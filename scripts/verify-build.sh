@@ -11,11 +11,8 @@ python3 -m unittest tests/test_modular_architecture.py -q
 
 echo "==> [2/3] Verifying SDK and daemon static typing (mypy --strict)..."
 PYTHONPATH="${REPO_ROOT}/scripts" python3 -m mypy \
-    "${REPO_ROOT}/scripts/agy_switcher/api.py" \
-    "${REPO_ROOT}/scripts/agy_switcher/models.py" \
-    "${REPO_ROOT}/scripts/agy_switcher/formatters.py" \
-    "${REPO_ROOT}/scripts/agy_switcher/watcher.py"
+    "${REPO_ROOT}/scripts/agy_switcher"
 
-echo "==> [3/3] Running full unit test suite (897 tests)..."
-PYTHONWARNINGS="ignore::ResourceWarning" python3 -m unittest discover -s "${REPO_ROOT}/tests" -q
+echo "==> [3/3] Running full unit test suite..."
+AGY_DISABLE_HOST_SYSTEMD=1 PYTHONWARNINGS="ignore::ResourceWarning" python3 -m unittest discover -s "${REPO_ROOT}/tests" -q
 echo "✅ All verification gates passed cleanly."

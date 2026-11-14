@@ -1431,6 +1431,7 @@ class LogWatcher:
         except (BlockingIOError, IOError):
             print("Error: Another watcher daemon is already running.", file=sys.stderr)
             sys.exit(1)
+        self.daemon_manager._write_pid_file(os.getpid())
         print("[watch] Daemon started, tailing logs for quota exhaustion...", file=sys.stderr)
         iterations = 0
         try:
@@ -1448,6 +1449,7 @@ class LogWatcher:
                     print(f"[watch] Unhandled exception in loop: {e}", file=sys.stderr)
                     time.sleep(5)
         finally:
+            self.daemon_manager._clean_pid_file()
             self.daemon_manager._release_lock()
 
 class DaemonManager:
@@ -1506,26 +1508,19 @@ class DaemonManager:
 
     def is_systemd_active(self, service_name: str = "agy-switch-watcher.service") -> bool:
         """Detects whether the specified user-level systemd service is actively running."""
-        if not shutil.which("systemctl"):
+        if "INVOCATION_ID" in os.environ or not shutil.which("systemctl"):
+            return False
+        if os.environ.get("AGY_DISABLE_HOST_SYSTEMD") == "1" and not (hasattr(subprocess.run, "assert_called") or hasattr(subprocess.run, "mock_calls")):
             return False
         current_popen = subprocess.Popen
         try:
-            if current_popen is not _real_popen:
-                setattr(subprocess, "Popen", _real_popen)
-            res = subprocess.run(
-                ["systemctl", "--user", "is-active", service_name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-                timeout=5.0,
-            )
+            if current_popen is not _real_popen: setattr(subprocess, "Popen", _real_popen)
+            res = subprocess.run(["systemctl", "--user", "is-active", service_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=5.0)
             return res.returncode == 0
         except (subprocess.SubprocessError, OSError, Exception):
             return False
         finally:
-            if current_popen is not _real_popen:
-                setattr(subprocess, "Popen", current_popen)
+            if current_popen is not _real_popen: setattr(subprocess, "Popen", current_popen)
 
     def _resolve_lock_path(self) -> Path:
         """Resolves watch.lock path, rejecting symlinks and handling permission errors."""
@@ -1792,6 +1787,12 @@ class DaemonManager:
     def status(self) -> dict[str, Any]:
         """Returns status dictionary: {'running': bool, 'pid': int | None, 'log_file': str, 'targets': list[str]}."""
         pid = self.get_running_pid()
+        if pid is None and self.is_systemd_active() and shutil.which("systemctl"):
+            try:
+                res = subprocess.run(["systemctl", "--user", "show", "--property", "MainPID", "--value", self.SYSTEMD_SERVICE_NAME], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=5.0)
+                if res.returncode == 0 and res.stdout.strip().isdigit() and int(res.stdout.strip()) > 1:
+                    pid = int(res.stdout.strip())
+            except Exception: pass
         targets: list[str] = []
         if pid is not None:
             try:

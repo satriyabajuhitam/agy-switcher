@@ -3998,6 +3998,11 @@ class TestDaemonSystemdActiveDetection(unittest.TestCase):
              patch("subprocess.run", return_value=mock_proc):
             self.assertFalse(dm.is_systemd_active())
 
+    def test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_under_systemd_invocation(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        with patch.dict(os.environ, {"INVOCATION_ID": "abcd1234ef5678"}):
+            self.assertFalse(dm.is_systemd_active())
+
     def test_DAEMON_MUTEX_003_daemon_manager_start_rejected_when_systemd_active(self) -> None:
         dm = DaemonManager(vault_dir=self.vault_dir)
         stderr_capture = io.StringIO()

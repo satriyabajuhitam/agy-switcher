@@ -37,7 +37,7 @@ def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> An
     return fallback_factory()
 
 
-def _get_telemetry_fetchers() -> tuple[Callable, Callable]:
+def _get_telemetry_fetchers() -> tuple[Callable[..., Any], Callable[..., Any]]:
     """Resolves fetch_account_quota and fetch_all_accounts_quota dynamically."""
     mod = sys.modules.get("agy_switch")
     if mod and hasattr(mod, "fetch_account_quota") and hasattr(mod, "fetch_all_accounts_quota"):
@@ -60,7 +60,7 @@ def _get_rotation_engine_class() -> Any:
     )
 
 
-def _get_error_classifiers() -> tuple[Callable, Callable]:
+def _get_error_classifiers() -> tuple[Callable[..., Any], Callable[..., Any]]:
     mod = sys.modules.get("agy_switch")
     auth_fn = getattr(mod, "_is_auth_error", None) if mod else None
     net_fn = getattr(mod, "_is_network_error", None) if mod else None

@@ -28,7 +28,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 import urllib.parse
 
 from agy_switcher.exceptions import (
@@ -155,11 +155,11 @@ class AgySwitchEngine:
 
     def validate_token_dict(self, data: Any) -> dict[str, Any]:
         """Validates that data complies with Google OAuth token JSON schema."""
-        return validate_token_dict(data)
+        return cast(dict[str, Any], validate_token_dict(data))
 
     def validate_token_file(self, token_path: Path) -> dict[str, Any]:
         """Reads and validates a token file from disk."""
-        return validate_token_file(token_path)
+        return cast(dict[str, Any], validate_token_file(token_path))
 
     def get_account_tokens(self, name: str) -> dict[str, str | None] | None:
         """Retrieves and returns access_token and refresh_token for a given account.
@@ -316,7 +316,8 @@ class AgySwitchEngine:
         """Loads vault configuration from ~/.antigravity-vault/config.json."""
         if self.config_file.is_file():
             try:
-                return json.loads(self.config_file.read_text(encoding="utf-8"))
+                res = json.loads(self.config_file.read_text(encoding="utf-8"))
+                return cast(dict[str, Any], res) if isinstance(res, dict) else {}
             except Exception:
                 return {}
         return {}

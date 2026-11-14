@@ -14,7 +14,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, cast
 import urllib.parse
 
 from agy_switcher.exceptions import (
@@ -97,16 +97,22 @@ def _get_engine_class() -> Any:
 
 
 def _get_format_accounts_listicle() -> Callable[..., str]:
-    return _resolve_symbol(
-        "format_accounts_listicle",
-        lambda: format_accounts_listicle,
+    return cast(
+        Callable[..., str],
+        _resolve_symbol(
+            "format_accounts_listicle",
+            lambda: format_accounts_listicle,
+        ),
     )
 
 
 def _get_format_accounts_table() -> Callable[..., str]:
-    return _resolve_symbol(
-        "format_accounts_table",
-        lambda: format_accounts_table,
+    return cast(
+        Callable[..., str],
+        _resolve_symbol(
+            "format_accounts_table",
+            lambda: format_accounts_table,
+        ),
     )
 
 
@@ -816,7 +822,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             "handle_vault",
             lambda: handle_vault,
         )
-        return vault_fn(args, engine)
+        return int(vault_fn(args, engine))
 
     if args.command == "remove":
         try:
@@ -1016,7 +1022,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             "handle_pre_invocation_hook",
             lambda: handle_pre_invocation_hook,
         )
-        return hook_fn(engine)
+        return int(hook_fn(engine))
 
     return 0
 

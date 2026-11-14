@@ -19,3 +19,8 @@ agy-switch = "agy_switcher.cli:main"
 [tool.setuptools.packages.find]
 where = ["scripts"]
 include = ["agy_switcher*"]
+
+[tool.mypy]
+mypy_path = "scripts"
+packages = ["agy_switcher"]
+strict = true

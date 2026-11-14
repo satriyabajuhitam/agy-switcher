@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import Any, cast
 
 from agy_switcher.exceptions import InvalidTokenError
 
@@ -141,12 +141,12 @@ def validate_token_file(token_path: Path | str, *, return_tuple: bool = False) -
 
 def check_token_dict(data: Any) -> tuple[bool, str | None]:
     """Validates token dictionary returning (is_valid, error_message)."""
-    return validate_token_dict(data, return_tuple=True)
+    return cast(tuple[bool, str | None], validate_token_dict(data, return_tuple=True))
 
 
-def check_token_file(token_path: Path | str) -> tuple[bool, str | None, dict | None]:
+def check_token_file(token_path: Path | str) -> tuple[bool, str | None, dict[str, Any] | None]:
     """Validates token file returning (is_valid, error_message, token_dict)."""
-    return validate_token_file(token_path, return_tuple=True)
+    return cast(tuple[bool, str | None, dict[str, Any] | None], validate_token_file(token_path, return_tuple=True))
 
 
 __all__ = [

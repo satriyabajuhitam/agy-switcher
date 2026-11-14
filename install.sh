@@ -438,10 +438,13 @@ if not installed:
         ],
     }
 
-    tmp_path = hooks_path.with_name(f'.{hooks_path.name}.tmp.{os.getpid()}')
-    with open(tmp_path, 'w', encoding='utf-8') as f:
+    import tempfile
+    tmp_fd, tmp_path_str = tempfile.mkstemp(dir=hooks_path.parent, prefix=f'.{hooks_path.name}.tmp.')
+    tmp_path = Path(tmp_path_str)
+    with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
         json.dump(existing, f, indent=2)
         f.write('\n')
+    os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, hooks_path)
 " "$target_dest" "$hooks_file"
             echo "Registered PreInvocation hook: $hooks_file"
