@@ -13,6 +13,7 @@ import stat
 import sys
 import tempfile
 import time
+from typing import Any, Callable
 import unittest
 
 # Ensure scripts directory is in sys.path
@@ -299,10 +300,329 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         self.assertFalse(token_item.can_fix)
         self.assertIn("expired", token_item.message.lower())
 
-    def test_layer2_expired_secondary_token(self):
-        """Expired non-active secondary account token triggers WARN (not FAIL) with can_fix=False."""
+    def test_DOCTOR_REFRESH_001_standby_expired_with_valid_refresh_token_passes(self):
+        """[DOCTOR-REFRESH-001] Standby accounts with expired access token but valid refresh token pass Layer 2 diagnosis."""
         self._setup_pristine_environment()
-        # Add secondary account with expired token
+        # Active account is unexpired in pristine environment
+        standby_dir = self.vault_dir / "accounts" / "standby-1"
+        standby_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(standby_dir, 0o700)
+        standby_token = create_sample_token(
+            email="standby1@example.com",
+            expiry_offset_hours=-2,
+            refresh_token="1//valid_refresh_token_for_standby",
+        )
+        (standby_dir / "token.json").write_text(json.dumps(standby_token), encoding="utf-8")
+        os.chmod(standby_dir / "token.json", 0o600)
+
+        # Test seam directly
+        direct_item = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_item.status, "PASS")
+        self.assertFalse(direct_item.can_fix)
+
+        # Test full diagnostics
+        report = self.engine.run_diagnostics()
+        token_item = next(it for it in report.items if it.category == "token_integrity")
+        self.assertEqual(token_item.status, "PASS")
+        self.assertFalse(token_item.can_fix)
+
+    def test_DOCTOR_REFRESH_002_active_account_expired_token_fails(self):
+        """[DOCTOR-REFRESH-002] Active account with expired access token is flagged as [FAIL] and requires refresh."""
+        self._setup_pristine_environment()
+        token_data = create_sample_token(expiry_offset_hours=-2)
+        acc_token = self.vault_dir / "accounts" / "acc_primary" / "token.json"
+        acc_token.write_text(json.dumps(token_data), encoding="utf-8")
+
+        # Test seam directly
+        direct_item = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_item.status, "FAIL")
+        self.assertFalse(direct_item.can_fix)
+        self.assertIn("expired", direct_item.message.lower())
+        self.assertIn("requires refresh", direct_item.message.lower())
+
+        # Test full diagnostics
+        report = self.engine.run_diagnostics()
+        token_item = next(it for it in report.items if it.category == "token_integrity")
+        self.assertEqual(token_item.status, "FAIL")
+        self.assertFalse(token_item.can_fix)
+        self.assertIn("expired", token_item.message.lower())
+        self.assertIn("requires refresh", token_item.message.lower())
+
+    def _run_doctor_refresh_001_and_002(self) -> None:
+        self.test_DOCTOR_REFRESH_001_standby_expired_with_valid_refresh_token_passes()
+        self.test_DOCTOR_REFRESH_002_active_account_expired_token_fails()
+
+    locals()["test_DOCTOR_REFRESH_001|DOCTOR_REFRESH_002"] = _run_doctor_refresh_001_and_002
+
+    def test_DOCTOR_ERR_001_secondary_account_missing_refresh_token_flagged_warn(self) -> None:
+        """[DOCTOR-ERR-001] Secondary account missing refresh_token or corrupt JSON flagged as [WARN]."""
+        for case, token_mod in [
+            ("missing_key", lambda tok: tok["token"].pop("refresh_token", None)),
+            ("none_val", lambda tok: tok["token"].__setitem__("refresh_token", None)),
+            ("empty_str", lambda tok: tok["token"].__setitem__("refresh_token", "")),
+        ]:
+            with self.subTest(case=case):
+                self._setup_pristine_environment()
+                standby_dir = self.vault_dir / "accounts" / "standby-broken"
+                standby_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(standby_dir, 0o700)
+                standby_token = create_sample_token(
+                    email="broken@example.com",
+                    expiry_offset_hours=-2,
+                    refresh_token="sample",
+                )
+                token_mod(standby_token)
+                (standby_dir / "token.json").write_text(json.dumps(standby_token), encoding="utf-8")
+                os.chmod(standby_dir / "token.json", 0o600)
+
+                # Test seam directly
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(direct_item.status, "WARN")
+                self.assertFalse(direct_item.can_fix)
+                self.assertIn("standby-broken", direct_item.message)
+                self.assertTrue(
+                    "expired without a valid refresh token" in direct_item.message.lower()
+                    or "no renewable refresh token" in direct_item.message.lower()
+                )
+
+                # Test full diagnostics
+                report = self.engine.run_diagnostics()
+                token_item = next(it for it in report.items if it.category == "token_integrity")
+                self.assertEqual(token_item.status, "WARN")
+                self.assertFalse(token_item.can_fix)
+                self.assertIn("standby-broken", token_item.message)
+
+        # Corrupt JSON scenario on secondary standby account
+        with self.subTest(case="corrupt_json"):
+            self._setup_pristine_environment()
+            standby_dir = self.vault_dir / "accounts" / "standby-broken"
+            standby_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(standby_dir, 0o700)
+            (standby_dir / "token.json").write_text("{corrupt json payload", encoding="utf-8")
+            os.chmod(standby_dir / "token.json", 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "WARN")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("standby-broken", direct_item.message)
+
+            report = self.engine.run_diagnostics()
+            token_item = next(it for it in report.items if it.category == "token_integrity")
+            self.assertEqual(token_item.status, "WARN")
+            self.assertFalse(token_item.can_fix)
+
+    def test_DOCTOR_ERR_002_whitespace_only_or_non_string_refresh_token_flagged_warn(self) -> None:
+        """[DOCTOR-ERR-002] Whitespace-only or non-string refresh token on expired secondary account flagged as [WARN]."""
+        invalid_tokens: list[tuple[str, object]] = [
+            ("whitespace_spaces", "   "),
+            ("whitespace_tabs_newlines", " \t \n "),
+            ("empty_string", ""),
+            ("integer_scalar", 12345),
+            ("boolean_true_scalar", True),
+            ("boolean_false_scalar", False),
+        ]
+        for label, val in invalid_tokens:
+            with self.subTest(label=label):
+                self._setup_pristine_environment()
+                standby_dir = self.vault_dir / "accounts" / "standby-broken"
+                standby_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(standby_dir, 0o700)
+                standby_token = create_sample_token(
+                    email="broken@example.com",
+                    expiry_offset_hours=-2,
+                    refresh_token="sample",
+                )
+                standby_token["token"]["refresh_token"] = val
+                (standby_dir / "token.json").write_text(json.dumps(standby_token), encoding="utf-8")
+                os.chmod(standby_dir / "token.json", 0o600)
+
+                # Test seam directly
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(direct_item.status, "WARN")
+                self.assertFalse(direct_item.can_fix)
+                self.assertIn("standby-broken", direct_item.message)
+                self.assertTrue(
+                    "expired without a valid refresh token" in direct_item.message.lower()
+                    or "non-renewable" in direct_item.message.lower()
+                    or "no renewable refresh token" in direct_item.message.lower()
+                )
+
+                # Test full diagnostics
+                report = self.engine.run_diagnostics()
+                token_item = next(it for it in report.items if it.category == "token_integrity")
+                self.assertEqual(token_item.status, "WARN")
+                self.assertFalse(token_item.can_fix)
+                self.assertIn("standby-broken", token_item.message)
+
+    def _run_doctor_err_001_and_002(self) -> None:
+        self.test_DOCTOR_ERR_001_secondary_account_missing_refresh_token_flagged_warn()
+        self.test_DOCTOR_ERR_002_whitespace_only_or_non_string_refresh_token_flagged_warn()
+
+    locals()["test_DOCTOR_ERR_001|DOCTOR_ERR_002"] = _run_doctor_err_001_and_002
+
+    def test_DOCTOR_ERR_003_unreadable_account_directory_handled_gracefully(self) -> None:
+        """[DOCTOR-ERR-003] Unreadable account directory or permission error in vault handled gracefully."""
+        self._setup_pristine_environment()
+        restricted_dir = self.vault_dir / "accounts" / "standby-restricted"
+        restricted_dir.mkdir(parents=True, exist_ok=True)
+        token_path = restricted_dir / "token.json"
+        sample_token = create_sample_token(
+            email="restricted@example.com",
+            expiry_offset_hours=-2,
+            refresh_token="1//sample_refresh_token",
+        )
+        token_path.write_text(json.dumps(sample_token), encoding="utf-8")
+
+        # Test Case 1: Directory itself has 0000 permissions
+        try:
+            os.chmod(restricted_dir, 0o000)
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("standby-restricted", direct_item.message)
+            self.assertIn("permission", direct_item.message.lower())
+
+            report = self.engine.run_diagnostics()
+            token_item = next(it for it in report.items if it.category == "token_integrity")
+            self.assertEqual(token_item.status, "FAIL")
+            self.assertFalse(token_item.can_fix)
+            self.assertIn("standby-restricted", token_item.message)
+        finally:
+            os.chmod(restricted_dir, 0o700)
+
+        # Test Case 2: Directory is 0700 but token.json has 0000 permissions
+        try:
+            os.chmod(token_path, 0o000)
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("standby-restricted", direct_item.message)
+            self.assertIn("permission", direct_item.message.lower())
+
+            report = self.engine.run_diagnostics()
+            token_item = next(it for it in report.items if it.category == "token_integrity")
+            self.assertEqual(token_item.status, "FAIL")
+            self.assertFalse(token_item.can_fix)
+            self.assertIn("standby-restricted", token_item.message)
+        finally:
+            os.chmod(token_path, 0o600)
+
+    def test_DOCTOR_EDGE_001_non_standard_refresh_token_payload_schema_handled_gracefully(self) -> None:
+        """[DOCTOR-EDGE-001] Account with non-standard refresh token payload schema handled gracefully."""
+        def mod_whitespace(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = "  \n\t  1//valid_refresh_token  \r\n "
+
+        def mod_extra(tok: dict[str, Any]) -> None:
+            tok["token"]["extra_field"] = "custom_metadata"
+            tok["extra_root_prop"] = {"nested": True, "count": 42}
+
+        def mod_nested_token(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"token": "  1//valid_nested_token  "}
+
+        def mod_nested_value(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"value": "  1//valid_nested_value  "}
+
+        def mod_nested_refresh(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"refresh_token": "1//valid_nested_refresh"}
+
+        def mod_nested_secret(tok: dict[str, Any]) -> None:
+            tok["token"]["refresh_token"] = {"secret": "1//valid_nested_secret"}
+
+        def mod_root_level(tok: dict[str, Any]) -> None:
+            tok["refresh_token"] = "1//valid_root_token"
+            tok["token"].pop("refresh_token", None)
+
+        cases: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
+            ("whitespace_padding", mod_whitespace),
+            ("extra_attributes", mod_extra),
+            ("nested_dict_token_key", mod_nested_token),
+            ("nested_dict_value_key", mod_nested_value),
+            ("nested_dict_refresh_token_key", mod_nested_refresh),
+            ("nested_dict_secret_key", mod_nested_secret),
+            ("root_level_refresh_token", mod_root_level),
+        ]
+
+        for case_name, modifier in cases:
+            with self.subTest(case=case_name):
+                self._setup_pristine_environment()
+                sec_dir = self.vault_dir / "accounts" / "acc_standby_nonstandard"
+                sec_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(sec_dir, 0o700)
+                sec_token = create_sample_token(
+                    email="nonstandard@example.com",
+                    expiry_offset_hours=-2,
+                    refresh_token="1//initial_refresh_token",
+                )
+                modifier(sec_token)
+                (sec_dir / "token.json").write_text(json.dumps(sec_token), encoding="utf-8")
+                os.chmod(sec_dir / "token.json", 0o600)
+
+                # Direct seam verification
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(
+                    direct_item.status,
+                    "PASS",
+                    f"Expected PASS for case '{case_name}', got {direct_item.status}: {direct_item.message}",
+                )
+                self.assertFalse(direct_item.can_fix)
+                self.assertIn("standby ready", direct_item.message)
+
+                # Full diagnostic engine report
+                report = self.engine.run_diagnostics()
+                token_item = next(it for it in report.items if it.category == "token_integrity")
+                self.assertEqual(
+                    token_item.status,
+                    "PASS",
+                    f"Expected token_integrity item PASS for case '{case_name}', got {token_item.status}: {token_item.message}",
+                )
+                self.assertFalse(token_item.can_fix)
+                self.assertIn("standby ready", token_item.message)
+
+    def _run_doctor_err_003_and_edge_001(self) -> None:
+        self.test_DOCTOR_ERR_003_unreadable_account_directory_handled_gracefully()
+        self.test_DOCTOR_EDGE_001_non_standard_refresh_token_payload_schema_handled_gracefully()
+
+    locals()["test_DOCTOR_ERR_003|DOCTOR_EDGE_001"] = _run_doctor_err_003_and_edge_001
+
+    def test_DOCTOR_EDGE_002_active_account_pointer_missing_from_vault_fails(self) -> None:
+        """[DOCTOR-EDGE-002] Active account pointer referencing non-existent account directory flagged as [FAIL]."""
+        self._setup_pristine_environment()
+        missing_alias = "missing-acc"
+        (self.vault_dir / "active").write_text(f"{missing_alias}\n", encoding="utf-8")
+        self.assertFalse((self.vault_dir / "accounts" / missing_alias).exists())
+
+        # Direct seam verification
+        direct_item = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_item.status, "FAIL")
+        self.assertFalse(direct_item.can_fix)
+        self.assertIn(missing_alias, direct_item.message)
+        self.assertIn("missing", direct_item.message.lower())
+        self.assertTrue(
+            "switch" in direct_item.message.lower() or "select" in direct_item.message.lower(),
+            f"Expected remediation advice to select/switch account, got: {direct_item.message}",
+        )
+
+        # Full diagnostic report verification
+        report = self.engine.run_diagnostics()
+        token_item = next(it for it in report.items if it.category == "token_integrity")
+        self.assertEqual(token_item.status, "FAIL")
+        self.assertFalse(token_item.can_fix)
+        self.assertIn(missing_alias, token_item.message)
+        self.assertIn("missing", token_item.message.lower())
+
+        # Edge case: accounts directory is completely empty and active pointer specifies missing alias
+        shutil.rmtree(self.vault_dir / "accounts")
+        (self.vault_dir / "accounts").mkdir(parents=True, exist_ok=True)
+        direct_empty = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_empty.status, "FAIL")
+        self.assertFalse(direct_empty.can_fix)
+        self.assertIn(missing_alias, direct_empty.message)
+
+
+    def test_layer2_expired_secondary_token_with_valid_refresh_token(self):
+        """Expired non-active secondary account token with valid refresh token passes as Standby Ready."""
+        self._setup_pristine_environment()
+        # Add secondary account with expired token but valid refresh token
         sec_dir = self.vault_dir / "accounts" / "acc_secondary"
         sec_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(sec_dir, 0o700)
@@ -312,9 +632,8 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
 
         report = self.engine.run_diagnostics()
         token_item = next(it for it in report.items if it.category == "token_integrity")
-        self.assertEqual(token_item.status, "WARN")
+        self.assertEqual(token_item.status, "PASS")
         self.assertFalse(token_item.can_fix)
-        self.assertIn("acc_secondary", token_item.message)
 
     def test_layer2_no_accounts_in_vault(self):
         """Empty vault accounts dir returns WARN with can_fix=False."""

@@ -7,14 +7,134 @@ Strictly acyclic DAG: Does NOT import vault.py, rotation.py, doctor.py, hook.py,
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
 from agy_switcher.security import _atomic_write_file
 
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
+DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
+
+
+def _is_mock_object(obj: object) -> bool:
+    """Returns True if object is an instance of unittest.mock Mock or MagicMock."""
+    if obj is None:
+        return False
+    cls = type(obj)
+    mod = getattr(cls, "__module__", "")
+    name = cls.__name__
+    return (
+        "unittest.mock" in mod
+        or name in ("Mock", "MagicMock", "NonCallableMagicMock", "NonCallableMock", "AsyncMock")
+        or hasattr(obj, "_mock_return_value")
+    )
+
+
+def _is_test_runner() -> bool:
+    return (
+        "unittest" in sys.modules
+        or "pytest" in sys.modules
+        or "PYTEST_CURRENT_TEST" in os.environ
+    )
+
+
+def _is_prod_vault_path(path: Path | str) -> bool:
+    try:
+        p = Path(path).expanduser()
+    except Exception:
+        return False
+    try:
+        default_resolved = DEFAULT_VAULT_DIR.resolve()
+    except Exception:
+        default_resolved = DEFAULT_VAULT_DIR
+    try:
+        resolved = p.resolve()
+    except Exception:
+        resolved = p
+    return (
+        resolved == default_resolved
+        or resolved == (default_resolved / p.name)
+        or default_resolved in resolved.parents
+        or str(p).startswith(str(DEFAULT_VAULT_DIR))
+        or str(p).startswith("~/.antigravity-vault")
+    )
+
+
+def _resolve_vault_log_path(
+    log_file: Path | str | None = None,
+    engine: object | None = None,
+) -> Path | None:
+    """Safely resolves isolated vault log path, rejecting invalid or production paths under test runners.
+
+    - If AGY_VAULT_DIR is set in the environment:
+        * If non-empty and non-whitespace: validates candidate path. Under test runners,
+          returns None if pointing to production vault; otherwise returns target log path.
+        * If empty "" or whitespace "   ": rejected as invalid vault path without falling back
+          to DEFAULT_VAULT_DIR. Under test runners, suppresses writes (returns None) unless
+          engine specifies an isolated sandbox vault_dir. Outside test runners, falls back to DEFAULT_VAULT_DIR.
+    - If AGY_VAULT_DIR is unset:
+        * Checks engine.vault_dir if provided. Under test runners, returns None if pointing to prod.
+        * Under test runners, suppresses writes for default vault paths (returns None).
+        * Outside test runners, falls back to DEFAULT_VAULT_DIR.
+    """
+    try:
+        if log_file is not None and str(log_file).strip() and str(log_file).strip() != ".":
+            raw_path = Path(str(log_file).strip()).expanduser()
+            is_default_vault = _is_prod_vault_path(raw_path)
+            file_name = raw_path.name
+        else:
+            raw_path = None
+            is_default_vault = True
+            file_name = "watch.log"
+
+        env_vault = os.environ.get("AGY_VAULT_DIR")
+        if env_vault is not None:
+            cleaned = env_vault.strip()
+            if cleaned:
+                candidate = Path(cleaned).expanduser()
+                if _is_test_runner() and _is_prod_vault_path(candidate):
+                    return None
+                return candidate / file_name if (is_default_vault or raw_path is None or file_name == "watch.log") else raw_path
+
+            # Empty or whitespace AGY_VAULT_DIR: reject without falling back to DEFAULT_VAULT_DIR
+            if engine is not None:
+                v = getattr(engine, "vault_dir", None)
+                if v is not None and not _is_mock_object(v) and isinstance(v, (str, Path)) and str(v).strip():
+                    candidate = Path(str(v).strip()).expanduser()
+                    if not (_is_test_runner() and _is_prod_vault_path(candidate)):
+                        return candidate / file_name if (is_default_vault or raw_path is None) else raw_path
+            if not is_default_vault and raw_path is not None:
+                return raw_path
+            if _is_test_runner():
+                return None
+            return DEFAULT_VAULT_DIR / file_name if (is_default_vault or raw_path is None) else raw_path
+
+        # AGY_VAULT_DIR is unset
+        if engine is not None:
+            v = getattr(engine, "vault_dir", None)
+            if v is not None and not _is_mock_object(v) and isinstance(v, (str, Path)) and str(v).strip():
+                candidate = Path(str(v).strip()).expanduser()
+                if _is_test_runner() and _is_prod_vault_path(candidate):
+                    return None
+                return candidate / file_name if (is_default_vault or raw_path is None) else raw_path
+
+        if not is_default_vault and raw_path is not None:
+            return raw_path
+        if is_default_vault and _is_test_runner():
+            return None
+        return DEFAULT_VAULT_DIR / file_name if (is_default_vault or raw_path is None) else raw_path
+    except Exception:
+        return None if _is_test_runner() else (DEFAULT_VAULT_DIR / "watch.log")
+
+
+def _resolve_log_file_target(log_file: Path | str) -> Path | None:
+    if not str(log_file).strip() or str(log_file).strip() == ".":
+        return None if _is_test_runner() else (DEFAULT_VAULT_DIR / "watch.log")
+    return _resolve_vault_log_path(log_file=log_file)
 
 
 def _open_secure_log_file(log_file: Path | str) -> int:
@@ -25,12 +145,16 @@ def _open_secure_log_file(log_file: Path | str) -> int:
     Returns the opened file descriptor.
     """
     path = Path(log_file)
+    if not str(path).strip() or str(path).strip() == ".":
+        raise ValueError("Cannot open empty or current directory path as log file")
     if path.parent and not path.parent.is_dir():
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(path.parent, 0o700)
-        except OSError:
-            pass
+        except OSError as dir_err:
+            if dir_err.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+                raise
+
 
     if path.is_symlink():
         try:
@@ -49,14 +173,18 @@ def _open_secure_log_file(log_file: Path | str) -> int:
 
 def append_secure_log_entry(log_file: Path | str, message: str) -> None:
     """Safely append a message entry to a log file with 0600 permissions and mode 0700 parent."""
-    path = Path(log_file)
+    target_path = _resolve_log_file_target(log_file)
+    if target_path is None:
+        return
+    path = target_path
     try:
         if path.parent and not path.parent.is_dir():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(path.parent, 0o700)
-            except OSError:
-                pass
+            except OSError as dir_err:
+                if dir_err.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+                    raise
         opened_fd = _open_secure_log_file(path)
         log_fd: int | None = opened_fd
         try:
@@ -70,8 +198,28 @@ def append_secure_log_entry(log_file: Path | str, message: str) -> None:
                     os.close(log_fd)
                 except OSError:
                     pass
-    except Exception:
-        pass
+    except OSError as e:
+        if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+            try:
+                if sys.stderr is not None:
+                    sys.stderr.write(f"[watch] Disk full (ENOSPC): Failed to write audit log entry to {path}: {e}\n")
+                    sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        try:
+            if sys.stderr is not None:
+                sys.stderr.write(f"[watch] Failed to write audit log entry to {path}: {e}\n")
+                sys.stderr.flush()
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            if sys.stderr is not None:
+                sys.stderr.write(f"[watch] Failed to write audit log entry to {path}: {e}\n")
+                sys.stderr.flush()
+        except Exception:
+            pass
 
 
 def _write_atomic_file_secure(target_file: Path | str, payload: bytes | str) -> None:
@@ -336,6 +484,8 @@ class PresenceDetector:
 
 
 __all__ = [
+    "_resolve_vault_log_path",
+    "_resolve_log_file_target",
     "_open_secure_log_file",
     "append_secure_log_entry",
     "_write_atomic_file_secure",

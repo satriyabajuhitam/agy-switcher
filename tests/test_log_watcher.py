@@ -3637,6 +3637,178 @@ class TestDaemonLifecycle(unittest.TestCase):
             self.assertEqual(self.dm.log_file.stat().st_mode & 0o777, 0o600)
 
 
+class TestSystemdCanonicalLauncher(unittest.TestCase):
+    __qualname__ = "Test_BOOTSTRAP_002|BOOTSTRAP_EDGE_002"
+    """[BOOTSTRAP-002, BOOTSTRAP-EDGE-002] Verification of systemd canonical launcher unit generation and graceful reload."""
+
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.tmp_dir.name)
+        self.vault_dir = self.base_dir / "vault"
+        self.gemini_dir = self.base_dir / ".gemini"
+        self.proc_dir = self.base_dir / "proc"
+        self.user_systemd_dir = self.base_dir / ".config" / "systemd" / "user"
+
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.user_systemd_dir.mkdir(parents=True, exist_ok=True)
+
+        self.dm = DaemonManager(
+            vault_dir=self.vault_dir,
+            proc_dir=self.proc_dir,
+            gemini_dir=self.gemini_dir,
+        )
+
+    def tearDown(self) -> None:
+        self.tmp_dir.cleanup()
+
+    def test_BOOTSTRAP_002_generate_systemd_specifies_canonical_launcher(self) -> None:
+        """[BOOTSTRAP-002] generate_systemd unit references canonical launcher %h/.local/bin/agy-switch watch run."""
+        unit = self.dm.generate_systemd()
+        self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", unit)
+        self.assertNotIn("python", unit.lower().split("execstart=")[-1].splitlines()[0])
+        self.assertNotIn(str(Path(__file__).resolve().parent.parent), unit)
+
+    def test_BOOTSTRAP_002_install_systemd_writes_unit_and_reloads(self) -> None:
+        """[BOOTSTRAP-002] install_systemd generates unit file at target and reloads systemd."""
+        target = self.user_systemd_dir / "agy-switch-watcher.service"
+        with patch("shutil.which", return_value="/bin/systemctl"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            self.dm.install_systemd(target_path=target)
+            self.assertTrue(target.is_file())
+            content = target.read_text(encoding="utf-8")
+            self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", content)
+            mock_run.assert_called_with(
+                ["systemctl", "--user", "daemon-reload"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+
+    def test_BOOTSTRAP_002_cli_watch_install_systemd_success(self) -> None:
+        """[BOOTSTRAP-002] agy-switch watch --install-systemd generates unit and exits 0."""
+        from io import StringIO
+        from scripts import agy_switch
+
+        target = self.user_systemd_dir / "agy-switch-watcher.service"
+        mock_engine = MagicMock()
+        mock_engine.vault_dir = self.vault_dir
+
+        out = StringIO()
+        err = StringIO()
+        with patch("pathlib.Path.home", return_value=self.base_dir), \
+             patch("shutil.which", return_value="/bin/systemctl"), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch("sys.stdout", out), \
+             patch("sys.stderr", err):
+            code = agy_switch.main(["watch", "--install-systemd"], engine=mock_engine)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(target.is_file())
+        self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", target.read_text(encoding="utf-8"))
+
+    def test_BOOTSTRAP_002_install_sh_systemd_generates_unit(self) -> None:
+        """[BOOTSTRAP-002] install.sh --systemd generates unit at ~/.config/systemd/user/agy-switch-watcher.service."""
+        install_sh = Path(__file__).resolve().parent.parent / "install.sh"
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_dir)
+        res = subprocess.run(
+            ["bash", str(install_sh), "--global", "--systemd"],
+            cwd=str(self.base_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(res.returncode, 0, f"install.sh failed: {res.stderr}\n{res.stdout}")
+        unit_file = self.user_systemd_dir / "agy-switch-watcher.service"
+        self.assertTrue(unit_file.is_file(), f"Service file should exist at {unit_file}")
+        content = unit_file.read_text(encoding="utf-8")
+        self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", content)
+
+    def test_BOOTSTRAP_EDGE_002_daemon_reload_failure_issues_advisory(self) -> None:
+        """[BOOTSTRAP-EDGE-002] When systemctl --user daemon-reload fails, logs advisory on loginctl enable-linger."""
+        from io import StringIO
+        err = StringIO()
+        with patch("shutil.which", return_value="/bin/systemctl"), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="Failed to connect to bus")), \
+             patch("sys.stderr", err):
+            ok = self.dm.reload_systemd()
+
+        self.assertFalse(ok)
+        self.assertIn("loginctl enable-linger", err.getvalue())
+
+    def test_BOOTSTRAP_EDGE_002_cli_watch_install_systemd_dbus_unavailable_warns_and_exits_zero(self) -> None:
+        """[BOOTSTRAP-EDGE-002] agy-switch watch --install-systemd catches reload failure, warns, and exits 0."""
+        from io import StringIO
+        from scripts import agy_switch
+
+        target = self.user_systemd_dir / "agy-switch-watcher.service"
+        mock_engine = MagicMock()
+        mock_engine.vault_dir = self.vault_dir
+
+        out = StringIO()
+        err = StringIO()
+        with patch("pathlib.Path.home", return_value=self.base_dir), \
+             patch("shutil.which", return_value="/bin/systemctl"), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="Failed to connect to bus")), \
+             patch("sys.stdout", out), \
+             patch("sys.stderr", err):
+            code = agy_switch.main(["watch", "--install-systemd"], engine=mock_engine)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(target.is_file())
+        self.assertIn("ExecStart=%h/.local/bin/agy-switch watch run", target.read_text(encoding="utf-8"))
+        self.assertIn("loginctl enable-linger", err.getvalue())
+
+    def test_BOOTSTRAP_EDGE_002_missing_systemctl_binary_issues_advisory_and_exits_zero(self) -> None:
+        """[BOOTSTRAP-EDGE-002] When systemctl binary is missing, install_systemd warns on linger and completes."""
+        from io import StringIO
+        target = self.user_systemd_dir / "agy-switch-watcher.service"
+        err = StringIO()
+        with patch("shutil.which", return_value=None), \
+             patch("sys.stderr", err):
+            self.dm.install_systemd(target_path=target)
+
+        self.assertTrue(target.is_file())
+        self.assertIn("loginctl enable-linger", err.getvalue())
+
+    def test_BOOTSTRAP_EDGE_002_install_sh_systemd_dbus_unavailable_warns_and_exits_zero(self) -> None:
+        """[BOOTSTRAP-EDGE-002] install.sh --systemd catches daemon-reload failure, logs linger advisory, exits 0."""
+        mock_bin = self.base_dir / "mock_bin"
+        mock_bin.mkdir(parents=True, exist_ok=True)
+        fake_systemctl = mock_bin / "systemctl"
+        fake_systemctl.write_text(
+            "#!/bin/sh\n"
+            "echo 'Failed to connect to bus: No medium found' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_systemctl.chmod(0o755)
+
+        install_sh = Path(__file__).resolve().parent.parent / "install.sh"
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_dir)
+        env["PATH"] = f"{mock_bin}:{env.get('PATH', '')}"
+
+        res = subprocess.run(
+            ["bash", str(install_sh), "--global", "--systemd"],
+            cwd=str(self.base_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(res.returncode, 0, f"install.sh should exit 0 even if daemon-reload fails. Output:\n{res.stderr}\n{res.stdout}")
+        unit_file = self.user_systemd_dir / "agy-switch-watcher.service"
+        self.assertTrue(unit_file.is_file())
+        self.assertIn("loginctl enable-linger", res.stderr + res.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
 

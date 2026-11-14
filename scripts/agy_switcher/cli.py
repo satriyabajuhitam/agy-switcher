@@ -938,11 +938,16 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
                 if getattr(args, "install_systemd", False)
                 else None
             )
-            unit_content = dm.generate_systemd(target_path=target)
-            sys.stdout.write(unit_content)
-            sys.stdout.flush()
-            if target:
-                print(f"[agy-switch watch] Installed systemd unit to {target}", file=sys.stderr)
+            if getattr(args, "install_systemd", False):
+                unit_content = dm.install_systemd(target_path=target)
+                sys.stdout.write(unit_content)
+                sys.stdout.flush()
+                if target:
+                    print(f"[agy-switch watch] Installed systemd unit to {target}", file=sys.stderr)
+            else:
+                unit_content = dm.generate_systemd(target_path=target)
+                sys.stdout.write(unit_content)
+                sys.stdout.flush()
             return 0
 
         action = getattr(args, "watch_action", None) or "run"

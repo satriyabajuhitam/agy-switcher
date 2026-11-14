@@ -15,8 +15,9 @@ from pathlib import Path
 import shlex
 import shutil
 import stat
+import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from agy_switcher.exceptions import InvalidTokenError
 from agy_switcher.models import DiagnosticItem, DiagnosticReport
@@ -287,30 +288,81 @@ class DoctorEngine:
         _atomic_write_file(self.desktop_token_file, payload_str, mode=0o600)
         _atomic_write_file(self.cli_token_file, payload_str, mode=0o600)
 
-    def install_hook(self, hooks_file: Path | None = None) -> Path:
+    def install_hook(
+        self,
+        hooks_file: Path | None = None,
+        launcher_bin: Path | str | None = None,
+    ) -> Path:
         """Installs the PreInvocation lifecycle hook into hooks.json via deep merge."""
         if self.hook_installer is not None:
             return self.hook_installer(hooks_file)
         if self.engine is not None and hasattr(self.engine, "install_hook"):
-            return self.engine.install_hook(hooks_file)
+            res = self.engine.install_hook(hooks_file, launcher_bin=launcher_bin)
+            return Path(res) if isinstance(res, (Path, str)) else cast(Path, res)
 
         target_hooks = Path(hooks_file or (self.gemini_dir / "config" / "hooks.json")).expanduser()
         target_hooks.parent.mkdir(parents=True, exist_ok=True)
 
         existing: dict[str, Any] = {}
         if target_hooks.is_file():
+            is_corrupt = False
+            corruption_reason = ""
             try:
                 content = target_hooks.read_text(encoding="utf-8").strip()
-                if content:
+                if not content:
+                    is_corrupt = True
+                    corruption_reason = "file is empty (0 bytes)"
+                else:
                     loaded = json.loads(content)
                     if isinstance(loaded, dict):
                         existing = loaded
-            except Exception:
+                    else:
+                        is_corrupt = True
+                        corruption_reason = f"root JSON element is {type(loaded).__name__}, expected object"
+            except Exception as exc:
+                is_corrupt = True
+                corruption_reason = str(exc)
+
+            if is_corrupt:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                bak_file = target_hooks.parent / f"{target_hooks.name}.bak.{ts}"
+                counter = 1
+                while bak_file.exists():
+                    bak_file = target_hooks.parent / f"{target_hooks.name}.bak.{ts}_{counter}"
+                    counter += 1
+                backup_succeeded = False
+                try:
+                    shutil.copy2(target_hooks, bak_file)
+                    backup_succeeded = True
+                except OSError as err:
+                    print(
+                        f"[agy-switch] Warning: Failed to backup corrupted hooks file '{target_hooks}' to '{bak_file}': {err}",
+                        file=sys.stderr,
+                    )
+                if backup_succeeded:
+                    print(
+                        f"[agy-switch] Warning: Corrupted hooks file '{target_hooks}' ({corruption_reason}) backed up to '{bak_file.name}' and reset to valid schema.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[agy-switch] Warning: Corrupted hooks file '{target_hooks}' ({corruption_reason}) reset to valid schema without backup.",
+                        file=sys.stderr,
+                    )
                 existing = {}
 
-        # Resolve launcher path
-        launcher_path = Path(__file__).resolve().parent.parent / "agy_switch.py"
-        hook_cmd = f"python3 {shlex.quote(str(launcher_path))} hook-pre-invocation"
+        if launcher_bin is not None:
+            hook_cmd = f"{launcher_bin} hook-pre-invocation"
+        else:
+            canonical_candidates = [
+                Path.home() / ".local" / "bin" / "agy-switch",
+                self.gemini_dir.parent / ".local" / "bin" / "agy-switch",
+            ]
+            if any(p.is_file() or p.is_symlink() for p in canonical_candidates):
+                hook_cmd = "~/.local/bin/agy-switch hook-pre-invocation"
+            else:
+                launcher_path = Path(__file__).resolve().parent.parent / "agy_switch.py"
+                hook_cmd = f"python3 {shlex.quote(str(launcher_path))} hook-pre-invocation"
 
         hook_def = {
             "enabled": True,
@@ -331,8 +383,59 @@ class DoctorEngine:
         """Decodes JWT payload to extract user email."""
         return extract_email_from_jwt(id_token)
 
+    @staticmethod
+    def _extract_refresh_token(token_obj: object, data: object = None) -> str | None:
+        """Extracts and strips a refresh token from string, nested wrapper dict, or container."""
+        raw: object = None
+        if isinstance(token_obj, str):
+            raw = token_obj
+        elif isinstance(token_obj, dict):
+            raw = token_obj.get("refresh_token")
+        if (raw is None or raw == "") and isinstance(data, dict):
+            raw = data.get("refresh_token")
+
+        if isinstance(raw, str):
+            cleaned = raw.strip()
+            return cleaned if cleaned else None
+
+        if isinstance(raw, dict):
+            for candidate_key in ("token", "value", "refresh_token", "secret", "key", "token_value"):
+                val = raw.get(candidate_key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+                if isinstance(val, dict):
+                    nested = DoctorEngine._extract_refresh_token(val)
+                    if nested:
+                        return nested
+            for val in raw.values():
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+                if isinstance(val, dict):
+                    nested = DoctorEngine._extract_refresh_token(val)
+                    if nested:
+                        return nested
+            return None
+
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+                if isinstance(item, dict):
+                    nested = DoctorEngine._extract_refresh_token(item)
+                    if nested:
+                        return nested
+            return None
+
+        return None
+
     def validate_token_dict(self, data: Any) -> dict[str, Any]:
         """Validates token schema dictionary."""
+        if isinstance(data, dict):
+            token_obj = data.get("token")
+            if isinstance(token_obj, dict):
+                extracted = self._extract_refresh_token(token_obj, data)
+                if extracted is not None:
+                    token_obj["refresh_token"] = extracted
         return validate_token_dict(data)
 
     def validate_token_file(self, token_path: Path) -> dict[str, Any]:
@@ -416,11 +519,17 @@ class DoctorEngine:
 
         files_to_check: list[Path] = []
         if self.accounts_dir.is_dir():
-            for acc in self.accounts_dir.iterdir():
-                if acc.is_dir() and not acc.name.startswith("."):
-                    for f in acc.iterdir():
-                        if f.is_file():
-                            files_to_check.append(f)
+            try:
+                for acc in self.accounts_dir.iterdir():
+                    if acc.is_dir() and not acc.name.startswith("."):
+                        try:
+                            for f in acc.iterdir():
+                                if f.is_file():
+                                    files_to_check.append(f)
+                        except (PermissionError, OSError):
+                            pass
+            except (PermissionError, OSError):
+                pass
         if self.active_file.is_file():
             files_to_check.append(self.active_file)
         if self.cache_dir.is_dir():
@@ -472,7 +581,50 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        accounts = sorted([p for p in self.accounts_dir.iterdir() if p.is_dir() and not p.name.startswith(".")])
+        try:
+            accounts = sorted([p for p in self.accounts_dir.iterdir() if p.is_dir() and not p.name.startswith(".")])
+        except PermissionError as e:
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=f"Inaccessible vault accounts directory due to filesystem permissions: '{self.accounts_dir}' ({e}).",
+                can_fix=False,
+            )
+
+        active_account = self.get_active_name()
+        if active_account:
+            active_path = self.accounts_dir / active_account
+            is_valid_active = (
+                Path(active_account).name == active_account
+                and not active_account.startswith(".")
+                and active_path.is_dir()
+            )
+            if not is_valid_active:
+                return DiagnosticItem(
+                    category="token_integrity",
+                    name="OAuth Token & JWT Identity Integrity",
+                    status="FAIL",
+                    message=(
+                        f"Configured active account '{active_account}' is missing from the vault. "
+                        "Select a valid active account with 'agy-switch switch <alias>' or "
+                        "register one with 'agy-switch login <alias>'."
+                    ),
+                    can_fix=False,
+                )
+        elif self.active_file.is_file():
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=(
+                    "Active account pointer file does not specify a valid account alias. "
+                    "Select a valid active account with 'agy-switch switch <alias>' or "
+                    "register one with 'agy-switch login <alias>'."
+                ),
+                can_fix=False,
+            )
+
         if not accounts:
             return DiagnosticItem(
                 category="token_integrity",
@@ -482,43 +634,138 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        active_account = self.get_active_name()
+        permission_denied_accounts: list[tuple[str, str, str]] = []
         corrupt_accounts: list[tuple[str, str]] = []
+        corrupt_secondary: list[tuple[str, str]] = []
         expired_active: list[str] = []
         expired_secondary: list[str] = []
+        standby_ready: list[str] = []
 
         for acc in accounts:
             acc_name = acc.name
             token_path = acc / "token.json"
-            if not token_path.is_file():
-                corrupt_accounts.append((acc_name, "token.json does not exist"))
+            is_active = bool(active_account and acc_name == active_account.strip())
+
+            try:
+                os.scandir(acc).close()
+            except PermissionError as e:
+                permission_denied_accounts.append((acc_name, str(acc), str(e)))
+                continue
+
+            try:
+                token_stat = token_path.stat()
+            except PermissionError as e:
+                permission_denied_accounts.append((acc_name, str(token_path), str(e)))
+                continue
+            except FileNotFoundError:
+                if is_active:
+                    corrupt_accounts.append((acc_name, "token.json does not exist"))
+                else:
+                    corrupt_secondary.append((acc_name, "token.json does not exist"))
+                continue
+            except OSError as e:
+                if is_active:
+                    corrupt_accounts.append((acc_name, f"Filesystem error: {e}"))
+                else:
+                    corrupt_secondary.append((acc_name, f"Filesystem error: {e}"))
+                continue
+
+            if not stat.S_ISREG(token_stat.st_mode):
+                if is_active:
+                    corrupt_accounts.append((acc_name, "token.json is not a regular file"))
+                else:
+                    corrupt_secondary.append((acc_name, "token.json is not a regular file"))
                 continue
 
             try:
                 raw_text = token_path.read_text(encoding="utf-8")
                 data = json.loads(raw_text)
-                self.validate_token_dict(data)
+            except PermissionError as e:
+                permission_denied_accounts.append((acc_name, str(token_path), str(e)))
+                continue
             except Exception as e:
-                corrupt_accounts.append((acc_name, str(e)))
-                continue
-
-            id_tok = data.get("id_token", "")
-            email = self.extract_email_from_jwt(id_tok)
-            if not email:
-                corrupt_accounts.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
-                continue
-
-            token_obj = data.get("token", {})
-            raw_expiry = token_obj.get("expiry")
-            if not self._is_valid_expiry(raw_expiry):
-                corrupt_accounts.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
-                continue
-
-            if self._is_token_expired(raw_expiry):
-                if active_account and acc_name == active_account.strip():
-                    expired_active.append(acc_name)
+                if is_active:
+                    corrupt_accounts.append((acc_name, str(e)))
                 else:
-                    expired_secondary.append(acc_name)
+                    corrupt_secondary.append((acc_name, f"Corrupt token JSON: {e}"))
+                continue
+
+            if is_active:
+                try:
+                    self.validate_token_dict(data)
+                except Exception as e:
+                    corrupt_accounts.append((acc_name, str(e)))
+                    continue
+
+                id_tok = data.get("id_token", "")
+                email = self.extract_email_from_jwt(id_tok)
+                if not email:
+                    corrupt_accounts.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
+                    continue
+
+                token_obj = data.get("token", {})
+                raw_expiry = token_obj.get("expiry")
+                if not self._is_valid_expiry(raw_expiry):
+                    corrupt_accounts.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
+                    continue
+
+                if self._is_token_expired(raw_expiry):
+                    expired_active.append(acc_name)
+            else:
+                if not isinstance(data, dict):
+                    corrupt_secondary.append((acc_name, "Token payload must be a JSON object."))
+                    continue
+
+                token_obj = data.get("token")
+                if not isinstance(token_obj, dict):
+                    corrupt_secondary.append((acc_name, "Missing required 'token' object in payload."))
+                    continue
+
+                required_secondary_keys = ("access_token", "token_type", "expiry")
+                missing_keys = [k for k in required_secondary_keys if not token_obj.get(k)]
+                if missing_keys:
+                    corrupt_secondary.append((acc_name, f"Missing required token fields: {', '.join(missing_keys)}"))
+                    continue
+
+                if not data.get("auth_method"):
+                    corrupt_secondary.append((acc_name, "Missing required 'auth_method' field."))
+                    continue
+
+                id_tok = data.get("id_token")
+                if not id_tok or not isinstance(id_tok, str):
+                    corrupt_secondary.append((acc_name, "Missing or invalid 'id_token' JWT field."))
+                    continue
+
+                email = self.extract_email_from_jwt(id_tok)
+                if not email:
+                    corrupt_secondary.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
+                    continue
+
+                raw_expiry = token_obj.get("expiry")
+                if not self._is_valid_expiry(raw_expiry):
+                    corrupt_secondary.append((acc_name, "Invalid token expiry format (unparseable timestamp/date)"))
+                    continue
+
+                refresh_token = self._extract_refresh_token(token_obj, data)
+                if refresh_token is not None:
+                    token_obj["refresh_token"] = refresh_token
+                has_valid_refresh = refresh_token is not None
+
+                if self._is_token_expired(raw_expiry):
+                    if has_valid_refresh:
+                        standby_ready.append(acc_name)
+                    else:
+                        expired_secondary.append(acc_name)
+
+        if permission_denied_accounts:
+            err_details = [f"'{a}' ({path}): {msg}" for a, path, msg in permission_denied_accounts]
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=f"Inaccessible account directory due to filesystem permissions: {', '.join(err_details)}.",
+                can_fix=False,
+            )
 
         if corrupt_accounts:
             err_details = [f"'{a}': {msg}" for a, msg in corrupt_accounts]
@@ -535,24 +782,41 @@ class DoctorEngine:
                 category="token_integrity",
                 name="OAuth Token & JWT Identity Integrity",
                 status="FAIL",
-                message=f"Active account '{expired_active[0]}' token is expired.",
+                message=f"Active account '{expired_active[0]}' token is expired and requires refresh.",
                 can_fix=False,
             )
 
-        if expired_secondary:
+        if corrupt_secondary or expired_secondary:
+            warn_parts: list[str] = []
+            if expired_secondary:
+                warn_parts.append(
+                    f"Secondary account token(s) expired without a valid refresh token "
+                    f"(non-renewable): {', '.join(expired_secondary)}"
+                )
+            if corrupt_secondary:
+                err_details = [f"'{a}': {msg}" for a, msg in corrupt_secondary]
+                warn_parts.append(
+                    f"Secondary account token schema corrupt or invalid: {', '.join(err_details)}"
+                )
+            warn_msg = ". ".join(warn_parts) + ". Re-authenticate with 'agy-switch login <alias>'."
             return DiagnosticItem(
                 category="token_integrity",
                 name="OAuth Token & JWT Identity Integrity",
                 status="WARN",
-                message=f"Secondary account token(s) expired: {', '.join(expired_secondary)}.",
+                message=warn_msg,
                 can_fix=False,
             )
+
+        if standby_ready:
+            msg = f"All {len(accounts)} account tokens valid (active unexpired, {len(standby_ready)} standby ready)."
+        else:
+            msg = f"All {len(accounts)} account tokens valid and unexpired."
 
         return DiagnosticItem(
             category="token_integrity",
             name="OAuth Token & JWT Identity Integrity",
             status="PASS",
-            message=f"All {len(accounts)} account tokens valid and unexpired.",
+            message=msg,
             can_fix=False,
         )
 

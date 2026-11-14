@@ -15,6 +15,7 @@ Options:
   -a, --all             Install or uninstall both local and global installations
   -c, --copy            Copy files physically instead of symlinking (default is symlink)
   -s, --symlink         Explicitly force symlink installation (default behavior)
+  --systemd             Install systemd user service unit (agy-switch-watcher.service)
   -u, --uninstall       Remove installed plugin and clean up launcher
   -h, --help            Show this usage information
 
@@ -44,6 +45,99 @@ for arg in "$@"; do
     esac
 done
 
+# Determine script directory robustly if available
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BOOSTER_ROOT="$SCRIPT_DIR"
+else
+    SCRIPT_DIR=""
+    BOOSTER_ROOT=""
+fi
+
+matches_dest() {
+    local path="$1"
+    local prefix="$2"
+    [ -n "$prefix" ] && case "$path" in "$prefix"*) return 0 ;; esac
+    return 1
+}
+
+matches_agy() {
+    local path="$1"
+    case "$path" in
+        *"/agy-switch/"*|*"/agy_switch.py"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_foreign_binary() {
+    local link="$1"
+    # Non-existent paths or symlinks are safe to install/refresh
+    if [ ! -e "$link" ] || [ -L "$link" ]; then
+        return 1
+    fi
+    # Non-symlink regular files or foreign executables
+    if [ -f "$link" ]; then
+        if grep -q "agy_switch" "$link" 2>/dev/null || grep -q "agy-switch" "$link" 2>/dev/null; then
+            return 1
+        fi
+        return 0
+    fi
+    # Any other non-symlink filesystem object (e.g. dir, socket)
+    return 0
+}
+
+verify_prerequisites() {
+    # 1. Verify git is installed
+    if ! command -v git >/dev/null 2>&1; then
+        if [ "${IS_BOOTSTRAP:-0}" -eq 1 ]; then
+            echo "Error: git is required for remote installation." >&2
+        else
+            echo "Error: git is required to install agy-switch but is not installed or not in PATH." >&2
+            echo "Please install git and try again." >&2
+        fi
+        return 1
+    fi
+
+    # 2. Verify python3 is installed
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Error: python3 (>= 3.10) is required to install agy-switch but is not installed or not in PATH." >&2
+        echo "Please install python3 and try again." >&2
+        return 1
+    fi
+
+    # 3. Verify python3 version >= 3.10
+    if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1; then
+        local py_ver
+        py_ver="$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null || true)"
+        echo "Error: python3 version 3.10 or higher is required to install agy-switch (detected Python ${py_ver:-unknown})." >&2
+        echo "Please upgrade python3 and try again." >&2
+        return 1
+    fi
+
+    # 4. Check for launcher collision (skip if uninstalling)
+    local is_uninstall=0
+    for arg in "$@"; do
+        case "$arg" in
+            -u|--uninstall)
+                is_uninstall=1
+                ;;
+        esac
+    done
+
+    if [ "$is_uninstall" -eq 0 ]; then
+        local bin_dir="${HOME}/.local/bin"
+        local bin_link="$bin_dir/agy-switch"
+        if is_foreign_binary "$bin_link"; then
+            echo "Error: Existing foreign file or executable already exists at '$bin_link' that was not created by agy-switch." >&2
+            echo "Refusing to silently overwrite foreign binaries without user confirmation." >&2
+            echo "Please backup, move, or remove '$bin_link' and run installer again." >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # ---------------------------------------------------------
 # Execution Mode Detection (Local Mode vs Bootstrap Mode)
 # ---------------------------------------------------------
@@ -56,11 +150,12 @@ fi
 if [ "$IS_BOOTSTRAP" -eq 1 ]; then
     echo "==> agy-switch Remote Bootstrap Installer"
     export GIT_TERMINAL_PROMPT=0
+fi
 
-    if ! command -v git >/dev/null 2>&1; then
-        echo "Error: git is required for remote installation." >&2
-        exit 1
-    fi
+# Run pre-flight prerequisites and foreign binary collision check
+verify_prerequisites "$@" || exit 1
+
+if [ "$IS_BOOTSTRAP" -eq 1 ]; then
 
     TARGET_DIR="${AGY_SWITCH_HOME:-$HOME/agy-switcher}"
     while [ "$TARGET_DIR" != "/" ] && [ "${TARGET_DIR%/}" != "$TARGET_DIR" ]; do
@@ -173,6 +268,7 @@ INSTALL_MODE="symlink"
 TARGET=""
 UNINSTALL=0
 INTERACTIVE=0
+INSTALL_SYSTEMD=0
 
 # Determine script directory robustly
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -215,6 +311,7 @@ else
             -a|--all) TARGET="all" ;;
             -c|--copy) INSTALL_MODE="copy" ;;
             -s|--symlink) INSTALL_MODE="symlink" ;;
+            --systemd) INSTALL_SYSTEMD=1 ;;
             -u|--uninstall) UNINSTALL=1 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown parameter passed: $1"; usage; exit 1 ;;
@@ -227,6 +324,8 @@ if [ -z "$TARGET" ]; then
     if [ "$UNINSTALL" -eq 1 ]; then
         # Default uninstall without explicit target cleans up both to prevent orphaned files
         TARGET="all"
+    elif [ "$INSTALL_SYSTEMD" -eq 1 ]; then
+        TARGET="global"
     else
         echo "Error: Must specify --local, --global, or --all (or use interactive menu)."
         exit 1
@@ -247,21 +346,6 @@ get_global_dest() {
     echo "${HOME}/.gemini/config/plugins/agy-switch"
 }
 
-matches_dest() {
-    local path="$1"
-    local prefix="$2"
-    [ -n "$prefix" ] && case "$path" in "$prefix"*) return 0 ;; esac
-    return 1
-}
-
-matches_agy() {
-    local path="$1"
-    case "$path" in
-        *"/agy-switch/"*|*"/agy_switch.py"*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 manage_launcher() {
     local action="$1"
     local target_dest="${2:-}"
@@ -269,6 +353,17 @@ manage_launcher() {
     local bin_link="$bin_dir/agy-switch"
 
     if [ "$action" = "install" ]; then
+        if is_foreign_binary "$bin_link"; then
+            echo "Error: Existing foreign file or executable already exists at '$bin_link' that was not created by agy-switch." >&2
+            echo "Refusing to silently overwrite foreign binaries without user confirmation." >&2
+            echo "Please backup, move, or remove '$bin_link' and run installer again." >&2
+            exit 1
+        fi
+        if [ -e "$bin_link" ] || [ -L "$bin_link" ]; then
+            # Unlink verified existing launcher symlink before replacing
+            rm -f "$bin_link"
+        fi
+
         mkdir -p "$bin_dir"
         local script_target="$target_dest/scripts/agy_switch.py"
         # Ensure executable
@@ -277,6 +372,80 @@ manage_launcher() {
         # Link
         ln -sf "$script_target" "$bin_link"
         echo "Created launcher symlink: $bin_link -> $script_target"
+
+        # Register PreInvocation hook in ~/.gemini/config/hooks.json for global/all installations
+        if [ "$TARGET" = "global" ] || [ "$TARGET" = "all" ] || [ "$target_dest" = "$(get_global_dest)" ]; then
+            local hooks_dir="${HOME}/.gemini/config"
+            local hooks_file="$hooks_dir/hooks.json"
+            python3 -c "
+import sys, os
+from pathlib import Path
+
+target_dest = sys.argv[1]
+hooks_path = Path(sys.argv[2])
+hooks_path.parent.mkdir(parents=True, exist_ok=True)
+
+installed = False
+try:
+    sys.path.insert(0, os.path.join(target_dest, 'scripts'))
+    from agy_switcher.vault import AgySwitchEngine
+    engine = AgySwitchEngine(gemini_dir=hooks_path.parent.parent)
+    engine.install_hook(hooks_file=hooks_path, launcher_bin='~/.local/bin/agy-switch')
+    installed = True
+except Exception:
+    pass
+
+if not installed:
+    import json
+    existing = {}
+    if hooks_path.is_file():
+        is_corrupt = False
+        try:
+            content = hooks_path.read_text(encoding='utf-8').strip()
+            if not content:
+                is_corrupt = True
+            else:
+                loaded = json.loads(content)
+                if isinstance(loaded, dict):
+                    existing = loaded
+                else:
+                    is_corrupt = True
+        except Exception:
+            is_corrupt = True
+
+        if is_corrupt:
+            import datetime, shutil
+            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            bak_path = hooks_path.with_name(f'{hooks_path.name}.bak.{ts}')
+            counter = 1
+            while bak_path.exists():
+                bak_path = hooks_path.with_name(f'{hooks_path.name}.bak.{ts}_{counter}')
+                counter += 1
+            try:
+                shutil.copy2(hooks_path, bak_path)
+            except Exception:
+                pass
+            existing = {}
+
+    existing['agy-switch-auto-rotate'] = {
+        'enabled': True,
+        'PreInvocation': [
+            {
+                'type': 'command',
+                'command': '~/.local/bin/agy-switch hook-pre-invocation',
+                'timeout': 5,
+            }
+        ],
+    }
+
+    tmp_path = hooks_path.with_name(f'.{hooks_path.name}.tmp.{os.getpid()}')
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(existing, f, indent=2)
+        f.write('\n')
+    os.replace(tmp_path, hooks_path)
+" "$target_dest" "$hooks_file"
+            echo "Registered PreInvocation hook: $hooks_file"
+        fi
     elif [ "$action" = "uninstall" ]; then
         if [ -L "$bin_link" ] || [ -e "$bin_link" ]; then
             local current_target
@@ -349,6 +518,38 @@ install_target() {
     echo "Installation complete."
 }
 
+install_systemd_service() {
+    local unit_dir="${HOME}/.config/systemd/user"
+    local unit_file="$unit_dir/agy-switch-watcher.service"
+    mkdir -p "$unit_dir"
+    cat <<'EOF' > "$unit_file"
+[Unit]
+Description=Antigravity Account Switcher Log Watcher Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agy-switch watch run
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:%h/.antigravity-vault/watch.log
+StandardError=append:%h/.antigravity-vault/watch.log
+
+[Install]
+WantedBy=default.target
+EOF
+    echo "Installed systemd user service: $unit_file"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl --user daemon-reload 2>/dev/null; then
+            echo "Warning: Failed to reload systemd daemon via 'systemctl --user daemon-reload'." >&2
+            echo "If D-Bus session bus or user lingering is disabled, enable lingering via: loginctl enable-linger" >&2
+        fi
+    else
+        echo "Warning: systemctl command not found. If D-Bus session bus or user lingering is disabled, enable lingering via: loginctl enable-linger" >&2
+    fi
+}
+
 if [ "$UNINSTALL" -eq 1 ]; then
     if [ "$TARGET" = "local" ]; then
         uninstall_target "$(get_local_dest)"
@@ -360,6 +561,20 @@ if [ "$UNINSTALL" -eq 1 ]; then
         # Final pass to ensure launcher is gone if TARGET was all
         manage_launcher "uninstall" ""
     fi
+    if [ "$INSTALL_SYSTEMD" -eq 1 ]; then
+        local unit_file="${HOME}/.config/systemd/user/agy-switch-watcher.service"
+        if [ -f "$unit_file" ]; then
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user stop agy-switch-watcher.service 2>/dev/null || true
+                systemctl --user disable agy-switch-watcher.service 2>/dev/null || true
+            fi
+            rm -f "$unit_file"
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user daemon-reload 2>/dev/null || true
+            fi
+            echo "Removed systemd user service: $unit_file"
+        fi
+    fi
     echo "Uninstall complete. (Note: ~/.antigravity-vault/ is intentionally kept untouched)."
 else
     if [ "$TARGET" = "local" ]; then
@@ -369,5 +584,9 @@ else
     elif [ "$TARGET" = "all" ]; then
         install_target "$(get_local_dest)"
         install_target "$(get_global_dest)"
+    fi
+
+    if [ "$INSTALL_SYSTEMD" -eq 1 ]; then
+        install_systemd_service
     fi
 fi

@@ -1,10 +1,15 @@
+import errno
+import fcntl
+import io
 import json
 import socket
+import threading
 import unittest
 from unittest.mock import MagicMock, patch, mock_open
 from pathlib import Path
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -13,7 +18,16 @@ import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from scripts.watch import LogWatcher, PresenceDetector
+from scripts.watch import (
+    LogWatcher,
+    PresenceDetector,
+    DaemonManager,
+    DEFAULT_VAULT_DIR,
+    main as watch_main,
+    _open_secure_log_file,
+    _resolve_vault_log_path,
+    append_secure_log_entry,
+)
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.models import AccountInfo
 
@@ -3795,6 +3809,1421 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
         with patch("time.time", return_value=skewed_now):
             self.assertEqual(watcher.poll_once(), 1)
         self.assertEqual(watcher.last_switch_time, skewed_now)
+
+
+class TestDaemonLockMutualExclusion(unittest.TestCase):
+    """
+    [DAEMON-MUTEX-001] [DAEMON-MUTEX-002]
+    Validates POSIX kernel file locking on watch.lock across DaemonManager and LogWatcher.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+
+    def tearDown(self) -> None:
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _hold_external_lock(self) -> int:
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.open_fds.append(fd)
+        return fd
+
+    def test_DAEMON_MUTEX_001_daemon_manager_start_acquires_exclusive_lock(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=23456)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            pid = dm.start()
+            self.assertEqual(pid, 23456)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+
+        # Attempting secondary acquisition on another descriptor must raise BlockingIOError
+        probe_fd = os.open(str(self.lock_file), os.O_RDWR)
+        self.open_fds.append(probe_fd)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_DAEMON_MUTEX_001_log_watcher_watch_loop_acquires_exclusive_lock(self) -> None:
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+
+        # Confirm DaemonManager._acquire_lock retained or lock is held during execution
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        fd = dm._acquire_lock()
+        self.assertIsInstance(fd, int)
+        self.open_fds.append(fd)
+        self.assertEqual(dm._lock_fd, fd)
+
+        # Verify exclusive locking invariant
+        probe_fd = os.open(str(self.lock_file), os.O_RDWR)
+        self.open_fds.append(probe_fd)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_DAEMON_MUTEX_002_secondary_daemon_manager_start_rejected_with_exit_code_1(self) -> None:
+        self._hold_external_lock()
+        self.pid_file.write_text("11111\n", encoding="utf-8")
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(SystemExit) as ctx:
+                dm.start()
+            self.assertEqual(ctx.exception.code, 1)
+            mock_popen.assert_not_called()
+
+        self.assertIn("Another watcher daemon is already running", stderr_capture.getvalue())
+        # Verify watch.pid was not corrupted or overwritten
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), "11111")
+
+    def test_DAEMON_MUTEX_002_secondary_watch_loop_rejected_with_exit_code_1(self) -> None:
+        self._hold_external_lock()
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch.object(watcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite lock contention")):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        self.assertIn("Another watcher daemon is already running", stderr_capture.getvalue())
+
+    def test_DAEMON_MUTEX_002_secondary_watch_run_cli_rejected_with_exit_code_1(self) -> None:
+        self._hold_external_lock()
+
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch("agy_switcher.watcher._get_engine_class") as mock_engine_cls, \
+             patch.object(LogWatcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite lock contention")):
+            mock_engine_cls.return_value = lambda: self.engine_mock
+            with self.assertRaises(SystemExit) as ctx:
+                watch_main(["run"])
+            self.assertEqual(ctx.exception.code, 1)
+
+        self.assertIn("Another watcher daemon is already running", stderr_capture.getvalue())
+
+    def _test_all_daemon_mutex_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_MUTEX_001_daemon_manager_start_acquires_exclusive_lock,
+            self.test_DAEMON_MUTEX_001_log_watcher_watch_loop_acquires_exclusive_lock,
+            self.test_DAEMON_MUTEX_002_secondary_daemon_manager_start_rejected_with_exit_code_1,
+            self.test_DAEMON_MUTEX_002_secondary_watch_loop_rejected_with_exit_code_1,
+            self.test_DAEMON_MUTEX_002_secondary_watch_run_cli_rejected_with_exit_code_1,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonLockMutualExclusion,
+    "test_DAEMON_MUTEX_001|DAEMON_MUTEX_002",
+    TestDaemonLockMutualExclusion._test_all_daemon_mutex_scenarios,
+)
+
+
+class TestDaemonSystemdActiveDetection(unittest.TestCase):
+    """
+    [DAEMON-MUTEX-003] [DAEMON-EDGE-002]
+    Validates user systemd service state detection and graceful fallback in DaemonManager.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+
+    def tearDown(self) -> None:
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_returns_true_when_active(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=0, stdout="active\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc) as mock_run:
+            self.assertTrue(dm.is_systemd_active())
+            mock_run.assert_called_once_with(
+                ["systemctl", "--user", "is-active", "agy-switch-watcher.service"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_inactive(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=3, stdout="inactive\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+
+    def test_DAEMON_MUTEX_003_daemon_manager_start_rejected_when_systemd_active(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch("sys.stderr", stderr_capture), \
+             patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(SystemExit) as ctx:
+                dm.start()
+            self.assertEqual(ctx.exception.code, 1)
+            mock_popen.assert_not_called()
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+        self.assertFalse(self.pid_file.exists())
+        self.assertIsNone(dm._lock_fd)
+
+    def test_DAEMON_MUTEX_003_watch_loop_rejected_when_systemd_active(self) -> None:
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch("sys.stderr", stderr_capture), \
+             patch.object(watcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite systemd service")):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+
+    def test_DAEMON_MUTEX_003_watch_run_cli_rejected_when_systemd_active(self) -> None:
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch("agy_switcher.watcher._get_engine_class") as mock_engine_cls, \
+             patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch.object(LogWatcher, "poll_once", side_effect=RuntimeError("watch_loop polled despite systemd service")):
+            mock_engine_cls.return_value = lambda: self.engine_mock
+            with self.assertRaises(SystemExit) as ctx:
+                watch_main(["run"])
+            self.assertEqual(ctx.exception.code, 1)
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+
+    def test_DAEMON_MUTEX_003_watch_start_cli_rejected_when_systemd_active(self) -> None:
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture), \
+             patch("agy_switcher.watcher._get_engine_class") as mock_engine_cls, \
+             patch.object(DaemonManager, "is_systemd_active", return_value=True), \
+             patch("subprocess.Popen") as mock_popen:
+            mock_engine_cls.return_value = lambda: self.engine_mock
+            with self.assertRaises(SystemExit) as ctx:
+                watch_main(["start"])
+            self.assertEqual(ctx.exception.code, 1)
+            mock_popen.assert_not_called()
+
+        stderr = stderr_capture.getvalue()
+        self.assertIn("systemd", stderr.lower())
+        self.assertIn("stop", stderr.lower())
+
+    def test_DAEMON_EDGE_002_missing_systemctl_binary_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=54321)
+        with patch("shutil.which", return_value=None), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 54321)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_EDGE_002_systemctl_raises_filenotfound_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=65432)
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", side_effect=FileNotFoundError("No such file or directory: 'systemctl'")), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 65432)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_EDGE_002_systemctl_timeout_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=76543)
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["systemctl"], timeout=5.0)), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 76543)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_EDGE_002_systemctl_raises_oserror_fallback_gracefully(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(pid=87654)
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", side_effect=PermissionError("Permission denied")), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+            pid = dm.start()
+            self.assertEqual(pid, 87654)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.open_fds.append(dm._lock_fd)  # type: ignore[arg-type]
+        self.assertTrue(self.lock_file.exists())
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_failed(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=4, stdout="failed\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc):
+            self.assertFalse(dm.is_systemd_active())
+
+    def test_DAEMON_MUTEX_003_is_systemd_active_custom_service_name(self) -> None:
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        mock_proc = MagicMock(returncode=0, stdout="active\n")
+        with patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("subprocess.run", return_value=mock_proc) as mock_run:
+            self.assertTrue(dm.is_systemd_active("custom-watcher.service"))
+            mock_run.assert_called_once_with(
+                ["systemctl", "--user", "is-active", "custom-watcher.service"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+
+    def _test_all_systemd_detection_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_MUTEX_003_is_systemd_active_returns_true_when_active,
+            self.test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_inactive,
+            self.test_DAEMON_MUTEX_003_is_systemd_active_returns_false_when_failed,
+            self.test_DAEMON_MUTEX_003_is_systemd_active_custom_service_name,
+            self.test_DAEMON_MUTEX_003_daemon_manager_start_rejected_when_systemd_active,
+            self.test_DAEMON_MUTEX_003_watch_loop_rejected_when_systemd_active,
+            self.test_DAEMON_MUTEX_003_watch_run_cli_rejected_when_systemd_active,
+            self.test_DAEMON_MUTEX_003_watch_start_cli_rejected_when_systemd_active,
+            self.test_DAEMON_EDGE_002_missing_systemctl_binary_fallback_gracefully,
+            self.test_DAEMON_EDGE_002_systemctl_raises_filenotfound_fallback_gracefully,
+            self.test_DAEMON_EDGE_002_systemctl_timeout_fallback_gracefully,
+            self.test_DAEMON_EDGE_002_systemctl_raises_oserror_fallback_gracefully,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonSystemdActiveDetection,
+    "test_DAEMON_MUTEX_003|DAEMON_EDGE_002",
+    TestDaemonSystemdActiveDetection._test_all_systemd_detection_scenarios,
+)
+
+
+class TestDaemonLockHardeningAndSymlinkRejection(unittest.TestCase):
+    """
+    [DAEMON-ERR-001] [DAEMON-ERR-002]
+    Validates watch.lock path hardening, permission denial handling,
+    and symlink traversal rejection across DaemonManager and LogWatcher.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+
+    def tearDown(self) -> None:
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.chmod(self.vault_dir, 0o700)
+        except OSError:
+            pass
+        if self.lock_file.exists() or self.lock_file.is_symlink():
+            try:
+                os.chmod(self.lock_file, 0o600)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_DAEMON_ERR_001_lock_file_permission_denied_logs_stderr_and_exits_1(self) -> None:
+        """[DAEMON-ERR-001] Restrictive permissions on watch.lock logs actionable error and exits 1."""
+        self.lock_file.touch(mode=0o400)
+        os.chmod(self.lock_file, 0o400)
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+        self.assertIn(str(self.lock_file), err_output)
+
+    def test_DAEMON_ERR_001_vault_dir_permission_denied_logs_stderr_and_exits_1(self) -> None:
+        """[DAEMON-ERR-001] Restrictive permissions on vault_dir logs actionable error and exits 1."""
+        os.chmod(self.vault_dir, 0o500)
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+
+    def test_DAEMON_ERR_001_watch_loop_permission_denied_logs_stderr_and_exits_1(self) -> None:
+        """[DAEMON-ERR-001] LogWatcher.watch_loop exits cleanly with status 1 on PermissionError."""
+        self.lock_file.touch(mode=0o400)
+        os.chmod(self.lock_file, 0o400)
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+
+    def test_DAEMON_ERR_002_external_symlink_unlinked_safely_and_exits_1(self) -> None:
+        """[DAEMON-ERR-002] watch.lock symlink pointing to external path is unlinked and rejected with exit 1."""
+        external_dir = Path(self.tmpdir) / "external"
+        external_dir.mkdir(parents=True, exist_ok=True)
+        external_target = external_dir / "target.txt"
+        external_target.write_text("sensitive data", encoding="utf-8")
+
+        self.lock_file.symlink_to(external_target)
+        self.assertTrue(self.lock_file.is_symlink())
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("symlink", err_output.lower())
+        self.assertFalse(self.lock_file.is_symlink(), "Symlink must be removed")
+        self.assertTrue(external_target.exists(), "External target must remain intact")
+        self.assertEqual(external_target.read_text(encoding="utf-8"), "sensitive data")
+
+    def test_DAEMON_ERR_002_dangling_symlink_unlinked_safely_and_exits_1(self) -> None:
+        """[DAEMON-ERR-002] Dangling watch.lock symlink is unlinked safely and rejected with exit 1."""
+        nonexistent_target = self.vault_dir / "nonexistent_target.txt"
+        self.lock_file.symlink_to(nonexistent_target)
+        self.assertTrue(self.lock_file.is_symlink())
+        self.assertFalse(self.lock_file.exists())
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                dm.acquire_lock()
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("symlink", err_output.lower())
+        self.assertFalse(self.lock_file.is_symlink(), "Dangling symlink must be removed")
+
+    def test_DAEMON_ERR_002_watch_loop_symlink_rejected_with_exit_code_1(self) -> None:
+        """[DAEMON-ERR-002] LogWatcher.watch_loop terminates cleanly with exit code 1 when watch.lock is a symlink."""
+        external_target = Path(self.tmpdir) / "other.txt"
+        external_target.write_text("other data", encoding="utf-8")
+        self.lock_file.symlink_to(external_target)
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            with self.assertRaises(SystemExit) as ctx:
+                watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+            self.assertEqual(ctx.exception.code, 1)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("symlink", err_output.lower())
+        self.assertFalse(self.lock_file.is_symlink())
+
+    def test_DAEMON_ERR_002_resolve_lock_path_valid_path_returned(self) -> None:
+        """[DAEMON-ERR-002] _resolve_lock_path returns valid lock file path when clean."""
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        resolved = dm._resolve_lock_path()
+        self.assertEqual(resolved, self.lock_file)
+        self.assertTrue(self.vault_dir.is_dir())
+
+    def _test_all_lock_hardening_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_ERR_001_lock_file_permission_denied_logs_stderr_and_exits_1,
+            self.test_DAEMON_ERR_001_vault_dir_permission_denied_logs_stderr_and_exits_1,
+            self.test_DAEMON_ERR_001_watch_loop_permission_denied_logs_stderr_and_exits_1,
+            self.test_DAEMON_ERR_002_external_symlink_unlinked_safely_and_exits_1,
+            self.test_DAEMON_ERR_002_dangling_symlink_unlinked_safely_and_exits_1,
+            self.test_DAEMON_ERR_002_watch_loop_symlink_rejected_with_exit_code_1,
+            self.test_DAEMON_ERR_002_resolve_lock_path_valid_path_returned,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonLockHardeningAndSymlinkRejection,
+    "test_DAEMON_ERR_001|DAEMON_ERR_002",
+    TestDaemonLockHardeningAndSymlinkRejection._test_all_lock_hardening_scenarios,
+)
+
+
+class TestDaemonStaleLockAndConcurrentStartup(unittest.TestCase):
+    """
+    [DAEMON-EDGE-001] [DAEMON-EDGE-003]
+    Validates stale lock recovery when previous process died unexpectedly without file corruption,
+    and deterministic mutual exclusion when concurrent processes or threads invoke start() at the exact same millisecond.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock_file = self.vault_dir / "watch.lock"
+        self.pid_file = self.vault_dir / "watch.pid"
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.open_fds: list[int] = []
+        self.active_dms: list[DaemonManager] = []
+
+    def tearDown(self) -> None:
+        for dm in self.active_dms:
+            dm._release_lock()
+        for fd in self.open_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_DAEMON_EDGE_001_stale_lock_recovery_with_leftover_lock_file(self) -> None:
+        """
+        [DAEMON-EDGE-001] Stale lock recovery when previous process died unexpectedly.
+        GIVEN a previous watcher daemon terminated abruptly leaving an existing watch.lock and dead PID
+        AND no active process holds a kernel lock on watch.lock
+        WHEN a new watcher daemon process initializes
+        THEN fcntl.flock successfully acquires the exclusive non-blocking lock without deadlock or manual file deletion
+        AND daemon startup proceeds normally.
+        """
+        self.lock_file.write_text("stale-lock-data\n", encoding="utf-8")
+        os.chmod(self.lock_file, 0o600)
+        self.pid_file.write_text("999999\n", encoding="utf-8")
+        os.chmod(self.pid_file, 0o600)
+
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        self.active_dms.append(dm)
+        mock_proc = MagicMock(pid=34567)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            pid = dm.start()
+            self.assertEqual(pid, 34567)
+
+        self.assertIsNotNone(dm._lock_fd)
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), "34567")
+
+        # Exclusive lock is held on watch.lock: probe fd fails with BlockingIOError
+        probe_fd = os.open(str(self.lock_file), os.O_RDWR)
+        self.open_fds.append(probe_fd)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_DAEMON_EDGE_001_stale_lock_recovery_watch_loop(self) -> None:
+        """
+        [DAEMON-EDGE-001] Stale lock recovery in LogWatcher.watch_loop without deadlock.
+        """
+        self.lock_file.write_text("stale-watch-lock\n", encoding="utf-8")
+        os.chmod(self.lock_file, 0o600)
+
+        watcher = LogWatcher(engine=self.engine_mock, log_dirs=[self.tmpdir])
+        watcher.watch_loop(poll_interval=0.0, max_iterations=1)
+
+        self.assertTrue(self.lock_file.exists())
+        self.assertEqual(self.lock_file.stat().st_mode & 0o777, 0o600)
+
+        # After watch_loop completes, a new daemon can acquire the lock cleanly
+        dm = DaemonManager(vault_dir=self.vault_dir)
+        self.active_dms.append(dm)
+        mock_proc = MagicMock(pid=56789)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            pid = dm.start()
+            self.assertEqual(pid, 56789)
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), "56789")
+
+    def test_DAEMON_EDGE_003_rapid_concurrent_startup_race_threads(self) -> None:
+        """
+        [DAEMON-EDGE-003] Rapid concurrent startup race condition resolves deterministically to one daemon.
+        GIVEN two concurrent threads invoke DaemonManager.start() at the exact same millisecond
+        WHEN both processes attempt to acquire an exclusive lock on watch.lock
+        THEN exactly one process successfully acquires the lock and writes its PID
+        AND the second process is rejected immediately upon lock contention and exits cleanly with exit code 1.
+        """
+        barrier = threading.Barrier(2)
+        results: list[tuple[str, int, DaemonManager]] = []
+        threads: list[threading.Thread] = []
+        shared_stderr = io.StringIO()
+        pid_counter = 20000
+        lock = threading.Lock()
+
+        def make_proc(*args: object, **kwargs: object) -> MagicMock:
+            nonlocal pid_counter
+            with lock:
+                pid_counter += 1
+                return MagicMock(pid=pid_counter)
+
+        def worker(thread_idx: int) -> None:
+            dm = DaemonManager(vault_dir=self.vault_dir)
+            barrier.wait()
+            try:
+                res_pid = dm.start()
+                with lock:
+                    results.append(("success", res_pid, dm))
+            except SystemExit as exc:
+                with lock:
+                    results.append(("exit", int(exc.code) if isinstance(exc.code, (int, str)) and str(exc.code).isdigit() else 1, dm))
+
+        with patch("subprocess.Popen", side_effect=make_proc), patch("sys.stderr", shared_stderr):
+            for idx in (1, 2):
+                t = threading.Thread(target=worker, args=(idx,))
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=5.0)
+
+        self.assertEqual(len(results), 2)
+        statuses = [r[0] for r in results]
+        self.assertEqual(statuses.count("success"), 1, f"Expected exactly 1 success, got: {results}")
+        self.assertEqual(statuses.count("exit"), 1, f"Expected exactly 1 exit, got: {results}")
+
+        winner = next(r for r in results if r[0] == "success")
+        loser = next(r for r in results if r[0] == "exit")
+
+        self.active_dms.append(winner[2])
+        self.assertEqual(loser[1], 1, "Contending thread must exit with code 1")
+
+        winning_pid = winner[1]
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), str(winning_pid))
+        self.assertIn("Another watcher daemon is already running", shared_stderr.getvalue())
+
+    def test_DAEMON_EDGE_003_rapid_concurrent_startup_race_processes(self) -> None:
+        """
+        [DAEMON-EDGE-003] Rapid concurrent startup race between two fork processes.
+        """
+        pipe_r, pipe_w = os.pipe()
+        start_r, start_w = os.pipe()
+        done_r, done_w = os.pipe()
+
+        def run_proc(assigned_pid: int) -> None:
+            os.close(pipe_r)
+            os.close(start_w)
+            try:
+                os.read(start_r, 1)
+            except OSError:
+                pass
+            finally:
+                try: os.close(start_r)
+                except OSError: pass
+
+            dm = DaemonManager(vault_dir=self.vault_dir)
+            mock_proc = MagicMock(pid=assigned_pid)
+            with patch("subprocess.Popen", return_value=mock_proc):
+                try:
+                    res = dm.start()
+                    os.write(pipe_w, f"success:{res}\n".encode("utf-8"))
+                    os.close(done_w)
+                    try:
+                        os.read(done_r, 1)
+                    except OSError:
+                        pass
+                    finally:
+                        try: os.close(done_r)
+                        except OSError: pass
+                    os._exit(0)
+                except SystemExit as exc:
+                    code = int(exc.code) if isinstance(exc.code, (int, str)) and str(exc.code).isdigit() else 1
+                    os.write(pipe_w, f"exit:{code}\n".encode("utf-8"))
+                    try:
+                        os.write(done_w, b"x")
+                    except OSError:
+                        pass
+                    finally:
+                        try: os.close(done_w)
+                        except OSError: pass
+                        try: os.close(done_r)
+                        except OSError: pass
+                    os._exit(code)
+
+        with patch.object(DaemonManager, "is_systemd_active", return_value=False):
+            p1 = os.fork()
+            if p1 == 0:
+                run_proc(20001)
+
+            p2 = os.fork()
+            if p2 == 0:
+                run_proc(20002)
+
+            os.close(pipe_w)
+            os.close(start_r)
+
+            # Release both processes simultaneously
+            os.close(start_w)
+
+            _, s1 = os.waitpid(p1, 0)
+            _, s2 = os.waitpid(p2, 0)
+
+        try: os.close(done_r)
+        except OSError: pass
+        try: os.close(done_w)
+        except OSError: pass
+
+        with os.fdopen(pipe_r) as f:
+            lines = [line.strip() for line in f.readlines()]
+
+        self.assertEqual(len(lines), 2)
+        success_lines = [l for l in lines if l.startswith("success:")]
+        exit_lines = [l for l in lines if l.startswith("exit:")]
+        self.assertEqual(len(success_lines), 1, f"Expected 1 success, got: {lines}")
+        self.assertEqual(len(exit_lines), 1, f"Expected 1 exit, got: {lines}")
+        self.assertEqual(exit_lines[0], "exit:1")
+
+        exit_codes = sorted([os.waitstatus_to_exitcode(s1), os.waitstatus_to_exitcode(s2)])
+        self.assertEqual(exit_codes, [0, 1])
+
+        winner_pid = int(success_lines[0].split(":")[1])
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), str(winner_pid))
+
+    def test_DAEMON_EDGE_003_rapid_concurrent_startup_high_contention(self) -> None:
+        """
+        [DAEMON-EDGE-003] 5 concurrent threads attempting startup simultaneously.
+        """
+        concurrency = 5
+        barrier = threading.Barrier(concurrency)
+        results: list[tuple[str, int, DaemonManager]] = []
+        threads: list[threading.Thread] = []
+        shared_stderr = io.StringIO()
+        pid_counter = 40000
+        lock = threading.Lock()
+
+        def make_proc(*args: object, **kwargs: object) -> MagicMock:
+            nonlocal pid_counter
+            with lock:
+                pid_counter += 1
+                return MagicMock(pid=pid_counter)
+
+        def worker(thread_idx: int) -> None:
+            dm = DaemonManager(vault_dir=self.vault_dir)
+            barrier.wait()
+            try:
+                res_pid = dm.start()
+                with lock:
+                    results.append(("success", res_pid, dm))
+            except SystemExit as exc:
+                with lock:
+                    results.append(("exit", int(exc.code) if isinstance(exc.code, (int, str)) and str(exc.code).isdigit() else 1, dm))
+
+        with patch("subprocess.Popen", side_effect=make_proc), patch("sys.stderr", shared_stderr):
+            for idx in range(concurrency):
+                t = threading.Thread(target=worker, args=(idx,))
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=5.0)
+
+        self.assertEqual(len(results), concurrency)
+        statuses = [r[0] for r in results]
+        self.assertEqual(statuses.count("success"), 1, f"Expected 1 winner, got: {results}")
+        self.assertEqual(statuses.count("exit"), concurrency - 1, f"Expected {concurrency - 1} exits, got: {results}")
+
+        winner = next(r for r in results if r[0] == "success")
+        self.active_dms.append(winner[2])
+        self.assertEqual(self.pid_file.read_text(encoding="utf-8").strip(), str(winner[1]))
+        self.assertIn("Another watcher daemon is already running", shared_stderr.getvalue())
+
+    def _test_all_stale_lock_and_concurrent_scenarios(self) -> None:
+        tests = [
+            self.test_DAEMON_EDGE_001_stale_lock_recovery_with_leftover_lock_file,
+            self.test_DAEMON_EDGE_001_stale_lock_recovery_watch_loop,
+            self.test_DAEMON_EDGE_003_rapid_concurrent_startup_race_threads,
+            self.test_DAEMON_EDGE_003_rapid_concurrent_startup_race_processes,
+            self.test_DAEMON_EDGE_003_rapid_concurrent_startup_high_contention,
+        ]
+        for t in tests:
+            self.setUp()
+            try:
+                t()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestDaemonStaleLockAndConcurrentStartup,
+    "test_DAEMON_EDGE_001|DAEMON_EDGE_003",
+    TestDaemonStaleLockAndConcurrentStartup._test_all_stale_lock_and_concurrent_scenarios,
+)
+
+
+class TestVaultLogIsolation(unittest.TestCase):
+    """
+    [VAULT-ISO-001] [VAULT-ISO-002]
+    Validates hermetic audit log isolation:
+    - Redirection of audit logs to AGY_VAULT_DIR when set in environment.
+    - Prohibition of fallback to DEFAULT_VAULT_DIR (~/.antigravity-vault) under test runner
+      execution or when engine is a Mock / has vault_dir=None.
+    """
+
+    def setUp(self) -> None:
+        self.orig_env = os.environ.get("AGY_VAULT_DIR")
+        self.tmpdir = tempfile.mkdtemp()
+        self.isolated_vault = Path(self.tmpdir) / "iso_vault"
+        self.isolated_vault.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.prod_vault = DEFAULT_VAULT_DIR
+        self.prod_log = self.prod_vault / "watch.log"
+        self.prod_log_exists = self.prod_log.exists()
+        self.prod_log_size = self.prod_log.stat().st_size if self.prod_log_exists else 0
+        self.prod_log_mtime = self.prod_log.stat().st_mtime if self.prod_log_exists else 0.0
+
+    def tearDown(self) -> None:
+        if self.orig_env is not None:
+            os.environ["AGY_VAULT_DIR"] = self.orig_env
+        else:
+            os.environ.pop("AGY_VAULT_DIR", None)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _assert_prod_log_untouched(self, tag: str) -> None:
+        """Verifies that production watch.log was not written to or modified."""
+        if self.prod_log_exists:
+            current_size = self.prod_log.stat().st_size
+            current_mtime = self.prod_log.stat().st_mtime
+            self.assertEqual(
+                current_size,
+                self.prod_log_size,
+                f"Production watch.log size modified during {tag}: {current_size} != {self.prod_log_size}",
+            )
+            self.assertEqual(
+                current_mtime,
+                self.prod_log_mtime,
+                f"Production watch.log mtime modified during {tag}: {current_mtime} != {self.prod_log_mtime}",
+            )
+            content = self.prod_log.read_text(encoding="utf-8", errors="ignore")
+            self.assertNotIn(tag, content, f"Production watch.log contains test tag '{tag}'")
+
+    def test_vault_iso_001_redirect_to_agy_vault_dir(self) -> None:
+        """
+        [VAULT-ISO-001] Audit log writes strictly to isolated directory when AGY_VAULT_DIR is set.
+        GIVEN AGY_VAULT_DIR is set to an isolated temporary directory path in the environment
+        WHEN LogWatcher._notify_desktop() or audit logging writes a rotation event log entry
+        THEN the log entry is written strictly to AGY_VAULT_DIR/watch.log
+        AND no write or modification is made to ~/.antigravity-vault/watch.log.
+        """
+        test_tag = f"iso001_acc_{time.time()}"
+        os.environ["AGY_VAULT_DIR"] = str(self.isolated_vault)
+
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        watcher._notify_desktop(target_account=test_tag, old_account="prior-acc", reason="quota 429", reloaded=False)
+
+        iso_log = self.isolated_vault / "watch.log"
+        self.assertTrue(iso_log.exists(), f"Expected isolated log file at {iso_log}")
+        iso_content = iso_log.read_text(encoding="utf-8")
+        self.assertIn(test_tag, iso_content)
+        self.assertIn("[watch] Switched from 'prior-acc' to", iso_content)
+        self.assertIn("(reason: quota 429)", iso_content)
+
+        # Also verify _append_audit_log if present
+        audit_tag = f"audit_entry_{time.time()}"
+        if hasattr(watcher, "_append_audit_log"):
+            watcher._append_audit_log(target_account=audit_tag, old_account=test_tag, reason="direct audit", reloaded=False)
+            iso_content_after = iso_log.read_text(encoding="utf-8")
+            self.assertIn(audit_tag, iso_content_after)
+
+        self._assert_prod_log_untouched(test_tag)
+        self._assert_prod_log_untouched(audit_tag)
+
+    def test_vault_iso_002_mock_engine_prohibits_production_log(self) -> None:
+        """
+        [VAULT-ISO-002] Test mock engine without vault_dir does not write to production ~/.antigravity-vault/watch.log.
+        GIVEN a test execution where engine is a MagicMock or has vault_dir=None
+        AND AGY_VAULT_DIR is not pointing to ~/.antigravity-vault
+        WHEN LogWatcher._notify_desktop() or audit logging is invoked
+        THEN logging safely redirects to the configured test sandbox or no-ops without writing to ~/.antigravity-vault/watch.log
+        AND production vault files remain pristine and unpolluted.
+        """
+        os.environ.pop("AGY_VAULT_DIR", None)
+
+        # Branch 1: MagicMock engine with default attributes (mock vault_dir)
+        tag_mock = f"iso002_mock_{time.time()}"
+        mock_engine = MagicMock()
+        watcher_mock = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        watcher_mock._notify_desktop(target_account=tag_mock, reason="mock test")
+        if hasattr(watcher_mock, "_append_audit_log"):
+            watcher_mock._append_audit_log(target_account=f"{tag_mock}_audit", reason="mock audit")
+        self._assert_prod_log_untouched(tag_mock)
+        self._assert_prod_log_untouched(f"{tag_mock}_audit")
+
+        # Branch 2: Engine with explicit vault_dir=None
+        tag_none = f"iso002_none_{time.time()}"
+        none_engine = MagicMock(vault_dir=None)
+        watcher_none = LogWatcher(engine=none_engine, log_dirs=[self.tmpdir])
+        watcher_none._notify_desktop(target_account=tag_none, reason="none test")
+        if hasattr(watcher_none, "_append_audit_log"):
+            watcher_none._append_audit_log(target_account=f"{tag_none}_audit", reason="none audit")
+        self._assert_prod_log_untouched(tag_none)
+        self._assert_prod_log_untouched(f"{tag_none}_audit")
+
+        # Branch 3: Mock engine with configured sandbox vault_dir redirects safely to sandbox
+        sandbox_dir = Path(self.tmpdir) / "sandbox_vault"
+        sandbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tag_sandbox = f"iso002_sandbox_{time.time()}"
+        sandbox_engine = MagicMock(vault_dir=sandbox_dir)
+        watcher_sandbox = LogWatcher(engine=sandbox_engine, log_dirs=[self.tmpdir])
+        watcher_sandbox._notify_desktop(target_account=tag_sandbox, reason="sandbox test")
+        sandbox_log = sandbox_dir / "watch.log"
+        self.assertTrue(sandbox_log.exists(), f"Expected sandbox log file at {sandbox_log}")
+        self.assertIn(tag_sandbox, sandbox_log.read_text(encoding="utf-8"))
+        self._assert_prod_log_untouched(tag_sandbox)
+
+    def test_vault_iso_003_prod_agy_vault_dir_under_test_prohibits_production_log(self) -> None:
+        """Production vault paths in AGY_VAULT_DIR or engine.vault_dir never write to production under tests."""
+        tag_prod_env = f"iso003_prodenv_{time.time()}"
+        os.environ["AGY_VAULT_DIR"] = str(self.prod_vault)
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        watcher._notify_desktop(target_account=tag_prod_env, reason="prod env test")
+        self._assert_prod_log_untouched(tag_prod_env)
+
+        tag_prod_eng = f"iso003_prodeng_{time.time()}"
+        os.environ.pop("AGY_VAULT_DIR", None)
+        prod_engine = MagicMock(vault_dir=self.prod_vault)
+        watcher_prod = LogWatcher(engine=prod_engine, log_dirs=[self.tmpdir])
+        watcher_prod._notify_desktop(target_account=tag_prod_eng, reason="prod eng test")
+        self._assert_prod_log_untouched(tag_prod_eng)
+
+    def test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully(self) -> None:
+        """[VAULT-ERR-001] Read-only isolated vault directory logs error without crashing parent."""
+        ro_vault = Path(self.tmpdir) / "ro_vault"
+        ro_vault.mkdir(parents=True, exist_ok=True, mode=0o500)
+        os.chmod(ro_vault, 0o500)
+        os.environ["AGY_VAULT_DIR"] = str(ro_vault)
+
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        stderr_buf = io.StringIO()
+        try:
+            with patch("sys.stderr", stderr_buf):
+                watcher._notify_desktop(target_account="ro_acc", reason="ro test")
+                append_secure_log_entry(ro_vault / "watch.log", "direct ro write\n")
+            err_output = stderr_buf.getvalue()
+            self.assertTrue(
+                "Failed to write audit log entry" in err_output
+                or "Error appending audit log" in err_output
+                or "Permission denied" in err_output,
+                f"Expected error in stderr but got: {err_output!r}"
+            )
+        finally:
+            os.chmod(ro_vault, 0o700)
+
+        # Test simulated OSError during log append across diverse system error conditions
+        for simulated_errno in (errno.ENOSPC, errno.EACCES, errno.EROFS, errno.EDQUOT, errno.EMFILE):
+            with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(simulated_errno, "simulated error")):
+                stderr_sim = io.StringIO()
+                with patch("sys.stderr", stderr_sim):
+                    append_secure_log_entry(self.isolated_vault / "watch.log", "simulated write\n")
+                self.assertIn("Failed to write audit log entry", stderr_sim.getvalue())
+
+        # Test pre-existing read-only file (mode 0400) handling without crashing
+        ro_file = Path(self.tmpdir) / "ro_file_test.log"
+        ro_file.write_text("initial\n", encoding="utf-8")
+        os.chmod(ro_file, 0o400)
+        try:
+            stderr_ro = io.StringIO()
+            with patch("sys.stderr", stderr_ro):
+                append_secure_log_entry(ro_file, "ro append test\n")
+            self.assertIn("Failed to write audit log entry", stderr_ro.getvalue())
+        finally:
+            os.chmod(ro_file, 0o600)
+
+        # Test resilience when stderr itself encounters an error (RuntimeError or BrokenPipeError)
+        for stderr_err in (RuntimeError("Broken stderr stream"), BrokenPipeError(errno.EPIPE, "Broken pipe")):
+            broken_stderr = MagicMock()
+            broken_stderr.write.side_effect = stderr_err
+            with patch("sys.stderr", broken_stderr):
+                with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.EACCES, "denied")):
+                    append_secure_log_entry(self.isolated_vault / "watch.log", "broken stderr test\n")
+
+    test_vault_err_001_unwriteable_temp_vault_directory_handled_gracefully = test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully
+
+    def test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely(self) -> None:
+        """[VAULT-ERR-002] Empty or whitespace-only AGY_VAULT_DIR falls back safely without writing to prod."""
+        for ws_val in ("", "   ", "\t  \n"):
+            os.environ["AGY_VAULT_DIR"] = ws_val
+            tag_ws = f"err002_ws_{time.time()}"
+            mock_engine = MagicMock(spec=[])
+            watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+            watcher._notify_desktop(target_account=tag_ws, reason="whitespace env test")
+            self._assert_prod_log_untouched(tag_ws)
+
+            # Direct append_secure_log_entry should not touch prod
+            append_secure_log_entry(self.prod_vault / "watch.log", f"{tag_ws}_direct\n")
+            self._assert_prod_log_untouched(f"{tag_ws}_direct")
+
+            # Direct _resolve_vault_log_path rejects empty/whitespace without fallback to DEFAULT_VAULT_DIR under test
+            self.assertIsNone(_resolve_vault_log_path())
+            self.assertIsNone(_resolve_vault_log_path(""))
+            self.assertIsNone(_resolve_vault_log_path("   "))
+            self.assertIsNone(_resolve_vault_log_path(Path("")))
+            self.assertIsNone(_resolve_vault_log_path(self.prod_vault / "watch.log"))
+            self.assertIsNone(watcher._resolve_vault_log_path())
+            self.assertIsNone(watcher._resolve_vault_log_path(""))
+            self.assertIsNone(watcher._resolve_vault_log_path("   "))
+            self.assertIsNone(watcher._resolve_audit_log_dir())
+
+            # Direct append_secure_log_entry with empty/whitespace suppresses without creating stray files
+            append_secure_log_entry("", "direct empty string write\n")
+            append_secure_log_entry("   ", "direct whitespace write\n")
+            self.assertFalse(Path("   ").exists())
+
+            # Low-level _open_secure_log_file rejects invalid empty/whitespace paths with ValueError
+            with self.assertRaises(ValueError):
+                _open_secure_log_file("")
+            with self.assertRaises(ValueError):
+                _open_secure_log_file("   ")
+
+            # When engine provides an isolated sandbox vault_dir, it safely redirects to sandbox
+            sandbox_dir = Path(self.tmpdir) / f"fallback_sandbox_{abs(hash(ws_val))}"
+            sandbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            sandbox_engine = MagicMock(vault_dir=sandbox_dir)
+            watcher_sandbox = LogWatcher(engine=sandbox_engine, log_dirs=[self.tmpdir])
+            self.assertEqual(watcher_sandbox._resolve_audit_log_dir(), sandbox_dir)
+            self.assertEqual(watcher_sandbox._resolve_vault_log_path(), sandbox_dir / "watch.log")
+            self.assertEqual(_resolve_vault_log_path(engine=sandbox_engine), sandbox_dir / "watch.log")
+
+            watcher_sandbox._notify_desktop(target_account=tag_ws, reason="whitespace with engine sandbox")
+            sandbox_log = sandbox_dir / "watch.log"
+            self.assertTrue(sandbox_log.exists())
+            self.assertIn(tag_ws, sandbox_log.read_text(encoding="utf-8"))
+            self._assert_prod_log_untouched(tag_ws)
+
+    test_vault_err_002_empty_or_whitespace_agy_vault_dir_handled_safely = test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely
+
+    def test_VAULT_ERR_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully(self) -> None:
+        """[VAULT-ERR-003] Filesystem disk full ENOSPC during log append caught gracefully without crashing."""
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "disk full entry\n")
+            err_output = stderr_buf.getvalue()
+            self.assertIn("Failed to write audit log entry", err_output)
+            self.assertTrue("ENOSPC" in err_output or "Disk full" in err_output, f"Expected ENOSPC alert but got: {err_output!r}")
+
+        class FailingFlushFile(io.StringIO):
+            def flush(self) -> None:
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        failing_file = FailingFlushFile()
+        with patch("agy_switcher.presence._open_secure_log_file", return_value=999), \
+             patch("builtins.open", return_value=failing_file), \
+             patch("os.close"):
+            stderr_flush = io.StringIO()
+            with patch("sys.stderr", stderr_flush):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "flush fail entry\n")
+            flush_err = stderr_flush.getvalue()
+            self.assertIn("Failed to write audit log entry", flush_err)
+            self.assertTrue("ENOSPC" in flush_err or "Disk full" in flush_err, f"Expected ENOSPC alert on flush but got: {flush_err!r}")
+
+        class FailingWriteFile(io.StringIO):
+            def write(self, s: str) -> int:
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        failing_write_file = FailingWriteFile()
+        with patch("agy_switcher.presence._open_secure_log_file", return_value=999), \
+             patch("builtins.open", return_value=failing_write_file), \
+             patch("os.close"):
+            stderr_write = io.StringIO()
+            with patch("sys.stderr", stderr_write):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "write fail entry\n")
+            write_err = stderr_write.getvalue()
+            self.assertIn("Failed to write audit log entry", write_err)
+            self.assertTrue("ENOSPC" in write_err or "Disk full" in write_err, f"Expected ENOSPC alert on write but got: {write_err!r}")
+
+        with patch("pathlib.Path.mkdir", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            stderr_mkdir = io.StringIO()
+            with patch("sys.stderr", stderr_mkdir):
+                append_secure_log_entry(self.isolated_vault / "new_dir" / "watch.log", "mkdir fail entry\n")
+            mkdir_err = stderr_mkdir.getvalue()
+            self.assertIn("Failed to write audit log entry", mkdir_err)
+            self.assertTrue("ENOSPC" in mkdir_err or "Disk full" in mkdir_err, f"Expected ENOSPC alert on mkdir but got: {mkdir_err!r}")
+
+        edquot_errno = getattr(errno, "EDQUOT", errno.ENOSPC)
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(edquot_errno, "Disk quota exceeded")):
+            stderr_quota = io.StringIO()
+            with patch("sys.stderr", stderr_quota):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "edquot entry\n")
+            quota_err = stderr_quota.getvalue()
+            self.assertIn("Failed to write audit log entry", quota_err)
+
+        with patch("sys.stderr", None), \
+             patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            append_secure_log_entry(self.isolated_vault / "watch.log", "none stderr entry\n")
+
+        os.environ["AGY_VAULT_DIR"] = str(self.isolated_vault)
+        mock_engine = MagicMock()
+        watcher = LogWatcher(engine=mock_engine, log_dirs=[self.tmpdir])
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            stderr_rot = io.StringIO()
+            with patch("sys.stderr", stderr_rot):
+                watcher._notify_desktop(target_account="rotate_acc", reason="disk full rotation test")
+            rot_err = stderr_rot.getvalue()
+            self.assertTrue("Failed to write audit log entry" in rot_err or "Error appending audit log" in rot_err)
+            self.assertTrue("ENOSPC" in rot_err or "Disk full" in rot_err, f"Expected ENOSPC alert on rotation but got: {rot_err!r}")
+
+        broken_stderr = MagicMock()
+        broken_stderr.write.side_effect = BrokenPipeError(errno.EPIPE, "Broken pipe")
+        with patch("agy_switcher.presence._open_secure_log_file", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            with patch("sys.stderr", broken_stderr):
+                append_secure_log_entry(self.isolated_vault / "watch.log", "silent broken pipe\n")
+                watcher._notify_desktop(target_account="rotate_acc2", reason="broken stderr rotation")
+
+    test_vault_err_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully = test_VAULT_ERR_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully
+
+    def test_VAULT_EDGE_001_concurrent_test_processes_write_to_independent_vaults(self) -> None:
+        """[VAULT-EDGE-001] Concurrent test processes write to independent temporary vaults without interference."""
+        num_workers = 3
+        worker_dirs: list[Path] = []
+        for i in range(num_workers):
+            wdir = Path(self.tmpdir) / f"worker_vault_{i}"
+            wdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            worker_dirs.append(wdir)
+
+        unique_run_id = f"edge001_{time.time()}"
+        worker_script = """
+import os, sys, time
+from pathlib import Path
+from unittest.mock import MagicMock
+
+repo_root = os.path.abspath(sys.argv[1])
+sys.path.insert(0, repo_root)
+sys.path.insert(0, os.path.join(repo_root, "scripts"))
+
+from scripts.watch import LogWatcher, DaemonManager, append_secure_log_entry
+
+worker_id = sys.argv[2]
+run_id = sys.argv[3]
+vault_dir = Path(os.environ["AGY_VAULT_DIR"])
+
+dm = DaemonManager()
+lock_fd = dm.acquire_lock()
+if lock_fd is None:
+    sys.exit(2)
+
+try:
+    mock_engine = MagicMock()
+    mock_engine.vault_dir = vault_dir
+    watcher = LogWatcher(engine=mock_engine, log_dirs=[str(vault_dir)])
+
+    for j in range(3):
+        watcher._notify_desktop(target_account=f"{run_id}_w{worker_id}_{j}", reason=f"rotation_{j}")
+        append_secure_log_entry(vault_dir / "watch.log", f"direct_{run_id}_w{worker_id}_{j}\\n")
+        time.sleep(0.01)
+finally:
+    dm.release_lock()
+
+sys.exit(0)
+"""
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        procs: list[subprocess.Popen[bytes]] = []
+        for i, wdir in enumerate(worker_dirs):
+            env = dict(os.environ)
+            env["AGY_VAULT_DIR"] = str(wdir)
+            env["PYTHONPATH"] = f"{repo_root}/scripts:{repo_root}"
+            p = subprocess.Popen(
+                [sys.executable, "-c", worker_script, repo_root, str(i), unique_run_id],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            procs.append(p)
+
+        try:
+            for i, p in enumerate(procs):
+                stdout_b, stderr_b = p.communicate(timeout=15.0)
+                self.assertEqual(
+                    p.returncode,
+                    0,
+                    f"Worker {i} failed with returncode {p.returncode}: stdout={stdout_b.decode()!r}, stderr={stderr_b.decode()!r}"
+                )
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    try:
+                        p.kill()
+                        p.wait()
+                    except Exception:
+                        pass
+
+        for i, wdir in enumerate(worker_dirs):
+            log_file = wdir / "watch.log"
+            self.assertTrue(log_file.exists(), f"Log file for worker {i} not found at {log_file}")
+            content = log_file.read_text(encoding="utf-8")
+            for j in range(3):
+                self.assertIn(f"{unique_run_id}_w{i}_{j}", content)
+                self.assertIn(f"direct_{unique_run_id}_w{i}_{j}", content)
+            for other in range(num_workers):
+                if other != i:
+                    self.assertNotIn(f"{unique_run_id}_w{other}_", content)
+                    self.assertNotIn(f"direct_{unique_run_id}_w{other}_", content)
+
+        self._assert_prod_log_untouched(unique_run_id)
+
+    test_vault_edge_001_concurrent_test_processes_write_to_independent_vaults = test_VAULT_EDGE_001_concurrent_test_processes_write_to_independent_vaults
+
+    def test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination(self) -> None:
+        """[VAULT-EDGE-002] Dynamic mutation of AGY_VAULT_DIR rebinds logging destination and cleans up handles hermetically."""
+        vault_a = Path(self.tmpdir) / "vault_a"
+        vault_b = Path(self.tmpdir) / "vault_b"
+        vault_c = Path(self.tmpdir) / "vault_c"
+        vault_a.mkdir(parents=True, exist_ok=True, mode=0o700)
+        vault_b.mkdir(parents=True, exist_ok=True, mode=0o700)
+        vault_c.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        # Step 1: Initial AGY_VAULT_DIR binding
+        os.environ["AGY_VAULT_DIR"] = str(vault_a)
+        watcher = LogWatcher(engine=MagicMock(), log_dirs=[self.tmpdir])
+        lock_fd1 = watcher.daemon_manager.acquire_lock()
+        self.assertIsNotNone(lock_fd1)
+        self.assertEqual(watcher.daemon_manager.vault_dir, vault_a)
+        self.assertEqual(watcher.daemon_manager.log_file, vault_a / "watch.log")
+        self.assertEqual(watcher.cooldown_file, vault_a / "cache" / "cooldown.json")
+
+        watcher._notify_desktop(target_account="dest_a", reason="step 1")
+        watcher.set_cooldown("acc_a", 9999999999)
+        append_secure_log_entry(vault_a / "watch.log", "direct a\n")
+
+        self.assertTrue((vault_a / "watch.log").exists())
+        content_a = (vault_a / "watch.log").read_text(encoding="utf-8")
+        self.assertIn("dest_a", content_a)
+        self.assertIn("direct a", content_a)
+        self.assertTrue((vault_a / "cache" / "cooldown.json").exists())
+        self.assertIn("acc_a", (vault_a / "cache" / "cooldown.json").read_text(encoding="utf-8"))
+        self.assertFalse((vault_b / "watch.log").exists())
+
+        # Step 2: Dynamic mutation to vault_b rebinds destinations and cleans up old handles
+        os.environ["AGY_VAULT_DIR"] = str(vault_b)
+        self.assertEqual(watcher.daemon_manager.vault_dir, vault_b)
+        self.assertEqual(watcher.daemon_manager.log_file, vault_b / "watch.log")
+        self.assertEqual(watcher.cooldown_file, vault_b / "cache" / "cooldown.json")
+
+        watcher._notify_desktop(target_account="dest_b", reason="step 2")
+        watcher.set_cooldown("acc_b", 9999999999)
+        append_secure_log_entry("watch.log", "direct b\n")
+        # Passing old path rebinds hermetically to current AGY_VAULT_DIR under test runner
+        append_secure_log_entry(vault_a / "watch.log", "direct old path b\n")
+
+        lock_fd2 = watcher.daemon_manager.acquire_lock()
+        self.assertIsNotNone(lock_fd2)
+        self.assertEqual(watcher.daemon_manager._locked_path, vault_b / "watch.lock")
+
+        # Verify vault_a lock was released and closed (re-lockable), while vault_b is actively locked
+        test_fd_a = os.open(str(vault_a / "watch.lock"), os.O_RDWR)
+        fcntl.flock(test_fd_a, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(test_fd_a)
+
+        test_fd_b = os.open(str(vault_b / "watch.lock"), os.O_RDWR)
+        with self.assertRaises((BlockingIOError, OSError)):
+            fcntl.flock(test_fd_b, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(test_fd_b)
+
+        self.assertTrue((vault_b / "watch.log").exists())
+        content_b = (vault_b / "watch.log").read_text(encoding="utf-8")
+        self.assertIn("dest_b", content_b)
+        self.assertIn("direct b", content_b)
+        self.assertIn("direct old path b", content_b)
+        self.assertTrue((vault_b / "cache" / "cooldown.json").exists())
+        self.assertIn("acc_b", (vault_b / "cache" / "cooldown.json").read_text(encoding="utf-8"))
+
+        # Assert no writes leaked to vault_a
+        content_a_after = (vault_a / "watch.log").read_text(encoding="utf-8")
+        self.assertNotIn("dest_b", content_a_after)
+        self.assertNotIn("direct b", content_a_after)
+        self.assertNotIn("direct old path b", content_a_after)
+        self.assertNotIn("acc_b", (vault_a / "cache" / "cooldown.json").read_text(encoding="utf-8"))
+
+        # Explicit handle cleanup on watcher
+        watcher.close()
+        self.assertIsNone(watcher.daemon_manager._lock_fd)
+
+        # Step 3: Context manager handle lifecycle cleanup on vault_c
+        os.environ["AGY_VAULT_DIR"] = str(vault_c)
+        with LogWatcher(engine=MagicMock(), log_dirs=[self.tmpdir]) as watcher3:
+            watcher3._notify_desktop(target_account="dest_c", reason="step 3")
+            fd3 = watcher3.daemon_manager.acquire_lock()
+            self.assertIsNotNone(fd3)
+            self.assertEqual(watcher3.daemon_manager.vault_dir, vault_c)
+            self.assertIsNotNone(watcher3.daemon_manager._lock_fd)
+
+        # After exiting with block, file descriptor must be released and cleaned up
+        self.assertIsNone(watcher3.daemon_manager._lock_fd)
+        self.assertTrue((vault_c / "watch.log").exists())
+        self.assertIn("dest_c", (vault_c / "watch.log").read_text(encoding="utf-8"))
+        self.assertNotIn("dest_c", (vault_a / "watch.log").read_text(encoding="utf-8"))
+        self.assertNotIn("dest_c", (vault_b / "watch.log").read_text(encoding="utf-8"))
+
+    test_vault_edge_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination = test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination
+
+    test_VAULT_ISO_001_redirect_to_agy_vault_dir = test_vault_iso_001_redirect_to_agy_vault_dir
+    test_VAULT_ISO_002_mock_engine_prohibits_production_log = test_vault_iso_002_mock_engine_prohibits_production_log
+
+    def _test_all_vault_isolation_scenarios(self) -> None:
+        scenarios = [
+            self.test_vault_iso_001_redirect_to_agy_vault_dir,
+            self.test_vault_iso_002_mock_engine_prohibits_production_log,
+            self.test_vault_iso_003_prod_agy_vault_dir_under_test_prohibits_production_log,
+            self.test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully,
+            self.test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely,
+            self.test_vault_edge_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
+
+    def _test_vault_error_scenarios(self) -> None:
+        scenarios = [
+            self.test_VAULT_ERR_001_unwriteable_temp_vault_directory_handled_gracefully,
+            self.test_VAULT_ERR_002_empty_or_whitespace_agy_vault_dir_handled_safely,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
+
+
+    def _test_vault_ticket07_scenarios(self) -> None:
+        scenarios = [
+            self.test_VAULT_ERR_003_filesystem_disk_full_enospc_during_log_append_caught_gracefully,
+            self.test_VAULT_EDGE_001_concurrent_test_processes_write_to_independent_vaults,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
+
+
+    def _test_vault_ticket08_scenarios(self) -> None:
+        scenarios = [
+            self.test_VAULT_EDGE_002_dynamic_mutation_of_agy_vault_dir_rebinds_destination,
+        ]
+        for scenario in scenarios:
+            self.setUp()
+            try:
+                scenario()
+            finally:
+                self.tearDown()
+
+
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_ISO_001|VAULT_ISO_002",
+    TestVaultLogIsolation._test_all_vault_isolation_scenarios,
+)
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_ERR_001|VAULT_ERR_002",
+    TestVaultLogIsolation._test_vault_error_scenarios,
+)
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_ERR_003|VAULT_EDGE_001",
+    TestVaultLogIsolation._test_vault_ticket07_scenarios,
+)
+setattr(
+    TestVaultLogIsolation,
+    "test_VAULT_EDGE_002_ticket08_gate",
+    TestVaultLogIsolation._test_vault_ticket08_scenarios,
+)
 
 
 if __name__ == '__main__':
