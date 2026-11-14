@@ -761,3 +761,205 @@ The `LogWatcher` and `CooldownManager` modules MUST implement **Telemetry-Aware 
 - WHEN `LogWatcher` filters valid accounts
 - THEN it grants immunity to `"acc1"` and `"acc3"`, while continuing to penalize `"acc2"`
 - AND selects `"acc3"` as the highest-quota rotation target.
+
+### Requirement: Watcher Daemon Mutual Exclusion and Service State Awareness
+The `LogWatcher` daemon and `DaemonManager` in `scripts/agy_switcher/watcher.py` MUST enforce cross-process mutual exclusion via a non-blocking POSIX kernel file lock (`fcntl.flock` with `LOCK_EX | LOCK_NB` on `~/.antigravity-vault/watch.lock`). Before launching a background watcher or entering the watch polling loop, the process must acquire the lock and retain the open file descriptor for the lifetime of the process. In addition, `DaemonManager.start()` and CLI `watch start`/`watch run` must inspect whether the user-level systemd service `agy-switch-watcher.service` is actively running (via `systemctl --user is-active agy-switch-watcher.service`). If active, starting a secondary duplicate watcher must be refused with a diagnostic error directing the user to systemd or `agy-switch watch stop/start`, exiting with status code 1. Upon process termination (SIGTERM, SIGINT, or normal exit), signal handlers and exit traps must cleanly release the lock and close the file descriptor.
+
+#### Scenario: [DAEMON-MUTEX-001] Exclusive lock acquisition on clean daemon startup
+- GIVEN no existing watcher daemon process is running
+- AND `watch.lock` in the active vault directory is unlocked
+- WHEN `LogWatcher.watch_loop()` or `DaemonManager.start()` initializes the daemon
+- THEN it successfully acquires an exclusive non-blocking lock via `fcntl.flock` on `watch.lock`
+- AND retains the open lock file descriptor throughout daemon execution.
+
+#### Scenario: [DAEMON-MUTEX-002] Secondary daemon startup rejected with exit code 1 when lock is held
+- GIVEN a primary watcher daemon process is actively running and holding an exclusive lock on `watch.lock`
+- WHEN a secondary watcher daemon process attempts to run `watch run` or `DaemonManager.start()`
+- THEN `fcntl.flock` raises `BlockingIOError` or `IOError`
+- AND the secondary process catches the exception, outputs an informative error message indicating another watcher daemon is already running
+- AND terminates immediately with exit code 1 without corrupting `watch.pid` or spawning duplicate threads.
+
+#### Scenario: [DAEMON-MUTEX-003] Startup rejected when systemd user service is actively running
+- GIVEN the systemd user service `agy-switch-watcher.service` is active (`systemctl --user is-active agy-switch-watcher.service` exits 0)
+- WHEN a user invokes `agy-switch watch start` or `agy-switch watch run` from the command line
+- THEN `DaemonManager` detects that the systemd user service is running
+- AND refuses to start an interactive or detached daemon
+- AND prints a diagnostic message directing the user to manage the service via systemd or stop it first
+- AND exits with status code 1.
+
+#### Scenario: [DAEMON-ERR-001] Lock file unwriteable or permission denied handled gracefully
+- GIVEN the vault directory or `watch.lock` file has restrictive permissions preventing write or lock acquisition (`PermissionError` or `OSError`)
+- WHEN `LogWatcher` or `DaemonManager` attempts to acquire the mutual exclusion lock
+- THEN it logs an actionable error message to stderr describing the permission failure
+- AND terminates or refuses startup cleanly with exit code 1 without raising an unhandled stack trace.
+
+#### Scenario: [DAEMON-ERR-002] Malformed or symlinked watch.lock pointing to external path is rejected
+- GIVEN `watch.lock` in the vault directory is a dangling symlink or points to a path outside the vault directory
+- WHEN `LogWatcher` or `DaemonManager` initializes lock acquisition
+- THEN it detects that `watch.lock` is a symlink and unlinks it safely or rejects lock acquisition
+- AND terminates cleanly with an error message and exit code 1, preventing symlink traversal attacks.
+
+#### Scenario: [DAEMON-EDGE-001] Stale lock recovery when previous process died unexpectedly without file corruption
+- GIVEN a previous watcher daemon terminated abruptly (SIGKILL or host power loss) leaving an existing `watch.lock` file on disk
+- AND no active process holds a kernel lock on `watch.lock`
+- WHEN a new watcher daemon process initializes
+- THEN `fcntl.flock` successfully acquires the exclusive non-blocking lock without deadlock or requiring manual file deletion
+- AND daemon startup proceeds normally.
+
+#### Scenario: [DAEMON-EDGE-002] Missing systemctl binary in containerized environment falls back gracefully to file lock
+- GIVEN a containerized or minimal host environment where `systemctl` is not installed or not found in PATH
+- WHEN `DaemonManager.start()` or CLI `watch start` checks for an active systemd service
+- THEN the missing command lookup is handled safely without raising `FileNotFoundError`
+- AND daemon startup falls back to POSIX `fcntl.flock` mutual exclusion without interrupting startup.
+
+#### Scenario: [DAEMON-EDGE-003] Rapid concurrent startup race condition resolves deterministically to one daemon
+- GIVEN two concurrent processes or threads invoke `DaemonManager.start()` at the exact same millisecond
+- WHEN both processes attempt to acquire an exclusive lock on `watch.lock`
+- THEN exactly one process successfully acquires the lock and writes its PID
+- AND the second process is rejected immediately upon lock contention and exits cleanly with exit code 1.
+
+### Requirement: Strict Test Vault Sandboxing and Log Isolation
+Under test suite execution or when `engine.vault_dir` is missing, `None`, unparseable, or an instance of `unittest.mock.MagicMock` / `Mock`, all logging and credential lookup operations in `scripts/agy_switcher/watcher.py` (`append_secure_log_entry`, `LogWatcher._notify_desktop`, `LogWatcher._append_audit_log`) and `scripts/agy_switcher/vault.py` (`AgySwitchEngine`) MUST strictly avoid falling back to `DEFAULT_VAULT_DIR` (`~/.antigravity-vault`). Logging operations in test environments must redirect exclusively to the isolated directory specified by `AGY_VAULT_DIR` or an ephemeral temporary directory. If no isolated directory is set and the runtime is detected as a test runner (e.g., `unittest` in `sys.modules`, `pytest` in `sys.modules`, or `PYTEST_CURRENT_TEST` in environment), log-writing operations must no-op or raise an explicit configuration error rather than polluting the user's production `~/.antigravity-vault/watch.log`.
+
+#### Scenario: [VAULT-ISO-001] Audit log writes strictly to isolated directory when AGY_VAULT_DIR is set
+- GIVEN `AGY_VAULT_DIR` is set to an isolated temporary directory path in the environment
+- WHEN `LogWatcher._notify_desktop()` or audit logging writes a rotation event log entry
+- THEN the log entry is written strictly to `AGY_VAULT_DIR/watch.log`
+- AND no write or modification is made to `~/.antigravity-vault/watch.log`.
+
+#### Scenario: [VAULT-ISO-002] Test mock engine without vault_dir does not write to production ~/.antigravity-vault/watch.log
+- GIVEN a test execution where `engine` is a `MagicMock` or has `vault_dir=None`
+- AND `AGY_VAULT_DIR` is not pointing to `~/.antigravity-vault`
+- WHEN `LogWatcher._notify_desktop()` or audit logging is invoked
+- THEN logging safely redirects to the configured test sandbox or no-ops without writing to `~/.antigravity-vault/watch.log`
+- AND production vault files remain pristine and unpolluted.
+
+#### Scenario: [VAULT-ERR-001] Unwriteable temp vault directory logs error without crashing parent turn runner
+- GIVEN the isolated vault directory becomes read-only or raises `OSError` during log append operations
+- WHEN `append_secure_log_entry` or `LogWatcher` attempts to record an audit log entry
+- THEN it handles the filesystem exception gracefully without raising an uncaught error
+- AND does not crash the parent turn runner, daemon polling loop, or agent workflow.
+
+#### Scenario: [VAULT-ERR-002] Empty or whitespace-only AGY_VAULT_DIR environment variable handled safely
+- GIVEN `AGY_VAULT_DIR` is set to an empty string `""` or whitespace-only string `"   "` in the environment
+- AND a test runner is active (`unittest` or `pytest` present in `sys.modules`)
+- WHEN `append_secure_log_entry` or `LogWatcher` resolves the audit log destination
+- THEN it rejects the empty string as an invalid vault path without falling back to `DEFAULT_VAULT_DIR`
+- AND redirects log writes safely to an ephemeral system temp directory or suppresses audit write operations.
+
+#### Scenario: [VAULT-ERR-003] Filesystem disk full ENOSPC during log append caught gracefully
+- GIVEN the filesystem hosting the vault log runs out of space, raising `OSError` with `ENOSPC`
+- WHEN `append_secure_log_entry` attempts to flush log records
+- THEN it catches the exception and logs an alert to stderr without raising an unhandled exception
+- AND allows active rotation and agent execution to proceed uninterrupted.
+
+#### Scenario: [VAULT-EDGE-001] Concurrent test processes write to independent temporary vaults without interference
+- GIVEN multiple concurrent test runner processes each configured with distinct temporary `AGY_VAULT_DIR` directories
+- WHEN each test process generates rotation events and audit logs simultaneously
+- THEN each process writes exclusively to its assigned temporary vault directory
+- AND no cross-process file locks, race conditions, or log collisions occur.
+
+#### Scenario: [VAULT-EDGE-002] Dynamic mutation of AGY_VAULT_DIR across test cases rebinds destination hermetically
+- GIVEN a test fixture dynamically alters `os.environ["AGY_VAULT_DIR"]` between successive test cases
+- WHEN consecutive audit log writes or `LogWatcher` operations are executed
+- THEN each operation dynamically resolves the current `AGY_VAULT_DIR` path
+- AND no stale file handles or leaked paths write to previous test directories.
+
+### Requirement: End-to-End Bootstrap Installer with Canonical Launcher Binding
+The installer script `install.sh` and hook registration APIs in `scripts/agy_switcher/vault.py` (`install_hook` / `install_pre_invocation_hook`) and `scripts/agy_switcher/watcher.py` (`DaemonManager.generate_systemd`) MUST provide an end-to-end, deterministic bootstrap setup that installs the plugin, creates the canonical launcher executable symlink at `~/.local/bin/agy-switch`, registers the Antigravity `PreInvocation` lifecycle hook in `~/.gemini/config/hooks.json` bound to `~/.local/bin/agy-switch hook-pre-invocation`, and optionally generates, installs, and enables the systemd user service `agy-switch-watcher.service` referencing `~/.local/bin/agy-switch watch run`. All hooks, systemd unit files, and external integration points MUST reference the canonical launcher binary path rather than local repository clone paths, guaranteeing operational stability across workspace relocations.
+
+#### Scenario: [BOOTSTRAP-001] Full install configures plugin, canonical launcher symlink, and hooks.json pointing to ~/.local/bin/agy-switch
+- GIVEN a clean host machine or local repository clone
+- WHEN `install.sh --global` (or `--all`) is executed with complete setup options
+- THEN the plugin files or symlink are installed into `~/.gemini/config/plugins/agy-switch`
+- AND the canonical launcher executable is symlinked at `~/.local/bin/agy-switch`
+- AND `~/.gemini/config/hooks.json` is updated with `agy-switch-auto-rotate` `PreInvocation` hook referencing `~/.local/bin/agy-switch hook-pre-invocation` without repo clone paths.
+
+#### Scenario: [BOOTSTRAP-002] Systemd service unit generation and installation references canonical launcher executable
+- GIVEN systemd user services are supported on the host platform
+- WHEN `agy-switch watch --install-systemd` or `install.sh --systemd` is executed
+- THEN the unit file `~/.config/systemd/user/agy-switch-watcher.service` is generated
+- AND the `ExecStart` directive specifies `%h/.local/bin/agy-switch watch run`
+- AND references the canonical launcher rather than a Python interpreter invoking a local clone path.
+
+#### Scenario: [BOOTSTRAP-ERR-001] Missing git or python3 fails early with clear actionable diagnostic
+- GIVEN a minimal container or host environment where `git` or `python3` (version >= 3.10) is missing
+- WHEN `install.sh` is invoked
+- THEN the installer checks prerequisites before modifying filesystem state
+- AND halts with a non-zero exit code and an informative error message specifying the missing prerequisite package.
+
+#### Scenario: [BOOTSTRAP-ERR-002] Corrupted or unparseable hooks.json creates timestamped backup before recovery
+- GIVEN `~/.gemini/config/hooks.json` exists on disk but contains syntax errors or truncated unparseable JSON
+- WHEN `install.sh` or `AgySwitchEngine.install_hook()` attempts to register the `PreInvocation` hook
+- THEN it detects the JSON decode error without aborting execution
+- AND creates a timestamped backup copy `hooks.json.bak.<timestamp>`
+- AND initializes a valid hooks schema containing the canonical launcher hook command without crashing.
+
+#### Scenario: [BOOTSTRAP-ERR-003] Existing foreign file at canonical launcher path halts safely with error
+- GIVEN a non-symlink regular file or foreign executable already exists at `~/.local/bin/agy-switch` that was not created by agy-switch
+- WHEN `install.sh` attempts to install the canonical launcher
+- THEN it verifies the existing file before unlinking
+- AND refuses to silently overwrite foreign binaries without user confirmation, exiting with an informative error.
+
+#### Scenario: [BOOTSTRAP-EDGE-001] Idempotent re-installation does not duplicate hooks or break existing configs
+- GIVEN `~/.gemini/config/hooks.json` already contains custom user hooks alongside an existing `agy-switch-auto-rotate` hook
+- AND `~/.local/bin/agy-switch` already exists
+- WHEN `install.sh` is executed repeatedly
+- THEN the existing non-conflicting hooks in `hooks.json` are preserved without duplication
+- AND the launcher symlink is refreshed idempotently
+- AND the script exits with code 0.
+
+#### Scenario: [BOOTSTRAP-EDGE-002] Systemd installation on system without active user session bus issues non-fatal warning
+- GIVEN a host environment where the systemd user manager or D-Bus session bus is unavailable
+- WHEN `install.sh --systemd` or `agy-switch watch --install-systemd` attempts to execute `systemctl --user daemon-reload`
+- THEN it catches the command failure and logs an actionable advisory on enabling lingering via `loginctl enable-linger`
+- AND completes all other installation steps successfully with exit code 0 rather than aborting.
+
+### Requirement: Refresh-Aware Standby Account Validation in Diagnostics
+The Layer 2 token diagnostics in `agy-switch doctor` (`DoctorEngine._check_token_integrity` in `scripts/agy_switcher/doctor.py`) MUST distinguish between the currently active account and secondary standby accounts. For the active account, token expiry continues to be verified strictly; if the active account's 1-hour access token is expired, status `[FAIL]` is returned. For standby accounts, if the access token timestamp has expired, the engine inspects `data["token"]["refresh_token"]`. If a non-empty string `refresh_token` is present, the account is validated as `[PASS]` (Standby Ready). Status `[WARN]` or `[FAIL]` is strictly reserved for accounts missing a `refresh_token`, containing corrupt JSON, failing JWT email extraction, or when the active account's access token is expired.
+
+#### Scenario: [DOCTOR-REFRESH-001] Standby accounts with expired access token but valid refresh token pass Layer 2 diagnosis
+- GIVEN a registered standby account `"standby-1"` whose `token.json` has an expired access token timestamp (`expiry` in the past)
+- AND `token.json` contains a valid, non-empty `refresh_token` string
+- AND the active account `"primary-acc"` has an unexpired access token
+- WHEN `DoctorEngine._check_token_integrity()` or `agy-switch doctor` executes Layer 2 diagnostics
+- THEN `"standby-1"` is classified as healthy standby ready
+- AND the diagnostic status for token integrity returns `[PASS]` without issuing warnings.
+
+#### Scenario: [DOCTOR-REFRESH-002] Active account with expired access token is flagged as [FAIL]
+- GIVEN the currently active account `"primary-acc"` whose `token.json` has an expired access token timestamp
+- WHEN `DoctorEngine._check_token_integrity()` evaluates token integrity
+- THEN it detects that the active account has an expired access token
+- AND returns status `[FAIL]` with a message indicating the active account token is expired and requires refresh.
+
+#### Scenario: [DOCTOR-ERR-001] Secondary account missing refresh_token or corrupt JSON flagged as [WARN]
+- GIVEN a secondary standby account `"standby-broken"` whose access token is expired
+- AND `refresh_token` is missing, empty, or `None`
+- WHEN `DoctorEngine._check_token_integrity()` evaluates the account vault
+- THEN it classifies `"standby-broken"` as unhealthy
+- AND returns status `[WARN]` indicating that the secondary account is expired without a valid refresh token.
+
+#### Scenario: [DOCTOR-ERR-002] Whitespace-only or non-string refresh token on expired secondary account flagged as [WARN]
+- GIVEN a secondary standby account whose access token timestamp is expired
+- AND `token["refresh_token"]` is a whitespace-only string `"   "`, empty string `""`, or non-string scalar (integer or boolean)
+- WHEN `DoctorEngine._check_token_integrity()` evaluates token integrity
+- THEN it detects that the refresh token is invalid or non-renewable
+- AND returns status `[WARN]` indicating the secondary account has no renewable refresh token.
+
+#### Scenario: [DOCTOR-ERR-003] Unreadable account directory or permission error in vault handled gracefully
+- GIVEN an account subdirectory in `accounts/` has restrictive permissions causing `PermissionError` when reading `token.json`
+- WHEN `DoctorEngine._check_token_integrity()` inspects vault accounts
+- THEN it catches the filesystem exception cleanly without throwing an unhandled exception
+- AND returns status `[FAIL]` with details specifying the inaccessible account directory.
+
+#### Scenario: [DOCTOR-EDGE-001] Account with non-standard refresh token payload schema handled gracefully
+- GIVEN a vault account where `token.json` contains non-standard whitespace, extra attributes, or nested structure around `refresh_token`
+- WHEN `DoctorEngine._check_token_integrity()` parses and validates the token schema
+- THEN it extracts and strips the refresh token safely without throwing unhandled exceptions
+- AND correctly evaluates standby viability according to refresh token presence.
+
+#### Scenario: [DOCTOR-EDGE-002] Active account pointer referencing non-existent account directory flagged as [FAIL]
+- GIVEN the active account pointer file `active` specifies an alias `"missing-acc"` that does not exist in the `accounts/` directory
+- WHEN `DoctorEngine._check_token_integrity()` evaluates token integrity
+- THEN it detects that the configured active account is missing from the vault
+- AND returns status `[FAIL]` with an actionable message directing the operator to select a valid active account.
