@@ -350,7 +350,7 @@ def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
         if not force and _account_exists(engine, alias):
             try:
                 confirm = input(f"Account '{alias}' already exists. Overwrite? [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt, OSError):
                 print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
                 return 1
 
@@ -407,6 +407,9 @@ def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
         print(f"  - Status: Standby (Run 'agy-switch switch {res['name']}' to activate)")
         print(f"  - Vault : {engine.accounts_dir / res['name'] / 'token.json'}")
         return 0
+    except KeyboardInterrupt:
+        print("Error: Login process interrupted by user.", file=sys.stderr)
+        return 1
     except AgySwitchError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

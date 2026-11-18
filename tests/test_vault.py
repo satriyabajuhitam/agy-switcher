@@ -437,6 +437,129 @@ class TestAgySwitchEngine(unittest.TestCase):
         token_data = json.loads((acc_dir / "token.json").read_text(encoding="utf-8"))
         self.assertEqual(token_data["token"]["access_token"], "ya29.sample_token_for_new@example.com")
 
+    def test_login_headless_existing_account_collision_and_atomic_overwrite(self) -> None:
+        """[HEADLESS-EDGE-002] force=False rejects before spawning agy and preserves prior credentials; force=True atomically overwrites with 0600."""
+        acc_dir = self.vault_dir / "accounts" / "existing-acc"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        token_path = acc_dir / "token.json"
+        prior_payload = make_valid_token_payload("prior-existing@example.com")
+        original_content = json.dumps(prior_payload, indent=2) + "\n"
+        token_path.write_text(original_content, encoding="utf-8")
+        token_path.chmod(0o644)
+        original_inode = token_path.stat().st_ino
+
+        spawn_marker = self.base_path / "existing_acc_spawned.txt"
+        new_payload = make_valid_token_payload("replaced-existing@example.com")
+        fake_agy = self.base_path / "fake_agy_existing_acc"
+        fake_agy.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, sys\n"
+            f"pathlib.Path({str(spawn_marker)!r}).write_text('spawned', encoding='utf-8')\n"
+            "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=edge002', flush=True)\n"
+            "code = sys.stdin.readline().strip()\n"
+            "if code != '4/0PKCE-EDGE-002':\n"
+            "    sys.exit(1)\n"
+            "home = pathlib.Path(os.environ['HOME'])\n"
+            "tok = home / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
+            "tok.parent.mkdir(parents=True, exist_ok=True)\n"
+            f"tok.write_text({json.dumps(new_payload)!r}, encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        fake_agy.chmod(0o755)
+
+        # 1. force=False rejects before spawning agy or invoking prompt_fn and preserves prior credentials
+        prompt_calls_blocked: list[str] = []
+        with patch("subprocess.Popen", wraps=subprocess.Popen) as spy_popen:
+            success_false, msg_false = self.engine.login_headless(
+                "existing-acc",
+                force=False,
+                agy_binary=str(fake_agy),
+                timeout=2.0,
+                prompt_fn=lambda p: (prompt_calls_blocked.append(p) or "unused"),
+            )
+
+        self.assertFalse(success_false)
+        self.assertIn("already exists in vault", msg_false)
+        spy_popen.assert_not_called()
+        self.assertFalse(spawn_marker.exists())
+        self.assertEqual(prompt_calls_blocked, [])
+        self.assertEqual(token_path.read_text(encoding="utf-8"), original_content)
+        self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o644)
+
+        # 1b. force=False also rejects when an existing alias directory exists without token.json
+        empty_acc_dir = self.vault_dir / "accounts" / "empty-existing-acc"
+        empty_acc_dir.mkdir(parents=True, exist_ok=True)
+        with patch("subprocess.Popen", wraps=subprocess.Popen) as spy_popen_empty:
+            success_empty, msg_empty = self.engine.login_headless(
+                "empty-existing-acc",
+                force=False,
+                agy_binary=str(fake_agy),
+                timeout=2.0,
+                prompt_fn=lambda _: "unused",
+            )
+        self.assertFalse(success_empty)
+        self.assertIn("already exists in vault", msg_empty)
+        spy_popen_empty.assert_not_called()
+
+        # 2. force=True preserves prior credentials if PKCE exchange fails mid-way or atomic write fails
+        with self.subTest(failure="pkce_exchange_rejected"):
+            success_fail_code, msg_fail_code = self.engine.login_headless(
+                "existing-acc",
+                force=True,
+                agy_binary=str(fake_agy),
+                timeout=2.0,
+                prompt_fn=lambda _: "4/0INVALID-CODE",
+            )
+            self.assertFalse(success_fail_code)
+            self.assertIn("OAuth token exchange failed", msg_fail_code)
+            self.assertEqual(token_path.read_text(encoding="utf-8"), original_content)
+            self.assertEqual(token_path.stat().st_ino, original_inode)
+            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o644)
+
+        with self.subTest(failure="atomic_replace_oserror"):
+            with patch("agy_switcher.security.os.replace", side_effect=OSError("simulated replace failure")):
+                success_fail_write, msg_fail_write = self.engine.login_headless(
+                    "existing-acc",
+                    force=True,
+                    agy_binary=str(fake_agy),
+                    timeout=2.0,
+                    prompt_fn=lambda _: "4/0PKCE-EDGE-002",
+                )
+
+            self.assertFalse(success_fail_write)
+            self.assertIn("Failed to save credentials", msg_fail_write)
+            self.assertEqual(token_path.read_text(encoding="utf-8"), original_content)
+            self.assertEqual(token_path.stat().st_ino, original_inode)
+            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o644)
+
+        # 3. force=True succeeds and atomically replaces accounts/existing-acc/token.json with 0600 permissions
+        spawn_marker.unlink(missing_ok=True)
+        prompt_calls_force: list[str] = []
+        with patch("agy_switcher.security.os.replace", wraps=os.replace) as spy_replace:
+            success_true, msg_true = self.engine.login_headless(
+                "existing-acc",
+                force=True,
+                agy_binary=str(fake_agy),
+                timeout=2.0,
+                prompt_fn=lambda p: (prompt_calls_force.append(p) or "4/0PKCE-EDGE-002"),
+            )
+
+        self.assertTrue(success_true, f"login_headless(force=True) failed: {msg_true}")
+        self.assertTrue(spawn_marker.is_file())
+        self.assertEqual(len(prompt_calls_force), 1)
+        self.assertIn("https://accounts.google.com/o/oauth2/v2/auth", prompt_calls_force[0])
+        self.assertTrue(
+            any(Path(call.args[1]) == token_path for call in spy_replace.call_args_list),
+            f"Expected os.replace targeting {token_path}, got {spy_replace.call_args_list}",
+        )
+        self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+        self.assertNotEqual(token_path.stat().st_ino, original_inode)
+        saved_data = json.loads(token_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            saved_data["token"]["access_token"],
+            "ya29.sample_token_for_replaced-existing@example.com",
+        )
+
     def test_login_headless_missing_agy_binary(self) -> None:
         """[REQ-3-ERR-004] Antigravity CLI binary missing returns failure cleanly."""
         with patch.object(

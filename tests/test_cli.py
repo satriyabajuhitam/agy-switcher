@@ -1026,6 +1026,159 @@ class TestCLI(unittest.TestCase):
             timeout=600,
         )
 
+    def test_login_headless_existing_account_overwrite_decline_and_confirm_real_engine(self):
+        """[HEADLESS-EDGE-001] Real engine handle_login aborts on declined overwrite before agy spawn or auth prompt, and overwrites on confirm."""
+        import base64
+
+        def _make_payload(email: str, access_token: str) -> dict[str, object]:
+            payload_b64 = base64.urlsafe_b64encode(
+                json.dumps({"email": email, "sub": "123"}).encode("utf-8")
+            ).decode("utf-8").rstrip("=")
+            return {
+                "token": {
+                    "access_token": access_token,
+                    "token_type": "Bearer",
+                    "refresh_token": f"1//refresh_{email}",
+                    "expiry": "2026-12-31T23:59:59Z",
+                },
+                "auth_method": "oauth",
+                "id_token": f"header.{payload_b64}.signature",
+            }
+
+        prior_payload = _make_payload("old-cli@example.com", "ya29.prior_cli_access")
+        new_payload = _make_payload("new-cli@example.com", "ya29.new_cli_access")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_engine = AgySwitchEngine(
+                vault_dir=tmp_path / "vault",
+                gemini_dir=tmp_path / "gemini",
+                legacy_root=tmp_path / "legacy",
+            )
+            acc_dir = tmp_path / "vault" / "accounts" / "existing-acc"
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            token_path = acc_dir / "token.json"
+            original_content = json.dumps(prior_payload, indent=2) + "\n"
+            token_path.write_text(original_content, encoding="utf-8")
+            token_path.chmod(0o644)
+
+            spawn_marker = tmp_path / "agy_spawned.txt"
+            fake_agy = tmp_path / "fake_agy_collision_cli"
+            fake_agy.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, pathlib, sys\n"
+                f"pathlib.Path({str(spawn_marker)!r}).write_text('spawned', encoding='utf-8')\n"
+                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=edge001', flush=True)\n"
+                "code = sys.stdin.readline().strip()\n"
+                "if code != '4/0PKCE-CONFIRM':\n"
+                "    sys.exit(1)\n"
+                "home = pathlib.Path(os.environ['HOME'])\n"
+                "token_file = home / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
+                "token_file.parent.mkdir(parents=True, exist_ok=True)\n"
+                f"token_file.write_text({json.dumps(new_payload)!r}, encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(0o755)
+
+            # 1. Declining overwrite ("n", empty, EOFError, OSError) aborts with exit code 1 before spawning agy or prompting for auth code
+            for label, input_effect in (
+                ("decline_n", ["n"]),
+                ("empty_enter", [""]),
+                ("eof", EOFError),
+                ("stdin_oserror", OSError("closed stdin")),
+            ):
+                with self.subTest(case=label):
+                    stdout_dec = io.StringIO()
+                    stderr_dec = io.StringIO()
+                    with patch("sys.stdout", stdout_dec), patch("sys.stderr", stderr_dec), \
+                         patch("builtins.input", side_effect=input_effect) as mock_input, \
+                         patch("subprocess.Popen", wraps=subprocess.Popen) as spy_popen:
+                        ret_dec = main(
+                            ["login", "existing-acc", "--headless", "--agy-binary", str(fake_agy)],
+                            engine=real_engine,
+                        )
+
+                    self.assertEqual(ret_dec, 1)
+                    self.assertEqual(stdout_dec.getvalue(), "")
+                    self.assertIn("Account 'existing-acc' already exists in vault. Overwrite aborted.", stderr_dec.getvalue())
+                    mock_input.assert_called_once_with("Account 'existing-acc' already exists. Overwrite? [y/N]: ")
+                    spy_popen.assert_not_called()
+                    self.assertFalse(spawn_marker.exists())
+                    self.assertEqual(token_path.read_text(encoding="utf-8"), original_content)
+
+            # 1b. Browser flow (without --headless) also aborts before spawning agy on decline/empty/EOF/KeyboardInterrupt
+            for label, input_effect, expected_err in (
+                ("browser_n", ["n"], "Overwrite aborted."),
+                ("browser_empty", [""], "Overwrite aborted."),
+                ("browser_eof", EOFError, "Overwrite aborted."),
+                ("browser_interrupt", KeyboardInterrupt, "interrupted by user"),
+            ):
+                with self.subTest(case=label):
+                    stdout_br = io.StringIO()
+                    stderr_br = io.StringIO()
+                    with patch("sys.stdout", stdout_br), patch("sys.stderr", stderr_br), \
+                         patch("builtins.input", side_effect=input_effect) as mock_input_br, \
+                         patch("subprocess.Popen", wraps=subprocess.Popen) as spy_popen_br:
+                        ret_br = main(
+                            ["login", "existing-acc", "--agy-binary", str(fake_agy)],
+                            engine=real_engine,
+                        )
+
+                    self.assertEqual(ret_br, 1)
+                    self.assertEqual(stdout_br.getvalue(), "")
+                    self.assertIn(expected_err, stderr_br.getvalue())
+                    mock_input_br.assert_called_once()
+                    spy_popen_br.assert_not_called()
+                    self.assertFalse(spawn_marker.exists())
+                    self.assertEqual(token_path.read_text(encoding="utf-8"), original_content)
+
+            # 2. Confirming overwrite ("y") proceeds to PKCE spawn, auth code prompt, and 0600 replacement
+            stdout_ok = io.StringIO()
+            stderr_ok = io.StringIO()
+            with patch("sys.stdout", stdout_ok), patch("sys.stderr", stderr_ok), \
+                 patch("builtins.input", side_effect=["y", "4/0PKCE-CONFIRM"]) as mock_input_ok:
+                ret_ok = main(
+                    ["login", "existing-acc", "--headless", "--agy-binary", str(fake_agy)],
+                    engine=real_engine,
+                )
+
+            self.assertEqual(ret_ok, 0, f"stderr: {stderr_ok.getvalue()}")
+            self.assertEqual(mock_input_ok.call_count, 2)
+            self.assertEqual(
+                mock_input_ok.call_args_list[0].args,
+                ("Account 'existing-acc' already exists. Overwrite? [y/N]: ",),
+            )
+            self.assertEqual(
+                mock_input_ok.call_args_list[1].args,
+                ("Enter authorization code: ",),
+            )
+            self.assertTrue(spawn_marker.is_file())
+            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+            saved_data = json.loads(token_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_data["token"]["access_token"], "ya29.new_cli_access")
+
+            # 3. --force bypasses overwrite prompt and replaces existing account atomically
+            spawn_marker.unlink(missing_ok=True)
+            token_path.write_text(original_content, encoding="utf-8")
+            token_path.chmod(0o644)
+            stdout_force = io.StringIO()
+            stderr_force = io.StringIO()
+            with patch("sys.stdout", stdout_force), patch("sys.stderr", stderr_force), \
+                 patch("builtins.input", side_effect=["4/0PKCE-CONFIRM"]) as mock_input_force:
+                ret_force = main(
+                    ["login", "existing-acc", "--headless", "--force", "--agy-binary", str(fake_agy)],
+                    engine=real_engine,
+                )
+
+            self.assertEqual(ret_force, 0, f"stderr: {stderr_force.getvalue()}")
+            mock_input_force.assert_called_once_with("Enter authorization code: ")
+            self.assertTrue(spawn_marker.is_file())
+            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(token_path.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.new_cli_access",
+            )
+
     def test_login_headless_stdin_closed_eof(self):
         """[REQ-3-EDGE-003] EOF on authorization code prompt after PKCE URL terminates child cleanly and exits with 1."""
         with tempfile.TemporaryDirectory() as tmpdir:
