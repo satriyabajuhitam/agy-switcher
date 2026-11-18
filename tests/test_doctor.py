@@ -286,6 +286,7 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         token_item = next(it for it in report.items if it.category == "token_integrity")
         self.assertEqual(token_item.status, "FAIL")
         self.assertFalse(token_item.can_fix)
+        self.assertIn("id_token", token_item.message)
 
     def test_layer2_expired_active_token(self):
         """Expired active account token triggers FAIL with can_fix=False."""
@@ -836,6 +837,90 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
             self.assertFalse(direct_item.can_fix)
             self.assertIn("standby-unexpired-no-id", direct_item.message)
             self.assertIn("unavailable", direct_item.message.lower())
+
+    def test_DOCTOR_ID_ERR_001_corrupt_jwt_id_token_via_run_diagnostics_and_cli(self) -> None:
+        """[DOCTOR-ID-ERR-001] Malformed non-empty id_token without valid id_token_email flags corrupt via run_diagnostics() and CLI."""
+        email_variants: list[tuple[str, object | None]] = [
+            ("omitted", None),
+            ("whitespace_only", "   "),
+            ("non_string_int", 12345),
+        ]
+        for target_role in ("active", "secondary"):
+            for email_label, bad_email in email_variants:
+                with self.subTest(role=target_role, id_token_email=email_label):
+                    shutil.rmtree(self.vault_dir, ignore_errors=True)
+                    self._setup_pristine_environment()
+                    tok = create_sample_token(
+                        email="primary@example.com" if target_role == "active" else f"{target_role}@example.com"
+                    )
+                    tok["id_token"] = "malformed-not-jwt"
+                    if bad_email is None:
+                        tok.pop("id_token_email", None)
+                    else:
+                        tok["id_token_email"] = bad_email
+
+                    if target_role == "active":
+                        target_file = self.vault_dir / "accounts" / "acc_primary" / "token.json"
+                    else:
+                        sec_dir = self.vault_dir / "accounts" / "standby-bad-jwt"
+                        sec_dir.mkdir(parents=True, exist_ok=True)
+                        os.chmod(sec_dir, 0o700)
+                        target_file = sec_dir / "token.json"
+
+                    target_file.write_text(json.dumps(tok), encoding="utf-8")
+                    os.chmod(target_file, 0o600)
+
+                    report = self.engine.run_diagnostics()
+                    token_item = next(it for it in report.items if it.category == "token_integrity")
+                    expected_status = "FAIL" if target_role == "active" else "WARN"
+                    expected_code = 2 if target_role == "active" else 1
+                    self.assertEqual(token_item.status, expected_status)
+                    self.assertFalse(token_item.can_fix)
+                    self.assertIn("id_token", token_item.message)
+                    if target_role == "secondary":
+                        self.assertIn("standby-bad-jwt", token_item.message)
+                    self.assertEqual(report.exit_code, expected_code)
+
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        cli_code = main(["doctor"], engine=self.engine)
+                    self.assertEqual(cli_code, expected_code)
+                    cli_out = stdout.getvalue()
+                    self.assertIn(f"[{expected_status}]", cli_out)
+                    self.assertIn("id_token", cli_out)
+
+    def test_DOCTOR_ID_EDGE_001_invalid_id_token_email_without_id_token_warns(self) -> None:
+        """[DOCTOR-ID-EDGE-001] Unexpired active account with omitted id_token and invalid id_token_email emits WARN via run_diagnostics()."""
+        for label, bad_email in [
+            ("whitespace_only", "   "),
+            ("non_string_int", 12345),
+        ]:
+            with self.subTest(id_token_email=label):
+                shutil.rmtree(self.vault_dir, ignore_errors=True)
+                self._setup_pristine_environment()
+                tok = create_sample_token(email="primary@example.com", expiry_offset_hours=24)
+                tok.pop("id_token", None)
+                tok["id_token_email"] = bad_email
+                (self.vault_dir / "accounts" / "acc_primary" / "token.json").write_text(
+                    json.dumps(tok), encoding="utf-8"
+                )
+
+                report = self.engine.run_diagnostics()
+                token_item = next(it for it in report.items if it.category == "token_integrity")
+                self.assertEqual(token_item.status, "WARN")
+                self.assertNotIn(token_item.status, ("FAIL", "PASS"))
+                self.assertFalse(token_item.can_fix)
+                self.assertIn("unavailable", token_item.message.lower())
+                self.assertEqual(report.overall_status, "WARN")
+                self.assertEqual(report.exit_code, 1)
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    cli_code = main(["doctor"], engine=self.engine)
+                self.assertEqual(cli_code, 1)
+                self.assertIn("[WARN]", stdout.getvalue())
 
 
 
