@@ -28,7 +28,7 @@ from agy_switcher.formatters import (
 )
 from agy_switcher.models import AccountInfo, RotationResult, FleetQuotaSummary
 from agy_switcher.rotation import RotationEngine
-from agy_switcher.security import extract_email_from_jwt
+from agy_switcher.security import resolve_token_email
 from agy_switcher.telemetry import normalize_model_name
 from agy_switcher.vault import AgySwitchEngine
 
@@ -158,8 +158,7 @@ def get_active_account(engine: AgySwitchEngine | None = None) -> AccountInfo:
         raw = token_path.read_text(encoding="utf-8")
         token_data = json.loads(raw)
         engine.validate_token_dict(token_data)
-        raw_email = extract_email_from_jwt(token_data.get("id_token", ""))
-        email = raw_email if (raw_email and raw_email.strip()) else None
+        email = resolve_token_email(token_data)
         return AccountInfo(
             name=clean_name,
             email=email,
@@ -581,10 +580,22 @@ def get_accounts(engine: AgySwitchEngine | None = None) -> list[AccountInfo]:
                 name = str(acc.get("name", "")).strip()
                 if not name:
                     continue
-                email = acc.get("email")
+                raw_email = acc.get("email")
+                email = raw_email.strip() if isinstance(raw_email, str) and raw_email.strip() else None
+                if email is None and ("id_token" in acc or "id_token_email" in acc):
+                    email = resolve_token_email(acc)
+                is_valid = acc.get("valid") is not False
                 is_act = bool(acc.get("is_active", False) or (name and name == active_name))
-                token_path = acc.get("token_path")
-                status = "active" if is_act else "standby"
+                raw_token_path = acc.get("token_path")
+                token_path: Path | str | None = (
+                    raw_token_path if isinstance(raw_token_path, (Path, str)) else None
+                )
+                if not is_valid:
+                    status = "corrupt"
+                    is_act = False
+                    email = None
+                else:
+                    status = "active" if is_act else "standby"
                 result.append(
                     AccountInfo(
                         name=name,

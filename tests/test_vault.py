@@ -847,6 +847,168 @@ class TestAgySwitchEngine(unittest.TestCase):
             )
             self.assertEqual(saved_cli.get("id_token_email"), "harvest@example.com")
 
+    def test_read_surfaces_resolve_id_token_email(self) -> None:
+        """[IDENTITY-EDGE-001] list_accounts, switch_tokens, and get_status resolve id_token_email cleanly."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=base / "proc",
+            )
+
+            work_dir = engine.accounts_dir / "work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            work_payload = make_token_payload_without_identity(access_token="ya29.work")
+            work_payload["id_token_email"] = "work@example.com"
+            (work_dir / "token.json").write_text(json.dumps(work_payload), encoding="utf-8")
+
+            standby_dir = engine.accounts_dir / "standby"
+            standby_dir.mkdir(parents=True, exist_ok=True)
+            standby_payload = make_token_payload_without_identity(access_token="ya29.standby")
+            standby_payload["id_token"] = ""
+            standby_payload["id_token_email"] = "  standby@example.com  "
+            (standby_dir / "token.json").write_text(json.dumps(standby_payload), encoding="utf-8")
+
+            jwt_dir = engine.accounts_dir / "jwt_first"
+            jwt_dir.mkdir(parents=True, exist_ok=True)
+            jwt_payload = make_valid_token_payload("jwt@example.com")
+            jwt_payload["id_token_email"] = "legacy@example.com"
+            (jwt_dir / "token.json").write_text(json.dumps(jwt_payload), encoding="utf-8")
+
+            engine.set_active_name("work")
+
+            listed = engine.list_accounts()
+            self.assertEqual(listed["active"], "work")
+            by_name = {entry["name"]: entry for entry in listed["accounts"]}
+            self.assertEqual(by_name["work"]["email"], "work@example.com")
+            self.assertTrue(by_name["work"]["valid"])
+            self.assertTrue(by_name["work"]["is_active"])
+            self.assertEqual(by_name["standby"]["email"], "standby@example.com")
+            self.assertTrue(by_name["standby"]["valid"])
+            self.assertFalse(by_name["standby"]["is_active"])
+            self.assertEqual(by_name["jwt_first"]["email"], "jwt@example.com")
+
+            status = engine.get_status()
+            self.assertEqual(status["active"], "work")
+            self.assertEqual(status["email"], "work@example.com")
+
+            swap_standby = engine.switch_tokens("standby", restart_server=False)
+            self.assertEqual(swap_standby["active"], "standby")
+            self.assertEqual(swap_standby["email"], "standby@example.com")
+            self.assertEqual(engine.get_status()["email"], "standby@example.com")
+
+            swap_work = engine.switch_tokens("work", restart_server=False)
+            self.assertEqual(swap_work["active"], "work")
+            self.assertEqual(swap_work["email"], "work@example.com")
+            for target_file in (engine.desktop_token_file, engine.cli_token_file):
+                loaded = json.loads(target_file.read_text(encoding="utf-8"))
+                self.assertEqual(loaded.get("id_token_email"), "work@example.com")
+
+            # switch_account facade alias also resolves and preserves id_token_email
+            swap_acc_res = engine.switch_account("standby", no_restart=True)
+            self.assertEqual(swap_acc_res["active"], "standby")
+            self.assertEqual(swap_acc_res["email"], "standby@example.com")
+            for target_file in (engine.desktop_token_file, engine.cli_token_file):
+                loaded = json.loads(target_file.read_text(encoding="utf-8"))
+                self.assertEqual(loaded.get("id_token_email"), "  standby@example.com  ")
+
+            # Whitespace-only, non-string, JWT-without-email-claim, and corrupt edge cases
+            ws_dir = engine.accounts_dir / "ws_only"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            ws_payload = make_token_payload_without_identity(access_token="ya29.ws")
+            ws_payload["id_token_email"] = "   "
+            (ws_dir / "token.json").write_text(json.dumps(ws_payload), encoding="utf-8")
+
+            non_str_dir = engine.accounts_dir / "non_str"
+            non_str_dir.mkdir(parents=True, exist_ok=True)
+            non_str_payload = make_token_payload_without_identity(access_token="ya29.nonstr")
+            non_str_payload["id_token_email"] = 12345
+            (non_str_dir / "token.json").write_text(json.dumps(non_str_payload), encoding="utf-8")
+
+            no_claim_b64 = base64.urlsafe_b64encode(json.dumps({"sub": "u1"}).encode("utf-8")).decode("utf-8").rstrip("=")
+            jwt_noclaim_dir = engine.accounts_dir / "jwt_noclaim"
+            jwt_noclaim_dir.mkdir(parents=True, exist_ok=True)
+            jwt_noclaim_payload = make_token_payload_without_identity(access_token="ya29.noclaim")
+            jwt_noclaim_payload["id_token"] = f"header.{no_claim_b64}.sig"
+            jwt_noclaim_payload["id_token_email"] = "fallback@example.com"
+            (jwt_noclaim_dir / "token.json").write_text(json.dumps(jwt_noclaim_payload), encoding="utf-8")
+
+            corrupt_dir = engine.accounts_dir / "corrupt_acc"
+            corrupt_dir.mkdir(parents=True, exist_ok=True)
+            (corrupt_dir / "token.json").write_text("{corrupt", encoding="utf-8")
+
+            listed_edge = {entry["name"]: entry for entry in engine.list_accounts()["accounts"]}
+            self.assertTrue(listed_edge["ws_only"]["valid"])
+            self.assertIsNone(listed_edge["ws_only"]["email"])
+            self.assertTrue(listed_edge["non_str"]["valid"])
+            self.assertIsNone(listed_edge["non_str"]["email"])
+            self.assertTrue(listed_edge["jwt_noclaim"]["valid"])
+            self.assertEqual(listed_edge["jwt_noclaim"]["email"], "fallback@example.com")
+            self.assertFalse(listed_edge["corrupt_acc"]["valid"])
+            self.assertIsNone(listed_edge["corrupt_acc"]["email"])
+
+            engine.set_active_name("non_str")
+            self.assertIsNone(engine.get_status()["email"])
+            engine.set_active_name("jwt_noclaim")
+            self.assertEqual(engine.get_status()["email"], "fallback@example.com")
+            engine.set_active_name("corrupt_acc")
+            self.assertIsNone(engine.get_status()["email"])
+
+    def test_auto_migrate_if_needed_preserves_id_token_email(self) -> None:
+        """auto_migrate_if_needed preserves id_token_email for legacy and harvested accounts."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=base / "proc",
+            )
+            legacy_token = (
+                engine.legacy_root
+                / "accounts"
+                / "work"
+                / ".gemini"
+                / "antigravity-cli"
+                / "antigravity-oauth-token"
+            )
+            legacy_token.parent.mkdir(parents=True, exist_ok=True)
+            legacy_payload = make_token_payload_without_identity(access_token="ya29.legacy_work")
+            legacy_payload["id_token_email"] = "work@example.com"
+            legacy_token.write_text(json.dumps(legacy_payload), encoding="utf-8")
+            (engine.legacy_root / "state.json").write_text(json.dumps({"active": "work"}), encoding="utf-8")
+
+            migrated = engine.auto_migrate_if_needed()
+            self.assertEqual(migrated, ["work"])
+            self.assertEqual(engine.get_active_name(), "work")
+            migrated_token = engine.accounts_dir / "work" / "token.json"
+            self.assertEqual(stat.S_IMODE(migrated_token.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(migrated_token.read_text(encoding="utf-8")).get("id_token_email"),
+                "work@example.com",
+            )
+            self.assertEqual(engine.get_status()["email"], "work@example.com")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=base / "proc",
+            )
+            live_payload = make_token_payload_without_identity(access_token="ya29.live_work")
+            live_payload["id_token_email"] = "work@example.com"
+            (engine.legacy_root / "accounts").mkdir(parents=True, exist_ok=True)
+            engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+            engine.desktop_token_file.write_text(json.dumps(live_payload), encoding="utf-8")
+
+            migrated_live = engine.auto_migrate_if_needed()
+            self.assertEqual(migrated_live, ["work"])
+            self.assertEqual(engine.get_status()["email"], "work@example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

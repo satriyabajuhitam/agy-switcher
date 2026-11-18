@@ -614,7 +614,7 @@ class AgySwitchEngine:
                 if token_file.is_file():
                     try:
                         data = self.validate_token_file(token_file)
-                        email = self.extract_email_from_jwt(data.get("id_token", ""))
+                        email = resolve_token_email(data)
                         valid = True
                     except InvalidTokenError:
                         pass
@@ -1309,7 +1309,7 @@ class AgySwitchEngine:
             if token_file.is_file():
                 try:
                     data = self.validate_token_file(token_file)
-                    email = self.extract_email_from_jwt(data.get("id_token", ""))
+                    email = resolve_token_email(data)
                 except Exception:
                     pass
 

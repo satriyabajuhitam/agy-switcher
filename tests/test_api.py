@@ -254,6 +254,237 @@ class TestSDKFacade(unittest.TestCase):
         self.assertEqual(account_info.status, "active")
         self.assertIsNone(account_info.email)
 
+    def test_get_active_account_list_accounts_and_get_accounts_with_id_token_email(self) -> None:
+        """[IDENTITY-EDGE-001] SDK read surfaces resolve id_token_email and report status='active'."""
+        work_dir = self.engine.accounts_dir / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        work_token = work_dir / "token.json"
+        work_payload: dict[str, Any] = {
+            "token": {
+                "access_token": "ya29.work_access",
+                "token_type": "Bearer",
+                "refresh_token": "1//work_refresh",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": "work@example.com",
+        }
+        work_token.write_text(json.dumps(work_payload), encoding="utf-8")
+
+        personal_dir = self.engine.accounts_dir / "personal"
+        personal_dir.mkdir(parents=True, exist_ok=True)
+        personal_token = personal_dir / "token.json"
+        personal_payload: dict[str, Any] = {
+            "token": {
+                "access_token": "ya29.personal_access",
+                "token_type": "Bearer",
+                "refresh_token": "1//personal_refresh",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token": "",
+            "id_token_email": "  personal@example.com  ",
+        }
+        personal_token.write_text(json.dumps(personal_payload), encoding="utf-8")
+
+        jwt_dir = self.engine.accounts_dir / "both"
+        jwt_dir.mkdir(parents=True, exist_ok=True)
+        both_payload = create_sample_token("jwt@example.com")
+        both_payload["id_token_email"] = "legacy@example.com"
+        (jwt_dir / "token.json").write_text(json.dumps(both_payload), encoding="utf-8")
+
+        self.engine.set_active_name("work")
+
+        active_info = api.get_active_account(engine=self.engine)
+        self.assertEqual(active_info.name, "work")
+        self.assertEqual(active_info.email, "work@example.com")
+        self.assertTrue(active_info.is_active)
+        self.assertEqual(active_info.status, "active")
+        self.assertEqual(Path(active_info.token_path), work_token)  # type: ignore[arg-type]
+
+        listed = api.list_accounts(engine=self.engine)
+        self.assertEqual(listed["active"], "work")
+        accounts_list = listed["accounts"]
+        assert isinstance(accounts_list, list)
+        by_name = {entry["name"]: entry for entry in accounts_list}
+        self.assertEqual(by_name["work"]["email"], "work@example.com")
+        self.assertTrue(by_name["work"]["valid"])
+        self.assertTrue(by_name["work"]["is_active"])
+        self.assertEqual(by_name["personal"]["email"], "personal@example.com")
+        self.assertTrue(by_name["personal"]["valid"])
+        self.assertFalse(by_name["personal"]["is_active"])
+        self.assertEqual(by_name["both"]["email"], "jwt@example.com")
+
+        acc_infos = api.get_accounts(engine=self.engine)
+        info_by_name = {acc.name: acc for acc in acc_infos}
+        self.assertEqual(info_by_name["work"].email, "work@example.com")
+        self.assertTrue(info_by_name["work"].is_active)
+        self.assertEqual(info_by_name["work"].status, "active")
+        self.assertEqual(info_by_name["personal"].email, "personal@example.com")
+        self.assertFalse(info_by_name["personal"].is_active)
+        self.assertEqual(info_by_name["personal"].status, "standby")
+        self.assertEqual(info_by_name["both"].email, "jwt@example.com")
+
+        # Whitespace-only id_token_email with id_token=None keeps status='active' and email=None
+        ws_dir = self.engine.accounts_dir / "ws_only"
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        ws_payload: dict[str, Any] = {
+            "token": {
+                "access_token": "ya29.ws_access",
+                "token_type": "Bearer",
+                "refresh_token": "1//ws_refresh",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token": None,
+            "id_token_email": "   ",
+        }
+        (ws_dir / "token.json").write_text(json.dumps(ws_payload), encoding="utf-8")
+        self.engine.set_active_name("ws_only")
+        ws_info = api.get_active_account(engine=self.engine)
+        self.assertEqual(ws_info.status, "active")
+        self.assertTrue(ws_info.is_active)
+        self.assertIsNone(ws_info.email)
+
+        # Corrupt entry reported by list_accounts is surfaced as status='corrupt' in get_accounts
+        bad_dir = self.engine.accounts_dir / "broken"
+        bad_dir.mkdir(parents=True, exist_ok=True)
+        (bad_dir / "token.json").write_text("{corrupt", encoding="utf-8")
+        self.engine.set_active_name("broken")
+        broken_by_name = {acc.name: acc for acc in api.get_accounts(engine=self.engine)}
+        self.assertEqual(broken_by_name["broken"].status, "corrupt")
+        self.assertFalse(broken_by_name["broken"].is_active)
+        self.assertIsNone(broken_by_name["broken"].email)
+
+    def test_get_active_account_list_accounts_and_get_accounts_id_token_email_edge_cases(self) -> None:
+        """Edge cases: non-string/whitespace id_token_email, JWT without email, malformed JWT, and switch_account."""
+        # 1. Non-string id_token_email without id_token remains valid/active with email=None
+        non_str_dir = self.engine.accounts_dir / "non_str"
+        non_str_dir.mkdir(parents=True, exist_ok=True)
+        non_str_payload: dict[str, Any] = {
+            "token": {
+                "access_token": "ya29.non_str",
+                "token_type": "Bearer",
+                "refresh_token": "1//non_str",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": 12345,
+        }
+        (non_str_dir / "token.json").write_text(json.dumps(non_str_payload), encoding="utf-8")
+
+        # 2. Standby whitespace-only id_token_email yields valid=True, status='standby', email=None
+        ws_standby_dir = self.engine.accounts_dir / "ws_standby"
+        ws_standby_dir.mkdir(parents=True, exist_ok=True)
+        ws_standby_payload: dict[str, Any] = {
+            "token": {
+                "access_token": "ya29.ws_standby",
+                "token_type": "Bearer",
+                "refresh_token": "1//ws_standby",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": "   ",
+        }
+        (ws_standby_dir / "token.json").write_text(json.dumps(ws_standby_payload), encoding="utf-8")
+
+        # 3. Valid id_token JWT lacking email claim falls back to id_token_email
+        no_claim_b64 = base64.urlsafe_b64encode(json.dumps({"sub": "u1"}).encode("utf-8")).decode("utf-8").rstrip("=")
+        jwt_fallback_dir = self.engine.accounts_dir / "jwt_fallback"
+        jwt_fallback_dir.mkdir(parents=True, exist_ok=True)
+        jwt_fallback_payload: dict[str, Any] = {
+            "token": {
+                "access_token": "ya29.jwt_fb",
+                "token_type": "Bearer",
+                "refresh_token": "1//jwt_fb",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token": f"header.{no_claim_b64}.sig",
+            "id_token_email": "fallback@example.com",
+        }
+        (jwt_fallback_dir / "token.json").write_text(json.dumps(jwt_fallback_payload), encoding="utf-8")
+
+        # 4. Malformed id_token with non-string id_token_email is corrupt across all SDK surfaces
+        bad_jwt_dir = self.engine.accounts_dir / "bad_jwt"
+        bad_jwt_dir.mkdir(parents=True, exist_ok=True)
+        bad_jwt_payload: dict[str, Any] = {
+            "token": {
+                "access_token": "ya29.bad_jwt",
+                "token_type": "Bearer",
+                "refresh_token": "1//bad_jwt",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token": "not.a.valid.jwt",
+            "id_token_email": 12345,
+        }
+        (bad_jwt_dir / "token.json").write_text(json.dumps(bad_jwt_payload), encoding="utf-8")
+
+        self.engine.set_active_name("non_str")
+        active_non_str = api.get_active_account(engine=self.engine)
+        self.assertEqual(active_non_str.status, "active")
+        self.assertTrue(active_non_str.is_active)
+        self.assertIsNone(active_non_str.email)
+
+        listed = api.list_accounts(engine=self.engine)
+        accounts_list = listed["accounts"]
+        assert isinstance(accounts_list, list)
+        listed_by_name = {entry["name"]: entry for entry in accounts_list}
+        self.assertIsNone(listed_by_name["non_str"]["email"])
+        self.assertTrue(listed_by_name["non_str"]["valid"])
+        self.assertIsNone(listed_by_name["ws_standby"]["email"])
+        self.assertTrue(listed_by_name["ws_standby"]["valid"])
+        self.assertEqual(listed_by_name["jwt_fallback"]["email"], "fallback@example.com")
+        self.assertFalse(listed_by_name["bad_jwt"]["valid"])
+        self.assertIsNone(listed_by_name["bad_jwt"]["email"])
+
+        by_name = {acc.name: acc for acc in api.get_accounts(engine=self.engine)}
+        self.assertEqual(by_name["non_str"].status, "active")
+        self.assertIsNone(by_name["non_str"].email)
+        self.assertEqual(by_name["ws_standby"].status, "standby")
+        self.assertIsNone(by_name["ws_standby"].email)
+        self.assertEqual(by_name["jwt_fallback"].status, "standby")
+        self.assertEqual(by_name["jwt_fallback"].email, "fallback@example.com")
+        self.assertEqual(by_name["bad_jwt"].status, "corrupt")
+        self.assertFalse(by_name["bad_jwt"].is_active)
+        self.assertIsNone(by_name["bad_jwt"].email)
+
+        self.engine.set_active_name("bad_jwt")
+        active_bad = api.get_active_account(engine=self.engine)
+        self.assertEqual(active_bad.status, "corrupt")
+        self.assertFalse(active_bad.is_active)
+        self.assertIsNone(active_bad.email)
+
+        # switch_account preserves id_token_email in dual targets and get_active_account resolves fallback
+        self.assertTrue(api.switch_account("jwt_fallback", reload_server=False, engine=self.engine))
+        active_fb = api.get_active_account(engine=self.engine)
+        self.assertEqual(active_fb.status, "active")
+        self.assertEqual(active_fb.email, "fallback@example.com")
+        for target_file in (self.engine.desktop_token_file, self.engine.cli_token_file):
+            loaded = json.loads(target_file.read_text(encoding="utf-8"))
+            self.assertEqual(loaded.get("id_token_email"), "fallback@example.com")
+
+        # Mocked corrupt entry with stale id_token_email still returns email=None in get_accounts()
+        mock_engine = MagicMock()
+        mock_engine.list_accounts.return_value = {
+            "active": "stale_corrupt",
+            "accounts": [
+                {
+                    "name": "stale_corrupt",
+                    "email": "stale@example.com",
+                    "id_token_email": "stale@example.com",
+                    "valid": False,
+                    "is_active": True,
+                }
+            ],
+        }
+        mocked_accounts = api.get_accounts(engine=mock_engine)
+        self.assertEqual(len(mocked_accounts), 1)
+        self.assertEqual(mocked_accounts[0].status, "corrupt")
+        self.assertFalse(mocked_accounts[0].is_active)
+        self.assertIsNone(mocked_accounts[0].email)
+
     def test_get_active_account_engine_exception_leak_protection(self) -> None:
         """Underlying engine failure does not leak unhandled exceptions to caller."""
         with patch.object(self.engine, "get_active_name", side_effect=OSError("Hardware I/O error")):
@@ -1138,8 +1369,6 @@ class TestSDKModels(unittest.TestCase):
         self.assertEqual(acc_objs[1].name, "acc2")
         self.assertFalse(acc_objs[1].is_active)
         self.assertEqual(acc_objs[1].status, "standby")
-
-
 
 if __name__ == "__main__":
     unittest.main()
