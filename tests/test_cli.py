@@ -1,5 +1,6 @@
 import io
 import json
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1025,7 +1026,7 @@ class TestCLI(unittest.TestCase):
         )
 
     def test_login_headless_stdin_closed_eof(self):
-        """[REQ-3-EDGE-003] EOF on authorization code prompt in real engine prints clean error and exits with 1."""
+        """[REQ-3-EDGE-003] EOF on authorization code prompt after PKCE URL terminates child cleanly and exits with 1."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             real_engine = AgySwitchEngine(
@@ -1033,16 +1034,28 @@ class TestCLI(unittest.TestCase):
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
             )
+            fake_agy = tmp_path / "fake_agy_eof"
+            fake_agy.write_text(
+                f"#!{sys.executable}\n"
+                "import sys\n"
+                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=eof', flush=True)\n"
+                "sys.stdin.readline()\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(0o755)
             stdout_buf = io.StringIO()
             stderr_buf = io.StringIO()
             with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                 patch("builtins.input", side_effect=EOFError), \
-                 patch("subprocess.Popen") as mock_popen:
-                ret = main(["login", "myacc", "--headless"], engine=real_engine)
+                 patch("builtins.input", side_effect=EOFError):
+                ret = main(
+                    ["login", "myacc", "--headless", "--agy-binary", str(fake_agy)],
+                    engine=real_engine,
+                )
 
             self.assertEqual(ret, 1)
-            mock_popen.assert_not_called()
+            self.assertIn("https://antigravity.google/oauth-callback", stdout_buf.getvalue())
             self.assertIn("Error: Failed to read authorization code from stdin.", stderr_buf.getvalue())
+            self.assertFalse((tmp_path / "vault" / "accounts" / "myacc").exists())
 
     def test_login_headless_real_engine_interactive_and_force_auth_code_rejection(self):
         """[OOB-RETIRE-002] [OOB-RETIRE-ERR-001] Real engine succeeds interactively without auth_code and rejects --force --auth-code on existing vault account."""
@@ -1069,22 +1082,26 @@ class TestCLI(unittest.TestCase):
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
             )
-
-            def fake_popen(cmd, **kwargs):
-                temp_home = Path(kwargs["env"]["HOME"])
-                token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-                token_file.parent.mkdir(parents=True, exist_ok=True)
-                token_file.write_text(json.dumps(token_payload), encoding="utf-8")
-                proc = MagicMock()
-                proc.returncode = 0
-                proc.communicate.return_value = (b"", b"")
-                return proc
+            fake_agy = tmp_path / "fake_agy_real"
+            fake_agy.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, pathlib, sys\n"
+                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=real', flush=True)\n"
+                "code = sys.stdin.readline().strip()\n"
+                "if not code:\n"
+                "    sys.exit(1)\n"
+                "home = pathlib.Path(os.environ['HOME'])\n"
+                "token_file = home / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
+                "token_file.parent.mkdir(parents=True, exist_ok=True)\n"
+                f"token_file.write_text({json.dumps(token_payload)!r}, encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(0o755)
 
             stdout_buf = io.StringIO()
             stderr_buf = io.StringIO()
             with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
-                 patch("subprocess.Popen", side_effect=fake_popen), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value=str(fake_agy)), \
                  patch("builtins.input", return_value="4/1AY0e-valid-code"):
                 ret = main(["login", "bot-acc", "--headless"], engine=real_engine)
 
@@ -1149,6 +1166,89 @@ class TestCLI(unittest.TestCase):
 
         self.assertEqual(ret, 1)
         self.assertIn("Error: Account alias contains invalid path traversal element: '../bad'", stderr_buf.getvalue())
+
+    def test_login_headless_pkce_interactive_url_capture_and_stdin_forwarding(self):
+        """[HEADLESS-PKCE-001] Interactive headless login spawns agy first, displays live PKCE URL, forwards stdin code, and persists 0600 token."""
+        import base64
+
+        payload_b64 = base64.urlsafe_b64encode(
+            json.dumps({"email": "headless@example.com", "sub": "headless-sub"}).encode("utf-8")
+        ).decode("utf-8").rstrip("=")
+        token_payload = {
+            "token": {
+                "access_token": "ya29.headless_pkce_access",
+                "token_type": "Bearer",
+                "refresh_token": "1//headless_pkce_refresh",
+                "expiry": "2026-12-31T23:59:59Z",
+            },
+            "auth_method": "oauth",
+            "id_token": f"header.{payload_b64}.signature",
+        }
+        expected_url = (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            "?client_id=test-client"
+            "&redirect_uri=https://antigravity.google/oauth-callback"
+            "&response_type=code"
+            "&code_challenge=live_challenge_001"
+            "&code_challenge_method=S256"
+            "&state=live_state_001"
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_engine = AgySwitchEngine(
+                vault_dir=tmp_path / "vault",
+                gemini_dir=tmp_path / "gemini",
+                legacy_root=tmp_path / "legacy",
+            )
+            marker_file = tmp_path / "agy_marker.json"
+            fake_agy = tmp_path / "fake_agy"
+            fake_agy.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, pathlib, sys\n"
+                f"print('Visit the URL below to authorize:', flush=True)\n"
+                f"print({expected_url!r}, flush=True)\n"
+                "print('Paste authorization code: ', end='', flush=True)\n"
+                "code = sys.stdin.readline().strip()\n"
+                "home = pathlib.Path(os.environ['HOME'])\n"
+                f"pathlib.Path({str(marker_file)!r}).write_text(json.dumps({{'home': str(home), 'code': code}}), encoding='utf-8')\n"
+                "tok = home / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
+                "tok.parent.mkdir(parents=True, exist_ok=True)\n"
+                f"tok.write_text({json.dumps(token_payload)!r}, encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(0o755)
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            stdout_at_prompt: list[str] = []
+
+            def fake_input(_prompt: str = "") -> str:
+                stdout_at_prompt.append(stdout_buf.getvalue())
+                return "4/0PKCE-auth-code-001"
+
+            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+                 patch("builtins.input", side_effect=fake_input):
+                ret = main(
+                    ["login", "headless-acc", "--headless", "--agy-binary", str(fake_agy), "--timeout", "10"],
+                    engine=real_engine,
+                )
+
+            self.assertEqual(ret, 0, f"stderr: {stderr_buf.getvalue()}")
+            self.assertEqual(len(stdout_at_prompt), 1)
+            self.assertIn(expected_url, stdout_at_prompt[0])
+            self.assertIn(expected_url, stdout_buf.getvalue())
+
+            marker = json.loads(marker_file.read_text(encoding="utf-8"))
+            self.assertEqual(marker["code"], "4/0PKCE-auth-code-001")
+            self.assertNotEqual(marker["home"], str(Path.home()))
+            self.assertIn("agy-login-headless-", marker["home"])
+
+            saved_path = tmp_path / "vault" / "accounts" / "headless-acc" / "token.json"
+            self.assertTrue(saved_path.is_file())
+            self.assertEqual(stat.S_IMODE(saved_path.stat().st_mode), 0o600)
+            saved_data = json.loads(saved_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_data["token"]["access_token"], "ya29.headless_pkce_access")
 
     def test_login_standard_browser_dispatch(self):
         """Standard login without --headless preserves backward compatibility with login_account."""
