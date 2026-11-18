@@ -57,22 +57,38 @@ def _atomic_write_json(target_path: Path | str, data: Any, mode: int = 0o600, in
     _atomic_write_file(Path(target_path), json.dumps(data, indent=indent) + "\n", mode=mode)
 
 
+_BASE64URL_TRANS = str.maketrans("-_", "+/")
+
+
+def _decode_jwt_payload(id_token: object) -> dict[str, object] | None:
+    """Decodes the second dot-separated JWT segment into a JSON object, or returns None."""
+    if not isinstance(id_token, str) or not id_token.strip():
+        return None
+    parts = id_token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    if not payload or "+" in payload or "/" in payload:
+        return None
+    padded = payload + ("=" * (-len(payload) % 4))
+    try:
+        raw_bytes = base64.b64decode(padded.translate(_BASE64URL_TRANS), validate=True)
+        decoded = json.loads(raw_bytes.decode("utf-8"))
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return cast(dict[str, object], decoded)
+
+
 def extract_email_from_jwt(id_token: str | None) -> str | None:
     """Decodes JWT payload to extract user email without external dependencies."""
-    if not id_token or not isinstance(id_token, str):
+    decoded = _decode_jwt_payload(id_token)
+    if decoded is None:
         return None
-    try:
-        parts = id_token.split(".")
-        if len(parts) >= 2:
-            payload = parts[1]
-            payload += "=" * (-len(payload) % 4)
-            decoded = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")))
-            if isinstance(decoded, dict):
-                email = decoded.get("email")
-                if isinstance(email, str) and email.strip():
-                    return email.strip()
-    except Exception:
-        return None
+    email = decoded.get("email")
+    if isinstance(email, str) and email.strip():
+        return email.strip()
     return None
 
 
@@ -103,10 +119,14 @@ def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
         if not _is_non_empty_str(data.get("auth_method")):
             raise InvalidTokenError("Missing required 'auth_method' field.")
 
-        # agy 1.5.10 omits id_token or sets it to null/"" in favor of id_token_email
+        # agy 1.5.10 omits id_token or sets it to null/"" in favor of id_token_email.
+        # Present non-empty id_token values must parse as a JWT JSON object unless a
+        # valid trimmed non-empty string id_token_email is provided.
         id_token = data.get("id_token")
-        if id_token is not None and (not isinstance(id_token, str) or (id_token != "" and not id_token.strip())):
-            raise InvalidTokenError("Invalid 'id_token' JWT field.")
+        if id_token is not None and id_token != "":
+            has_valid_email_fallback = _is_non_empty_str(data.get("id_token_email"))
+            if _decode_jwt_payload(id_token) is None and not has_valid_email_fallback:
+                raise InvalidTokenError("Invalid 'id_token' JWT field.")
 
         if return_tuple:
             return True, None
