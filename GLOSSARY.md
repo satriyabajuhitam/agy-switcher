@@ -28,10 +28,6 @@ _Avoid_: Fast switch, headless rotation, silent swap
 A programmatic standard-library interface exposing account status, quota telemetry, and rotation mechanisms directly within a consumer Python runtime.
 _Avoid_: Direct engine import, internal API, library binding
 
-**Headless Authentication**:
-An OAuth credential acquisition flow designed for non-graphical server environments that delegates PKCE URL generation to the Antigravity CLI and captures the resulting authorization code interactively after URL presentation.
-_Avoid_: Terminal OAuth, manual login, non-GUI login, pre-supplied auth code
-
 **Vault Bundle**:
 A compressed archive encapsulating multi-account vault states with restricted POSIX permissions and cryptographic checksum verification for transport.
 _Avoid_: Account export, backup archive, vault package

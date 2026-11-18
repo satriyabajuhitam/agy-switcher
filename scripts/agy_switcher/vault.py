@@ -27,9 +27,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import threading
 import time
-from typing import IO, Any, Callable, cast
+from typing import Any, Callable, cast
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -62,256 +61,6 @@ DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_LEGACY_ROOT = Path.home() / ".agy-cli-manager"
 GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
 USERINFO_TIMEOUT_SECONDS = 5.0
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1b\[[0-9;?]*[ -/]*[@-~]"
-    r"|\x1b[@-Z\\-_]"
-)
-_GOOGLE_OAUTH_URL_RE = re.compile(r"https://accounts\.google\.com/o/oauth2/[^\s\"'<>\x00-\x1f\x7f]+")
-_PKCE_REDIRECT_URI_MARKER = "antigravity.google/oauth-callback"
-
-
-def _extract_pkce_oauth_url(
-    text: str,
-    *,
-    allow_incomplete_tail: bool = False,
-) -> str | None:
-    """Extracts a live PKCE Google OAuth URL targeting antigravity.google/oauth-callback."""
-    if not text:
-        return None
-    cleaned = _ANSI_ESCAPE_RE.sub("", text)
-    for match in _GOOGLE_OAUTH_URL_RE.finditer(cleaned):
-        if not allow_incomplete_tail and match.end() == len(cleaned):
-            continue
-        candidate = match.group(0).rstrip(".,;)>]}")
-        parsed = urllib.parse.urlparse(candidate)
-        query_params = urllib.parse.parse_qs(parsed.query)
-        redirect_uris = query_params.get("redirect_uri", [])
-        if any(_PKCE_REDIRECT_URI_MARKER in uri for uri in redirect_uris):
-            return candidate
-    return None
-
-
-class _StreamEventQueue:
-    """Thread-safe FIFO queue for subprocess stream chunks using threading.Condition."""
-
-    def __init__(self) -> None:
-        self._items: list[tuple[str, str]] = []
-        self._cond = threading.Condition()
-
-    def put(self, item: tuple[str, str]) -> None:
-        with self._cond:
-            self._items.append(item)
-            self._cond.notify_all()
-
-    def get(self, timeout: float) -> tuple[str, str] | None:
-        with self._cond:
-            if not self._items:
-                self._cond.wait(timeout=timeout)
-            if not self._items:
-                return None
-            return self._items.pop(0)
-
-    def get_nowait(self) -> tuple[str, str] | None:
-        with self._cond:
-            if not self._items:
-                return None
-            return self._items.pop(0)
-
-
-def _stream_reader(
-    stream: IO[bytes],
-    stream_name: str,
-    out_queue: _StreamEventQueue,
-) -> None:
-    """Reads chunks from a subprocess pipe into out_queue until EOF."""
-    try:
-        read_fn = getattr(stream, "read", None)
-        if not callable(read_fn):
-            return
-        while True:
-            try:
-                chunk = read_fn(4096)
-            except (OSError, ValueError):
-                break
-            if not chunk:
-                break
-            if isinstance(chunk, bytes):
-                text = chunk.decode("utf-8", errors="replace")
-            elif isinstance(chunk, str):
-                text = chunk
-            else:
-                break
-            out_queue.put((stream_name, text))
-    finally:
-        out_queue.put(("eof", stream_name))
-
-
-def _resolve_isolated_pgid(proc: subprocess.Popen[bytes]) -> int | None:
-    """Returns proc's process group ID only when isolated from the current process group."""
-    if os.name != "posix" or not hasattr(os, "getpgid"):
-        return None
-    pid = getattr(proc, "pid", None)
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == os.getpid():
-        return None
-    try:
-        pgid = os.getpgid(pid)
-        if pgid == pid and pgid != os.getpgrp():
-            return pgid
-    except OSError:
-        return None
-    return None
-
-
-def _signal_process_or_group(
-    proc: subprocess.Popen[bytes],
-    pgid: int | None,
-    sig: int,
-) -> None:
-    """Signals the isolated process group when available, falling back to proc."""
-    if pgid is not None and os.name == "posix" and hasattr(os, "killpg"):
-        try:
-            os.killpg(pgid, sig)
-            return
-        except ProcessLookupError:
-            return
-        except OSError:
-            pass
-    try:
-        if sig == signal.SIGKILL:
-            proc.kill()
-        else:
-            proc.terminate()
-    except Exception:
-        pass
-
-
-def _terminate_process(proc: subprocess.Popen[bytes], pgid: int | None = None) -> None:
-    """Terminates a subprocess (and its isolated process group) cleanly, escalating to kill if needed."""
-    try:
-        if proc.poll() is not None:
-            return
-    except Exception:
-        return
-    _signal_process_or_group(proc, pgid, signal.SIGTERM)
-    try:
-        proc.wait(timeout=3)
-    except Exception:
-        _signal_process_or_group(proc, pgid, signal.SIGKILL)
-        try:
-            proc.wait(timeout=1)
-        except Exception:
-            pass
-        return
-
-    if pgid is not None and os.name == "posix" and hasattr(os, "killpg"):
-        grace_end = time.monotonic() + 0.1
-        while True:
-            try:
-                os.killpg(pgid, 0)
-            except OSError:
-                break
-            if time.monotonic() >= grace_end:
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except OSError:
-                    pass
-                break
-            time.sleep(0.01)
-
-
-def _close_process_streams(proc: subprocess.Popen[bytes]) -> None:
-    """Closes standard pipe handles on a subprocess without raising."""
-    for stream in (proc.stdin, proc.stdout, proc.stderr):
-        if stream is not None:
-            close_fn = getattr(stream, "close", None)
-            if callable(close_fn):
-                try:
-                    close_fn()
-                except Exception:
-                    pass
-
-
-def _consume_stream_event(
-    event: tuple[str, str],
-    stdout_parts: list[str],
-    stderr_parts: list[str],
-    open_streams: set[str],
-    last_activity: dict[str, float] | None = None,
-) -> None:
-    """Routes a single reader event into stream buffers, open-stream state, and timestamps."""
-    kind, payload = event
-    if kind == "stdout":
-        stdout_parts.append(payload)
-        if last_activity is not None:
-            last_activity["stdout"] = time.monotonic()
-    elif kind == "stderr":
-        stderr_parts.append(payload)
-        if last_activity is not None:
-            last_activity["stderr"] = time.monotonic()
-    elif kind == "eof":
-        open_streams.discard(payload)
-
-
-def _drain_stream_queue(
-    out_queue: _StreamEventQueue,
-    stdout_parts: list[str],
-    stderr_parts: list[str],
-    open_streams: set[str],
-    last_activity: dict[str, float] | None = None,
-) -> None:
-    """Consumes all currently buffered events from out_queue without blocking."""
-    while True:
-        next_event = out_queue.get_nowait()
-        if next_event is None:
-            break
-        _consume_stream_event(next_event, stdout_parts, stderr_parts, open_streams, last_activity)
-
-
-def _extract_pkce_url_from_streams(
-    stdout_parts: list[str],
-    stderr_parts: list[str],
-    open_streams: set[str],
-    last_activity: dict[str, float],
-    idle_flush_seconds: float,
-    *,
-    force_tail: bool = False,
-) -> str | None:
-    """Extracts a PKCE OAuth URL from stdout or stderr stream buffers."""
-    now = time.monotonic()
-    stdout_idle = force_tail or "stdout" not in open_streams or (
-        "stdout" in last_activity and now - last_activity["stdout"] >= idle_flush_seconds
-    )
-    stderr_idle = force_tail or "stderr" not in open_streams or (
-        "stderr" in last_activity and now - last_activity["stderr"] >= idle_flush_seconds
-    )
-    return (
-        _extract_pkce_oauth_url("".join(stdout_parts), allow_incomplete_tail=stdout_idle)
-        or _extract_pkce_oauth_url("".join(stderr_parts), allow_incomplete_tail=stderr_idle)
-    )
-
-
-def _poll_and_drain_streams(
-    out_queue: _StreamEventQueue,
-    wait_timeout: float,
-    stdout_parts: list[str],
-    stderr_parts: list[str],
-    open_streams: set[str],
-    last_activity: dict[str, float] | None = None,
-) -> bool:
-    """Waits for one stream event, consumes it, and drains any remaining buffered events."""
-    event = out_queue.get(timeout=wait_timeout)
-    if event is None:
-        return False
-    _consume_stream_event(event, stdout_parts, stderr_parts, open_streams, last_activity)
-    _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
-    return True
-
-
-def _get_returncode(proc: subprocess.Popen[bytes]) -> int | None:
-    """Returns the subprocess exit code if terminated, otherwise None."""
-    if hasattr(proc, "returncode") and proc.returncode is not None:
-        return proc.returncode
-    return proc.poll()
 
 
 def _clean_email_str(value: object) -> str | None:
@@ -980,9 +729,18 @@ class AgySwitchEngine:
     ) -> str | None:
         """Enriches registration Token Identity and writes accounts/<alias>/token.json atomically (0600)."""
         email = self._resolve_and_enrich_registration_email(token_data)
-        acc_dir.mkdir(parents=True, exist_ok=True)
-        dest_token = acc_dir / "token.json"
-        self._atomic_write_json(dest_token, token_data)
+        pre_existing = acc_dir.exists() or acc_dir.is_symlink()
+        succeeded = False
+        try:
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            dest_token = acc_dir / "token.json"
+            self._atomic_write_json(dest_token, token_data)
+            succeeded = True
+        except OSError as exc:
+            raise AgySwitchError(f"Failed to persist account '{acc_dir.name}' in vault: {exc}") from exc
+        finally:
+            if not succeeded and not pre_existing and (acc_dir.exists() or acc_dir.is_symlink()):
+                shutil.rmtree(acc_dir, ignore_errors=True)
         return email
 
     def add_account(self, name: str, token_path: Path) -> dict[str, Any]:
@@ -1261,6 +1019,31 @@ class AgySwitchEngine:
 
         raise AgySwitchError("Antigravity CLI binary ('agy') not found in ~/.local/bin/agy or system PATH.")
 
+    @staticmethod
+    def _terminate_login_process(proc: subprocess.Popen[bytes]) -> None:
+        """Gracefully terminates and reaps a still-running login subprocess."""
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=3)
+            return
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass
+        except OSError:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
+            pass
+
     def login_account(
         self,
         name: str,
@@ -1270,20 +1053,19 @@ class AgySwitchEngine:
         prompt_fn: Callable[[str], str] | None = None,
     ) -> dict[str, Any]:
         """Authenticates a new account via isolated agy CLI sandbox and saves to vault as Standby."""
-        clean_name = name.strip()
-        if not clean_name:
-            raise AgySwitchError("Account name cannot be empty.")
+        clean_name = self.validate_account_alias(name)
 
         acc_dir = self.accounts_dir / clean_name
         if acc_dir.is_dir() and not force:
             prompt_msg = f"Account '{clean_name}' already exists in vault. Overwrite? [y/N]: "
-            if prompt_fn is not None:
-                resp = prompt_fn(prompt_msg)
-            else:
-                try:
-                    resp = input(prompt_msg)
-                except (EOFError, OSError):
-                    resp = "n"
+            try:
+                resp = prompt_fn(prompt_msg) if prompt_fn is not None else input(prompt_msg)
+            except (EOFError, OSError):
+                resp = "n"
+            except KeyboardInterrupt as exc:
+                raise AgySwitchError(
+                    f"Account '{clean_name}' already exists in vault. Overwrite aborted."
+                ) from exc
             if str(resp).strip().lower() not in {"y", "yes"}:
                 raise AgySwitchError(f"Account '{clean_name}' already exists in vault. Overwrite aborted.")
 
@@ -1310,25 +1092,16 @@ class AgySwitchEngine:
             except Exception as exc:
                 raise AgySwitchError(f"Failed to spawn agy login process: {exc}") from exc
 
-            start_time = time.time()
             try:
+                start_time = time.time()
                 while proc.poll() is None:
                     if time.time() - start_time > timeout:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
                         raise AgySwitchError(f"Login timed out after {timeout} seconds.")
                     time.sleep(0.3)
-            except KeyboardInterrupt:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                raise AgySwitchError("Login process interrupted by user.")
+            except KeyboardInterrupt as exc:
+                raise AgySwitchError("Login process interrupted by user.") from exc
+            finally:
+                self._terminate_login_process(proc)
 
             token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             if not token_file.is_file():
@@ -1346,360 +1119,6 @@ class AgySwitchEngine:
                 "email": email,
                 "status": "standby",
             }
-
-    def _finalize_missing_pkce_url(
-        self,
-        proc: subprocess.Popen[bytes],
-        pgid: int | None,
-        out_queue: _StreamEventQueue,
-        stdout_parts: list[str],
-        stderr_parts: list[str],
-        open_streams: set[str],
-        last_activity: dict[str, float],
-        deadline: float,
-        timeout: float,
-    ) -> str:
-        """Waits briefly for child exit when no PKCE URL appeared and returns the failure message."""
-        remaining = deadline - time.monotonic()
-        streams_closed_without_exit = False
-        if proc.poll() is None:
-            if remaining <= 0:
-                _terminate_process(proc, pgid=pgid)
-                return f"Login timed out after {timeout} seconds."
-            # If all output streams already hit EOF, wait only briefly for exit status
-            # rather than blocking for the full login timeout if the child stayed alive.
-            wait_timeout = min(remaining, 0.2) if not open_streams else remaining
-            try:
-                proc.wait(timeout=wait_timeout)
-            except subprocess.TimeoutExpired:
-                _terminate_process(proc, pgid=pgid)
-                if open_streams:
-                    return f"Login timed out after {timeout} seconds."
-                streams_closed_without_exit = True
-        _terminate_process(proc, pgid=pgid)
-        _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
-        returncode = _get_returncode(proc)
-        err_msg = "".join(stderr_parts).strip() or "".join(stdout_parts).strip()
-        if not err_msg:
-            if streams_closed_without_exit:
-                err_msg = "agy closed output streams without emitting a PKCE OAuth URL."
-            elif returncode is not None and returncode != 0:
-                err_msg = f"agy exited with code {returncode} without emitting a PKCE OAuth URL."
-            else:
-                err_msg = "agy exited without emitting a PKCE OAuth URL."
-        return f"OAuth token exchange failed: {err_msg}"
-
-    def _wait_for_pkce_url(
-        self,
-        proc: subprocess.Popen[bytes],
-        pgid: int | None,
-        out_queue: _StreamEventQueue,
-        stdout_parts: list[str],
-        stderr_parts: list[str],
-        open_streams: set[str],
-        last_activity: dict[str, float],
-        deadline: float,
-        timeout: float,
-        idle_flush_seconds: float,
-    ) -> tuple[str | None, str | None]:
-        """Polls subprocess output streams until a PKCE OAuth URL is captured or an error occurs."""
-        pkce_url: str | None = None
-        exit_grace_deadline: float | None = None
-        while True:
-            pkce_url = _extract_pkce_url_from_streams(
-                stdout_parts, stderr_parts, open_streams, last_activity, idle_flush_seconds
-            )
-            if pkce_url is not None or not open_streams:
-                break
-
-            now = time.monotonic()
-            if proc.poll() is not None:
-                # Bound waiting on streams after child exit in case a grandchild inherited pipe FDs.
-                if exit_grace_deadline is None:
-                    exit_grace_deadline = min(deadline, now + 0.2)
-                if now >= exit_grace_deadline:
-                    break
-
-            remaining = deadline - now
-            if remaining <= 0:
-                _terminate_process(proc, pgid=pgid)
-                return None, f"Login timed out after {timeout} seconds."
-
-            wait_timeout = min(remaining, idle_flush_seconds)
-            if exit_grace_deadline is not None:
-                wait_timeout = min(wait_timeout, max(0.005, exit_grace_deadline - now))
-            received = _poll_and_drain_streams(
-                out_queue, wait_timeout, stdout_parts, stderr_parts, open_streams, last_activity
-            )
-            if not received:
-                pkce_url = _extract_pkce_url_from_streams(
-                    stdout_parts,
-                    stderr_parts,
-                    open_streams,
-                    last_activity,
-                    idle_flush_seconds,
-                    force_tail=True,
-                )
-                if pkce_url is not None:
-                    break
-
-        if pkce_url is None:
-            return None, self._finalize_missing_pkce_url(
-                proc, pgid, out_queue, stdout_parts, stderr_parts, open_streams, last_activity, deadline, timeout
-            )
-        return pkce_url, None
-
-    def _prompt_and_forward_auth_code(
-        self,
-        proc: subprocess.Popen[bytes],
-        pgid: int | None,
-        pkce_url: str,
-        prompt_fn: Callable[[str], str] | None,
-    ) -> str | None:
-        """Displays the PKCE URL, collects and validates the authorization code, and writes it to stdin."""
-        if prompt_fn is not None:
-            prompt_text = (
-                f"Open this URL in your browser to authenticate:\n"
-                f"{pkce_url}\n"
-                f"Enter authorization code: "
-            )
-            try:
-                raw_code = prompt_fn(prompt_text)
-            except Exception as exc:
-                _terminate_process(proc, pgid=pgid)
-                return f"Failed to prompt for authorization code: {exc}"
-        else:
-            print(f"Open this URL in your browser to authenticate:\n{pkce_url}", flush=True)
-            try:
-                raw_code = input("Enter authorization code: ")
-            except (EOFError, OSError):
-                _terminate_process(proc, pgid=pgid)
-                return "Failed to read authorization code from stdin."
-
-        if not isinstance(raw_code, str) or not raw_code.strip():
-            _terminate_process(proc, pgid=pgid)
-            return "Authorization code must be a non-empty string."
-
-        clean_code = raw_code.strip()
-        if len(clean_code) > 1024 or any(ord(c) < 32 for c in clean_code):
-            _terminate_process(proc, pgid=pgid)
-            return "Invalid authorization code format."
-
-        if proc.stdin is not None:
-            try:
-                proc.stdin.write((clean_code + "\n").encode("utf-8"))
-                proc.stdin.flush()
-            except (OSError, ValueError):
-                pass
-            finally:
-                try:
-                    proc.stdin.close()
-                except (OSError, ValueError):
-                    pass
-        return None
-
-    def _wait_for_subprocess_completion(
-        self,
-        proc: subprocess.Popen[bytes],
-        pgid: int | None,
-        out_queue: _StreamEventQueue,
-        threads: list[threading.Thread],
-        stdout_parts: list[str],
-        stderr_parts: list[str],
-        open_streams: set[str],
-        deadline: float,
-        timeout: float,
-        idle_flush_seconds: float,
-    ) -> tuple[bool, str | None]:
-        """Drains remaining subprocess output until exit and joins stream reader threads."""
-        while proc.poll() is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _terminate_process(proc, pgid=pgid)
-                return False, f"Login timed out after {timeout} seconds."
-            _poll_and_drain_streams(
-                out_queue, min(remaining, idle_flush_seconds), stdout_parts, stderr_parts, open_streams
-            )
-
-        drain_deadline = time.monotonic() + 0.5
-        while open_streams and time.monotonic() < drain_deadline:
-            drain_remaining = drain_deadline - time.monotonic()
-            received = _poll_and_drain_streams(
-                out_queue, min(drain_remaining, idle_flush_seconds), stdout_parts, stderr_parts, open_streams
-            )
-            if not received and all(not reader.is_alive() for reader in threads):
-                break
-
-        for reader in threads:
-            reader.join(timeout=0.2)
-        _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams)
-        return True, None
-
-    def _run_headless_agy_session(
-        self,
-        proc: subprocess.Popen[bytes],
-        timeout: float,
-        prompt_fn: Callable[[str], str] | None,
-    ) -> tuple[bool, str]:
-        """Executes the interactive PKCE handshake against a spawned agy subprocess."""
-        pgid = _resolve_isolated_pgid(proc)
-        out_queue = _StreamEventQueue()
-        open_streams: set[str] = set()
-        threads: list[threading.Thread] = []
-        for stream_name, stream_obj in (("stdout", proc.stdout), ("stderr", proc.stderr)):
-            if stream_obj is not None:
-                open_streams.add(stream_name)
-                reader = threading.Thread(
-                    target=_stream_reader,
-                    args=(stream_obj, stream_name, out_queue),
-                    daemon=True,
-                )
-                reader.start()
-                threads.append(reader)
-
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        last_activity: dict[str, float] = {}
-        idle_flush_seconds = 0.05
-        streams_joined = False
-
-        try:
-            pkce_url, err_msg = self._wait_for_pkce_url(
-                proc, pgid, out_queue, stdout_parts, stderr_parts,
-                open_streams, last_activity, deadline, timeout, idle_flush_seconds,
-            )
-            if err_msg is not None or pkce_url is None:
-                return False, err_msg or "OAuth token exchange failed: missing PKCE OAuth URL."
-
-            err_msg = self._prompt_and_forward_auth_code(proc, pgid, pkce_url, prompt_fn)
-            if err_msg is not None:
-                return False, err_msg
-
-            streams_joined, err_msg = self._wait_for_subprocess_completion(
-                proc, pgid, out_queue, threads, stdout_parts, stderr_parts,
-                open_streams, deadline, timeout, idle_flush_seconds,
-            )
-            if err_msg is not None:
-                return False, err_msg
-        except Exception as exc:
-            _terminate_process(proc, pgid=pgid)
-            return False, f"Process execution error: {exc}"
-        finally:
-            _terminate_process(proc, pgid=pgid)
-            _close_process_streams(proc)
-            if not streams_joined:
-                for reader in threads:
-                    reader.join(timeout=0.2)
-
-        returncode = _get_returncode(proc)
-        if returncode is not None and returncode != 0:
-            err_msg = "".join(stderr_parts).strip()
-            if not err_msg:
-                err_msg = (
-                    f"agy exited with code {returncode} "
-                    "(invalid or expired authorization code)."
-                )
-            return False, f"OAuth token exchange failed: {err_msg}"
-        return True, ""
-
-    def login_headless(
-        self,
-        alias: str = "",
-        auth_code: str | None = None,
-        force: bool = False,
-        agy_binary: str | None = None,
-        timeout: float = 600.0,
-        prompt_fn: Callable[[str], str] | None = None,
-        name: str | None = None,
-        code: str | None = None,
-    ) -> tuple[bool, str]:
-        """Performs PKCE-delegated headless OAuth login via live agy subprocess.
-
-        Spawns `agy` in an isolated temporary HOME before prompting, captures the
-        live PKCE Google OAuth URL emitted by `agy`, displays it before prompting,
-        forwards the user-provided authorization code to `agy`'s stdin, and
-        persists the validated token to the vault with 0600 permissions.
-        Pre-supplied `auth_code` or legacy `code` arguments are rejected.
-        Note: `name` is a legacy parameter alias for `alias`.
-        Returns tuple[bool, str] representing (success, message).
-        """
-        if auth_code is not None or code is not None:
-            return (
-                False,
-                "Pre-supplied authorization codes (auth_code/code) cannot be used with dynamic PKCE sessions. "
-                "Use interactive stdin or pass prompt_fn to capture the code after URL generation.",
-            )
-
-        raw_alias = alias or name or ""
-        try:
-            clean_alias = self.validate_account_alias(raw_alias)
-        except AgySwitchError as exc:
-            return False, str(exc)
-        except Exception as exc:
-            return False, f"Invalid account alias: {exc}"
-
-        acc_dir = self.accounts_dir / clean_alias
-        existed_before = acc_dir.is_dir()
-        if existed_before and not force:
-            return False, f"Account '{clean_alias}' already exists in vault. Overwrite aborted."
-
-        try:
-            resolved_binary = self.resolve_agy_binary(agy_binary)
-        except Exception as exc:
-            return False, str(exc)
-
-        with tempfile.TemporaryDirectory(prefix="agy-login-headless-") as temp_dir_str:
-            temp_home = Path(temp_dir_str)
-            (temp_home / ".gemini").mkdir(parents=True, exist_ok=True)
-
-            env = os.environ.copy()
-            env["HOME"] = str(temp_home)
-            env["PATH"] = f"{Path.home()}/.local/bin:{env.get('PATH', '/bin:/usr/bin:/usr/local/bin')}"
-
-            try:
-                proc = subprocess.Popen(
-                    [resolved_binary],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=0,
-                    cwd=str(temp_home),
-                    env=env,
-                    start_new_session=(os.name == "posix"),
-                )
-            except Exception as exc:
-                return False, f"Failed to spawn agy login process: {exc}"
-
-            ok, err_msg = self._run_headless_agy_session(proc, timeout, prompt_fn)
-            if not ok:
-                return False, err_msg
-
-            token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-            if not token_file.is_file():
-                jetski_token = temp_home / ".gemini" / "jetski-standalone-oauth-token"
-                if jetski_token.is_file():
-                    token_file = jetski_token
-                else:
-                    return False, "OAuth token exchange failed: invalid or expired authorization code."
-
-            try:
-                token_data = self.validate_token_file(token_file)
-            except Exception as exc:
-                return False, f"OAuth token exchange failed: invalid token data ({exc})"
-
-            try:
-                self._persist_registered_account(acc_dir, token_data)
-                try:
-                    os.chmod(acc_dir / "token.json", 0o600)
-                except OSError:
-                    pass
-            except Exception as exc:
-                if not existed_before:
-                    shutil.rmtree(acc_dir, ignore_errors=True)
-                return False, f"Failed to save credentials: {exc}"
-
-            return True, f"Account '{clean_alias}' successfully logged in"
 
     def has_account(self, name: str) -> bool:
         """Checks if account alias exists in vault accounts directory."""

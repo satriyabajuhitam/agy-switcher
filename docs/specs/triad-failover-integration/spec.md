@@ -1030,7 +1030,7 @@ The Layer 0 credential validation primitives `validate_token_dict()` and `valida
 - AND the second payload passes validation cleanly.
 
 ### Requirement: Layered Token Identity Resolution and UserInfo Persistence
-The security module (`scripts/agy_switcher/security.py`), vault engine (`scripts/agy_switcher/vault.py`), and In-Process SDK Facade (`scripts/agy_switcher/api.py`) MUST resolve **Token Identity** (`email`) using a new pure Layer 0 public interface `resolve_token_email(data)` (zero network I/O, exported in `security.py`, `scripts/agy_switcher/__init__.py`, and `scripts/agy_switch.py`): (1) the trimmed non-empty `email` claim decoded from `id_token` JWT via `extract_email_from_jwt()` when present and valid, falling back to (2) a trimmed non-empty string `id_token_email` field (ignoring non-string or whitespace-only values). During account registration (`AgySwitchEngine.login_account()`, `AgySwitchEngine.login_headless()`, and `AgySwitchEngine.add_account()`), when neither `id_token` nor `id_token_email` yields an email, the engine MUST attempt a best-effort HTTP GET lookup against the Google UserInfo API using `Authorization: Bearer <access_token>` (via Python stdlib `urllib.request` with a bounded timeout). If UserInfo returns a JSON object with a valid non-empty string `email`, the engine MUST persist it into the vault account's `token.json` under `"id_token_email"` via atomic write (`0600` permissions); if UserInfo fails due to network error, timeout, HTTP 4xx/5xx error, or malformed/non-JSON response, registration MUST still succeed gracefully with `email=None`. All read and transfer surfaces (`AgySwitchEngine.list_accounts()`, `AgySwitchEngine.switch_tokens()`, `AgySwitchEngine.switch_account()`, `AgySwitchEngine.get_status()`, `AgySwitchEngine.harvest_live_tokens_if_needed()`, `api.get_active_account()`, `api.list_accounts()`, `api.get_accounts()`) MUST surface **Token Identity** through `resolve_token_email()` and preserve `id_token_email` across dual-destination swaps without marking `id_token_email`-backed accounts as corrupt.
+The security module (`scripts/agy_switcher/security.py`), vault engine (`scripts/agy_switcher/vault.py`), and In-Process SDK Facade (`scripts/agy_switcher/api.py`) MUST resolve **Token Identity** (`email`) using the pure Layer 0 public interface `resolve_token_email(data)` (zero network I/O, exported in `security.py`, `scripts/agy_switcher/__init__.py`, and `scripts/agy_switch.py`): (1) the trimmed non-empty `email` claim decoded from `id_token` JWT via `extract_email_from_jwt()` when present and valid, falling back to (2) a trimmed non-empty string `id_token_email` field (ignoring non-string or whitespace-only values). During account registration (`AgySwitchEngine.login_account()` and `AgySwitchEngine.add_account()`), when neither `id_token` nor `id_token_email` yields an email, the engine MUST attempt a best-effort HTTP GET lookup against the Google UserInfo API using `Authorization: Bearer <access_token>` (via Python stdlib `urllib.request` with a bounded timeout). If UserInfo returns a JSON object with a valid non-empty string `email`, the engine MUST persist it into the vault account's `token.json` under `"id_token_email"` via atomic write (`0600` permissions); if UserInfo fails due to network error, timeout, HTTP 4xx/5xx error, or malformed/non-JSON response, registration MUST still succeed gracefully with `email=None`. All read and transfer surfaces (`AgySwitchEngine.list_accounts()`, `AgySwitchEngine.switch_tokens()`, `AgySwitchEngine.switch_account()`, `AgySwitchEngine.get_status()`, `AgySwitchEngine.harvest_live_tokens_if_needed()`, `api.get_active_account()`, `api.list_accounts()`, `api.get_accounts()`) MUST surface **Token Identity** through `resolve_token_email()` and preserve `id_token_email` across dual-destination swaps without marking `id_token_email`-backed accounts as corrupt.
 
 #### Scenario: [IDENTITY-RES-001] Layered Token Identity resolution prefers id_token JWT and falls back to id_token_email
 - GIVEN a token payload without `id_token` (or with empty `id_token`) and with `"id_token_email": "fallback@example.com"`
@@ -1039,7 +1039,7 @@ The security module (`scripts/agy_switcher/security.py`), vault engine (`scripts
 - THEN it returns `"fallback@example.com"` for the first payload and `"jwt@example.com"` for the second payload.
 
 #### Scenario: [IDENTITY-RES-002] Best-effort Google UserInfo lookup persists resolved email as id_token_email during login and add
-- GIVEN an account is registered via `AgySwitchEngine.login_account()`, `AgySwitchEngine.login_headless()`, or `AgySwitchEngine.add_account()` with a valid OAuth token lacking both `id_token` and `id_token_email`
+- GIVEN an account is registered via `AgySwitchEngine.login_account()` or `AgySwitchEngine.add_account()` with a valid OAuth token lacking both `id_token` and `id_token_email`
 - AND the Google UserInfo API responds with `{"email": "userinfo@example.com"}` for the `access_token`
 - WHEN the vault persists `token.json`
 - THEN `"id_token_email": "userinfo@example.com"` is written atomically (`0600`) to `accounts/<alias>/token.json`
@@ -1048,14 +1048,14 @@ The security module (`scripts/agy_switcher/security.py`), vault engine (`scripts
 #### Scenario: [IDENTITY-ERR-001] UserInfo API network failure or timeout degrades gracefully without failing registration
 - GIVEN an account is added or logged in with a valid OAuth token lacking both `id_token` and `id_token_email`
 - AND the Google UserInfo API request raises `urllib.error.URLError`, `TimeoutError`, or returns HTTP `503`
-- WHEN `AgySwitchEngine.add_account()`, `login_account()`, or `login_headless()` completes registration
+- WHEN `AgySwitchEngine.add_account()` or `AgySwitchEngine.login_account()` completes registration
 - THEN the failure is handled gracefully without raising an unhandled exception or aborting registration
 - AND the valid OAuth credentials are saved to `accounts/<alias>/token.json` with `email=None`.
 
 #### Scenario: [IDENTITY-ERR-002] UserInfo HTTP 401/500 or non-JSON response degrades gracefully without corrupting token.json
 - GIVEN an account is registered with a valid OAuth token lacking both `id_token` and `id_token_email`
 - AND the Google UserInfo API returns HTTP `401`, HTTP `500`, malformed non-JSON body `"<html>error</html>"`, or `{"email": "   "}`
-- WHEN `AgySwitchEngine.add_account()`, `login_account()`, or `login_headless()` completes registration
+- WHEN `AgySwitchEngine.add_account()` or `AgySwitchEngine.login_account()` completes registration
 - THEN registration succeeds with `email=None`
 - AND `accounts/<alias>/token.json` is written atomically (`0600`) without inserting an invalid `id_token_email` value.
 
@@ -1071,82 +1071,73 @@ The security module (`scripts/agy_switcher/security.py`), vault engine (`scripts
 - THEN `accounts/<alias>/token.json`, `desktop_token_file`, and `cli_token_file` all preserve `"id_token_email": "harvest@example.com"` intact via `0600` atomic writes
 - AND the harvested alias is derived from `"harvest"` rather than falling back to `"primary"`.
 
-### Requirement: PKCE-Delegated Headless Authentication via Live agy Subprocess
-`AgySwitchEngine.login_headless()` in `scripts/agy_switcher/vault.py` and `handle_login()` in `scripts/agy_switcher/cli.py` MUST implement **Headless Authentication** by delegating the entire PKCE session to `AgySwitchEngine.login_headless()`: `handle_login()` MUST NOT construct or print an OAuth URL itself and MUST invoke `engine.login_headless(alias=alias, force=force, agy_binary=agy_binary, timeout=timeout)` without `auth_code`. `login_headless()` MUST spawn the resolved `agy` binary directly in an isolated temporary `HOME` directory (e.g., `agy -p` or an isolated headless session), capture the live PKCE Google OAuth URL (`https://accounts.google.com/o/oauth2/...` with `redirect_uri=https://antigravity.google/oauth-callback`) emitted by `agy` on stdout/stderr, present that live PKCE URL to the user before requesting an authorization code, read the pasted authorization code from interactive `stdin` or the `prompt_fn` post-URL callback, and forward that authorization code to the running `agy` process's `stdin` so `agy` performs the PKCE token exchange using its session-bound `code_verifier` and `state`. Upon zero exit and valid token creation under the temporary `HOME`, the engine MUST validate the token, resolve/persist **Token Identity**, and atomically write `accounts/<alias>/token.json` with `0600` permissions.
+### Requirement: Standardized Interactive TTY OAuth Login and Alias Validation
+`build_parser()` and `handle_login()` in `scripts/agy_switcher/cli.py` alongside `AgySwitchEngine.login_account()` in `scripts/agy_switcher/vault.py` MUST establish `agy-switch login <alias>` as the sole official interactive login flow. `build_parser()` MUST register only positional `name`, `--agy-binary`, `--timeout`, and `--force` on the `login` subcommand, omitting `--headless` and `--auth-code` without deprecation stubs. `handle_login()` MUST delegate directly to `engine.login_account(alias, agy_binary=args.agy_binary, timeout=args.timeout, force=force)` and emit formatted account/vault details to `stdout` (exit code `0`) or formatted errors to `stderr` (exit code `1`) on `AgySwitchError` or `KeyboardInterrupt`. `AgySwitchEngine.login_account()` MUST call `self.validate_account_alias(name)` (normalizing leading/trailing whitespace on valid aliases) before checking vault directory existence, prompting for overwrite confirmation, resolving the `agy` binary, or spawning any subprocess—rejecting non-strings, empty strings, whitespace-only names, internal spaces, path traversal (`..`, `/`, `\`), invalid characters, or aliases exceeding 64 characters. When valid and overwrite-cleared, `login_account()` MUST spawn `agy` in an isolated temporary `HOME` directory inheriting `stdin=sys.stdin`, `stdout=sys.stdout`, and `stderr=sys.stderr` directly to the user's TTY, enforce `timeout` and `KeyboardInterrupt` termination cleanup, validate the resulting token file (`antigravity-oauth-token` or `jetski-standalone-oauth-token`) via `validate_token_file()`, resolve and persist **Token Identity**, and atomically write `accounts/<alias>/token.json` (`0600`) as Standby without altering the active account pointer or leaving partial vault directories on token validation or write failure. `scripts/agy_switcher/vault.py` MUST NOT define `login_headless`, `_run_headless_agy_session`, or headless PKCE stream-scraping helpers.
 
-#### Scenario: [HEADLESS-PKCE-001] login_headless spawns agy, displays live PKCE URL, and forwards user auth code to agy stdin
-- GIVEN no existing account `"headless-acc"` in the vault and an available `agy` binary
-- AND the `agy` subprocess prints a live PKCE OAuth URL containing `redirect_uri=https://antigravity.google/oauth-callback` and waits on `stdin` for the authorization code
-- WHEN `agy-switch login headless-acc --headless` runs interactively
-- THEN `agy-switch` spawns `agy` in an isolated temporary `HOME` before prompting the user
-- AND displays the live PKCE URL captured from `agy` to stdout
-- AND reads the user's pasted authorization code from `stdin` and writes it to the running `agy` process's `stdin`
-- AND saves the resulting validated token to `accounts/headless-acc/token.json` with `0600` permissions.
+#### Scenario: [TTY-LOGIN-001] Standard interactive TTY login delegates to login_account and saves 0600 Standby token
+- GIVEN no existing account `"work-acc"` in the vault and an executable `agy` binary
+- WHEN `agy-switch login work-acc` (via `main(["login", "work-acc"])` / `handle_login()`) runs interactively
+- THEN `handle_login()` invokes `engine.login_account("work-acc", agy_binary=None, timeout=600, force=False)`
+- AND `login_account()` spawns `agy` in an isolated temporary `HOME` with `stdin=sys.stdin`, `stdout=sys.stdout`, and `stderr=sys.stderr` inherited directly
+- AND validates the generated token, persists `accounts/work-acc/token.json` atomically with `0600` permissions as Standby without modifying the active account pointer, and exits with code `0`.
 
-#### Scenario: [HEADLESS-PKCE-002] login_headless invokes prompt_fn post-URL automation hook after capturing PKCE URL
-- GIVEN an automated caller invokes `AgySwitchEngine.login_headless(alias="auto-acc", prompt_fn=callback)`
-- AND the `agy` subprocess emits a live PKCE OAuth URL before awaiting authorization code input
-- WHEN `login_headless()` captures the PKCE URL from `agy`
-- THEN `login_headless()` invokes `prompt_fn` after the PKCE URL is captured (passing a prompt containing the captured URL)
-- AND forwards the returned code to `agy`'s `stdin` and persists the resulting vault token.
+#### Scenario: [TTY-LOGIN-002] Retired headless flags and PKCE stream-scraping symbols are cleanly absent from CLI and vault
+- GIVEN the `agy_switcher.cli` and `agy_switcher.vault` modules after headless login retirement
+- WHEN `build_parser()` inspects the `login` subparser and callers inspect `AgySwitchEngine` and `agy_switcher.vault`
+- THEN `--headless` and `--auth-code` are absent from `login` parser options
+- AND `login_headless`, `_run_headless_agy_session`, `_extract_pkce_oauth_url`, and `_StreamEventQueue` are absent from `AgySwitchEngine` and `agy_switcher.vault`.
 
-#### Scenario: [HEADLESS-ERR-001] agy exiting before emitting PKCE URL or rejecting authorization code fails cleanly
-- GIVEN the spawned `agy` subprocess terminates with non-zero exit code before emitting a PKCE OAuth URL or after receiving an invalid/expired authorization code
-- WHEN `AgySwitchEngine.login_headless()` monitors the subprocess
-- THEN it returns `(False, error_message)` describing the subprocess or OAuth exchange failure
-- AND leaves no partial account directory in the vault (unless `--force` targeted an existing account).
+#### Scenario: [TTY-LOGIN-ERR-001] Invalid alias or path traversal rejected by validate_account_alias before overwrite prompt or agy spawn
+- GIVEN an invalid alias such as `"../bad"`, `".."`, `"my account"`, `""`, or a 65-character string
+- WHEN `AgySwitchEngine.login_account(alias)` or `main(["login", alias])` is invoked
+- THEN `AgySwitchEngine.validate_account_alias()` raises `AgySwitchError` before checking vault overwrite prompts, resolving `agy`, or calling `subprocess.Popen`
+- AND `main(["login", alias])` writes an error to `stderr` and exits with code `1` leaving the vault unmodified.
 
-#### Scenario: [HEADLESS-ERR-002] Timeout waiting for PKCE URL or code exchange terminates subprocess cleanly
-- GIVEN the `agy` subprocess stalls without emitting a PKCE URL or hangs after receiving the authorization code beyond `timeout`
-- WHEN `AgySwitchEngine.login_headless(..., timeout=...)` detects the elapsed timeout
-- THEN it terminates (and kills if necessary) the child `agy` process cleanly
-- AND returns `(False, "Login timed out after <timeout> seconds.")`.
+#### Scenario: [TTY-LOGIN-ERR-002] Retired --headless or --auth-code CLI flags rejected by argparse without deprecation stub
+- GIVEN a user or script invokes `agy-switch login bot-acc --headless` or `agy-switch login bot-acc --auth-code stale`
+- WHEN `build_parser()` parses the CLI arguments
+- THEN `argparse` rejects the unrecognized flag directly with exit code `2` and standard unrecognized-arguments diagnostics on `stderr`
+- AND neither spawns `agy` nor prints a deprecation wrapper message.
 
-#### Scenario: [HEADLESS-ERR-003] Missing agy binary or invalid alias traversal fails before subprocess execution
-- GIVEN `agy` is missing from PATH and `~/.local/bin/agy` (or `alias` contains path traversal `"../bad"` or invalid characters `"my account"`)
-- WHEN `AgySwitchEngine.login_headless()` or `agy-switch login ../bad --headless` executes
-- THEN it fails cleanly (`(False, error_message)` or exit code `1`) before spawning any subprocess or prompting for an authorization code
-- AND leaves the vault unmodified.
+#### Scenario: [TTY-LOGIN-ERR-003] Missing agy binary, tokenless exit, timeout, or KeyboardInterrupt fails cleanly without partial vault state
+- GIVEN a valid alias `"fail-acc"` where `agy` is missing, exits (zero or non-zero) without producing a token file, exceeds `timeout`, or receives `KeyboardInterrupt`
+- WHEN `AgySwitchEngine.login_account("fail-acc", ...)` executes
+- THEN it terminates and cleans up any running child `agy` process cleanly and raises `AgySwitchError`
+- AND `main(["login", "fail-acc"])` prints the formatted error to `stderr`, exits with code `1`, and leaves no partial `accounts/fail-acc` directory in the vault.
 
-#### Scenario: [HEADLESS-ERR-004] Subprocess stream truncation without PKCE URL or stdin EOF aborts cleanly
-- GIVEN the spawned `agy` process closes stdout/stderr (EOF) without emitting a PKCE OAuth URL, or `stdin` hits EOF / empty input after the PKCE URL is displayed
-- WHEN `AgySwitchEngine.login_headless()` handles stream capture or code input
-- THEN it terminates any active `agy` child process cleanly without hanging
-- AND returns `(False, error_message)` without creating any partial account directory in the vault.
+#### Scenario: [TTY-LOGIN-ERR-004] Corrupt token output or vault write permission failure aborts without partial vault state
+- GIVEN a valid alias `"bad-tok"` where `agy` writes malformed JSON / missing OAuth fields to the token file or where writing `accounts/bad-tok/token.json` encounters `PermissionError` / `OSError`
+- WHEN `AgySwitchEngine.login_account("bad-tok", ...)` or `main(["login", "bad-tok"])` executes
+- THEN `validate_token_file()` raises `InvalidTokenError` (or vault persistence raises `AgySwitchError`)
+- AND no empty or partial `accounts/bad-tok` directory remains in the vault, and `main()` exits with code `1` after printing the error to `stderr`.
 
-#### Scenario: [HEADLESS-EDGE-001] Overwrite confirmation aborts before spawning agy unless force is specified
-- GIVEN an account `"existing-acc"` already exists in the vault
-- WHEN `agy-switch login existing-acc --headless` is invoked without `--force` and the user declines overwrite (`"n"`)
-- THEN `handle_login()` aborts with exit code `1` before spawning `agy` or prompting for an authorization code.
-
-#### Scenario: [HEADLESS-EDGE-002] Engine-level alias collision rejects overwrite without force and replaces atomically with force
+#### Scenario: [TTY-LOGIN-EDGE-001] Overwrite confirmation aborts before agy spawn on decline, EOF, or KeyboardInterrupt and replaces atomically on confirm or --force
 - GIVEN an account `"existing-acc"` already exists in the vault with prior credentials
-- WHEN `AgySwitchEngine.login_headless("existing-acc", force=False)` is invoked, and subsequently `AgySwitchEngine.login_headless("existing-acc", force=True, prompt_fn=...)` is invoked
-- THEN the `force=False` call returns `(False, error_message)` before spawning `agy` and preserves the prior credentials
-- AND the `force=True` call atomically overwrites `accounts/existing-acc/token.json` (`0600`) with the new PKCE-exchanged credentials.
+- WHEN `AgySwitchEngine.login_account("existing-acc", ...)` or `main(["login", "existing-acc"])` is invoked without `force=True` and the user declines (`"n"`, `""`, `EOFError`, or `KeyboardInterrupt`), and subsequently is invoked with `"y"` or `force=True` (including `jetski-standalone-oauth-token` fallback)
+- THEN declining, EOF, or `KeyboardInterrupt` aborts before resolving `agy` or calling `subprocess.Popen`, preserving the prior `token.json` and exiting with code `1` in `main()`
+- AND confirming (`"y"`) or `force=True` spawns `agy`, accepts `jetski-standalone-oauth-token` fallback if `antigravity-oauth-token` is absent, and atomically overwrites `accounts/existing-acc/token.json` with `0600` permissions.
 
-### Requirement: Retirement of OOB OAuth URL Builder and Rejection of Pre-Supplied --auth-code
-The legacy Out-Of-Band OAuth URL builder `build_oauth_url()` in `scripts/agy_switcher/telemetry.py`, `_get_default_oauth_url()` in `scripts/agy_switcher/cli.py`, and `AgySwitchEngine.get_oauth_url()` in `scripts/agy_switcher/vault.py` constructing `redirect_uri=urn:ietf:wg:oauth:2.0:oob` MUST be retired so no active code path emits Google-blocked OOB URLs (while retaining `DEFAULT_CLIENT_ID` in `telemetry.py` for `QuotaClient`). Furthermore, because PKCE `code_verifier` and `state` are generated dynamically per session by `agy`, `--auth-code` MUST remain registered in `build_parser()` (deprecated) so `handle_login()` explicitly rejects any supplied `--auth-code` flag with exit code `1` and an actionable error message, and `AgySwitchEngine.login_headless()` MUST reject non-`None` pre-supplied `auth_code`/`code` arguments with `(False, error_message)` explaining that interactive post-URL capture or `prompt_fn` is required.
+#### Scenario: [TTY-LOGIN-EDGE-002] Valid alias whitespace normalization and failed --force overwrite preserves prior token
+- GIVEN a valid alias `" work-acc "` with surrounding whitespace and an existing `"existing-acc"` vault account with prior `token.json`
+- WHEN `AgySwitchEngine.login_account(" work-acc ")` succeeds and `AgySwitchEngine.login_account("existing-acc", force=True)` subsequently fails because `agy` exits without producing a token or times out
+- THEN `" work-acc "` is normalized to `"work-acc"` under `accounts/work-acc/token.json`
+- AND the failed `--force` overwrite preserves `accounts/existing-acc/token.json` completely intact.
 
-#### Scenario: [OOB-RETIRE-001] CLI --auth-code flag rejected with actionable PKCE guidance and exit code 1
-- GIVEN a user or script executes `agy-switch login bot-acc --headless --auth-code 4/1AY0e-stale`
-- WHEN `handle_login()` processes the CLI arguments
-- THEN it does not spawn `agy` or construct an OOB URL
-- AND prints an actionable error message to stderr explaining that `--auth-code` is incompatible with dynamic `agy` PKCE sessions and directing the operator to run `agy-switch login bot-acc --headless` interactively
-- AND exits with code `1`.
+### Requirement: Permanent Retirement of Legacy OOB OAuth URL Builders
+The legacy Out-Of-Band OAuth URL builders `build_oauth_url()` in `scripts/agy_switcher/telemetry.py`, `_get_default_oauth_url()` in `scripts/agy_switcher/cli.py`, and `AgySwitchEngine.get_oauth_url()` in `scripts/agy_switcher/vault.py` constructing `redirect_uri=urn:ietf:wg:oauth:2.0:oob` MUST remain permanently retired so no active CLI, telemetry, or vault code path defines or emits Google-blocked OOB URLs, while retaining `DEFAULT_CLIENT_ID` in `scripts/agy_switcher/telemetry.py` for `QuotaClient`.
 
-#### Scenario: [OOB-RETIRE-002] Pre-supplied auth_code argument in login_headless rejected with PKCE session error
-- GIVEN a Python caller invokes `AgySwitchEngine.login_headless(alias="bot-acc", auth_code="4/1AY0e-stale")` (or legacy `code=...`)
-- WHEN `login_headless()` validates its arguments
-- THEN it returns `(False, error_message)` explaining that pre-supplied authorization codes cannot be used with dynamic PKCE and advising use of interactive stdin or `prompt_fn` after URL generation.
-
-#### Scenario: [OOB-RETIRE-003] No active CLI or vault code path emits urn:ietf:wg:oauth:2.0:oob URLs
+#### Scenario: [OOB-RETIRE-003] No active CLI or vault code path emits urn:ietf:wg:oauth:2.0:oob URLs while DEFAULT_CLIENT_ID remains
 - GIVEN the `agy_switcher` codebase after retiring `build_oauth_url()`, `_get_default_oauth_url()`, and `AgySwitchEngine.get_oauth_url()`
-- WHEN headless login or CLI OAuth flows execute
-- THEN no module emits or falls back to `redirect_uri=urn:ietf:wg:oauth:2.0:oob` URLs.
+- WHEN CLI login and telemetry flows execute
+- THEN no module emits or falls back to `redirect_uri=urn:ietf:wg:oauth:2.0:oob` URLs
+- AND `DEFAULT_CLIENT_ID` remains defined and non-empty in `scripts/agy_switcher/telemetry.py`.
 
-#### Scenario: [OOB-RETIRE-ERR-001] Empty --auth-code or --auth-code with --force still rejected before overwrite or subprocess spawn
-- GIVEN an existing or new account `"bot-acc"` and CLI arguments `login bot-acc --headless --force --auth-code ""` (or non-empty stale code)
-- WHEN `handle_login()` processes the CLI arguments
-- THEN it rejects the deprecated `--auth-code` flag immediately with exit code `1` and PKCE guidance on stderr
-- AND neither prompts for overwrite nor spawns `agy`.
+#### Scenario: [OOB-RETIRE-ERR-002] Retired OOB helper symbols remain absent from cli, vault, and telemetry modules
+- GIVEN the imported `agy_switcher.cli`, `agy_switcher.vault`, and `agy_switcher.telemetry` modules
+- WHEN callers inspect module and `AgySwitchEngine` attributes
+- THEN `_get_default_oauth_url`, `build_oauth_url`, and `AgySwitchEngine.get_oauth_url` are absent (`hasattr(...)` is `False`).
+
+#### Scenario: [OOB-RETIRE-EDGE-001] Standard TTY login failure never falls back to static OOB OAuth URL output
+- GIVEN `agy-switch login fail-acc` fails because `agy` is missing or exits without creating a token file
+- WHEN `handle_login()` reports the failure to `stderr`
+- THEN neither `stdout` nor `stderr` contains `urn:ietf:wg:oauth:2.0:oob` or any statically constructed Google OAuth URL.

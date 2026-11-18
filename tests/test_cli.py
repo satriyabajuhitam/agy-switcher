@@ -1,10 +1,10 @@
 import io
+import itertools
 import json
 import stat
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -12,6 +12,9 @@ from unittest.mock import MagicMock, patch
 # Ensure the scripts directory is in the path
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
+
+# Initialize test patterns and environment hooks
+import tests.test_agy_switch  # noqa: F401
 
 from agy_switch import (
     main,
@@ -874,667 +877,6 @@ class TestCLI(unittest.TestCase):
             with self.assertRaises(InvalidThresholdError):
                 engine.set_quota_threshold("not_a_number")
 
-    def test_login_headless_interactive_prompt_success(self):
-        """[OOB-RETIRE-003] Headless login delegates interactive flow to engine.login_headless without auth_code or OOB URL."""
-        self.engine.has_account.return_value = False
-        self.engine.accounts_dir = Path("/mock/vault/accounts")
-        self.engine.login_headless.return_value = (True, "Account 'myacc' successfully logged in")
-
-        stdout_buf = io.StringIO()
-        stderr_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
-            ret = main(["login", "myacc", "--headless"], engine=self.engine)
-
-        self.assertEqual(ret, 0)
-        self.assertFalse(hasattr(self.engine, "get_oauth_url"))
-        self.engine.login_headless.assert_called_once_with(
-            alias="myacc",
-            force=False,
-            agy_binary=None,
-            timeout=600,
-        )
-        self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_buf.getvalue())
-        self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stderr_buf.getvalue())
-        self.assertIn("Account 'myacc' successfully logged in and saved to vault.", stdout_buf.getvalue())
-
-    def test_login_headless_rejects_auth_code_flag(self):
-        """[OOB-RETIRE-001] Deprecated --auth-code is rejected with PKCE guidance and exit code 1."""
-        self.engine.has_account.return_value = False
-        self.engine.login_headless = MagicMock()
-
-        stdout_buf = io.StringIO()
-        stderr_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-             patch("builtins.input") as mock_input:
-            ret = main(["login", "bot-acc", "--headless", "--auth-code", "4/1AY0e-stale"], engine=self.engine)
-
-        self.assertEqual(ret, 1)
-        mock_input.assert_not_called()
-        self.engine.login_headless.assert_not_called()
-        self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_buf.getvalue())
-        err = stderr_buf.getvalue()
-        self.assertIn("--auth-code", err)
-        self.assertIn("PKCE", err)
-        self.assertIn("agy-switch login bot-acc --headless", err)
-
-    def test_login_headless_rejects_empty_and_force_auth_code_before_overwrite(self):
-        """[OOB-RETIRE-001] [OOB-RETIRE-ERR-001] Empty, whitespace, equals-syntax, non-headless, or --force --auth-code rejects before overwrite prompt or spawn."""
-        cases = [
-            ["login", "bot-acc", "--headless", "--auth-code", ""],
-            ["login", "bot-acc", "--headless", "--auth-code", "   "],
-            ["login", "bot-acc", "--headless", "--auth-code=4/1AY0e"],
-            ["login", "bot-acc", "--headless", "--force", "--auth-code", ""],
-            ["login", "bot-acc", "--headless", "--force", "--auth-code", "4/1AY0e-stale"],
-            ["login", "bot-acc", "--auth-code", "4/1AY0e-stale"],
-            ["login", "bot-acc", "--force", "--auth-code", ""],
-        ]
-        for argv in cases:
-            with self.subTest(argv=argv):
-                self.engine.reset_mock()
-                self.engine.has_account.return_value = True
-                self.engine.login_headless = MagicMock()
-                self.engine.login_account = MagicMock()
-                self.engine.validate_account_alias = MagicMock()
-                stdout_buf = io.StringIO()
-                stderr_buf = io.StringIO()
-                with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                     patch("builtins.input") as mock_input, \
-                     patch("subprocess.Popen") as mock_popen:
-                    ret = main(argv, engine=self.engine)
-
-                self.assertEqual(ret, 1)
-                self.assertEqual(stdout_buf.getvalue(), "")
-                mock_input.assert_not_called()
-                mock_popen.assert_not_called()
-                self.engine.validate_account_alias.assert_not_called()
-                self.engine.has_account.assert_not_called()
-                self.engine.login_headless.assert_not_called()
-                self.engine.login_account.assert_not_called()
-                err = stderr_buf.getvalue()
-                self.assertIn("--auth-code", err)
-                self.assertIn("PKCE", err)
-                self.assertIn("agy-switch login bot-acc --headless", err)
-                self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", err)
-
-    def test_login_headless_collision_abort_when_declined(self):
-        """[REQ-3-EDGE-001] Declining overwrite on existing account aborts safely."""
-        self.engine.has_account.return_value = True
-        self.engine.login_headless = MagicMock()
-
-        stderr_buf = io.StringIO()
-        with patch("sys.stderr", stderr_buf), patch("builtins.input", return_value="n"):
-            ret = main(["login", "existing_acc", "--headless"], engine=self.engine)
-
-        self.assertEqual(ret, 1)
-        self.engine.login_headless.assert_not_called()
-        self.assertIn("Error: Account 'existing_acc' already exists in vault. Overwrite aborted.", stderr_buf.getvalue())
-
-    def test_login_headless_collision_abort_on_eof(self):
-        """[REQ-3-EDGE-001] EOF during overwrite confirmation prompt aborts safely."""
-        self.engine.has_account.return_value = True
-        self.engine.login_headless = MagicMock()
-
-        stderr_buf = io.StringIO()
-        with patch("sys.stderr", stderr_buf), patch("builtins.input", side_effect=EOFError):
-            ret = main(["login", "existing_acc", "--headless"], engine=self.engine)
-
-        self.assertEqual(ret, 1)
-        self.engine.login_headless.assert_not_called()
-        self.assertIn("Error: Account 'existing_acc' already exists in vault. Overwrite aborted.", stderr_buf.getvalue())
-
-    def test_login_headless_collision_confirmed_overwrites(self):
-        """[REQ-3-EDGE-001] Confirming overwrite passes force=True to login_headless without auth_code."""
-        self.engine.has_account.return_value = True
-        self.engine.accounts_dir = Path("/mock/vault/accounts")
-        self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
-
-        stdout_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("builtins.input", return_value="y") as mock_input:
-            ret = main(
-                ["login", "existing_acc", "--headless"],
-                engine=self.engine,
-            )
-
-        self.assertEqual(ret, 0)
-        mock_input.assert_called_once_with("Account 'existing_acc' already exists. Overwrite? [y/N]: ")
-        self.engine.login_headless.assert_called_once_with(
-            alias="existing_acc",
-            force=True,
-            agy_binary=None,
-            timeout=600,
-        )
-
-    def test_login_headless_force_bypasses_prompt(self):
-        """[REQ-3-EDGE-002] Providing --force bypasses overwrite confirmation prompt."""
-        self.engine.has_account.return_value = True
-        self.engine.accounts_dir = Path("/mock/vault/accounts")
-        self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
-
-        stdout_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("builtins.input") as mock_input:
-            ret = main(
-                ["login", "existing_acc", "--headless", "--force"],
-                engine=self.engine,
-            )
-
-        self.assertEqual(ret, 0)
-        mock_input.assert_not_called()
-        self.engine.login_headless.assert_called_once_with(
-            alias="existing_acc",
-            force=True,
-            agy_binary=None,
-            timeout=600,
-        )
-
-    def test_login_headless_existing_account_overwrite_decline_and_confirm_real_engine(self):
-        """[HEADLESS-EDGE-001] Real engine handle_login aborts on declined overwrite before agy spawn or auth prompt, and overwrites on confirm."""
-        import base64
-
-        def _make_payload(email: str, access_token: str) -> dict[str, object]:
-            payload_b64 = base64.urlsafe_b64encode(
-                json.dumps({"email": email, "sub": "123"}).encode("utf-8")
-            ).decode("utf-8").rstrip("=")
-            return {
-                "token": {
-                    "access_token": access_token,
-                    "token_type": "Bearer",
-                    "refresh_token": f"1//refresh_{email}",
-                    "expiry": "2026-12-31T23:59:59Z",
-                },
-                "auth_method": "oauth",
-                "id_token": f"header.{payload_b64}.signature",
-            }
-
-        prior_payload = _make_payload("old-cli@example.com", "ya29.prior_cli_access")
-        new_payload = _make_payload("new-cli@example.com", "ya29.new_cli_access")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            real_engine = AgySwitchEngine(
-                vault_dir=tmp_path / "vault",
-                gemini_dir=tmp_path / "gemini",
-                legacy_root=tmp_path / "legacy",
-                proc_dir=tmp_path / "proc",
-            )
-            acc_dir = tmp_path / "vault" / "accounts" / "existing-acc"
-            acc_dir.mkdir(parents=True, exist_ok=True)
-            token_path = acc_dir / "token.json"
-            original_content = json.dumps(prior_payload, indent=2) + "\n"
-            token_path.write_text(original_content, encoding="utf-8")
-            token_path.chmod(0o644)
-
-            spawn_marker = tmp_path / "agy_spawned.txt"
-            fake_agy = tmp_path / "fake_agy_collision_cli"
-            fake_agy.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, pathlib, sys\n"
-                f"pathlib.Path({str(spawn_marker)!r}).write_text('spawned', encoding='utf-8')\n"
-                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=edge001', flush=True)\n"
-                "code = sys.stdin.readline().strip()\n"
-                "if code != '4/0PKCE-CONFIRM':\n"
-                "    sys.exit(1)\n"
-                "home = pathlib.Path(os.environ['HOME'])\n"
-                "token_file = home / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
-                "token_file.parent.mkdir(parents=True, exist_ok=True)\n"
-                f"token_file.write_text({json.dumps(new_payload)!r}, encoding='utf-8')\n",
-                encoding="utf-8",
-            )
-            fake_agy.chmod(0o755)
-
-            # 1. Declining overwrite ("n", empty, EOFError, OSError) aborts with exit code 1 before spawning agy or prompting for auth code
-            for label, input_effect in (
-                ("decline_n", ["n"]),
-                ("empty_enter", [""]),
-                ("eof", EOFError),
-                ("stdin_oserror", OSError("closed stdin")),
-            ):
-                with self.subTest(case=label):
-                    stdout_dec = io.StringIO()
-                    stderr_dec = io.StringIO()
-                    with patch("sys.stdout", stdout_dec), patch("sys.stderr", stderr_dec), \
-                         patch("builtins.input", side_effect=input_effect) as mock_input, \
-                         patch("subprocess.Popen", wraps=subprocess.Popen) as spy_popen:
-                        ret_dec = main(
-                            ["login", "existing-acc", "--headless", "--agy-binary", str(fake_agy)],
-                            engine=real_engine,
-                        )
-
-                    self.assertEqual(ret_dec, 1)
-                    self.assertEqual(stdout_dec.getvalue(), "")
-                    self.assertIn("Account 'existing-acc' already exists in vault. Overwrite aborted.", stderr_dec.getvalue())
-                    mock_input.assert_called_once_with("Account 'existing-acc' already exists. Overwrite? [y/N]: ")
-                    spy_popen.assert_not_called()
-                    self.assertFalse(spawn_marker.exists())
-                    self.assertEqual(token_path.read_text(encoding="utf-8"), original_content)
-
-            # 1b. Browser flow (without --headless) also aborts before spawning agy on decline/empty/EOF/KeyboardInterrupt
-            for label, input_effect, expected_err in (
-                ("browser_n", ["n"], "Overwrite aborted."),
-                ("browser_empty", [""], "Overwrite aborted."),
-                ("browser_eof", EOFError, "Overwrite aborted."),
-                ("browser_interrupt", KeyboardInterrupt, "interrupted by user"),
-            ):
-                with self.subTest(case=label):
-                    stdout_br = io.StringIO()
-                    stderr_br = io.StringIO()
-                    with patch("sys.stdout", stdout_br), patch("sys.stderr", stderr_br), \
-                         patch("builtins.input", side_effect=input_effect) as mock_input_br, \
-                         patch("subprocess.Popen", wraps=subprocess.Popen) as spy_popen_br:
-                        ret_br = main(
-                            ["login", "existing-acc", "--agy-binary", str(fake_agy)],
-                            engine=real_engine,
-                        )
-
-                    self.assertEqual(ret_br, 1)
-                    self.assertEqual(stdout_br.getvalue(), "")
-                    self.assertIn(expected_err, stderr_br.getvalue())
-                    mock_input_br.assert_called_once()
-                    spy_popen_br.assert_not_called()
-                    self.assertFalse(spawn_marker.exists())
-                    self.assertEqual(token_path.read_text(encoding="utf-8"), original_content)
-
-            # 2. Confirming overwrite ("y") proceeds to PKCE spawn, auth code prompt, and 0600 replacement
-            stdout_ok = io.StringIO()
-            stderr_ok = io.StringIO()
-            with patch("sys.stdout", stdout_ok), patch("sys.stderr", stderr_ok), \
-                 patch("builtins.input", side_effect=["y", "4/0PKCE-CONFIRM"]) as mock_input_ok:
-                ret_ok = main(
-                    ["login", "existing-acc", "--headless", "--agy-binary", str(fake_agy)],
-                    engine=real_engine,
-                )
-
-            self.assertEqual(ret_ok, 0, f"stderr: {stderr_ok.getvalue()}")
-            self.assertEqual(mock_input_ok.call_count, 2)
-            self.assertEqual(
-                mock_input_ok.call_args_list[0].args,
-                ("Account 'existing-acc' already exists. Overwrite? [y/N]: ",),
-            )
-            self.assertEqual(
-                mock_input_ok.call_args_list[1].args,
-                ("Enter authorization code: ",),
-            )
-            self.assertTrue(spawn_marker.is_file())
-            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
-            saved_data = json.loads(token_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved_data["token"]["access_token"], "ya29.new_cli_access")
-
-            # 3. --force bypasses overwrite prompt and replaces existing account atomically
-            spawn_marker.unlink(missing_ok=True)
-            token_path.write_text(original_content, encoding="utf-8")
-            token_path.chmod(0o644)
-            stdout_force = io.StringIO()
-            stderr_force = io.StringIO()
-            with patch("sys.stdout", stdout_force), patch("sys.stderr", stderr_force), \
-                 patch("builtins.input", side_effect=["4/0PKCE-CONFIRM"]) as mock_input_force:
-                ret_force = main(
-                    ["login", "existing-acc", "--headless", "--force", "--agy-binary", str(fake_agy)],
-                    engine=real_engine,
-                )
-
-            self.assertEqual(ret_force, 0, f"stderr: {stderr_force.getvalue()}")
-            mock_input_force.assert_called_once_with("Enter authorization code: ")
-            self.assertTrue(spawn_marker.is_file())
-            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
-            self.assertEqual(
-                json.loads(token_path.read_text(encoding="utf-8"))["token"]["access_token"],
-                "ya29.new_cli_access",
-            )
-
-    def test_login_headless_stdin_closed_eof(self):
-        """[REQ-3-EDGE-003] EOF on authorization code prompt after PKCE URL terminates child cleanly and exits with 1."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            real_engine = AgySwitchEngine(
-                vault_dir=tmp_path / "vault",
-                gemini_dir=tmp_path / "gemini",
-                legacy_root=tmp_path / "legacy",
-                proc_dir=tmp_path / "proc",
-            )
-            fake_agy = tmp_path / "fake_agy_eof"
-            fake_agy.write_text(
-                f"#!{sys.executable}\n"
-                "import sys\n"
-                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=eof', flush=True)\n"
-                "sys.stdin.readline()\n",
-                encoding="utf-8",
-            )
-            fake_agy.chmod(0o755)
-            stdout_buf = io.StringIO()
-            stderr_buf = io.StringIO()
-            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                 patch("builtins.input", side_effect=EOFError):
-                ret = main(
-                    ["login", "myacc", "--headless", "--agy-binary", str(fake_agy)],
-                    engine=real_engine,
-                )
-
-            self.assertEqual(ret, 1)
-            self.assertIn("https://antigravity.google/oauth-callback", stdout_buf.getvalue())
-            self.assertIn("Error: Failed to read authorization code from stdin.", stderr_buf.getvalue())
-            self.assertFalse((tmp_path / "vault" / "accounts" / "myacc").exists())
-
-    def test_login_headless_real_engine_interactive_and_force_auth_code_rejection(self):
-        """[OOB-RETIRE-002] [OOB-RETIRE-ERR-001] Real engine succeeds interactively without auth_code and rejects --force --auth-code on existing vault account."""
-        import base64
-
-        payload_b64 = base64.urlsafe_b64encode(
-            json.dumps({"email": "real@example.com", "sub": "123"}).encode("utf-8")
-        ).decode("utf-8").rstrip("=")
-        token_payload = {
-            "token": {
-                "access_token": "ya29.real_access",
-                "token_type": "Bearer",
-                "refresh_token": "1//real_refresh",
-                "expiry": "2026-12-31T23:59:59Z",
-            },
-            "auth_method": "oauth",
-            "id_token": f"header.{payload_b64}.signature",
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            real_engine = AgySwitchEngine(
-                vault_dir=tmp_path / "vault",
-                gemini_dir=tmp_path / "gemini",
-                legacy_root=tmp_path / "legacy",
-                proc_dir=tmp_path / "proc",
-            )
-            fake_agy = tmp_path / "fake_agy_real"
-            fake_agy.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, pathlib, sys\n"
-                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=real', flush=True)\n"
-                "code = sys.stdin.readline().strip()\n"
-                "if not code:\n"
-                "    sys.exit(1)\n"
-                "home = pathlib.Path(os.environ['HOME'])\n"
-                "token_file = home / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
-                "token_file.parent.mkdir(parents=True, exist_ok=True)\n"
-                f"token_file.write_text({json.dumps(token_payload)!r}, encoding='utf-8')\n",
-                encoding="utf-8",
-            )
-            fake_agy.chmod(0o755)
-
-            stdout_buf = io.StringIO()
-            stderr_buf = io.StringIO()
-            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                 patch.object(real_engine, "resolve_agy_binary", return_value=str(fake_agy)), \
-                 patch("builtins.input", return_value="4/1AY0e-valid-code"):
-                ret = main(["login", "bot-acc", "--headless"], engine=real_engine)
-
-            self.assertEqual(ret, 0, f"stderr: {stderr_buf.getvalue()}")
-            saved_path = tmp_path / "vault" / "accounts" / "bot-acc" / "token.json"
-            self.assertTrue(saved_path.is_file())
-            saved_before = saved_path.read_text(encoding="utf-8")
-
-            # Existing account with --force --auth-code "" or ="" must reject before overwrite prompt or agy spawn
-            for argv in (
-                ["login", "bot-acc", "--headless", "--force", "--auth-code", ""],
-                ["login", "bot-acc", "--headless", "--force", "--auth-code="],
-                ["login", "bot-acc", "--headless", "--force", "--auth-code", "4/1AY0e-stale"],
-            ):
-                with self.subTest(argv=argv):
-                    stdout_rej = io.StringIO()
-                    stderr_rej = io.StringIO()
-                    with patch("sys.stdout", stdout_rej), patch("sys.stderr", stderr_rej), \
-                         patch("builtins.input") as mock_input, \
-                         patch("subprocess.Popen") as mock_popen:
-                        rej_ret = main(argv, engine=real_engine)
-
-                    self.assertEqual(rej_ret, 1)
-                    self.assertEqual(stdout_rej.getvalue(), "")
-                    mock_input.assert_not_called()
-                    mock_popen.assert_not_called()
-                    self.assertIn("--auth-code", stderr_rej.getvalue())
-                    self.assertIn("PKCE", stderr_rej.getvalue())
-                    self.assertEqual(saved_path.read_text(encoding="utf-8"), saved_before)
-
-    def test_login_headless_exchange_failure_stderr(self):
-        """[REQ-3-ERR-001] Exchange failure from engine writes error to stderr and exits with 1."""
-        self.engine.has_account.return_value = False
-        self.engine.login_headless.return_value = (
-            False,
-            "OAuth token exchange failed: invalid or expired authorization code.",
-        )
-
-        stderr_buf = io.StringIO()
-        with patch("sys.stderr", stderr_buf):
-            ret = main(
-                ["login", "bad-acc", "--headless"],
-                engine=self.engine,
-            )
-
-        self.assertEqual(ret, 1)
-        self.assertIn(
-            "Error: OAuth token exchange failed: invalid or expired authorization code.",
-            stderr_buf.getvalue(),
-        )
-
-    def test_login_headless_invalid_alias_path_traversal(self):
-        """[REQ-3-ERR-003] Invalid alias syntax with path traversal rejects before subprocess execution."""
-        from agy_switcher.exceptions import AgySwitchError
-        self.engine.validate_account_alias.side_effect = AgySwitchError(
-            "Account alias contains invalid path traversal element: '../bad'"
-        )
-
-        stderr_buf = io.StringIO()
-        with patch("sys.stderr", stderr_buf):
-            ret = main(["login", "../bad", "--headless"], engine=self.engine)
-
-        self.assertEqual(ret, 1)
-        self.assertIn("Error: Account alias contains invalid path traversal element: '../bad'", stderr_buf.getvalue())
-
-    def test_login_headless_pkce_interactive_url_capture_and_stdin_forwarding(self):
-        """[HEADLESS-PKCE-001] Interactive headless login spawns agy first, displays live PKCE URL, forwards stdin code, and persists 0600 token."""
-        import base64
-
-        payload_b64 = base64.urlsafe_b64encode(
-            json.dumps({"email": "headless@example.com", "sub": "headless-sub"}).encode("utf-8")
-        ).decode("utf-8").rstrip("=")
-        token_payload = {
-            "token": {
-                "access_token": "ya29.headless_pkce_access",
-                "token_type": "Bearer",
-                "refresh_token": "1//headless_pkce_refresh",
-                "expiry": "2026-12-31T23:59:59Z",
-            },
-            "auth_method": "oauth",
-            "id_token": f"header.{payload_b64}.signature",
-        }
-        expected_url = (
-            "https://accounts.google.com/o/oauth2/v2/auth"
-            "?client_id=test-client"
-            "&redirect_uri=https://antigravity.google/oauth-callback"
-            "&response_type=code"
-            "&code_challenge=live_challenge_001"
-            "&code_challenge_method=S256"
-            "&state=live_state_001"
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            real_engine = AgySwitchEngine(
-                vault_dir=tmp_path / "vault",
-                gemini_dir=tmp_path / "gemini",
-                legacy_root=tmp_path / "legacy",
-                proc_dir=tmp_path / "proc",
-            )
-            marker_file = tmp_path / "agy_marker.json"
-            fake_agy = tmp_path / "fake_agy"
-            fake_agy.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, pathlib, sys\n"
-                f"print('Visit the URL below to authorize:', flush=True)\n"
-                f"print({expected_url!r}, flush=True)\n"
-                "print('Paste authorization code: ', end='', flush=True)\n"
-                "code = sys.stdin.readline().strip()\n"
-                "home = pathlib.Path(os.environ['HOME'])\n"
-                f"pathlib.Path({str(marker_file)!r}).write_text(json.dumps({{'home': str(home), 'code': code}}), encoding='utf-8')\n"
-                "tok = home / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
-                "tok.parent.mkdir(parents=True, exist_ok=True)\n"
-                f"tok.write_text({json.dumps(token_payload)!r}, encoding='utf-8')\n",
-                encoding="utf-8",
-            )
-            fake_agy.chmod(0o755)
-
-            stdout_buf = io.StringIO()
-            stderr_buf = io.StringIO()
-            stdout_at_prompt: list[str] = []
-
-            def fake_input(_prompt: str = "") -> str:
-                stdout_at_prompt.append(stdout_buf.getvalue())
-                return "4/0PKCE-auth-code-001"
-
-            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                 patch("builtins.input", side_effect=fake_input):
-                ret = main(
-                    ["login", "headless-acc", "--headless", "--agy-binary", str(fake_agy), "--timeout", "10"],
-                    engine=real_engine,
-                )
-
-            self.assertEqual(ret, 0, f"stderr: {stderr_buf.getvalue()}")
-            self.assertEqual(len(stdout_at_prompt), 1)
-            self.assertIn(expected_url, stdout_at_prompt[0])
-            self.assertIn(expected_url, stdout_buf.getvalue())
-
-            marker = json.loads(marker_file.read_text(encoding="utf-8"))
-            self.assertEqual(marker["code"], "4/0PKCE-auth-code-001")
-            self.assertNotEqual(marker["home"], str(Path.home()))
-            self.assertIn("agy-login-headless-", marker["home"])
-
-            saved_path = tmp_path / "vault" / "accounts" / "headless-acc" / "token.json"
-            self.assertTrue(saved_path.is_file())
-            self.assertEqual(stat.S_IMODE(saved_path.stat().st_mode), 0o600)
-            saved_data = json.loads(saved_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved_data["token"]["access_token"], "ya29.headless_pkce_access")
-
-    def test_login_headless_cli_missing_binary_and_invalid_alias_real_engine(self):
-        """[HEADLESS-ERR-003] CLI with real engine rejects invalid aliases and missing agy binary before spawn or prompt."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            isolated_home = tmp_path / "empty_home"
-            isolated_home.mkdir(parents=True, exist_ok=True)
-            real_engine = AgySwitchEngine(
-                vault_dir=tmp_path / "vault",
-                gemini_dir=tmp_path / "gemini",
-                legacy_root=tmp_path / "legacy",
-                proc_dir=tmp_path / "proc",
-            )
-            accounts_dir = tmp_path / "vault" / "accounts"
-
-            # 1. Invalid aliases ("../bad", "my account")
-            for bad_alias in ("../bad", "my account"):
-                with self.subTest(bad_alias=bad_alias):
-                    stdout_buf = io.StringIO()
-                    stderr_buf = io.StringIO()
-                    with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                         patch("subprocess.Popen") as mock_popen, \
-                         patch("builtins.input") as mock_input:
-                        ret = main(["login", bad_alias, "--headless"], engine=real_engine)
-
-                    self.assertEqual(ret, 1)
-                    self.assertEqual(stdout_buf.getvalue(), "")
-                    self.assertIn("Error:", stderr_buf.getvalue())
-                    mock_popen.assert_not_called()
-                    mock_input.assert_not_called()
-                    self.assertEqual(list(accounts_dir.iterdir()), [])
-                    self.assertFalse((tmp_path / "vault" / "bad").exists())
-
-            # 2. Missing agy binary from PATH and ~/.local/bin/agy
-            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
-            clean_env["PATH"] = ""
-            clean_env["HOME"] = str(isolated_home)
-            stdout_buf = io.StringIO()
-            stderr_buf = io.StringIO()
-            with patch.dict(os.environ, clean_env, clear=True), \
-                 patch("pathlib.Path.home", return_value=isolated_home), \
-                 patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                 patch("subprocess.Popen") as mock_popen, \
-                 patch("builtins.input") as mock_input:
-                ret = main(["login", "valid-acc", "--headless"], engine=real_engine)
-
-            self.assertEqual(ret, 1)
-            self.assertEqual(stdout_buf.getvalue(), "")
-            self.assertIn("Error:", stderr_buf.getvalue())
-            self.assertIn("not found", stderr_buf.getvalue())
-            mock_popen.assert_not_called()
-            mock_input.assert_not_called()
-            self.assertEqual(list(accounts_dir.iterdir()), [])
-
-    def test_login_headless_cli_stream_eof_and_empty_stdin_terminates_child(self):
-        """[HEADLESS-ERR-004] CLI with real engine aborts cleanly on output stream EOF or empty stdin without hanging."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            real_engine = AgySwitchEngine(
-                vault_dir=tmp_path / "vault",
-                gemini_dir=tmp_path / "gemini",
-                legacy_root=tmp_path / "legacy",
-                proc_dir=tmp_path / "proc",
-            )
-
-            # 1. agy closes stdout/stderr without emitting PKCE URL while staying alive
-            eof_pid_file = tmp_path / "cli_eof_pid.txt"
-            fake_eof_agy = tmp_path / "fake_cli_eof_agy"
-            fake_eof_agy.write_text(
-                f"#!{sys.executable}\n"
-                "import os, pathlib, time\n"
-                f"pathlib.Path({str(eof_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
-                "os.close(1)\n"
-                "os.close(2)\n"
-                "time.sleep(10.0)\n",
-                encoding="utf-8",
-            )
-            fake_eof_agy.chmod(0o755)
-
-            stdout_buf = io.StringIO()
-            stderr_buf = io.StringIO()
-            start = time.monotonic()
-            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                 patch("builtins.input") as mock_input:
-                ret = main(
-                    ["login", "eof-cli-acc", "--headless", "--agy-binary", str(fake_eof_agy), "--timeout", "5"],
-                    engine=real_engine,
-                )
-            elapsed = time.monotonic() - start
-            self.assertEqual(ret, 1)
-            self.assertLess(elapsed, 2.0)
-            self.assertIn("Error:", stderr_buf.getvalue())
-            self.assertNotIn("timed out", stderr_buf.getvalue().lower())
-            mock_input.assert_not_called()
-            self.assertFalse((tmp_path / "vault" / "accounts" / "eof-cli-acc").exists())
-            eof_pid = int(eof_pid_file.read_text(encoding="utf-8").strip())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(eof_pid, 0)
-
-            # 2. Empty stdin input after PKCE URL terminates child cleanly
-            empty_pid_file = tmp_path / "cli_empty_pid.txt"
-            fake_wait_agy = tmp_path / "fake_cli_wait_agy"
-            fake_wait_agy.write_text(
-                f"#!{sys.executable}\n"
-                "import os, pathlib, time\n"
-                f"pathlib.Path({str(empty_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
-                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=empty', flush=True)\n"
-                "time.sleep(10.0)\n",
-                encoding="utf-8",
-            )
-            fake_wait_agy.chmod(0o755)
-
-            stdout_buf2 = io.StringIO()
-            stderr_buf2 = io.StringIO()
-            with patch("sys.stdout", stdout_buf2), patch("sys.stderr", stderr_buf2), \
-                 patch("builtins.input", return_value=""):
-                ret2 = main(
-                    ["login", "empty-cli-acc", "--headless", "--agy-binary", str(fake_wait_agy), "--timeout", "5"],
-                    engine=real_engine,
-                )
-            self.assertEqual(ret2, 1)
-            self.assertIn("https://antigravity.google/oauth-callback", stdout_buf2.getvalue())
-            self.assertIn("Error:", stderr_buf2.getvalue())
-            self.assertFalse((tmp_path / "vault" / "accounts" / "empty-cli-acc").exists())
-            empty_pid = int(empty_pid_file.read_text(encoding="utf-8").strip())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(empty_pid, 0)
-
     def test_login_standard_browser_dispatch(self):
         """Standard login without --headless preserves backward compatibility with login_account."""
         self.engine.login_account.return_value = {
@@ -1556,6 +898,540 @@ class TestCLI(unittest.TestCase):
             force=False,
         )
         self.assertIn("Account 'browseracc' (browser@example.com) successfully logged in", stdout_buf.getvalue())
+
+    def test_login_retired_headless_flags_absent_from_parser(self):
+        """[TTY-LOGIN-002] Retired --headless and --auth-code flags are absent from login subparser."""
+        import argparse
+        from agy_switcher.cli import build_parser
+
+        parser = build_parser()
+        subparsers_actions = [
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        ]
+        self.assertEqual(len(subparsers_actions), 1)
+        login_parser = subparsers_actions[0].choices["login"]
+        option_strings = {opt for action in login_parser._actions for opt in action.option_strings}
+
+        self.assertNotIn("--headless", option_strings)
+        self.assertNotIn("--auth-code", option_strings)
+        self.assertEqual(option_strings, {"-h", "--help", "--agy-binary", "--timeout", "--force"})
+
+    def test_login_rejects_retired_headless_and_auth_code_flags(self):
+        """[TTY-LOGIN-ERR-002] argparse rejects --headless and --auth-code with exit code 2 without spawning agy or deprecation stub."""
+        from agy_switcher.cli import build_parser
+
+        cases = [
+            ["login", "bot-acc", "--headless"],
+            ["login", "bot-acc", "--auth-code", "stale"],
+            ["login", "bot-acc", "--auth-code=stale"],
+            ["login", "bot-acc", "--headless", "--auth-code", "stale"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                parser = build_parser()
+                stderr_parser = io.StringIO()
+                with patch("sys.stderr", stderr_parser), \
+                     patch("subprocess.Popen") as mock_popen:
+                    with self.assertRaises(SystemExit) as ctx:
+                        parser.parse_args(argv)
+                self.assertEqual(ctx.exception.code, 2)
+                err_parser = stderr_parser.getvalue()
+                self.assertIn("unrecognized arguments", err_parser)
+                self.assertNotIn("deprecated", err_parser.lower())
+                mock_popen.assert_not_called()
+
+                stderr_main = io.StringIO()
+                with patch("sys.stderr", stderr_main), \
+                     patch("subprocess.Popen") as mock_popen_main:
+                    with self.assertRaises(SystemExit) as main_ctx:
+                        main(argv, engine=self.engine)
+                self.assertEqual(main_ctx.exception.code, 2)
+                err_main = stderr_main.getvalue()
+                self.assertIn("unrecognized arguments", err_main)
+                self.assertNotIn("deprecated", err_main.lower())
+                mock_popen_main.assert_not_called()
+                self.engine.login_account.assert_not_called()
+
+    def test_login_invalid_alias_cli_exits_one_and_preserves_vault(self):
+        """[TTY-LOGIN-ERR-001] main(['login', alias]) rejects invalid aliases to stderr with exit 1 without touching vault."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            (real_engine.vault_dir / "bad").mkdir(parents=True, exist_ok=True)
+            valid_dir = real_engine.accounts_dir / "valid-acc"
+            valid_dir.mkdir(parents=True, exist_ok=True)
+            (valid_dir / "token.json").write_text('{"keep": true}', encoding="utf-8")
+
+            invalid_aliases = ["../bad", "..", ".", "my account", "", "   ", "a/b", "a\\b", "bad\x00acc", "a" * 65]
+            for alias in invalid_aliases:
+                with self.subTest(alias=alias):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch("builtins.input") as mock_input, \
+                         patch.object(real_engine, "resolve_agy_binary") as mock_resolve, \
+                         patch("subprocess.Popen") as mock_popen:
+                        ret = main(["login", alias], engine=real_engine)
+
+                    self.assertEqual(ret, 1)
+                    self.assertEqual(stdout_buf.getvalue(), "")
+                    self.assertIn("Error:", stderr_buf.getvalue())
+                    mock_input.assert_not_called()
+                    mock_resolve.assert_not_called()
+                    mock_popen.assert_not_called()
+
+            self.assertEqual(list((real_engine.vault_dir / "bad").iterdir()), [])
+            self.assertEqual(sorted(p.name for p in real_engine.accounts_dir.iterdir()), ["valid-acc"])
+            self.assertEqual((valid_dir / "token.json").read_text(encoding="utf-8"), '{"keep": true}')
+
+    def test_login_account_cli_whitespace_and_failed_force_overwrite(self):
+        """[TTY-LOGIN-EDGE-002] main(['login', ' work-acc ']) normalizes alias and failed --force preserves prior token."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+
+            class _StubProc:
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def mock_popen_success(args, **kwargs):
+                temp_home = Path(kwargs["env"]["HOME"])
+                tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                tok.parent.mkdir(parents=True, exist_ok=True)
+                tok.write_text(
+                    json.dumps({
+                        "token": {
+                            "access_token": "ya29.work",
+                            "token_type": "Bearer",
+                            "refresh_token": "1//work",
+                            "expiry": "2026-12-31T23:59:59Z",
+                        },
+                        "auth_method": "oauth",
+                        "id_token_email": "work@example.com",
+                    }),
+                    encoding="utf-8",
+                )
+                return _StubProc()
+
+            stdout_buf = io.StringIO()
+            with patch("sys.stdout", stdout_buf), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", side_effect=mock_popen_success):
+                ret = main(["login", " work-acc "], engine=real_engine)
+
+            self.assertEqual(ret, 0)
+            stdout_text = stdout_buf.getvalue()
+            self.assertIn("Account 'work-acc' (work@example.com) successfully logged in", stdout_text)
+            self.assertIn("agy-switch switch work-acc", stdout_text)
+            self.assertIn(str(real_engine.accounts_dir / "work-acc" / "token.json"), stdout_text)
+            self.assertNotIn(" work-acc ", stdout_text)
+            self.assertTrue((real_engine.accounts_dir / "work-acc" / "token.json").is_file())
+            self.assertFalse((real_engine.accounts_dir / " work-acc ").exists())
+
+            existing_dir = real_engine.accounts_dir / "existing-acc"
+            existing_dir.mkdir(parents=True, exist_ok=True)
+            existing_token = existing_dir / "token.json"
+            prior_json = '{"prior": "token"}'
+            existing_token.write_text(prior_json, encoding="utf-8")
+
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", return_value=_StubProc()):
+                ret_fail = main(["login", "existing-acc", "--force"], engine=real_engine)
+
+            self.assertEqual(ret_fail, 1)
+            self.assertIn("Error:", stderr_buf.getvalue())
+            self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_json)
+            self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+    def test_login_standard_interactive_tty_end_to_end(self):
+        """[TTY-LOGIN-001] main(['login', 'work-acc']) invokes login_account, inherits TTY stdio in temp HOME, and saves 0600 Standby token."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            # Pre-populate an active account to prove login leaves active pointer untouched
+            active_dir = real_engine.accounts_dir / "active-acc"
+            active_dir.mkdir(parents=True, exist_ok=True)
+            (active_dir / "token.json").write_text('{"active": true}', encoding="utf-8")
+            real_engine.active_file.write_text("active-acc\n", encoding="utf-8")
+
+            bin_dir = base / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            agy_bin = bin_dir / "agy"
+            agy_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            agy_bin.chmod(0o755)
+
+            observed_popen = {}
+
+            class _StubProc:
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def mock_popen(args, **kwargs):
+                temp_home = Path(kwargs["env"]["HOME"])
+                observed_popen["args"] = args
+                observed_popen["stdin_is_sys"] = kwargs.get("stdin") is sys.stdin
+                observed_popen["stdout_is_sys"] = kwargs.get("stdout") is sys.stdout
+                observed_popen["stderr_is_sys"] = kwargs.get("stderr") is sys.stderr
+                observed_popen["cwd"] = kwargs.get("cwd")
+                observed_popen["temp_home"] = temp_home
+                observed_popen["temp_home_exists_during_spawn"] = temp_home.is_dir()
+
+                tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                tok.parent.mkdir(parents=True, exist_ok=True)
+                tok.write_text(
+                    json.dumps({
+                        "token": {
+                            "access_token": "ya29.tty_work",
+                            "token_type": "Bearer",
+                            "refresh_token": "1//tty_work",
+                            "expiry": "2026-12-31T23:59:59Z",
+                        },
+                        "auth_method": "oauth",
+                        "id_token_email": "work@example.com",
+                    }),
+                    encoding="utf-8",
+                )
+                return _StubProc()
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+            clean_env["PATH"] = str(bin_dir)
+            clean_env["HOME"] = str(base)
+
+            with patch.dict(os.environ, clean_env, clear=True), \
+                 patch.object(real_engine, "login_account", wraps=real_engine.login_account) as spy_login, \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf), \
+                 patch("subprocess.Popen", side_effect=mock_popen):
+                ret = main(["login", "work-acc"], engine=real_engine)
+
+            self.assertEqual(ret, 0)
+            self.assertEqual(stderr_buf.getvalue(), "")
+            spy_login.assert_called_once_with("work-acc", agy_binary=None, timeout=600, force=False)
+            self.assertEqual(observed_popen["args"], [str(agy_bin)])
+            self.assertTrue(observed_popen["stdin_is_sys"])
+            self.assertTrue(observed_popen["stdout_is_sys"])
+            self.assertTrue(observed_popen["stderr_is_sys"])
+            self.assertTrue(observed_popen["temp_home_exists_during_spawn"])
+            self.assertNotEqual(observed_popen["temp_home"], base)
+            self.assertEqual(observed_popen["cwd"], str(observed_popen["temp_home"]))
+            self.assertFalse(observed_popen["temp_home"].exists())
+
+            saved_token = real_engine.accounts_dir / "work-acc" / "token.json"
+            self.assertTrue(saved_token.is_file())
+            self.assertEqual(stat.S_IMODE(saved_token.stat().st_mode), 0o600)
+            saved_data = json.loads(saved_token.read_text(encoding="utf-8"))
+            self.assertEqual(saved_data["token"]["access_token"], "ya29.tty_work")
+            self.assertEqual(saved_data["id_token_email"], "work@example.com")
+            self.assertEqual(real_engine.get_active_name(), "active-acc")
+            self.assertIn("Status: Standby", stdout_buf.getvalue())
+            self.assertIn(str(saved_token), stdout_buf.getvalue())
+
+    def test_login_overwrite_confirmation_cli_lifecycle_and_jetski_fallback(self):
+        """[TTY-LOGIN-EDGE-001] CLI overwrite decline/EOF/KeyboardInterrupt exits 1 before agy spawn; confirm/force accepts jetski fallback."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            existing_dir = real_engine.accounts_dir / "existing-acc"
+            existing_dir.mkdir(parents=True, exist_ok=True)
+            existing_token = existing_dir / "token.json"
+            prior_json = json.dumps({
+                "token": {
+                    "access_token": "ya29.prior",
+                    "token_type": "Bearer",
+                    "refresh_token": "1//prior",
+                    "expiry": "2026-12-31T23:59:59Z",
+                },
+                "auth_method": "oauth",
+                "id_token_email": "prior@example.com",
+            })
+            existing_token.write_text(prior_json, encoding="utf-8")
+            existing_token.chmod(0o600)
+
+            for label, side_eff in (("n", "n"), ("empty", ""), ("eof", EOFError()), ("sigint", KeyboardInterrupt())):
+                with self.subTest(decline=label):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch("builtins.input", side_effect=[side_eff]) as mock_input, \
+                         patch.object(real_engine, "resolve_agy_binary") as mock_resolve, \
+                         patch("subprocess.Popen") as mock_popen:
+                        ret = main(["login", "existing-acc"], engine=real_engine)
+
+                    self.assertEqual(ret, 1)
+                    self.assertEqual(stdout_buf.getvalue(), "")
+                    self.assertIn("Error:", stderr_buf.getvalue())
+                    mock_input.assert_called_once()
+                    mock_resolve.assert_not_called()
+                    mock_popen.assert_not_called()
+                    self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_json)
+                    self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+
+            class _StubProc:
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def make_jetski_popen(access_tok: str, email: str):
+                def _mock_popen(args, **kwargs):
+                    temp_home = Path(kwargs["env"]["HOME"])
+                    jetski_tok = temp_home / ".gemini" / "jetski-standalone-oauth-token"
+                    jetski_tok.parent.mkdir(parents=True, exist_ok=True)
+                    jetski_tok.write_text(
+                        json.dumps({
+                            "token": {
+                                "access_token": access_tok,
+                                "token_type": "Bearer",
+                                "refresh_token": f"1//{access_tok}",
+                                "expiry": "2026-12-31T23:59:59Z",
+                            },
+                            "auth_method": "oauth",
+                            "id_token_email": email,
+                        }),
+                        encoding="utf-8",
+                    )
+                    return _StubProc()
+
+                return _mock_popen
+
+            stdout_confirm = io.StringIO()
+            stderr_confirm = io.StringIO()
+            with patch("sys.stdout", stdout_confirm), \
+                 patch("sys.stderr", stderr_confirm), \
+                 patch("builtins.input", return_value="y") as mock_input_yes, \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy") as mock_resolve_yes, \
+                 patch("subprocess.Popen", side_effect=make_jetski_popen("ya29.cli_confirm", "cli-confirm@example.com")) as mock_popen_yes:
+                ret_yes = main(["login", "existing-acc"], engine=real_engine)
+
+            self.assertEqual(ret_yes, 0)
+            self.assertEqual(stderr_confirm.getvalue(), "")
+            mock_input_yes.assert_called_once()
+            mock_resolve_yes.assert_called_once_with(None)
+            mock_popen_yes.assert_called_once()
+            self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(existing_token.read_text(encoding="utf-8"))["token"]["access_token"], "ya29.cli_confirm")
+
+            stdout_force = io.StringIO()
+            stderr_force = io.StringIO()
+            with patch("sys.stdout", stdout_force), \
+                 patch("sys.stderr", stderr_force), \
+                 patch("builtins.input") as mock_input_force, \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy") as mock_resolve_force, \
+                 patch("subprocess.Popen", side_effect=make_jetski_popen("ya29.cli_force", "cli-force@example.com")) as mock_popen_force:
+                ret_force = main(["login", "existing-acc", "--force"], engine=real_engine)
+
+            self.assertEqual(ret_force, 0)
+            self.assertEqual(stderr_force.getvalue(), "")
+            mock_input_force.assert_not_called()
+            mock_resolve_force.assert_called_once_with(None)
+            mock_popen_force.assert_called_once()
+            self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(existing_token.read_text(encoding="utf-8"))["token"]["access_token"], "ya29.cli_force")
+
+    def test_login_cli_missing_binary_tokenless_timeout_interrupt_and_corrupt_cleanup(self):
+        """[TTY-LOGIN-ERR-003][TTY-LOGIN-ERR-004] main(['login', ...]) exits 1 to stderr and leaves no partial account dir."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            fail_dir = real_engine.accounts_dir / "fail-acc"
+            bad_dir = real_engine.accounts_dir / "bad-tok"
+
+            # 1. Missing agy binary
+            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+            stdout_missing = io.StringIO()
+            stderr_missing = io.StringIO()
+            with patch.dict(os.environ, clean_env, clear=True), \
+                 patch("agy_switcher.vault.Path.home", return_value=base), \
+                 patch("agy_switcher.vault.shutil.which", return_value=None), \
+                 patch("sys.stdout", stdout_missing), \
+                 patch("sys.stderr", stderr_missing), \
+                 patch("subprocess.Popen") as mock_popen:
+                ret_missing = main(["login", "fail-acc"], engine=real_engine)
+
+            self.assertEqual(ret_missing, 1)
+            self.assertEqual(stdout_missing.getvalue(), "")
+            self.assertIn("Error:", stderr_missing.getvalue())
+            mock_popen.assert_not_called()
+            self.assertFalse(fail_dir.exists())
+
+            class _StubProc:
+                def __init__(self, returncode=0):
+                    self.returncode = returncode
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            # 2. agy exits 0 or non-zero without producing a token file
+            for exit_code in (0, 1):
+                with self.subTest(exit_code=exit_code):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", return_value=_StubProc(returncode=exit_code)):
+                        ret = main(["login", "fail-acc"], engine=real_engine)
+                    self.assertEqual(ret, 1)
+                    self.assertEqual(stdout_buf.getvalue(), "")
+                    self.assertIn("Error:", stderr_buf.getvalue())
+                    self.assertFalse(fail_dir.exists())
+
+            # 3. Timeout and KeyboardInterrupt terminate/kill/reap stubborn child cleanly
+            class _StubbornProc:
+                def __init__(self):
+                    self.terminated = False
+                    self.killed = False
+                    self.wait_calls = 0
+
+                def poll(self):
+                    return None
+
+                def terminate(self):
+                    self.terminated = True
+
+                def wait(self, timeout=None):
+                    self.wait_calls += 1
+                    if self.wait_calls == 1:
+                        raise subprocess.TimeoutExpired(cmd="agy", timeout=timeout or 3)
+                    return -9
+
+                def kill(self):
+                    self.killed = True
+
+            timeout_proc = _StubbornProc()
+            stdout_to = io.StringIO()
+            stderr_to = io.StringIO()
+            with patch("sys.stdout", stdout_to), \
+                 patch("sys.stderr", stderr_to), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", return_value=timeout_proc), \
+                 patch("time.sleep", return_value=None), \
+                 patch("time.time", side_effect=itertools.chain([0.0], itertools.repeat(100.0))):
+                ret_to = main(["login", "fail-acc", "--timeout", "5"], engine=real_engine)
+
+            self.assertEqual(ret_to, 1)
+            self.assertEqual(stdout_to.getvalue(), "")
+            self.assertIn("Error:", stderr_to.getvalue())
+            self.assertTrue(timeout_proc.terminated)
+            self.assertTrue(timeout_proc.killed)
+            self.assertEqual(timeout_proc.wait_calls, 2)
+            self.assertFalse(fail_dir.exists())
+
+            interrupt_proc = _StubbornProc()
+            stdout_int = io.StringIO()
+            stderr_int = io.StringIO()
+            with patch("sys.stdout", stdout_int), \
+                 patch("sys.stderr", stderr_int), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", return_value=interrupt_proc), \
+                 patch("time.sleep", side_effect=KeyboardInterrupt):
+                ret_int = main(["login", "fail-acc"], engine=real_engine)
+
+            self.assertEqual(ret_int, 1)
+            self.assertEqual(stdout_int.getvalue(), "")
+            self.assertIn("Error:", stderr_int.getvalue())
+            self.assertTrue(interrupt_proc.terminated)
+            self.assertTrue(interrupt_proc.killed)
+            self.assertEqual(interrupt_proc.wait_calls, 2)
+            self.assertFalse(fail_dir.exists())
+
+            # 4. Corrupt token JSON / missing OAuth fields
+            for bad_body in ("{not-json", json.dumps({"token": {"access_token": "ya29.only"}})):
+                with self.subTest(bad_body=bad_body):
+                    def _mock_popen_bad_tok(args, *, _body=bad_body, **kwargs):
+                        temp_home = Path(kwargs["env"]["HOME"])
+                        tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                        tok.parent.mkdir(parents=True, exist_ok=True)
+                        tok.write_text(_body, encoding="utf-8")
+                        return _StubProc(returncode=0)
+
+                    stdout_bad = io.StringIO()
+                    stderr_bad = io.StringIO()
+                    with patch("sys.stdout", stdout_bad), \
+                         patch("sys.stderr", stderr_bad), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", side_effect=_mock_popen_bad_tok):
+                        ret_bad = main(["login", "bad-tok"], engine=real_engine)
+
+                    self.assertEqual(ret_bad, 1)
+                    self.assertEqual(stdout_bad.getvalue(), "")
+                    self.assertIn("Error:", stderr_bad.getvalue())
+                    self.assertFalse(bad_dir.exists())
+
+            # 5. Vault write PermissionError / OSError aborts cleanly without partial accounts/bad-tok dir
+            def _mock_popen_valid_tok(args, **kwargs):
+                temp_home = Path(kwargs["env"]["HOME"])
+                tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                tok.parent.mkdir(parents=True, exist_ok=True)
+                tok.write_text(
+                    json.dumps({
+                        "token": {
+                            "access_token": "ya29.badtok",
+                            "token_type": "Bearer",
+                            "refresh_token": "1//badtok",
+                            "expiry": "2026-12-31T23:59:59Z",
+                        },
+                        "auth_method": "oauth",
+                        "id_token_email": "badtok@example.com",
+                    }),
+                    encoding="utf-8",
+                )
+                return _StubProc(returncode=0)
+
+            for patch_target, err in (
+                ("agy_switcher.security.os.replace", PermissionError("simulated permission denied")),
+                ("agy_switcher.security.tempfile.mkstemp", OSError("simulated os error")),
+            ):
+                with self.subTest(patch_target=patch_target):
+                    stdout_perm = io.StringIO()
+                    stderr_perm = io.StringIO()
+                    with patch("sys.stdout", stdout_perm), \
+                         patch("sys.stderr", stderr_perm), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", side_effect=_mock_popen_valid_tok), \
+                         patch(patch_target, side_effect=err):
+                        ret_perm = main(["login", "bad-tok"], engine=real_engine)
+
+                    self.assertEqual(ret_perm, 1)
+                    self.assertEqual(stdout_perm.getvalue(), "")
+                    self.assertIn("Error:", stderr_perm.getvalue())
+                    self.assertFalse(bad_dir.exists())
 
 
     def test_vault_export_and_import_routing(self):
@@ -1852,6 +1728,72 @@ class TestCLI(unittest.TestCase):
         self.assertFalse(hasattr(cli_mod, "_get_default_oauth_url"))
         self.assertFalse(hasattr(telemetry_mod, "build_oauth_url"))
         self.assertTrue(bool(DEFAULT_CLIENT_ID))
+
+    def test_login_failure_never_emits_oob_or_static_oauth_urls_OOB_RETIRE_EDGE_001(self):
+        """[OOB-RETIRE-EDGE-001] TTY login failure never falls back to OOB URLs or static OAuth URLs on stdout/stderr."""
+        import agy_switcher.cli as cli_mod
+        import agy_switcher.telemetry as telemetry_mod
+        from agy_switcher.telemetry import DEFAULT_CLIENT_ID
+
+        self.assertTrue(bool(DEFAULT_CLIENT_ID))
+        self.assertFalse(hasattr(cli_mod, "_get_default_oauth_url"))
+        self.assertFalse(hasattr(telemetry_mod, "build_oauth_url"))
+        self.assertFalse(hasattr(AgySwitchEngine, "get_oauth_url"))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            self.assertFalse(hasattr(real_engine, "get_oauth_url"))
+
+            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+            stdout_missing = io.StringIO()
+            stderr_missing = io.StringIO()
+            with patch.dict(os.environ, clean_env, clear=True), \
+                 patch("agy_switcher.vault.Path.home", return_value=base), \
+                 patch("agy_switcher.vault.shutil.which", return_value=None), \
+                 patch("sys.stdout", stdout_missing), \
+                 patch("sys.stderr", stderr_missing):
+                ret_missing = main(["login", "fail-acc"], engine=real_engine)
+
+            self.assertEqual(ret_missing, 1)
+            stdout_missing_val = stdout_missing.getvalue()
+            stderr_missing_val = stderr_missing.getvalue()
+            self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_missing_val)
+            self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stderr_missing_val)
+            self.assertNotIn("accounts.google.com/o/oauth2", stdout_missing_val)
+            self.assertNotIn("accounts.google.com/o/oauth2", stderr_missing_val)
+
+            class _StubProc:
+                def __init__(self, returncode: int = 0) -> None:
+                    self.returncode = returncode
+
+                def poll(self) -> int:
+                    return self.returncode
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return self.returncode
+
+            for exit_code in (0, 1):
+                with self.subTest(exit_code=exit_code):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", return_value=_StubProc(returncode=exit_code)):
+                        ret = main(["login", "fail-acc"], engine=real_engine)
+
+                    self.assertEqual(ret, 1)
+                    stdout_val = stdout_buf.getvalue()
+                    stderr_val = stderr_buf.getvalue()
+                    self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_val)
+                    self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stderr_val)
+                    self.assertNotIn("accounts.google.com/o/oauth2", stdout_val)
+                    self.assertNotIn("accounts.google.com/o/oauth2", stderr_val)
 
 
 if __name__ == '__main__':
