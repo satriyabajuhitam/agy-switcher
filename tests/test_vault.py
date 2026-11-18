@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import email.message
 import io
+import itertools
 import json
 from pathlib import Path
 import stat
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -20,7 +22,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from agy_switcher.vault import AgySwitchEngine
+from agy_switcher.vault import AgySwitchEngine, AgySwitchError
 
 
 def make_valid_token_payload(email: str = "remote@example.com") -> dict[str, object]:
@@ -741,6 +743,187 @@ class TestAgySwitchEngine(unittest.TestCase):
             migrated_live = engine.auto_migrate_if_needed()
             self.assertEqual(migrated_live, ["work"])
             self.assertEqual(engine.get_status()["email"], "work@example.com")
+
+    def test_login_account_invalid_alias_rejected_before_prompt_or_spawn(self) -> None:
+        """[TTY-LOGIN-ERR-001] Invalid aliases fail validate_account_alias before prompt, resolve_agy_binary, or Popen."""
+        # Create sibling directory outside accounts/ so '../bad' would exist if unvalidated
+        (self.vault_dir / "bad").mkdir(parents=True, exist_ok=True)
+        existing_dir = self.engine.accounts_dir / "valid-acc"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        (existing_dir / "token.json").write_text('{"keep": true}', encoding="utf-8")
+
+        invalid_aliases: list[object] = [
+            "../bad",
+            "..",
+            ".",
+            "my account",
+            "",
+            "   ",
+            "\t\n",
+            "a/b",
+            "a\\b",
+            "bad\x00acc",
+            "a" * 65,
+            " " + "a" * 65 + " ",
+            None,
+            123,
+        ]
+        for alias in invalid_aliases:
+            for force in (False, True):
+                with self.subTest(alias=alias, force=force):
+                    prompt_calls: list[str] = []
+
+                    def fail_if_prompted(msg: str) -> str:
+                        prompt_calls.append(msg)
+                        return "y"
+
+                    with patch.object(
+                        self.engine,
+                        "validate_account_alias",
+                        wraps=self.engine.validate_account_alias,
+                    ) as spy_validate, \
+                         patch("builtins.input") as mock_input, \
+                         patch.object(self.engine, "resolve_agy_binary") as mock_resolve, \
+                         patch("subprocess.Popen") as mock_popen:
+                        with self.assertRaises(AgySwitchError):
+                            self.engine.login_account(cast(str, alias), force=force, prompt_fn=fail_if_prompted)
+                        if not force:
+                            with self.assertRaises(AgySwitchError):
+                                self.engine.login_account(cast(str, alias), force=False)
+
+                    self.assertEqual(spy_validate.call_args_list[0].args, (alias,))
+                    self.assertEqual(prompt_calls, [])
+                    mock_input.assert_not_called()
+                    mock_resolve.assert_not_called()
+                    mock_popen.assert_not_called()
+
+        self.assertEqual(list((self.vault_dir / "bad").iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.engine.accounts_dir.iterdir()), ["valid-acc"])
+        self.assertEqual((existing_dir / "token.json").read_text(encoding="utf-8"), '{"keep": true}')
+
+    def test_login_account_whitespace_normalization_and_failed_force_overwrite(self) -> None:
+        """[TTY-LOGIN-EDGE-002] Valid whitespace-padded alias normalizes and failed --force preserves prior token."""
+        work_payload = make_valid_token_payload("work@example.com")
+
+        def mock_popen_success(args: list[str], **kwargs: object) -> _StubLoginProcess:
+            env = kwargs.get("env")
+            assert isinstance(env, dict)
+            temp_home = Path(env["HOME"])
+            token_target = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+            token_target.parent.mkdir(parents=True, exist_ok=True)
+            token_target.write_text(json.dumps(work_payload), encoding="utf-8")
+            return _StubLoginProcess(returncode=0)
+
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", side_effect=mock_popen_success):
+            result = self.engine.login_account(" work-acc ")
+
+        self.assertEqual(result["name"], "work-acc")
+        self.assertEqual(result["email"], "work@example.com")
+        self.assertEqual(result["status"], "standby")
+        work_token = self.vault_dir / "accounts" / "work-acc" / "token.json"
+        self.assertTrue(work_token.is_file())
+        self.assertEqual(stat.S_IMODE(work_token.stat().st_mode), 0o600)
+        self.assertFalse((self.vault_dir / "accounts" / " work-acc ").exists())
+        self.assertIsNone(self.engine.get_active_name())
+
+        # Re-login with whitespace padding and force=False prompts with normalized alias
+        seen_prompts: list[str] = []
+        with self.assertRaises(AgySwitchError):
+            self.engine.login_account(
+                " work-acc ",
+                force=False,
+                prompt_fn=lambda msg: seen_prompts.append(msg) or "n",
+            )
+        self.assertEqual(len(seen_prompts), 1)
+        self.assertIn("'work-acc'", seen_prompts[0])
+
+        # Existing account prior token must remain intact when --force fails across all failure modes
+        existing_dir = self.vault_dir / "accounts" / "existing-acc"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        existing_token = existing_dir / "token.json"
+        prior_content = json.dumps(make_valid_token_payload("prior@example.com"))
+        existing_token.write_text(prior_content, encoding="utf-8")
+        existing_token.chmod(0o600)
+
+        # Case A: agy exits 0 or non-zero without producing a token
+        for exit_code in (0, 1):
+            with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", return_value=_StubLoginProcess(returncode=exit_code)):
+                with self.assertRaises(AgySwitchError):
+                    self.engine.login_account("existing-acc", force=True)
+
+            self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
+            self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+        # Case B: agy times out
+        class _HangingProcess:
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def poll(self) -> int | None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                return -15
+
+            def kill(self) -> None:
+                return None
+
+        hanging_proc = _HangingProcess()
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", return_value=hanging_proc), \
+             patch("time.sleep", return_value=None), \
+             patch("time.time", side_effect=itertools.chain([0.0], itertools.repeat(100.0))):
+            with self.assertRaises(AgySwitchError):
+                self.engine.login_account("existing-acc", timeout=5, force=True)
+
+        self.assertTrue(hanging_proc.terminated)
+        self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
+        self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+        # Case C: KeyboardInterrupt while agy is running
+        interrupted_proc = _HangingProcess()
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", return_value=interrupted_proc), \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(AgySwitchError):
+                self.engine.login_account("existing-acc", force=True)
+
+        self.assertTrue(interrupted_proc.terminated)
+        self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
+        self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+        # Case D: agy produces corrupt token JSON
+        def mock_popen_corrupt(args: list[str], **kwargs: object) -> _StubLoginProcess:
+            env = kwargs.get("env")
+            assert isinstance(env, dict)
+            temp_home = Path(env["HOME"])
+            token_target = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+            token_target.parent.mkdir(parents=True, exist_ok=True)
+            token_target.write_text("{not-valid-json", encoding="utf-8")
+            return _StubLoginProcess(returncode=0)
+
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", side_effect=mock_popen_corrupt):
+            with self.assertRaises(AgySwitchError):
+                self.engine.login_account("existing-acc", force=True)
+
+        self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
+        self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+        # Case E: atomic replace fails during --force write (preserves prior token & cleans temp file)
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", side_effect=mock_popen_success), \
+             patch("agy_switcher.security.os.replace", side_effect=OSError("simulated replace failure")):
+            with self.assertRaises(OSError):
+                self.engine.login_account("existing-acc", force=True)
+
+        self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
+        self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
 
 
 if __name__ == "__main__":

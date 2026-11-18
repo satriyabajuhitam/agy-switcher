@@ -1019,9 +1019,7 @@ class AgySwitchEngine:
         prompt_fn: Callable[[str], str] | None = None,
     ) -> dict[str, Any]:
         """Authenticates a new account via isolated agy CLI sandbox and saves to vault as Standby."""
-        clean_name = name.strip()
-        if not clean_name:
-            raise AgySwitchError("Account name cannot be empty.")
+        clean_name = self.validate_account_alias(name)
 
         acc_dir = self.accounts_dir / clean_name
         if acc_dir.is_dir() and not force:

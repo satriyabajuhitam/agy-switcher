@@ -947,6 +947,111 @@ class TestCLI(unittest.TestCase):
                 mock_popen_main.assert_not_called()
                 self.engine.login_account.assert_not_called()
 
+    def test_login_invalid_alias_cli_exits_one_and_preserves_vault(self):
+        """[TTY-LOGIN-ERR-001] main(['login', alias]) rejects invalid aliases to stderr with exit 1 without touching vault."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            (real_engine.vault_dir / "bad").mkdir(parents=True, exist_ok=True)
+            valid_dir = real_engine.accounts_dir / "valid-acc"
+            valid_dir.mkdir(parents=True, exist_ok=True)
+            (valid_dir / "token.json").write_text('{"keep": true}', encoding="utf-8")
+
+            invalid_aliases = ["../bad", "..", ".", "my account", "", "   ", "a/b", "a\\b", "bad\x00acc", "a" * 65]
+            for alias in invalid_aliases:
+                with self.subTest(alias=alias):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch("builtins.input") as mock_input, \
+                         patch.object(real_engine, "resolve_agy_binary") as mock_resolve, \
+                         patch("subprocess.Popen") as mock_popen:
+                        ret = main(["login", alias], engine=real_engine)
+
+                    self.assertEqual(ret, 1)
+                    self.assertEqual(stdout_buf.getvalue(), "")
+                    self.assertIn("Error:", stderr_buf.getvalue())
+                    mock_input.assert_not_called()
+                    mock_resolve.assert_not_called()
+                    mock_popen.assert_not_called()
+
+            self.assertEqual(list((real_engine.vault_dir / "bad").iterdir()), [])
+            self.assertEqual(sorted(p.name for p in real_engine.accounts_dir.iterdir()), ["valid-acc"])
+            self.assertEqual((valid_dir / "token.json").read_text(encoding="utf-8"), '{"keep": true}')
+
+    def test_login_account_cli_whitespace_and_failed_force_overwrite(self):
+        """[TTY-LOGIN-EDGE-002] main(['login', ' work-acc ']) normalizes alias and failed --force preserves prior token."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+
+            class _StubProc:
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def mock_popen_success(args, **kwargs):
+                temp_home = Path(kwargs["env"]["HOME"])
+                tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                tok.parent.mkdir(parents=True, exist_ok=True)
+                tok.write_text(
+                    json.dumps({
+                        "token": {
+                            "access_token": "ya29.work",
+                            "token_type": "Bearer",
+                            "refresh_token": "1//work",
+                            "expiry": "2026-12-31T23:59:59Z",
+                        },
+                        "auth_method": "oauth",
+                        "id_token_email": "work@example.com",
+                    }),
+                    encoding="utf-8",
+                )
+                return _StubProc()
+
+            stdout_buf = io.StringIO()
+            with patch("sys.stdout", stdout_buf), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", side_effect=mock_popen_success):
+                ret = main(["login", " work-acc "], engine=real_engine)
+
+            self.assertEqual(ret, 0)
+            stdout_text = stdout_buf.getvalue()
+            self.assertIn("Account 'work-acc' (work@example.com) successfully logged in", stdout_text)
+            self.assertIn("agy-switch switch work-acc", stdout_text)
+            self.assertIn(str(real_engine.accounts_dir / "work-acc" / "token.json"), stdout_text)
+            self.assertNotIn(" work-acc ", stdout_text)
+            self.assertTrue((real_engine.accounts_dir / "work-acc" / "token.json").is_file())
+            self.assertFalse((real_engine.accounts_dir / " work-acc ").exists())
+
+            existing_dir = real_engine.accounts_dir / "existing-acc"
+            existing_dir.mkdir(parents=True, exist_ok=True)
+            existing_token = existing_dir / "token.json"
+            prior_json = '{"prior": "token"}'
+            existing_token.write_text(prior_json, encoding="utf-8")
+
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", return_value=_StubProc()):
+                ret_fail = main(["login", "existing-acc", "--force"], engine=real_engine)
+
+            self.assertEqual(ret_fail, 1)
+            self.assertIn("Error:", stderr_buf.getvalue())
+            self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_json)
+            self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
 
     def test_vault_export_and_import_routing(self):
         """Subcommand routing: Add vault parser with export and import subcommands."""
