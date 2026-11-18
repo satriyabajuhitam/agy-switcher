@@ -29,6 +29,8 @@ import tarfile
 import tempfile
 import time
 from typing import Any, Callable, cast
+import urllib.error
+import urllib.request
 
 from agy_switcher.exceptions import (
     AccountNotFoundError,
@@ -42,6 +44,7 @@ from agy_switcher.security import (
     _atomic_write_file,
     _atomic_write_json,
     extract_email_from_jwt,
+    resolve_token_email,
     validate_token_dict,
     validate_token_file,
 )
@@ -55,6 +58,50 @@ from agy_switcher.doctor import DoctorEngine
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_LEGACY_ROOT = Path.home() / ".agy-cli-manager"
+GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
+USERINFO_TIMEOUT_SECONDS = 5.0
+
+
+def _fetch_google_userinfo_email(
+    access_token: str,
+    timeout: float = USERINFO_TIMEOUT_SECONDS,
+) -> str | None:
+    """Best-effort Google UserInfo email lookup using a bearer access token."""
+    if not isinstance(access_token, str):
+        return None
+    clean_token = access_token.strip()
+    if not clean_token or any(ord(ch) < 32 for ch in clean_token):
+        return None
+
+    req = urllib.request.Request(
+        GOOGLE_USERINFO_ENDPOINT,
+        headers={"Authorization": f"Bearer {clean_token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+    try:
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        payload = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    email = payload.get("email")
+    if isinstance(email, str) and email.strip():
+        return email.strip()
+    return None
 
 
 class AgySwitchEngine:
@@ -627,6 +674,37 @@ class AgySwitchEngine:
         """Unified Facade alias for switch_tokens matching specification."""
         return self.switch_tokens(name=name, restart_server=not no_restart, force=force)
 
+    def _resolve_and_enrich_registration_email(self, token_data: dict[str, Any]) -> str | None:
+        """Resolves Token Identity via id_token/id_token_email or best-effort Google UserInfo lookup."""
+        email = resolve_token_email(token_data)
+        if email is not None:
+            return email
+
+        token_obj = token_data.get("token")
+        if not isinstance(token_obj, dict):
+            return None
+        access_token = token_obj.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            return None
+
+        fetched_email = _fetch_google_userinfo_email(access_token)
+        if fetched_email is not None:
+            token_data["id_token_email"] = fetched_email
+            return fetched_email
+        return None
+
+    def _persist_registered_account(
+        self,
+        acc_dir: Path,
+        token_data: dict[str, Any],
+    ) -> str | None:
+        """Enriches registration Token Identity and writes accounts/<alias>/token.json atomically (0600)."""
+        email = self._resolve_and_enrich_registration_email(token_data)
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        dest_token = acc_dir / "token.json"
+        self._atomic_write_json(dest_token, token_data)
+        return email
+
     def add_account(self, name: str, token_path: Path) -> dict[str, Any]:
         """Validates and registers a new account in the vault."""
         clean_name = name.strip()
@@ -637,11 +715,7 @@ class AgySwitchEngine:
         token_data = self.validate_token_file(token_file)
 
         acc_dir = self.accounts_dir / clean_name
-        acc_dir.mkdir(parents=True, exist_ok=True)
-        dest_token = acc_dir / "token.json"
-        self._atomic_write_json(dest_token, token_data)
-
-        email = self.extract_email_from_jwt(token_data.get("id_token", ""))
+        email = self._persist_registered_account(acc_dir, token_data)
         return {"name": clean_name, "email": email}
 
     def remove_account(self, name: str, force: bool = False) -> None:
@@ -985,9 +1059,7 @@ class AgySwitchEngine:
                     raise AgySwitchError("agy login did not produce a usable auth token profile.")
 
             token_data = self.validate_token_file(token_file)
-            acc_dir.mkdir(parents=True, exist_ok=True)
-            self._atomic_write_json(acc_dir / "token.json", token_data)
-            email = self.extract_email_from_jwt(token_data.get("id_token", ""))
+            email = self._persist_registered_account(acc_dir, token_data)
 
             return {
                 "name": clean_name,
@@ -1139,11 +1211,9 @@ class AgySwitchEngine:
                 return False, f"OAuth token exchange failed: invalid token data ({exc})"
 
             try:
-                acc_dir.mkdir(parents=True, exist_ok=True)
-                token_path = acc_dir / "token.json"
-                self._atomic_write_json(token_path, token_data)
+                self._persist_registered_account(acc_dir, token_data)
                 try:
-                    os.chmod(token_path, 0o600)
+                    os.chmod(acc_dir / "token.json", 0o600)
                 except OSError:
                     pass
             except Exception as exc:

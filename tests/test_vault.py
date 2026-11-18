@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import email.message
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,8 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+import urllib.error
+import urllib.request
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -37,6 +41,37 @@ def make_valid_token_payload(email: str = "remote@example.com") -> dict[str, obj
         "auth_method": "oauth",
         "id_token": f"header.{payload_b64}.signature",
     }
+
+
+def make_token_payload_without_identity(
+    access_token: str = "ya29.no_identity_access_token",
+) -> dict[str, object]:
+    """Generates a valid agy 1.5.10 OAuth token lacking both id_token and id_token_email."""
+    return {
+        "token": {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "refresh_token": "1//no_identity_refresh_token",
+            "expiry": "2026-12-31T23:59:59Z",
+        },
+        "auth_method": "oauth",
+    }
+
+
+class _MockHTTPResponse:
+    """Minimal context-manager HTTP response stub for urllib.request.urlopen."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _MockHTTPResponse:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
 
 
 class MockSubprocess:
@@ -373,6 +408,239 @@ class TestAgySwitchEngine(unittest.TestCase):
                 mock_popen.assert_not_called()
 
         self.assertEqual(json.loads(token_path.read_text(encoding="utf-8")), existing_payload)
+
+    def _run_registration_path(
+        self,
+        method: str,
+        alias: str,
+        payload: dict[str, object],
+    ) -> dict[str, object] | tuple[bool, str]:
+        """Executes add_account, login_account, or login_headless with subprocess mocked."""
+        if method == "add_account":
+            src_token = self.base_path / f"{alias}_src_token.json"
+            src_token.write_text(json.dumps(payload), encoding="utf-8")
+            return self.engine.add_account(alias, src_token)
+
+        def mock_popen(args: list[str], **kwargs: object) -> MockSubprocess:
+            env = kwargs.get("env")
+            assert isinstance(env, dict)
+            temp_home = Path(env["HOME"])
+            if method == "login_account":
+                token_target = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                token_target.parent.mkdir(parents=True, exist_ok=True)
+                token_target.write_text(json.dumps(payload), encoding="utf-8")
+            return MockSubprocess(temp_home=temp_home, should_succeed=True, token_payload=payload)
+
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", side_effect=mock_popen):
+            if method == "login_account":
+                return self.engine.login_account(alias, force=True)
+            return self.engine.login_headless(
+                alias=alias,
+                force=True,
+                prompt_fn=lambda _p: "4/0AWgav-valid-code",
+            )
+
+    def test_add_account_and_login_userinfo_persists_id_token_email(self) -> None:
+        """[IDENTITY-RES-002] Missing id_token/id_token_email resolves email via Google UserInfo and writes 0600 id_token_email."""
+        for method in ("add_account", "login_account", "login_headless"):
+            with self.subTest(method=method):
+                alias = f"ui_{method}"
+                access_token = f"ya29.userinfo_tok_{method}"
+                payload = make_token_payload_without_identity(access_token=access_token)
+                captured_requests: list[tuple[urllib.request.Request, object]] = []
+
+                def mock_urlopen(req: urllib.request.Request, timeout: object = None) -> _MockHTTPResponse:
+                    captured_requests.append((req, timeout))
+                    return _MockHTTPResponse(b'{"email": "userinfo@example.com", "verified_email": true}')
+
+                with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+                    result = self._run_registration_path(method, alias, payload)
+
+                self.assertEqual(len(captured_requests), 1, f"Expected 1 UserInfo call for {method}")
+                req, timeout = captured_requests[0]
+                self.assertEqual(req.get_method(), "GET")
+                self.assertIn("googleapis.com", req.full_url)
+                self.assertIn("userinfo", req.full_url)
+                self.assertEqual(req.get_header("Authorization"), f"Bearer {access_token}")
+                self.assertIsInstance(timeout, (int, float))
+                assert isinstance(timeout, (int, float))
+                self.assertGreater(timeout, 0.0)
+
+                token_path = self.vault_dir / "accounts" / alias / "token.json"
+                self.assertTrue(token_path.is_file())
+                self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+                saved = json.loads(token_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved.get("id_token_email"), "userinfo@example.com")
+
+                if method == "add_account":
+                    self.assertEqual(result, {"name": alias, "email": "userinfo@example.com"})
+                elif method == "login_account":
+                    self.assertEqual(
+                        result,
+                        {"name": alias, "email": "userinfo@example.com", "status": "standby"},
+                    )
+                else:
+                    self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+    def test_add_account_and_login_skip_userinfo_when_id_token_email_present(self) -> None:
+        """Registration resolves existing id_token_email without calling Google UserInfo."""
+        for method in ("add_account", "login_account", "login_headless"):
+            with self.subTest(method=method):
+                alias = f"existing_email_{method}"
+                payload = make_token_payload_without_identity()
+                payload["id_token_email"] = "  preset@example.com  "
+
+                with patch("urllib.request.urlopen") as mock_urlopen:
+                    result = self._run_registration_path(method, alias, payload)
+
+                mock_urlopen.assert_not_called()
+                if method in ("add_account", "login_account"):
+                    assert isinstance(result, dict)
+                    self.assertEqual(result.get("email"), "preset@example.com")
+                else:
+                    self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+    def test_add_account_and_login_userinfo_errors_degrade_gracefully(self) -> None:
+        """[IDENTITY-ERR-001] URLError, TimeoutError, and HTTP 503 degrade gracefully to email=None without aborting registration."""
+        hdrs = email.message.Message()
+        errors: list[tuple[str, Exception]] = [
+            ("url_error", urllib.error.URLError("Network unreachable")),
+            ("timeout_error", TimeoutError("Connection timed out")),
+            (
+                "http_503",
+                urllib.error.HTTPError(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    503,
+                    "Service Unavailable",
+                    hdrs,
+                    io.BytesIO(b"Service Unavailable"),
+                ),
+            ),
+        ]
+
+        for err_label, err in errors:
+            for method in ("add_account", "login_account", "login_headless"):
+                with self.subTest(err=err_label, method=method):
+                    alias = f"err_{err_label}_{method}"
+                    payload = make_token_payload_without_identity()
+
+                    with patch("urllib.request.urlopen", side_effect=err) as mock_urlopen:
+                        result = self._run_registration_path(method, alias, payload)
+
+                    self.assertEqual(mock_urlopen.call_count, 1)
+                    token_path = self.vault_dir / "accounts" / alias / "token.json"
+                    self.assertTrue(token_path.is_file())
+                    self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+                    saved = json.loads(token_path.read_text(encoding="utf-8"))
+                    self.assertNotIn("id_token_email", saved)
+                    expected_token = payload["token"]
+                    assert isinstance(expected_token, dict)
+                    self.assertEqual(saved["token"]["access_token"], expected_token["access_token"])
+
+                    if method == "add_account":
+                        self.assertEqual(result, {"name": alias, "email": None})
+                    elif method == "login_account":
+                        self.assertEqual(result, {"name": alias, "email": None, "status": "standby"})
+                    else:
+                        self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+    def test_add_account_and_login_skip_userinfo_when_id_token_has_email(self) -> None:
+        """Registration resolves existing id_token JWT email without calling Google UserInfo."""
+        for method in ("add_account", "login_account", "login_headless"):
+            with self.subTest(method=method):
+                alias = f"jwt_email_{method}"
+                payload = make_valid_token_payload("jwt_user@example.com")
+
+                with patch("urllib.request.urlopen") as mock_urlopen:
+                    result = self._run_registration_path(method, alias, payload)
+
+                mock_urlopen.assert_not_called()
+                token_path = self.vault_dir / "accounts" / alias / "token.json"
+                self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+                saved = json.loads(token_path.read_text(encoding="utf-8"))
+                self.assertNotIn("id_token_email", saved)
+                if method == "add_account":
+                    self.assertEqual(result, {"name": alias, "email": "jwt_user@example.com"})
+                elif method == "login_account":
+                    self.assertEqual(
+                        result,
+                        {"name": alias, "email": "jwt_user@example.com", "status": "standby"},
+                    )
+                else:
+                    self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+    def test_add_account_and_login_userinfo_fallback_when_jwt_lacks_email_claim(self) -> None:
+        """Valid JWT without email claim falls back to Google UserInfo lookup during registration."""
+        no_email_jwt_payload = base64.urlsafe_b64encode(b'{"sub":"no_email_user"}').decode("utf-8").rstrip("=")
+        for method in ("add_account", "login_account", "login_headless"):
+            with self.subTest(method=method):
+                alias = f"jwt_no_email_{method}"
+                payload = make_token_payload_without_identity(access_token=f"ya29.jwt_no_email_{method}")
+                payload["id_token"] = f"header.{no_email_jwt_payload}.signature"
+
+                with patch(
+                    "urllib.request.urlopen",
+                    return_value=_MockHTTPResponse(b'{"email": "from_userinfo@example.com"}'),
+                ) as mock_urlopen:
+                    result = self._run_registration_path(method, alias, payload)
+
+                mock_urlopen.assert_called_once()
+                token_path = self.vault_dir / "accounts" / alias / "token.json"
+                self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+                saved = json.loads(token_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved.get("id_token_email"), "from_userinfo@example.com")
+                if method == "add_account":
+                    self.assertEqual(result, {"name": alias, "email": "from_userinfo@example.com"})
+                elif method == "login_account":
+                    self.assertEqual(
+                        result,
+                        {"name": alias, "email": "from_userinfo@example.com", "status": "standby"},
+                    )
+                else:
+                    self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+    def test_add_account_and_login_userinfo_incomplete_read_and_control_char_token_degrade(self) -> None:
+        """http.client.IncompleteRead and control-char access_token degrade cleanly without aborting or leaking tokens."""
+        import http.client
+
+        for method in ("add_account", "login_account", "login_headless"):
+            with self.subTest(case="incomplete_read", method=method):
+                alias = f"incomplete_{method}"
+                secret_tok = f"ya29.secret_tok_{method}"
+                payload = make_token_payload_without_identity(access_token=secret_tok)
+
+                class _IncompleteResp:
+                    def read(self) -> bytes:
+                        raise http.client.IncompleteRead(b'{"email": "half')
+
+                    def __enter__(self) -> _IncompleteResp:
+                        return self
+
+                    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                        return None
+
+                with patch("urllib.request.urlopen", return_value=_IncompleteResp()) as mock_urlopen:
+                    result = self._run_registration_path(method, alias, payload)
+
+                mock_urlopen.assert_called_once()
+                token_path = self.vault_dir / "accounts" / alias / "token.json"
+                self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+                saved = json.loads(token_path.read_text(encoding="utf-8"))
+                self.assertNotIn("id_token_email", saved)
+                self.assertNotIn(secret_tok, repr(result))
+                if method == "add_account":
+                    self.assertEqual(result, {"name": alias, "email": None})
+                elif method == "login_account":
+                    self.assertEqual(result, {"name": alias, "email": None, "status": "standby"})
+                else:
+                    self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+        ctrl_payload = make_token_payload_without_identity(access_token="ya29.bad\r\nX-Injected: 1")
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            result = self._run_registration_path("add_account", "ctrl_tok_acc", ctrl_payload)
+        mock_urlopen.assert_not_called()
+        self.assertEqual(result, {"name": "ctrl_tok_acc", "email": None})
 
 
 if __name__ == "__main__":
