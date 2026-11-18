@@ -146,28 +146,77 @@ def _stream_reader(
         out_queue.put(("eof", stream_name))
 
 
-def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
-    """Terminates a subprocess cleanly, escalating to kill if needed."""
+def _resolve_isolated_pgid(proc: subprocess.Popen[bytes]) -> int | None:
+    """Returns proc's process group ID only when isolated from the current process group."""
+    if os.name != "posix" or not hasattr(os, "getpgid"):
+        return None
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == os.getpid():
+        return None
+    try:
+        pgid = os.getpgid(pid)
+        if pgid == pid and pgid != os.getpgrp():
+            return pgid
+    except OSError:
+        return None
+    return None
+
+
+def _signal_process_or_group(
+    proc: subprocess.Popen[bytes],
+    pgid: int | None,
+    sig: int,
+) -> None:
+    """Signals the isolated process group when available, falling back to proc."""
+    if pgid is not None and os.name == "posix" and hasattr(os, "killpg"):
+        try:
+            os.killpg(pgid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    try:
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+def _terminate_process(proc: subprocess.Popen[bytes], pgid: int | None = None) -> None:
+    """Terminates a subprocess (and its isolated process group) cleanly, escalating to kill if needed."""
     try:
         if proc.poll() is not None:
             return
     except Exception:
         return
-    try:
-        proc.terminate()
-    except Exception:
-        pass
+    _signal_process_or_group(proc, pgid, signal.SIGTERM)
     try:
         proc.wait(timeout=3)
     except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _signal_process_or_group(proc, pgid, signal.SIGKILL)
         try:
             proc.wait(timeout=1)
         except Exception:
             pass
+        return
+
+    if pgid is not None and os.name == "posix" and hasattr(os, "killpg"):
+        grace_end = time.monotonic() + 0.1
+        while True:
+            try:
+                os.killpg(pgid, 0)
+            except OSError:
+                break
+            if time.monotonic() >= grace_end:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
+            time.sleep(0.01)
 
 
 def _close_process_streams(proc: subprocess.Popen[bytes]) -> None:
@@ -201,6 +250,28 @@ def _consume_stream_event(
             last_activity["stderr"] = time.monotonic()
     elif kind == "eof":
         open_streams.discard(payload)
+
+
+def _drain_stream_queue(
+    out_queue: _StreamEventQueue,
+    stdout_parts: list[str],
+    stderr_parts: list[str],
+    open_streams: set[str],
+    last_activity: dict[str, float] | None = None,
+) -> None:
+    """Consumes all currently buffered events from out_queue without blocking."""
+    while True:
+        next_event = out_queue.get_nowait()
+        if next_event is None:
+            break
+        _consume_stream_event(next_event, stdout_parts, stderr_parts, open_streams, last_activity)
+
+
+def _get_returncode(proc: subprocess.Popen[bytes]) -> int | None:
+    """Returns the subprocess exit code if terminated, otherwise None."""
+    if hasattr(proc, "returncode") and proc.returncode is not None:
+        return proc.returncode
+    return proc.poll()
 
 
 def _clean_email_str(value: object) -> str | None:
@@ -1267,7 +1338,8 @@ class AgySwitchEngine:
             return False, f"Invalid account alias: {exc}"
 
         acc_dir = self.accounts_dir / clean_alias
-        if acc_dir.is_dir() and not force:
+        existed_before = acc_dir.is_dir()
+        if existed_before and not force:
             return False, f"Account '{clean_alias}' already exists in vault. Overwrite aborted."
 
         try:
@@ -1293,10 +1365,12 @@ class AgySwitchEngine:
                     bufsize=0,
                     cwd=str(temp_home),
                     env=env,
+                    start_new_session=(os.name == "posix"),
                 )
             except Exception as exc:
                 return False, f"Failed to spawn agy login process: {exc}"
 
+            pgid = _resolve_isolated_pgid(proc)
             out_queue = _StreamEventQueue()
             open_streams: set[str] = set()
             threads: list[threading.Thread] = []
@@ -1316,9 +1390,11 @@ class AgySwitchEngine:
             deadline = time.monotonic() + max(0.0, float(timeout))
             last_activity: dict[str, float] = {}
             idle_flush_seconds = 0.05
+            streams_joined = False
 
             try:
                 pkce_url: str | None = None
+                exit_grace_deadline: float | None = None
                 while True:
                     now = time.monotonic()
                     stdout_text = "".join(stdout_parts)
@@ -1338,12 +1414,22 @@ class AgySwitchEngine:
                     if pkce_url is not None or not open_streams:
                         break
 
+                    if proc.poll() is not None:
+                        # Bound waiting on streams after child exit in case a grandchild inherited pipe FDs.
+                        if exit_grace_deadline is None:
+                            exit_grace_deadline = min(deadline, now + 0.2)
+                        if now >= exit_grace_deadline:
+                            break
+
                     remaining = deadline - now
                     if remaining <= 0:
-                        _terminate_process(proc)
+                        _terminate_process(proc, pgid=pgid)
                         return False, f"Login timed out after {timeout} seconds."
 
-                    event = out_queue.get(timeout=min(remaining, idle_flush_seconds))
+                    wait_timeout = min(remaining, idle_flush_seconds)
+                    if exit_grace_deadline is not None:
+                        wait_timeout = min(wait_timeout, max(0.005, exit_grace_deadline - now))
+                    event = out_queue.get(timeout=wait_timeout)
                     if event is None:
                         pkce_url = (
                             _extract_pkce_oauth_url(stdout_text, allow_incomplete_tail=True)
@@ -1354,28 +1440,29 @@ class AgySwitchEngine:
                         continue
 
                     _consume_stream_event(event, stdout_parts, stderr_parts, open_streams, last_activity)
-                    while True:
-                        next_event = out_queue.get_nowait()
-                        if next_event is None:
-                            break
-                        _consume_stream_event(
-                            next_event, stdout_parts, stderr_parts, open_streams, last_activity
-                        )
+                    _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
 
                 if pkce_url is None:
                     remaining = deadline - time.monotonic()
-                    if remaining > 0 and proc.poll() is None:
+                    if proc.poll() is None:
+                        if remaining <= 0:
+                            _terminate_process(proc, pgid=pgid)
+                            return False, f"Login timed out after {timeout} seconds."
                         try:
                             proc.wait(timeout=remaining)
                         except subprocess.TimeoutExpired:
-                            _terminate_process(proc)
+                            _terminate_process(proc, pgid=pgid)
                             return False, f"Login timed out after {timeout} seconds."
-                    _terminate_process(proc)
-                    err_msg = "".join(stderr_parts).strip()
-                    return (
-                        False,
-                        f"OAuth token exchange failed: {err_msg or 'agy exited without emitting a PKCE OAuth URL.'}",
-                    )
+                    _terminate_process(proc, pgid=pgid)
+                    _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
+                    returncode = _get_returncode(proc)
+                    err_msg = "".join(stderr_parts).strip() or "".join(stdout_parts).strip()
+                    if not err_msg:
+                        if returncode is not None and returncode != 0:
+                            err_msg = f"agy exited with code {returncode} without emitting a PKCE OAuth URL."
+                        else:
+                            err_msg = "agy exited without emitting a PKCE OAuth URL."
+                    return False, f"OAuth token exchange failed: {err_msg}"
 
                 if prompt_fn is not None:
                     prompt_text = (
@@ -1386,23 +1473,23 @@ class AgySwitchEngine:
                     try:
                         raw_code = prompt_fn(prompt_text)
                     except Exception as exc:
-                        _terminate_process(proc)
+                        _terminate_process(proc, pgid=pgid)
                         return False, f"Failed to prompt for authorization code: {exc}"
                 else:
                     print(f"Open this URL in your browser to authenticate:\n{pkce_url}", flush=True)
                     try:
                         raw_code = input("Enter authorization code: ")
                     except (EOFError, OSError):
-                        _terminate_process(proc)
+                        _terminate_process(proc, pgid=pgid)
                         return False, "Failed to read authorization code from stdin."
 
                 if not isinstance(raw_code, str) or not raw_code.strip():
-                    _terminate_process(proc)
+                    _terminate_process(proc, pgid=pgid)
                     return False, "Authorization code must be a non-empty string."
 
                 clean_code = raw_code.strip()
                 if len(clean_code) > 1024 or any(ord(c) < 32 for c in clean_code):
-                    _terminate_process(proc)
+                    _terminate_process(proc, pgid=pgid)
                     return False, "Invalid authorization code format."
 
                 if proc.stdin is not None:
@@ -1420,7 +1507,7 @@ class AgySwitchEngine:
                 while proc.poll() is None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        _terminate_process(proc)
+                        _terminate_process(proc, pgid=pgid)
                         return False, f"Login timed out after {timeout} seconds."
                     event = out_queue.get(timeout=min(remaining, idle_flush_seconds))
                     if event is None:
@@ -1439,29 +1526,28 @@ class AgySwitchEngine:
 
                 for reader in threads:
                     reader.join(timeout=0.2)
+                streams_joined = True
 
-                while True:
-                    next_event = out_queue.get_nowait()
-                    if next_event is None:
-                        break
-                    _consume_stream_event(next_event, stdout_parts, stderr_parts, open_streams)
+                _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams)
             except Exception as exc:
-                _terminate_process(proc)
+                _terminate_process(proc, pgid=pgid)
                 return False, f"Process execution error: {exc}"
             finally:
-                _terminate_process(proc)
+                _terminate_process(proc, pgid=pgid)
                 _close_process_streams(proc)
-                for reader in threads:
-                    reader.join(timeout=0.2)
+                if not streams_joined:
+                    for reader in threads:
+                        reader.join(timeout=0.2)
 
-            returncode = (
-                proc.returncode
-                if hasattr(proc, "returncode") and proc.returncode is not None
-                else proc.poll()
-            )
+            returncode = _get_returncode(proc)
             if returncode is not None and returncode != 0:
                 err_msg = "".join(stderr_parts).strip()
-                return False, f"OAuth token exchange failed: {err_msg or 'invalid or expired authorization code.'}"
+                if not err_msg:
+                    err_msg = (
+                        f"agy exited with code {returncode} "
+                        "(invalid or expired authorization code)."
+                    )
+                return False, f"OAuth token exchange failed: {err_msg}"
 
             token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             if not token_file.is_file():
@@ -1483,7 +1569,7 @@ class AgySwitchEngine:
                 except OSError:
                     pass
             except Exception as exc:
-                if not force:
+                if not existed_before:
                     shutil.rmtree(acc_dir, ignore_errors=True)
                 return False, f"Failed to save credentials: {exc}"
 

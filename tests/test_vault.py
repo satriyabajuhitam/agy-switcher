@@ -688,6 +688,250 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertIn("Login timed out after 0.15 seconds.", msg)
         self.assertFalse((self.vault_dir / "accounts" / "hang-acc").exists())
 
+    def test_login_headless_nonzero_exit_before_url_and_after_code_cleanup(self) -> None:
+        """[HEADLESS-ERR-001] Non-zero exits before URL or after code fail cleanly without partial vault dirs."""
+        # 1. Silent non-zero exit before PKCE URL with force=True on brand-new account
+        fake_silent_fail = self.base_path / "fake_agy_silent_fail"
+        fake_silent_fail.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        fake_silent_fail.chmod(0o755)
+
+        success1, msg1 = self.engine.login_headless(
+            alias="new-silent-fail",
+            force=True,
+            agy_binary=str(fake_silent_fail),
+            timeout=2.0,
+            prompt_fn=lambda _: "unused",
+        )
+        self.assertFalse(success1)
+        self.assertIn("2", msg1)
+        self.assertFalse((self.vault_dir / "accounts" / "new-silent-fail").exists())
+
+        # 2. Non-zero exit before PKCE URL when a child inherits stdout FD (must not hang until timeout)
+        fake_inherited_fd = self.base_path / "fake_agy_inherited_fd"
+        fake_inherited_fd.write_text(
+            f"#!{sys.executable}\n"
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.8)'], close_fds=False)\n"
+            "sys.stderr.write('fatal: agy bootstrap failed\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        fake_inherited_fd.chmod(0o755)
+
+        start = time.monotonic()
+        success2, msg2 = self.engine.login_headless(
+            alias="inherited-fd-acc",
+            agy_binary=str(fake_inherited_fd),
+            timeout=5.0,
+            prompt_fn=lambda _: "unused",
+        )
+        elapsed = time.monotonic() - start
+        self.assertFalse(success2)
+        self.assertLess(elapsed, 2.0, f"login_headless hung despite process exit ({elapsed:.2f}s): {msg2}")
+        self.assertIn("fatal: agy bootstrap failed", msg2)
+        self.assertFalse((self.vault_dir / "accounts" / "inherited-fd-acc").exists())
+
+        # 3. Non-zero exit after receiving invalid/expired code with empty stderr
+        fake_code_reject = self.base_path / "fake_agy_code_reject"
+        fake_code_reject.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=rej', flush=True)\n"
+            "sys.stdin.readline()\n"
+            "sys.exit(3)\n",
+            encoding="utf-8",
+        )
+        fake_code_reject.chmod(0o755)
+
+        success3, msg3 = self.engine.login_headless(
+            alias="reject-acc",
+            agy_binary=str(fake_code_reject),
+            timeout=2.0,
+            prompt_fn=lambda _: "4/0INVALID-CODE",
+        )
+        self.assertFalse(success3)
+        self.assertIn("OAuth token exchange failed", msg3)
+        self.assertIn("3", msg3)
+        self.assertFalse((self.vault_dir / "accounts" / "reject-acc").exists())
+
+        # 4. --force targeting an existing account preserves the existing account on failure
+        existing_dir = self.vault_dir / "accounts" / "existing-force-err"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        existing_token = existing_dir / "token.json"
+        original_content = json.dumps(make_valid_token_payload("keep@example.com"))
+        existing_token.write_text(original_content, encoding="utf-8")
+
+        success4, _ = self.engine.login_headless(
+            alias="existing-force-err",
+            force=True,
+            agy_binary=str(fake_code_reject),
+            timeout=2.0,
+            prompt_fn=lambda _: "4/0INVALID-CODE",
+        )
+        self.assertFalse(success4)
+        self.assertTrue(existing_dir.is_dir())
+        self.assertEqual(existing_token.read_text(encoding="utf-8"), original_content)
+
+    def test_login_headless_timeout_before_url_and_sigkill_escalation(self) -> None:
+        """[HEADLESS-ERR-002] Stalls before URL or after code terminate/kill child cleanly and report exact timeout."""
+        # 1. Stall before emitting PKCE URL
+        pre_url_pid_file = self.base_path / "pre_url_pid.txt"
+        fake_stall_pre_url = self.base_path / "fake_agy_stall_pre_url"
+        fake_stall_pre_url.write_text(
+            f"#!{sys.executable}\n"
+            "import os, pathlib, time\n"
+            f"pathlib.Path({str(pre_url_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+            "time.sleep(10.0)\n",
+            encoding="utf-8",
+        )
+        fake_stall_pre_url.chmod(0o755)
+
+        success1, msg1 = self.engine.login_headless(
+            alias="stall-pre-url",
+            agy_binary=str(fake_stall_pre_url),
+            timeout=0.15,
+            prompt_fn=lambda _: "unused",
+        )
+        self.assertFalse(success1)
+        self.assertEqual(msg1, "Login timed out after 0.15 seconds.")
+        self.assertFalse((self.vault_dir / "accounts" / "stall-pre-url").exists())
+        self.assertTrue(pre_url_pid_file.is_file())
+        pre_pid = int(pre_url_pid_file.read_text(encoding="utf-8").strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pre_pid, 0)
+
+        # 2. Hang after receiving auth code while ignoring SIGTERM -> must escalate to SIGKILL
+        post_code_pid_file = self.base_path / "post_code_pid.txt"
+        fake_sigterm_immune = self.base_path / "fake_agy_sigterm_immune"
+        fake_sigterm_immune.write_text(
+            f"#!{sys.executable}\n"
+            "import os, pathlib, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"pathlib.Path({str(post_code_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+            "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=sigkill', flush=True)\n"
+            "sys.stdin.readline()\n"
+            "time.sleep(10.0)\n",
+            encoding="utf-8",
+        )
+        fake_sigterm_immune.chmod(0o755)
+
+        success2, msg2 = self.engine.login_headless(
+            alias="sigkill-acc",
+            agy_binary=str(fake_sigterm_immune),
+            timeout=0.15,
+            prompt_fn=lambda _: "4/0SIGKILL-CODE",
+        )
+        self.assertFalse(success2)
+        self.assertEqual(msg2, "Login timed out after 0.15 seconds.")
+        self.assertFalse((self.vault_dir / "accounts" / "sigkill-acc").exists())
+        self.assertTrue(post_code_pid_file.is_file())
+        post_pid = int(post_code_pid_file.read_text(encoding="utf-8").strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(post_pid, 0)
+
+    def test_login_headless_timeout_kills_sigterm_immune_descendant_and_preserves_force_account(self) -> None:
+        """[HEADLESS-ERR-002] Timeout cleans up SIGTERM-immune descendant groups, supports int timeout, and preserves existing force account."""
+        parent_pid_file = self.base_path / "desc_parent_pid.txt"
+        child_pid_file = self.base_path / "desc_child_pid.txt"
+        child_script = (
+            "import os, pathlib, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+            "time.sleep(10.0)\n"
+        )
+        fake_with_descendant = self.base_path / "fake_agy_with_descendant"
+        fake_with_descendant.write_text(
+            f"#!{sys.executable}\n"
+            "import os, pathlib, subprocess, sys, time\n"
+            f"pathlib.Path({str(parent_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_script!r}], close_fds=False)\n"
+            f"child_flag = pathlib.Path({str(child_pid_file)!r})\n"
+            "deadline = time.monotonic() + 2.0\n"
+            "while not child_flag.is_file() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=desc', flush=True)\n"
+            "sys.stdin.readline()\n"
+            "time.sleep(10.0)\n",
+            encoding="utf-8",
+        )
+        fake_with_descendant.chmod(0o755)
+
+        existing_dir = self.vault_dir / "accounts" / "existing-force-timeout"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        existing_token = existing_dir / "token.json"
+        original_content = json.dumps(make_valid_token_payload("keep-timeout@example.com"))
+        existing_token.write_text(original_content, encoding="utf-8")
+
+        success, msg = self.engine.login_headless(
+            alias="existing-force-timeout",
+            force=True,
+            agy_binary=str(fake_with_descendant),
+            timeout=1,
+            prompt_fn=lambda _: "4/0DESC-CODE",
+        )
+        self.assertFalse(success)
+        self.assertEqual(msg, "Login timed out after 1 seconds.")
+        self.assertTrue(existing_dir.is_dir())
+        self.assertEqual(existing_token.read_text(encoding="utf-8"), original_content)
+
+        parent_pid = int(parent_pid_file.read_text(encoding="utf-8").strip())
+        child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(parent_pid, 0)
+
+        reap_deadline = time.monotonic() + 1.0
+        child_alive = True
+        while time.monotonic() < reap_deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                child_alive = False
+                break
+            time.sleep(0.02)
+        self.assertFalse(child_alive, f"Descendant PID {child_pid} survived process-group cleanup")
+
+    def test_login_headless_exited_process_at_deadline_reports_error_and_preserves_force(self) -> None:
+        """[HEADLESS-ERR-001] Already-exited process at zero/expired deadline reports stderr/exit error instead of false timeout."""
+        existing_dir = self.vault_dir / "accounts" / "existing-force-preurl"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        existing_token = existing_dir / "token.json"
+        original_content = json.dumps(make_valid_token_payload("keep-preurl@example.com"))
+        existing_token.write_text(original_content, encoding="utf-8")
+
+        def mock_popen(args: list[str], **kwargs: object) -> MockSubprocess:
+            env = kwargs.get("env")
+            assert isinstance(env, dict)
+            proc = MockSubprocess(
+                temp_home=Path(env["HOME"]),
+                should_succeed=False,
+                exit_code=2,
+                pkce_url=None,
+                stderr_output=b"fatal: bootstrap rejected\n",
+            )
+            proc._done_event.wait(timeout=1.0)
+            return proc
+
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", side_effect=mock_popen):
+            success, msg = self.engine.login_headless(
+                alias="existing-force-preurl",
+                force=True,
+                timeout=0,
+                prompt_fn=lambda _: "unused",
+            )
+
+        self.assertFalse(success)
+        self.assertIn("fatal: bootstrap rejected", msg)
+        self.assertNotIn("timed out", msg)
+        self.assertTrue(existing_dir.is_dir())
+        self.assertEqual(existing_token.read_text(encoding="utf-8"), original_content)
+
     def test_oob_oauth_retired_and_vault_structure(self) -> None:
         """[OOB-RETIRE-003] Verifies OOB OAuth builders are retired while DEFAULT_CLIENT_ID remains."""
         import agy_switcher.telemetry as telemetry_mod
