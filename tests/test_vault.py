@@ -642,6 +642,211 @@ class TestAgySwitchEngine(unittest.TestCase):
         mock_urlopen.assert_not_called()
         self.assertEqual(result, {"name": "ctrl_tok_acc", "email": None})
 
+    def test_add_account_and_login_userinfo_http_401_500_non_json_and_whitespace_email(self) -> None:
+        """[IDENTITY-ERR-002] UserInfo 401/500, non-JSON HTML, malformed payloads, and invalid id_token_email degrade cleanly."""
+        class _StatusHTTPResponse(_MockHTTPResponse):
+            def __init__(self, body: bytes, status: int) -> None:
+                super().__init__(body)
+                self.status = status
+
+        class _GetCodeHTTPResponse(_MockHTTPResponse):
+            def __init__(self, body: bytes, status: int) -> None:
+                super().__init__(body)
+                self._status = status
+
+            def getcode(self) -> int:
+                return self._status
+
+        hdrs = email.message.Message()
+        cases: list[tuple[str, object]] = [
+            (
+                "http_401",
+                urllib.error.HTTPError(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    401,
+                    "Unauthorized",
+                    hdrs,
+                    io.BytesIO(b"Unauthorized"),
+                ),
+            ),
+            (
+                "http_500",
+                urllib.error.HTTPError(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    500,
+                    "Internal Server Error",
+                    hdrs,
+                    io.BytesIO(b"Internal Server Error"),
+                ),
+            ),
+            ("status_401", _StatusHTTPResponse(b'{"email": "should_not_use@example.com"}', 401)),
+            ("status_500", _StatusHTTPResponse(b'{"email": "should_not_use@example.com"}', 500)),
+            ("getcode_401", _GetCodeHTTPResponse(b'{"email": "should_not_use@example.com"}', 401)),
+            ("getcode_500", _GetCodeHTTPResponse(b'{"email": "should_not_use@example.com"}', 500)),
+            ("non_json_html", _MockHTTPResponse(b"<html>error</html>")),
+            ("whitespace_email", _MockHTTPResponse(b'{"email": "   "}')),
+            ("non_str_email_int", _MockHTTPResponse(b'{"email": 123}')),
+            ("non_str_email_null", _MockHTTPResponse(b'{"email": null}')),
+            ("json_list", _MockHTTPResponse(b'["a@example.com"]')),
+            ("invalid_utf8_in_json", _MockHTTPResponse(b'{"email": "bad\xff@example.com"}')),
+            ("invalid_utf8_bytes", _MockHTTPResponse(b"\xff\xfe")),
+        ]
+
+        for case_label, outcome in cases:
+            for method in ("add_account", "login_account", "login_headless"):
+                with self.subTest(case=case_label, method=method):
+                    alias = f"err2_{case_label}_{method}"
+                    payload = make_token_payload_without_identity(
+                        access_token=f"ya29.{case_label}_{method}",
+                    )
+                    payload["id_token_email"] = "   "
+
+                    if isinstance(outcome, Exception):
+                        cm = patch("urllib.request.urlopen", side_effect=outcome)
+                    else:
+                        cm = patch("urllib.request.urlopen", return_value=outcome)
+
+                    with cm as mock_urlopen:
+                        result = self._run_registration_path(method, alias, payload)
+
+                    self.assertEqual(mock_urlopen.call_count, 1)
+                    token_path = self.vault_dir / "accounts" / alias / "token.json"
+                    self.assertTrue(token_path.is_file())
+                    self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+                    saved = json.loads(token_path.read_text(encoding="utf-8"))
+                    self.assertNotIn("id_token_email", saved)
+
+                    if method == "add_account":
+                        self.assertEqual(result, {"name": alias, "email": None})
+                    elif method == "login_account":
+                        self.assertEqual(result, {"name": alias, "email": None, "status": "standby"})
+                    else:
+                        self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+        # Pre-populated invalid id_token_email values are stripped across all registration methods
+        invalid_presets: list[tuple[str, object]] = [
+            ("ws", "   "),
+            ("int", 123),
+            ("none", None),
+            ("ctrl", "bad\n@example.com"),
+        ]
+        for label, bad_preset in invalid_presets:
+            for method in ("add_account", "login_account", "login_headless"):
+                with self.subTest(preset=label, method=method):
+                    alias = f"bad_preset_{label}_{method}"
+                    payload = make_token_payload_without_identity(access_token=f"ya29.{alias}")
+                    payload["id_token_email"] = bad_preset
+                    with patch("urllib.request.urlopen", return_value=_MockHTTPResponse(b"<html>error</html>")):
+                        result = self._run_registration_path(method, alias, payload)
+                    token_path = self.vault_dir / "accounts" / alias / "token.json"
+                    self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+                    saved = json.loads(token_path.read_text(encoding="utf-8"))
+                    self.assertNotIn("id_token_email", saved)
+                    if method == "add_account":
+                        self.assertEqual(result, {"name": alias, "email": None})
+                    elif method == "login_account":
+                        self.assertEqual(result, {"name": alias, "email": None, "status": "standby"})
+                    else:
+                        self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
+
+    def test_harvest_live_tokens_and_switch_tokens_preserve_id_token_email(self) -> None:
+        """[IDENTITY-EDGE-002] harvest_live_tokens_if_needed and switch_tokens derive alias and preserve id_token_email atomically."""
+        for source_kind in ("desktop", "cli"):
+            with self.subTest(source=source_kind):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    base = Path(tmp_dir)
+                    vault_dir = base / ".antigravity-vault"
+                    gemini_dir = base / ".gemini"
+                    legacy_root = base / ".agy-cli-manager"
+                    proc_dir = base / "proc"
+                    proc_dir.mkdir(parents=True, mode=0o700)
+                    engine = AgySwitchEngine(
+                        vault_dir=vault_dir,
+                        gemini_dir=gemini_dir,
+                        legacy_root=legacy_root,
+                        proc_dir=proc_dir,
+                    )
+
+                    live_payload = make_token_payload_without_identity(
+                        access_token=f"ya29.harvest_{source_kind}",
+                    )
+                    live_payload["id_token_email"] = "harvest@example.com"
+
+                    live_file = engine.desktop_token_file if source_kind == "desktop" else engine.cli_token_file
+                    live_file.parent.mkdir(parents=True, exist_ok=True)
+                    live_file.write_text(json.dumps(live_payload), encoding="utf-8")
+
+                    harvested_alias = engine.harvest_live_tokens_if_needed()
+                    self.assertEqual(harvested_alias, "harvest")
+                    self.assertEqual(engine.get_active_name(), "harvest")
+
+                    vault_token = vault_dir / "accounts" / "harvest" / "token.json"
+                    self.assertTrue(vault_token.is_file())
+                    self.assertEqual(stat.S_IMODE(vault_token.stat().st_mode), 0o600)
+                    self.assertEqual(
+                        json.loads(vault_token.read_text(encoding="utf-8")).get("id_token_email"),
+                        "harvest@example.com",
+                    )
+
+                    swap_res = engine.switch_tokens("harvest", restart_server=False)
+                    self.assertEqual(swap_res["active"], "harvest")
+                    self.assertEqual(swap_res["email"], "harvest@example.com")
+                    self.assertFalse(swap_res["server_restarted"])
+
+                    for target_file in (vault_token, engine.desktop_token_file, engine.cli_token_file):
+                        self.assertTrue(target_file.is_file())
+                        self.assertEqual(stat.S_IMODE(target_file.stat().st_mode), 0o600)
+                        loaded = json.loads(target_file.read_text(encoding="utf-8"))
+                        self.assertEqual(loaded.get("id_token_email"), "harvest@example.com")
+
+                    # Subsequent harvest on non-empty vault (when "harvest" already exists) is a no-op
+                    self.assertIsNone(engine.harvest_live_tokens_if_needed())
+
+        # Valid uppercase/dot local-part derives alias; invalid local-part chars fall back safely to "primary"
+        alias_cases = [
+            ("Harvest.User@example.com", "Harvest.User"),
+            ("Harvest.User+1@example.com", "primary"),
+            ("   ", "primary"),
+            ("../evil@example.com", "primary"),
+            (".@example.com", "primary"),
+        ]
+        for candidate_email, expected_alias in alias_cases:
+            with self.subTest(candidate_email=candidate_email):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    base = Path(tmp_dir)
+                    engine = AgySwitchEngine(
+                        vault_dir=base / ".antigravity-vault",
+                        gemini_dir=base / ".gemini",
+                        legacy_root=base / ".agy-cli-manager",
+                        proc_dir=base / "proc",
+                    )
+                    live_payload = make_token_payload_without_identity()
+                    live_payload["id_token_email"] = candidate_email
+                    engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+                    engine.desktop_token_file.write_text(json.dumps(live_payload), encoding="utf-8")
+                    self.assertEqual(engine.harvest_live_tokens_if_needed(), expected_alias)
+
+        # Corrupt desktop token falls back to valid CLI token and preserves id_token_email
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=base / "proc",
+            )
+            engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+            engine.desktop_token_file.write_text("{corrupt-json", encoding="utf-8")
+            cli_payload = make_token_payload_without_identity(access_token="ya29.cli_fallback")
+            cli_payload["id_token_email"] = "harvest@example.com"
+            engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+            engine.cli_token_file.write_text(json.dumps(cli_payload), encoding="utf-8")
+            self.assertEqual(engine.harvest_live_tokens_if_needed(), "harvest")
+            saved_cli = json.loads(
+                (engine.accounts_dir / "harvest" / "token.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(saved_cli.get("id_token_email"), "harvest@example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,6 +62,16 @@ GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
 USERINFO_TIMEOUT_SECONDS = 5.0
 
 
+def _clean_email_str(value: object) -> str | None:
+    """Returns a trimmed non-empty email string without control characters, or None."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if not trimmed or any(ord(ch) < 32 or ord(ch) == 127 for ch in trimmed):
+        return None
+    return trimmed
+
+
 def _fetch_google_userinfo_email(
     access_token: str,
     timeout: float = USERINFO_TIMEOUT_SECONDS,
@@ -80,6 +90,11 @@ def _fetch_google_userinfo_email(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", None)
+            if status is None and callable(getattr(resp, "getcode", None)):
+                status = resp.getcode()
+            if isinstance(status, int) and not isinstance(status, bool) and (status < 200 or status >= 300):
+                return None
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         try:
@@ -91,17 +106,19 @@ def _fetch_google_userinfo_email(
         return None
 
     try:
-        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        if isinstance(raw, (bytes, bytearray)):
+            text = bytes(raw).decode("utf-8")
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            return None
         payload = json.loads(text)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
         return None
 
     if not isinstance(payload, dict):
         return None
-    email = payload.get("email")
-    if isinstance(email, str) and email.strip():
-        return email.strip()
-    return None
+    return _clean_email_str(payload.get("email"))
 
 
 class AgySwitchEngine:
@@ -289,26 +306,28 @@ class AgySwitchEngine:
         if existing_accounts:
             return None
 
-        # Check Desktop Antigravity 2.0 token first, then CLI token
-        jetski_token = self.desktop_token_file
-        cli_token = self.cli_token_file
+        token_data: dict[str, Any] | None = None
+        for candidate_path in (self.desktop_token_file, self.cli_token_file):
+            if not candidate_path.is_file():
+                continue
+            try:
+                token_data = self.validate_token_file(candidate_path)
+                break
+            except InvalidTokenError:
+                continue
 
-        source_token = None
-        if jetski_token.is_file():
-            source_token = jetski_token
-        elif cli_token.is_file():
-            source_token = cli_token
-
-        if source_token is None:
+        if token_data is None:
             return None
 
-        try:
-            token_data = self.validate_token_file(source_token)
-        except InvalidTokenError:
-            return None
-
-        email = self.extract_email_from_jwt(token_data.get("id_token", ""))
-        account_name = email.split("@")[0] if email and "@" in email else "primary"
+        email = resolve_token_email(token_data)
+        account_name = "primary"
+        if email and "@" in email:
+            candidate_alias = email.split("@", 1)[0].strip()
+            if candidate_alias:
+                try:
+                    account_name = self.validate_account_alias(candidate_alias)
+                except AgySwitchError:
+                    account_name = "primary"
         target_dir = self.accounts_dir / account_name
         target_dir.mkdir(parents=True, exist_ok=True)
         self._atomic_write_json(target_dir / "token.json", token_data)
@@ -653,7 +672,7 @@ class AgySwitchEngine:
             except Exception:
                 pass
 
-        email = self.extract_email_from_jwt(token_data.get("id_token", ""))
+        email = resolve_token_email(token_data)
 
         server_restarted = False
         if restart_server:
@@ -676,6 +695,9 @@ class AgySwitchEngine:
 
     def _resolve_and_enrich_registration_email(self, token_data: dict[str, Any]) -> str | None:
         """Resolves Token Identity via id_token/id_token_email or best-effort Google UserInfo lookup."""
+        if "id_token_email" in token_data and _clean_email_str(token_data.get("id_token_email")) is None:
+            token_data.pop("id_token_email", None)
+
         email = resolve_token_email(token_data)
         if email is not None:
             return email

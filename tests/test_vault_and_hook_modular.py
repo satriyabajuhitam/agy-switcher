@@ -127,6 +127,35 @@ class TestVaultEngineModular(unittest.TestCase):
         self.assertEqual(res_alias["active"], "user1")
         self.assertFalse(res_alias["server_restarted"])
 
+    def test_switch_tokens_preserves_id_token_email_without_id_token(self):
+        """switch_tokens and switch_account must resolve id_token_email and preserve it atomically (0600)."""
+        tok_data = {
+            "token": {
+                "access_token": "ya29.id_token_email_access",
+                "token_type": "Bearer",
+                "refresh_token": "1//id_token_email_refresh",
+                "expiry": "2026-10-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": "harvest@example.com",
+        }
+        acc_dir = self.engine.accounts_dir / "harvest"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(tok_data), encoding="utf-8")
+
+        with patch.object(self.engine.supervisor, "restart_language_server", return_value=False):
+            res = self.engine.switch_tokens("harvest", restart_server=False)
+
+        self.assertEqual(res["active"], "harvest")
+        self.assertEqual(res["email"], "harvest@example.com")
+        for target in (self.engine.desktop_token_file, self.engine.cli_token_file):
+            self.assertTrue(target.is_file())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(target.read_text(encoding="utf-8")).get("id_token_email"),
+                "harvest@example.com",
+            )
+
     def test_transparent_delegation_supervisor_and_doctor(self):
         """Engine must delegate supervisor and doctor methods transparently."""
         with patch.object(self.engine.supervisor, "locate_language_server_pid", return_value=4242):
