@@ -288,6 +288,51 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
                 token_file.write_text(json.dumps(payload), encoding="utf-8")
                 self.assertEqual(validate_token_file(token_file, return_tuple=True), (True, None, payload))
 
+    def test_validate_token_missing_both_identity_fields_TOKEN_ID_003(self):
+        """[TOKEN-ID-003] Valid OAuth token missing both id_token and id_token_email passes validation."""
+        from agy_switcher.security import validate_token_dict
+
+        payload = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "refresh_token": "1//sample_refresh",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+        }
+        self.assertNotIn("id_token", payload)
+        self.assertNotIn("id_token_email", payload)
+        self.assertEqual(validate_token_dict(payload), payload)
+
+    def test_validate_token_missing_required_oauth_fields_TOKEN_ID_ERR_002(self):
+        """[TOKEN-ID-ERR-002] Missing refresh_token or auth_method raises InvalidTokenError specifying the field."""
+        from agy_switcher.security import validate_token_dict
+
+        missing_refresh = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+        }
+        with self.assertRaises(InvalidTokenError) as refresh_ctx:
+            validate_token_dict(missing_refresh)
+        self.assertIn("refresh_token", str(refresh_ctx.exception))
+
+        missing_auth = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "refresh_token": "1//sample_refresh",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+        }
+        with self.assertRaises(InvalidTokenError) as auth_ctx:
+            validate_token_dict(missing_auth)
+        self.assertIn("auth_method", str(auth_ctx.exception))
+
     def test_list_accounts_marks_active_account(self):
         """list_accounts() must return all accounts and mark the active account properly."""
         engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)

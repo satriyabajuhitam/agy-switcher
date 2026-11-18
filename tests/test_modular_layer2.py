@@ -837,6 +837,51 @@ class TestSecurityTokenSchemaValidation(unittest.TestCase):
                 payload["id_token"] = id_token_val
                 self.assertEqual(validate_token_dict(payload, return_tuple=True), (True, None))
 
+    def test_validate_token_missing_both_identity_fields_TOKEN_ID_003(self) -> None:
+        """[TOKEN-ID-003] Valid OAuth token missing both id_token and id_token_email passes structural validation."""
+        from agy_switcher.security import validate_token_dict
+
+        payload = self._base_payload()
+        self.assertNotIn("id_token", payload)
+        self.assertNotIn("id_token_email", payload)
+        self.assertEqual(validate_token_dict(payload), payload)
+        self.assertEqual(validate_token_dict(payload, return_tuple=True), (True, None))
+
+    def test_validate_token_missing_required_fields_specifies_field_TOKEN_ID_ERR_002(self) -> None:
+        """[TOKEN-ID-ERR-002] Missing required token fields or auth_method raises InvalidTokenError naming the field."""
+        from agy_switcher.security import validate_token_dict
+
+        for field in ("access_token", "refresh_token", "token_type", "expiry"):
+            with self.subTest(missing_token_field=field):
+                payload = self._base_payload()
+                raw_token = payload["token"]
+                assert isinstance(raw_token, dict)
+                token_dict = dict(raw_token)
+                del token_dict[field]
+                payload["token"] = token_dict
+
+                with self.assertRaises(InvalidTokenError) as ctx:
+                    validate_token_dict(payload)
+                self.assertIn(field, str(ctx.exception))
+
+                ok, err = validate_token_dict(payload, return_tuple=True)
+                self.assertFalse(ok)
+                self.assertIsNotNone(err)
+                assert err is not None
+                self.assertIn(field, err)
+
+        missing_auth = self._base_payload()
+        del missing_auth["auth_method"]
+        with self.assertRaises(InvalidTokenError) as auth_ctx:
+            validate_token_dict(missing_auth)
+        self.assertIn("auth_method", str(auth_ctx.exception))
+
+        ok_auth, err_auth = validate_token_dict(missing_auth, return_tuple=True)
+        self.assertFalse(ok_auth)
+        self.assertIsNotNone(err_auth)
+        assert err_auth is not None
+        self.assertIn("auth_method", err_auth)
+
     def test_validate_token_rejects_non_string_id_token_and_missing_required_fields(self) -> None:
         """Non-string id_token and missing required OAuth fields still fail validation."""
         from agy_switcher.security import validate_token_dict
