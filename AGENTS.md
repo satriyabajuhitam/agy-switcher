@@ -7,7 +7,8 @@ This workspace hosts `agy-switch` (Antigravity Multi-Account Switcher & Vault Ma
 - **Run multi-tier quality gate**: `bash scripts/verify-build.sh`
 - **Run tests**: `python3 -m unittest discover tests/`
 - **Verify specification**: `bash scripts/verify-spec.sh docs/specs/<domain>/spec.md`
-- **Verify switcher install**: `bash install.sh --local`
+- **Verify switcher install (local workspace only)**: `bash install.sh --local`
+- **Update global host installation (GitHub-only)**: `curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/main/install.sh | bash`
 - **Sandbox Execution Protocol**: In this containerized environment, file glob restrictions on `/etc/*` prevent sandboxed command execution. Always execute shell commands with `BypassSandbox: true` using identical `toolSummary` strings.
 
 ## Architectural Seams & Public APIs
@@ -33,6 +34,7 @@ This workspace hosts `agy-switch` (Antigravity Multi-Account Switcher & Vault Ma
 3. **Turn Safety & Process Supervisor**: Never restart or interrupt `language_server` during an active agent turn without checking process status.
 4. **Absolute Credential Protection**: Never expose, log, or commit OAuth tokens from `~/.antigravity-vault/`.
 5. **Branching & Git Workflow**: The repository follows Trunk-Based Development with main as the primary long-lived branch and distribution default. Feature development and hotfixes occur via short-lived feature branches or verified direct commits to main, with full test suite passing required before push.
+6. **GitHub-Only Global Installation & Update Standard**: The host machine's global `agy-switch` installation (`~/.gemini/config/plugins/agy-switch` -> `~/agy-switcher`, `~/.local/bin/agy-switch`, and `agy-switch-watcher.service`) MUST be installed and updated exclusively from the public GitHub `main` branch via `curl -fsSL https://raw.githubusercontent.com/satriyabajuhitam/agy-switcher/main/install.sh | bash` (followed by `systemctl --user restart agy-switch-watcher.service`). Agents are **strictly prohibited** from updating or re-linking the global host installation directly from a local development workspace (`bash install.sh --global` from a dev clone or symlinking `~/.gemini/config/plugins/agy-switch` to a local dev codebase). All changes must land on GitHub `main` first so host updates continuously test the public distribution flow.
 
 ## Agent skills
 
