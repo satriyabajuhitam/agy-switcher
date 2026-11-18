@@ -916,7 +916,7 @@ The installer script `install.sh` and hook registration APIs in `scripts/agy_swi
 - AND completes all other installation steps successfully with exit code 0 rather than aborting.
 
 ### Requirement: Refresh-Aware Standby Account Validation in Diagnostics
-The Layer 2 token diagnostics in `agy-switch doctor` (`DoctorEngine._check_token_integrity` in `scripts/agy_switcher/doctor.py`) MUST distinguish between the currently active account and secondary standby accounts. For the active account, token expiry continues to be verified strictly; if the active account's 1-hour access token is expired, status `[FAIL]` is returned. For standby accounts, if the access token timestamp has expired, the engine inspects `data["token"]["refresh_token"]`. If a non-empty string `refresh_token` is present, the account is validated as `[PASS]` (Standby Ready). Status `[WARN]` or `[FAIL]` is strictly reserved for accounts missing a `refresh_token`, containing corrupt JSON, failing JWT email extraction, or when the active account's access token is expired.
+The Layer 2 token diagnostics in `agy-switch doctor` (`DoctorEngine._check_token_integrity` and `DoctorEngine.run_diagnostics` in `scripts/agy_switcher/doctor.py`) SHALL distinguish between the currently active account and secondary standby accounts while enforcing resilient **Token Identity** and **Refresh-Aware Standby Viability**. For the active account, access token expiry continues to be verified strictly (`[FAIL]` if expired). For standby accounts, if the access token timestamp has expired, the engine inspects `refresh_token`; if a non-empty string `refresh_token` is present, the account is validated as `[PASS]` (Standby Ready), whereas missing, empty, whitespace-only, or non-string `refresh_token` on an expired secondary account returns `[WARN]`. For **Token Identity** across both active and standby accounts: (a) accounts resolving a valid email via `id_token` JWT claim or `id_token_email` evaluate cleanly to `[PASS]` (when unexpired or standby-ready); (b) valid OAuth accounts lacking all email identity (both `id_token` and `id_token_email` absent, `None`, empty `""`, or `id_token` valid JWT lacking an `"email"` claim without `id_token_email`) emit a non-fatal `[WARN]` advisory (never `[FAIL]`) unless superseded by a higher-severity `[FAIL]` such as an expired active token; and (c) accounts containing a present, non-empty `id_token` that fails JWT payload parsing with no valid `id_token_email` remain flagged as corrupt (`[FAIL]` for active, `[WARN]` for secondary).
 
 #### Scenario: [DOCTOR-REFRESH-001] Standby accounts with expired access token but valid refresh token pass Layer 2 diagnosis
 - GIVEN a registered standby account `"standby-1"` whose `token.json` has an expired access token timestamp (`expiry` in the past)
@@ -963,3 +963,190 @@ The Layer 2 token diagnostics in `agy-switch doctor` (`DoctorEngine._check_token
 - WHEN `DoctorEngine._check_token_integrity()` evaluates token integrity
 - THEN it detects that the configured active account is missing from the vault
 - AND returns status `[FAIL]` with an actionable message directing the operator to select a valid active account.
+
+#### Scenario: [DOCTOR-ID-001] Accounts with id_token_email and omitted id_token resolve identity cleanly as [PASS]
+- GIVEN an active account `"primary-acc"` (unexpired) and a standby account `"standby-1510"` (unexpired or expired with valid `refresh_token`)
+- AND their `token.json` payloads omit `id_token` while providing `"id_token_email": "user@example.com"`
+- WHEN `DoctorEngine.run_diagnostics()` (`_check_token_integrity`) or `agy-switch doctor` executes Layer 2 diagnostics
+- THEN both accounts resolve **Token Identity** cleanly without error
+- AND the diagnostic status for token integrity returns `[PASS]`.
+
+#### Scenario: [DOCTOR-ID-002] Valid OAuth account lacking both id_token and id_token_email emits non-fatal [WARN]
+- GIVEN an unexpired active account or standby-ready account whose `token.json` contains valid `token` (`access_token`, `refresh_token`, `token_type`, `expiry`) and `auth_method`
+- AND both `id_token` and `id_token_email` are absent, `None`, or empty `""`
+- WHEN `DoctorEngine.run_diagnostics()` (`_check_token_integrity`) or `agy-switch doctor` evaluates token integrity
+- THEN it classifies the missing **Token Identity** as a non-fatal advisory
+- AND returns status `[WARN]` (never `[FAIL]`) noting that email identity is unavailable for the account.
+
+#### Scenario: [DOCTOR-ID-ERR-001] Present non-empty malformed id_token JWT without id_token_email remains flagged as corrupt
+- GIVEN an account whose `token.json` contains `"id_token": "malformed-not-jwt"` (unparseable JWT payload) and no valid `id_token_email`
+- WHEN `DoctorEngine.run_diagnostics()` (`_check_token_integrity`) or `agy-switch doctor` evaluates token integrity
+- THEN it flags the account as corrupt (`[FAIL]` if active, `[WARN]` if secondary) with details indicating an invalid `id_token` JWT.
+
+#### Scenario: [DOCTOR-ID-EDGE-001] Non-string or whitespace-only id_token_email without id_token emits [WARN] advisory
+- GIVEN an unexpired active account whose `token.json` omits `id_token` and sets `id_token_email` to `"   "` or non-string `12345`
+- WHEN `DoctorEngine.run_diagnostics()` (`_check_token_integrity`) evaluates token integrity
+- THEN invalid `id_token_email` values are ignored safely without crashing
+- AND the missing **Token Identity** emits `[WARN]` (never `[FAIL]` and not `[PASS]`).
+
+### Requirement: Resilient Token Schema Validation and Corrupt JWT Distinction
+The Layer 0 credential validation primitives `validate_token_dict()` and `validate_token_file()` in `scripts/agy_switcher/security.py` MUST validate OAuth credential payloads against the `agy` 1.5.10 schema by requiring a JSON object with a non-empty `auth_method` string and a `token` dict containing non-empty `access_token`, `refresh_token`, `token_type`, and `expiry` fields, while treating `id_token` as optional (`omitempty`, `None`, or `""`). When `id_token` is omitted, `None`, or `""`, validation MUST succeed regardless of whether `id_token_email` is present. When `id_token` is present as a non-empty value, it MUST parse as a structurally valid JWT payload (at least two dot-separated segments where the second segment base64url-decodes into a JSON object, even if that JSON object omits an `"email"` claim); if `id_token` is non-empty and either non-string or fails JWT payload parsing when no valid trimmed non-empty string `id_token_email` is present, validation MUST reject the payload as corrupt by raising `InvalidTokenError` (or returning `(False, error_message)` when `return_tuple=True`).
+
+#### Scenario: [TOKEN-ID-001] Valid OAuth token with id_token_email and omitted id_token passes validation
+- GIVEN a token dictionary containing valid `token` fields (`access_token`, `refresh_token`, `token_type`, `expiry`) and `auth_method`
+- AND `id_token` is omitted from the payload while `id_token_email` is `"user@example.com"`
+- WHEN `validate_token_dict(data)` or `validate_token_file(path)` is invoked
+- THEN validation succeeds and returns the validated token dictionary without raising `InvalidTokenError`.
+
+#### Scenario: [TOKEN-ID-002] Valid OAuth token with None or empty id_token passes validation
+- GIVEN a token dictionary containing valid `token` fields (`access_token`, `refresh_token`, `token_type`, `expiry`) and `auth_method`
+- AND `id_token` is explicitly `None` or the empty string `""`
+- WHEN `validate_token_dict(data, return_tuple=True)` is invoked
+- THEN it returns `(True, None)`.
+
+#### Scenario: [TOKEN-ID-003] Valid OAuth token missing both id_token and id_token_email passes structural validation
+- GIVEN a token dictionary containing valid `token` fields (`access_token`, `refresh_token`, `token_type`, `expiry`) and `auth_method`
+- AND neither `id_token` nor `id_token_email` is present in the payload
+- WHEN `validate_token_dict(data)` is invoked
+- THEN structural validation succeeds and returns the token dictionary without raising `InvalidTokenError`.
+
+#### Scenario: [TOKEN-ID-ERR-001] Present non-empty malformed id_token JWT without valid id_token_email rejected as corrupt
+- GIVEN a token dictionary containing valid `token` fields and `auth_method`
+- AND `id_token` is a non-empty malformed string `"not.a.valid.jwt"` (or non-string scalar `12345`) that fails JWT payload parsing
+- AND no valid trimmed non-empty string `id_token_email` field is present
+- WHEN `validate_token_dict(data)` is invoked
+- THEN it distinguishes the corrupt JWT from an omitted field and raises `InvalidTokenError`.
+
+#### Scenario: [TOKEN-ID-ERR-002] Missing required OAuth token fields or auth_method still raises InvalidTokenError
+- GIVEN a token dictionary missing `refresh_token` inside `token` or missing `auth_method`
+- WHEN `validate_token_dict(data)` is invoked
+- THEN validation fails and raises `InvalidTokenError` specifying the missing required field.
+
+#### Scenario: [TOKEN-ID-EDGE-001] Non-string or whitespace-only id_token_email does not rescue corrupt id_token while valid JWT without email passes
+- GIVEN a token dictionary with malformed `id_token` (`"not.a.valid.jwt"`) and `id_token_email` set to whitespace `"   "` or non-string `12345`
+- AND a second token dictionary with a structurally valid `id_token` JWT whose base64url-decoded JSON payload is `{"sub": "no_email_user"}` without an `"email"` claim
+- WHEN `validate_token_dict()` is invoked on each payload
+- THEN the first payload raises `InvalidTokenError` because invalid `id_token_email` does not rescue a corrupt `id_token`
+- AND the second payload passes validation cleanly.
+
+### Requirement: Layered Token Identity Resolution and UserInfo Persistence
+The security module (`scripts/agy_switcher/security.py`), vault engine (`scripts/agy_switcher/vault.py`), and In-Process SDK Facade (`scripts/agy_switcher/api.py`) MUST resolve **Token Identity** (`email`) using a new pure Layer 0 public interface `resolve_token_email(data)` (zero network I/O, exported in `security.py`, `scripts/agy_switcher/__init__.py`, and `scripts/agy_switch.py`): (1) the trimmed non-empty `email` claim decoded from `id_token` JWT via `extract_email_from_jwt()` when present and valid, falling back to (2) a trimmed non-empty string `id_token_email` field (ignoring non-string or whitespace-only values). During account registration (`AgySwitchEngine.login_account()`, `AgySwitchEngine.login_headless()`, and `AgySwitchEngine.add_account()`), when neither `id_token` nor `id_token_email` yields an email, the engine MUST attempt a best-effort HTTP GET lookup against the Google UserInfo API using `Authorization: Bearer <access_token>` (via Python stdlib `urllib.request` with a bounded timeout). If UserInfo returns a JSON object with a valid non-empty string `email`, the engine MUST persist it into the vault account's `token.json` under `"id_token_email"` via atomic write (`0600` permissions); if UserInfo fails due to network error, timeout, HTTP 4xx/5xx error, or malformed/non-JSON response, registration MUST still succeed gracefully with `email=None`. All read and transfer surfaces (`AgySwitchEngine.list_accounts()`, `AgySwitchEngine.switch_tokens()`, `AgySwitchEngine.switch_account()`, `AgySwitchEngine.get_status()`, `AgySwitchEngine.harvest_live_tokens_if_needed()`, `api.get_active_account()`, `api.list_accounts()`, `api.get_accounts()`) MUST surface **Token Identity** through `resolve_token_email()` and preserve `id_token_email` across dual-destination swaps without marking `id_token_email`-backed accounts as corrupt.
+
+#### Scenario: [IDENTITY-RES-001] Layered Token Identity resolution prefers id_token JWT and falls back to id_token_email
+- GIVEN a token payload without `id_token` (or with empty `id_token`) and with `"id_token_email": "fallback@example.com"`
+- AND a second token payload containing a valid `id_token` JWT with `"email": "jwt@example.com"` alongside `"id_token_email": "legacy@example.com"`
+- WHEN `resolve_token_email()` is evaluated on each payload
+- THEN it returns `"fallback@example.com"` for the first payload and `"jwt@example.com"` for the second payload.
+
+#### Scenario: [IDENTITY-RES-002] Best-effort Google UserInfo lookup persists resolved email as id_token_email during login and add
+- GIVEN an account is registered via `AgySwitchEngine.login_account()`, `AgySwitchEngine.login_headless()`, or `AgySwitchEngine.add_account()` with a valid OAuth token lacking both `id_token` and `id_token_email`
+- AND the Google UserInfo API responds with `{"email": "userinfo@example.com"}` for the `access_token`
+- WHEN the vault persists `token.json`
+- THEN `"id_token_email": "userinfo@example.com"` is written atomically (`0600`) to `accounts/<alias>/token.json`
+- AND the returned account metadata includes `"email": "userinfo@example.com"`.
+
+#### Scenario: [IDENTITY-ERR-001] UserInfo API network failure or timeout degrades gracefully without failing registration
+- GIVEN an account is added or logged in with a valid OAuth token lacking both `id_token` and `id_token_email`
+- AND the Google UserInfo API request raises `urllib.error.URLError`, `TimeoutError`, or returns HTTP `503`
+- WHEN `AgySwitchEngine.add_account()`, `login_account()`, or `login_headless()` completes registration
+- THEN the failure is handled gracefully without raising an unhandled exception or aborting registration
+- AND the valid OAuth credentials are saved to `accounts/<alias>/token.json` with `email=None`.
+
+#### Scenario: [IDENTITY-ERR-002] UserInfo HTTP 401/500 or non-JSON response degrades gracefully without corrupting token.json
+- GIVEN an account is registered with a valid OAuth token lacking both `id_token` and `id_token_email`
+- AND the Google UserInfo API returns HTTP `401`, HTTP `500`, malformed non-JSON body `"<html>error</html>"`, or `{"email": "   "}`
+- WHEN `AgySwitchEngine.add_account()`, `login_account()`, or `login_headless()` completes registration
+- THEN registration succeeds with `email=None`
+- AND `accounts/<alias>/token.json` is written atomically (`0600`) without inserting an invalid `id_token_email` value.
+
+#### Scenario: [IDENTITY-EDGE-001] Vault and SDK read surfaces report id_token_email cleanly
+- GIVEN an active or standby vault account `"work"` whose `token.json` has no `id_token` but contains `"id_token_email": "work@example.com"`
+- WHEN `AgySwitchEngine.list_accounts()`, `AgySwitchEngine.switch_tokens()`, `AgySwitchEngine.get_status()`, `api.get_active_account()`, `api.list_accounts()`, or `api.get_accounts()` is called
+- THEN each surface reports `email="work@example.com"`
+- AND `api.get_active_account()` returns `AccountInfo` with `status="active"` and `is_active=True` rather than `"corrupt"`.
+
+#### Scenario: [IDENTITY-EDGE-002] Live token harvest and dual-destination swap preserve id_token_email atomically
+- GIVEN an empty vault with a live Desktop or CLI token file lacking `id_token` and containing `"id_token_email": "harvest@example.com"`
+- WHEN `AgySwitchEngine.harvest_live_tokens_if_needed()` imports the token and `AgySwitchEngine.switch_tokens()` subsequently swaps credentials
+- THEN `accounts/<alias>/token.json`, `desktop_token_file`, and `cli_token_file` all preserve `"id_token_email": "harvest@example.com"` intact via `0600` atomic writes
+- AND the harvested alias is derived from `"harvest"` rather than falling back to `"primary"`.
+
+### Requirement: PKCE-Delegated Headless Authentication via Live agy Subprocess
+`AgySwitchEngine.login_headless()` in `scripts/agy_switcher/vault.py` and `handle_login()` in `scripts/agy_switcher/cli.py` MUST implement **Headless Authentication** by delegating the entire PKCE session to `AgySwitchEngine.login_headless()`: `handle_login()` MUST NOT construct or print an OAuth URL itself and MUST invoke `engine.login_headless(alias=alias, force=force, agy_binary=agy_binary, timeout=timeout)` without `auth_code`. `login_headless()` MUST spawn the resolved `agy` binary directly in an isolated temporary `HOME` directory (e.g., `agy -p` or an isolated headless session), capture the live PKCE Google OAuth URL (`https://accounts.google.com/o/oauth2/...` with `redirect_uri=https://antigravity.google/oauth-callback`) emitted by `agy` on stdout/stderr, present that live PKCE URL to the user before requesting an authorization code, read the pasted authorization code from interactive `stdin` or the `prompt_fn` post-URL callback, and forward that authorization code to the running `agy` process's `stdin` so `agy` performs the PKCE token exchange using its session-bound `code_verifier` and `state`. Upon zero exit and valid token creation under the temporary `HOME`, the engine MUST validate the token, resolve/persist **Token Identity**, and atomically write `accounts/<alias>/token.json` with `0600` permissions.
+
+#### Scenario: [HEADLESS-PKCE-001] login_headless spawns agy, displays live PKCE URL, and forwards user auth code to agy stdin
+- GIVEN no existing account `"headless-acc"` in the vault and an available `agy` binary
+- AND the `agy` subprocess prints a live PKCE OAuth URL containing `redirect_uri=https://antigravity.google/oauth-callback` and waits on `stdin` for the authorization code
+- WHEN `agy-switch login headless-acc --headless` runs interactively
+- THEN `agy-switch` spawns `agy` in an isolated temporary `HOME` before prompting the user
+- AND displays the live PKCE URL captured from `agy` to stdout
+- AND reads the user's pasted authorization code from `stdin` and writes it to the running `agy` process's `stdin`
+- AND saves the resulting validated token to `accounts/headless-acc/token.json` with `0600` permissions.
+
+#### Scenario: [HEADLESS-PKCE-002] login_headless invokes prompt_fn post-URL automation hook after capturing PKCE URL
+- GIVEN an automated caller invokes `AgySwitchEngine.login_headless(alias="auto-acc", prompt_fn=callback)`
+- AND the `agy` subprocess emits a live PKCE OAuth URL before awaiting authorization code input
+- WHEN `login_headless()` captures the PKCE URL from `agy`
+- THEN `login_headless()` invokes `prompt_fn` after the PKCE URL is captured (passing a prompt containing the captured URL)
+- AND forwards the returned code to `agy`'s `stdin` and persists the resulting vault token.
+
+#### Scenario: [HEADLESS-ERR-001] agy exiting before emitting PKCE URL or rejecting authorization code fails cleanly
+- GIVEN the spawned `agy` subprocess terminates with non-zero exit code before emitting a PKCE OAuth URL or after receiving an invalid/expired authorization code
+- WHEN `AgySwitchEngine.login_headless()` monitors the subprocess
+- THEN it returns `(False, error_message)` describing the subprocess or OAuth exchange failure
+- AND leaves no partial account directory in the vault (unless `--force` targeted an existing account).
+
+#### Scenario: [HEADLESS-ERR-002] Timeout waiting for PKCE URL or code exchange terminates subprocess cleanly
+- GIVEN the `agy` subprocess stalls without emitting a PKCE URL or hangs after receiving the authorization code beyond `timeout`
+- WHEN `AgySwitchEngine.login_headless(..., timeout=...)` detects the elapsed timeout
+- THEN it terminates (and kills if necessary) the child `agy` process cleanly
+- AND returns `(False, "Login timed out after <timeout> seconds.")`.
+
+#### Scenario: [HEADLESS-ERR-003] Missing agy binary or invalid alias traversal fails before subprocess execution
+- GIVEN `agy` is missing from PATH and `~/.local/bin/agy` (or `alias` contains path traversal `"../bad"` or invalid characters `"my account"`)
+- WHEN `AgySwitchEngine.login_headless()` or `agy-switch login ../bad --headless` executes
+- THEN it fails cleanly (`(False, error_message)` or exit code `1`) before spawning any subprocess or prompting for an authorization code
+- AND leaves the vault unmodified.
+
+#### Scenario: [HEADLESS-ERR-004] Subprocess stream truncation without PKCE URL or stdin EOF aborts cleanly
+- GIVEN the spawned `agy` process closes stdout/stderr (EOF) without emitting a PKCE OAuth URL, or `stdin` hits EOF / empty input after the PKCE URL is displayed
+- WHEN `AgySwitchEngine.login_headless()` handles stream capture or code input
+- THEN it terminates any active `agy` child process cleanly without hanging
+- AND returns `(False, error_message)` without creating any partial account directory in the vault.
+
+#### Scenario: [HEADLESS-EDGE-001] Overwrite confirmation aborts before spawning agy unless force is specified
+- GIVEN an account `"existing-acc"` already exists in the vault
+- WHEN `agy-switch login existing-acc --headless` is invoked without `--force` and the user declines overwrite (`"n"`)
+- THEN `handle_login()` aborts with exit code `1` before spawning `agy` or prompting for an authorization code.
+
+#### Scenario: [HEADLESS-EDGE-002] Engine-level alias collision rejects overwrite without force and replaces atomically with force
+- GIVEN an account `"existing-acc"` already exists in the vault with prior credentials
+- WHEN `AgySwitchEngine.login_headless("existing-acc", force=False)` is invoked, and subsequently `AgySwitchEngine.login_headless("existing-acc", force=True, prompt_fn=...)` is invoked
+- THEN the `force=False` call returns `(False, error_message)` before spawning `agy` and preserves the prior credentials
+- AND the `force=True` call atomically overwrites `accounts/existing-acc/token.json` (`0600`) with the new PKCE-exchanged credentials.
+
+### Requirement: Retirement of OOB OAuth URL Builder and Rejection of Pre-Supplied --auth-code
+The legacy Out-Of-Band OAuth URL builder `build_oauth_url()` in `scripts/agy_switcher/telemetry.py`, `_get_default_oauth_url()` in `scripts/agy_switcher/cli.py`, and `AgySwitchEngine.get_oauth_url()` in `scripts/agy_switcher/vault.py` constructing `redirect_uri=urn:ietf:wg:oauth:2.0:oob` MUST be retired so no active code path emits Google-blocked OOB URLs (while retaining `DEFAULT_CLIENT_ID` in `telemetry.py` for `QuotaClient`). Furthermore, because PKCE `code_verifier` and `state` are generated dynamically per session by `agy`, `--auth-code` MUST remain registered in `build_parser()` (deprecated) so `handle_login()` explicitly rejects any supplied `--auth-code` flag with exit code `1` and an actionable error message, and `AgySwitchEngine.login_headless()` MUST reject non-`None` pre-supplied `auth_code`/`code` arguments with `(False, error_message)` explaining that interactive post-URL capture or `prompt_fn` is required.
+
+#### Scenario: [OOB-RETIRE-001] CLI --auth-code flag rejected with actionable PKCE guidance and exit code 1
+- GIVEN a user or script executes `agy-switch login bot-acc --headless --auth-code 4/1AY0e-stale`
+- WHEN `handle_login()` processes the CLI arguments
+- THEN it does not spawn `agy` or construct an OOB URL
+- AND prints an actionable error message to stderr explaining that `--auth-code` is incompatible with dynamic `agy` PKCE sessions and directing the operator to run `agy-switch login bot-acc --headless` interactively
+- AND exits with code `1`.
+
+#### Scenario: [OOB-RETIRE-002] Pre-supplied auth_code argument in login_headless rejected with PKCE session error
+- GIVEN a Python caller invokes `AgySwitchEngine.login_headless(alias="bot-acc", auth_code="4/1AY0e-stale")` (or legacy `code=...`)
+- WHEN `login_headless()` validates its arguments
+- THEN it returns `(False, error_message)` explaining that pre-supplied authorization codes cannot be used with dynamic PKCE and advising use of interactive stdin or `prompt_fn` after URL generation.
+
+#### Scenario: [OOB-RETIRE-003] No active CLI or vault code path emits urn:ietf:wg:oauth:2.0:oob URLs
+- GIVEN the `agy_switcher` codebase after retiring `build_oauth_url()`, `_get_default_oauth_url()`, and `AgySwitchEngine.get_oauth_url()`
+- WHEN headless login or CLI OAuth flows execute
+- THEN no module emits or falls back to `redirect_uri=urn:ietf:wg:oauth:2.0:oob` URLs.
+
+#### Scenario: [OOB-RETIRE-ERR-001] Empty --auth-code or --auth-code with --force still rejected before overwrite or subprocess spawn
+- GIVEN an existing or new account `"bot-acc"` and CLI arguments `login bot-acc --headless --force --auth-code ""` (or non-empty stale code)
+- WHEN `handle_login()` processes the CLI arguments
+- THEN it rejects the deprecated `--auth-code` flag immediately with exit code `1` and PKCE guidance on stderr
+- AND neither prompts for overwrite nor spawns `agy`.
