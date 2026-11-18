@@ -121,6 +121,19 @@ def _is_non_empty_str(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def has_valid_id_token_or_fallback(data: Mapping[str, object]) -> bool:
+    """Returns True when id_token is omitted/empty, a valid JWT object, or backed by id_token_email."""
+    # agy 1.5.10 omits id_token or sets it to null/"" in favor of id_token_email.
+    # Present non-empty id_token values must parse as a JWT JSON object unless a
+    # valid trimmed non-empty string id_token_email is provided.
+    id_token = data.get("id_token")
+    if id_token is None or id_token == "":
+        return True
+    if _decode_jwt_payload(id_token) is not None:
+        return True
+    return _is_non_empty_str(data.get("id_token_email"))
+
+
 def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
     """Validates that data complies with Google OAuth token JSON schema.
 
@@ -143,14 +156,8 @@ def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
         if not _is_non_empty_str(data.get("auth_method")):
             raise InvalidTokenError("Missing required 'auth_method' field.")
 
-        # agy 1.5.10 omits id_token or sets it to null/"" in favor of id_token_email.
-        # Present non-empty id_token values must parse as a JWT JSON object unless a
-        # valid trimmed non-empty string id_token_email is provided.
-        id_token = data.get("id_token")
-        if id_token is not None and id_token != "":
-            has_valid_email_fallback = _is_non_empty_str(data.get("id_token_email"))
-            if _decode_jwt_payload(id_token) is None and not has_valid_email_fallback:
-                raise InvalidTokenError("Invalid 'id_token' JWT field.")
+        if not has_valid_id_token_or_fallback(data):
+            raise InvalidTokenError("Invalid 'id_token' JWT field.")
 
         if return_tuple:
             return True, None
@@ -203,6 +210,7 @@ __all__ = [
     "_atomic_write_file",
     "_atomic_write_json",
     "extract_email_from_jwt",
+    "has_valid_id_token_or_fallback",
     "resolve_token_email",
     "validate_token_dict",
     "validate_token_file",

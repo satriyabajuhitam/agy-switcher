@@ -267,6 +267,46 @@ def _drain_stream_queue(
         _consume_stream_event(next_event, stdout_parts, stderr_parts, open_streams, last_activity)
 
 
+def _extract_pkce_url_from_streams(
+    stdout_parts: list[str],
+    stderr_parts: list[str],
+    open_streams: set[str],
+    last_activity: dict[str, float],
+    idle_flush_seconds: float,
+    *,
+    force_tail: bool = False,
+) -> str | None:
+    """Extracts a PKCE OAuth URL from stdout or stderr stream buffers."""
+    now = time.monotonic()
+    stdout_idle = force_tail or "stdout" not in open_streams or (
+        "stdout" in last_activity and now - last_activity["stdout"] >= idle_flush_seconds
+    )
+    stderr_idle = force_tail or "stderr" not in open_streams or (
+        "stderr" in last_activity and now - last_activity["stderr"] >= idle_flush_seconds
+    )
+    return (
+        _extract_pkce_oauth_url("".join(stdout_parts), allow_incomplete_tail=stdout_idle)
+        or _extract_pkce_oauth_url("".join(stderr_parts), allow_incomplete_tail=stderr_idle)
+    )
+
+
+def _poll_and_drain_streams(
+    out_queue: _StreamEventQueue,
+    wait_timeout: float,
+    stdout_parts: list[str],
+    stderr_parts: list[str],
+    open_streams: set[str],
+    last_activity: dict[str, float] | None = None,
+) -> bool:
+    """Waits for one stream event, consumes it, and drains any remaining buffered events."""
+    event = out_queue.get(timeout=wait_timeout)
+    if event is None:
+        return False
+    _consume_stream_event(event, stdout_parts, stderr_parts, open_streams, last_activity)
+    _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
+    return True
+
+
 def _get_returncode(proc: subprocess.Popen[bytes]) -> int | None:
     """Returns the subprocess exit code if terminated, otherwise None."""
     if hasattr(proc, "returncode") and proc.returncode is not None:
@@ -294,6 +334,12 @@ def _fetch_google_userinfo_email(
     clean_token = access_token.strip()
     if not clean_token or any(ord(ch) < 32 for ch in clean_token):
         return None
+
+    parsed = urllib.parse.urlsplit(GOOGLE_USERINFO_ENDPOINT)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"Invalid URL scheme '{parsed.scheme}'. Only http:// and https:// are permitted."
+        )
 
     req = urllib.request.Request(
         GOOGLE_USERINFO_ENDPOINT,
@@ -1301,6 +1347,262 @@ class AgySwitchEngine:
                 "status": "standby",
             }
 
+    def _finalize_missing_pkce_url(
+        self,
+        proc: subprocess.Popen[bytes],
+        pgid: int | None,
+        out_queue: _StreamEventQueue,
+        stdout_parts: list[str],
+        stderr_parts: list[str],
+        open_streams: set[str],
+        last_activity: dict[str, float],
+        deadline: float,
+        timeout: float,
+    ) -> str:
+        """Waits briefly for child exit when no PKCE URL appeared and returns the failure message."""
+        remaining = deadline - time.monotonic()
+        streams_closed_without_exit = False
+        if proc.poll() is None:
+            if remaining <= 0:
+                _terminate_process(proc, pgid=pgid)
+                return f"Login timed out after {timeout} seconds."
+            # If all output streams already hit EOF, wait only briefly for exit status
+            # rather than blocking for the full login timeout if the child stayed alive.
+            wait_timeout = min(remaining, 0.2) if not open_streams else remaining
+            try:
+                proc.wait(timeout=wait_timeout)
+            except subprocess.TimeoutExpired:
+                _terminate_process(proc, pgid=pgid)
+                if open_streams:
+                    return f"Login timed out after {timeout} seconds."
+                streams_closed_without_exit = True
+        _terminate_process(proc, pgid=pgid)
+        _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
+        returncode = _get_returncode(proc)
+        err_msg = "".join(stderr_parts).strip() or "".join(stdout_parts).strip()
+        if not err_msg:
+            if streams_closed_without_exit:
+                err_msg = "agy closed output streams without emitting a PKCE OAuth URL."
+            elif returncode is not None and returncode != 0:
+                err_msg = f"agy exited with code {returncode} without emitting a PKCE OAuth URL."
+            else:
+                err_msg = "agy exited without emitting a PKCE OAuth URL."
+        return f"OAuth token exchange failed: {err_msg}"
+
+    def _wait_for_pkce_url(
+        self,
+        proc: subprocess.Popen[bytes],
+        pgid: int | None,
+        out_queue: _StreamEventQueue,
+        stdout_parts: list[str],
+        stderr_parts: list[str],
+        open_streams: set[str],
+        last_activity: dict[str, float],
+        deadline: float,
+        timeout: float,
+        idle_flush_seconds: float,
+    ) -> tuple[str | None, str | None]:
+        """Polls subprocess output streams until a PKCE OAuth URL is captured or an error occurs."""
+        pkce_url: str | None = None
+        exit_grace_deadline: float | None = None
+        while True:
+            pkce_url = _extract_pkce_url_from_streams(
+                stdout_parts, stderr_parts, open_streams, last_activity, idle_flush_seconds
+            )
+            if pkce_url is not None or not open_streams:
+                break
+
+            now = time.monotonic()
+            if proc.poll() is not None:
+                # Bound waiting on streams after child exit in case a grandchild inherited pipe FDs.
+                if exit_grace_deadline is None:
+                    exit_grace_deadline = min(deadline, now + 0.2)
+                if now >= exit_grace_deadline:
+                    break
+
+            remaining = deadline - now
+            if remaining <= 0:
+                _terminate_process(proc, pgid=pgid)
+                return None, f"Login timed out after {timeout} seconds."
+
+            wait_timeout = min(remaining, idle_flush_seconds)
+            if exit_grace_deadline is not None:
+                wait_timeout = min(wait_timeout, max(0.005, exit_grace_deadline - now))
+            received = _poll_and_drain_streams(
+                out_queue, wait_timeout, stdout_parts, stderr_parts, open_streams, last_activity
+            )
+            if not received:
+                pkce_url = _extract_pkce_url_from_streams(
+                    stdout_parts,
+                    stderr_parts,
+                    open_streams,
+                    last_activity,
+                    idle_flush_seconds,
+                    force_tail=True,
+                )
+                if pkce_url is not None:
+                    break
+
+        if pkce_url is None:
+            return None, self._finalize_missing_pkce_url(
+                proc, pgid, out_queue, stdout_parts, stderr_parts, open_streams, last_activity, deadline, timeout
+            )
+        return pkce_url, None
+
+    def _prompt_and_forward_auth_code(
+        self,
+        proc: subprocess.Popen[bytes],
+        pgid: int | None,
+        pkce_url: str,
+        prompt_fn: Callable[[str], str] | None,
+    ) -> str | None:
+        """Displays the PKCE URL, collects and validates the authorization code, and writes it to stdin."""
+        if prompt_fn is not None:
+            prompt_text = (
+                f"Open this URL in your browser to authenticate:\n"
+                f"{pkce_url}\n"
+                f"Enter authorization code: "
+            )
+            try:
+                raw_code = prompt_fn(prompt_text)
+            except Exception as exc:
+                _terminate_process(proc, pgid=pgid)
+                return f"Failed to prompt for authorization code: {exc}"
+        else:
+            print(f"Open this URL in your browser to authenticate:\n{pkce_url}", flush=True)
+            try:
+                raw_code = input("Enter authorization code: ")
+            except (EOFError, OSError):
+                _terminate_process(proc, pgid=pgid)
+                return "Failed to read authorization code from stdin."
+
+        if not isinstance(raw_code, str) or not raw_code.strip():
+            _terminate_process(proc, pgid=pgid)
+            return "Authorization code must be a non-empty string."
+
+        clean_code = raw_code.strip()
+        if len(clean_code) > 1024 or any(ord(c) < 32 for c in clean_code):
+            _terminate_process(proc, pgid=pgid)
+            return "Invalid authorization code format."
+
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write((clean_code + "\n").encode("utf-8"))
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
+        return None
+
+    def _wait_for_subprocess_completion(
+        self,
+        proc: subprocess.Popen[bytes],
+        pgid: int | None,
+        out_queue: _StreamEventQueue,
+        threads: list[threading.Thread],
+        stdout_parts: list[str],
+        stderr_parts: list[str],
+        open_streams: set[str],
+        deadline: float,
+        timeout: float,
+        idle_flush_seconds: float,
+    ) -> tuple[bool, str | None]:
+        """Drains remaining subprocess output until exit and joins stream reader threads."""
+        while proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process(proc, pgid=pgid)
+                return False, f"Login timed out after {timeout} seconds."
+            _poll_and_drain_streams(
+                out_queue, min(remaining, idle_flush_seconds), stdout_parts, stderr_parts, open_streams
+            )
+
+        drain_deadline = time.monotonic() + 0.5
+        while open_streams and time.monotonic() < drain_deadline:
+            drain_remaining = drain_deadline - time.monotonic()
+            received = _poll_and_drain_streams(
+                out_queue, min(drain_remaining, idle_flush_seconds), stdout_parts, stderr_parts, open_streams
+            )
+            if not received and all(not reader.is_alive() for reader in threads):
+                break
+
+        for reader in threads:
+            reader.join(timeout=0.2)
+        _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams)
+        return True, None
+
+    def _run_headless_agy_session(
+        self,
+        proc: subprocess.Popen[bytes],
+        timeout: float,
+        prompt_fn: Callable[[str], str] | None,
+    ) -> tuple[bool, str]:
+        """Executes the interactive PKCE handshake against a spawned agy subprocess."""
+        pgid = _resolve_isolated_pgid(proc)
+        out_queue = _StreamEventQueue()
+        open_streams: set[str] = set()
+        threads: list[threading.Thread] = []
+        for stream_name, stream_obj in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            if stream_obj is not None:
+                open_streams.add(stream_name)
+                reader = threading.Thread(
+                    target=_stream_reader,
+                    args=(stream_obj, stream_name, out_queue),
+                    daemon=True,
+                )
+                reader.start()
+                threads.append(reader)
+
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        last_activity: dict[str, float] = {}
+        idle_flush_seconds = 0.05
+        streams_joined = False
+
+        try:
+            pkce_url, err_msg = self._wait_for_pkce_url(
+                proc, pgid, out_queue, stdout_parts, stderr_parts,
+                open_streams, last_activity, deadline, timeout, idle_flush_seconds,
+            )
+            if err_msg is not None or pkce_url is None:
+                return False, err_msg or "OAuth token exchange failed: missing PKCE OAuth URL."
+
+            err_msg = self._prompt_and_forward_auth_code(proc, pgid, pkce_url, prompt_fn)
+            if err_msg is not None:
+                return False, err_msg
+
+            streams_joined, err_msg = self._wait_for_subprocess_completion(
+                proc, pgid, out_queue, threads, stdout_parts, stderr_parts,
+                open_streams, deadline, timeout, idle_flush_seconds,
+            )
+            if err_msg is not None:
+                return False, err_msg
+        except Exception as exc:
+            _terminate_process(proc, pgid=pgid)
+            return False, f"Process execution error: {exc}"
+        finally:
+            _terminate_process(proc, pgid=pgid)
+            _close_process_streams(proc)
+            if not streams_joined:
+                for reader in threads:
+                    reader.join(timeout=0.2)
+
+        returncode = _get_returncode(proc)
+        if returncode is not None and returncode != 0:
+            err_msg = "".join(stderr_parts).strip()
+            if not err_msg:
+                err_msg = (
+                    f"agy exited with code {returncode} "
+                    "(invalid or expired authorization code)."
+                )
+            return False, f"OAuth token exchange failed: {err_msg}"
+        return True, ""
+
     def login_headless(
         self,
         alias: str = "",
@@ -1349,8 +1651,7 @@ class AgySwitchEngine:
 
         with tempfile.TemporaryDirectory(prefix="agy-login-headless-") as temp_dir_str:
             temp_home = Path(temp_dir_str)
-            gemini_login_dir = temp_home / ".gemini"
-            gemini_login_dir.mkdir(parents=True, exist_ok=True)
+            (temp_home / ".gemini").mkdir(parents=True, exist_ok=True)
 
             env = os.environ.copy()
             env["HOME"] = str(temp_home)
@@ -1370,192 +1671,9 @@ class AgySwitchEngine:
             except Exception as exc:
                 return False, f"Failed to spawn agy login process: {exc}"
 
-            pgid = _resolve_isolated_pgid(proc)
-            out_queue = _StreamEventQueue()
-            open_streams: set[str] = set()
-            threads: list[threading.Thread] = []
-            for stream_name, stream_obj in (("stdout", proc.stdout), ("stderr", proc.stderr)):
-                if stream_obj is not None:
-                    open_streams.add(stream_name)
-                    reader = threading.Thread(
-                        target=_stream_reader,
-                        args=(stream_obj, stream_name, out_queue),
-                        daemon=True,
-                    )
-                    reader.start()
-                    threads.append(reader)
-
-            stdout_parts: list[str] = []
-            stderr_parts: list[str] = []
-            deadline = time.monotonic() + max(0.0, float(timeout))
-            last_activity: dict[str, float] = {}
-            idle_flush_seconds = 0.05
-            streams_joined = False
-
-            try:
-                pkce_url: str | None = None
-                exit_grace_deadline: float | None = None
-                while True:
-                    now = time.monotonic()
-                    stdout_text = "".join(stdout_parts)
-                    stderr_text = "".join(stderr_parts)
-                    stdout_idle = "stdout" not in open_streams or (
-                        "stdout" in last_activity
-                        and now - last_activity["stdout"] >= idle_flush_seconds
-                    )
-                    stderr_idle = "stderr" not in open_streams or (
-                        "stderr" in last_activity
-                        and now - last_activity["stderr"] >= idle_flush_seconds
-                    )
-                    pkce_url = (
-                        _extract_pkce_oauth_url(stdout_text, allow_incomplete_tail=stdout_idle)
-                        or _extract_pkce_oauth_url(stderr_text, allow_incomplete_tail=stderr_idle)
-                    )
-                    if pkce_url is not None or not open_streams:
-                        break
-
-                    if proc.poll() is not None:
-                        # Bound waiting on streams after child exit in case a grandchild inherited pipe FDs.
-                        if exit_grace_deadline is None:
-                            exit_grace_deadline = min(deadline, now + 0.2)
-                        if now >= exit_grace_deadline:
-                            break
-
-                    remaining = deadline - now
-                    if remaining <= 0:
-                        _terminate_process(proc, pgid=pgid)
-                        return False, f"Login timed out after {timeout} seconds."
-
-                    wait_timeout = min(remaining, idle_flush_seconds)
-                    if exit_grace_deadline is not None:
-                        wait_timeout = min(wait_timeout, max(0.005, exit_grace_deadline - now))
-                    event = out_queue.get(timeout=wait_timeout)
-                    if event is None:
-                        pkce_url = (
-                            _extract_pkce_oauth_url(stdout_text, allow_incomplete_tail=True)
-                            or _extract_pkce_oauth_url(stderr_text, allow_incomplete_tail=True)
-                        )
-                        if pkce_url is not None:
-                            break
-                        continue
-
-                    _consume_stream_event(event, stdout_parts, stderr_parts, open_streams, last_activity)
-                    _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
-
-                if pkce_url is None:
-                    remaining = deadline - time.monotonic()
-                    streams_closed_without_exit = False
-                    if proc.poll() is None:
-                        if remaining <= 0:
-                            _terminate_process(proc, pgid=pgid)
-                            return False, f"Login timed out after {timeout} seconds."
-                        # If all output streams already hit EOF, wait only briefly for exit status
-                        # rather than blocking for the full login timeout if the child stayed alive.
-                        wait_timeout = min(remaining, 0.2) if not open_streams else remaining
-                        try:
-                            proc.wait(timeout=wait_timeout)
-                        except subprocess.TimeoutExpired:
-                            _terminate_process(proc, pgid=pgid)
-                            if open_streams:
-                                return False, f"Login timed out after {timeout} seconds."
-                            streams_closed_without_exit = True
-                    _terminate_process(proc, pgid=pgid)
-                    _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
-                    returncode = _get_returncode(proc)
-                    err_msg = "".join(stderr_parts).strip() or "".join(stdout_parts).strip()
-                    if not err_msg:
-                        if streams_closed_without_exit:
-                            err_msg = "agy closed output streams without emitting a PKCE OAuth URL."
-                        elif returncode is not None and returncode != 0:
-                            err_msg = f"agy exited with code {returncode} without emitting a PKCE OAuth URL."
-                        else:
-                            err_msg = "agy exited without emitting a PKCE OAuth URL."
-                    return False, f"OAuth token exchange failed: {err_msg}"
-
-                if prompt_fn is not None:
-                    prompt_text = (
-                        f"Open this URL in your browser to authenticate:\n"
-                        f"{pkce_url}\n"
-                        f"Enter authorization code: "
-                    )
-                    try:
-                        raw_code = prompt_fn(prompt_text)
-                    except Exception as exc:
-                        _terminate_process(proc, pgid=pgid)
-                        return False, f"Failed to prompt for authorization code: {exc}"
-                else:
-                    print(f"Open this URL in your browser to authenticate:\n{pkce_url}", flush=True)
-                    try:
-                        raw_code = input("Enter authorization code: ")
-                    except (EOFError, OSError):
-                        _terminate_process(proc, pgid=pgid)
-                        return False, "Failed to read authorization code from stdin."
-
-                if not isinstance(raw_code, str) or not raw_code.strip():
-                    _terminate_process(proc, pgid=pgid)
-                    return False, "Authorization code must be a non-empty string."
-
-                clean_code = raw_code.strip()
-                if len(clean_code) > 1024 or any(ord(c) < 32 for c in clean_code):
-                    _terminate_process(proc, pgid=pgid)
-                    return False, "Invalid authorization code format."
-
-                if proc.stdin is not None:
-                    try:
-                        proc.stdin.write((clean_code + "\n").encode("utf-8"))
-                        proc.stdin.flush()
-                    except (OSError, ValueError):
-                        pass
-                    finally:
-                        try:
-                            proc.stdin.close()
-                        except (OSError, ValueError):
-                            pass
-
-                while proc.poll() is None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        _terminate_process(proc, pgid=pgid)
-                        return False, f"Login timed out after {timeout} seconds."
-                    event = out_queue.get(timeout=min(remaining, idle_flush_seconds))
-                    if event is None:
-                        continue
-                    _consume_stream_event(event, stdout_parts, stderr_parts, open_streams)
-
-                drain_deadline = time.monotonic() + 0.5
-                while open_streams and time.monotonic() < drain_deadline:
-                    drain_remaining = drain_deadline - time.monotonic()
-                    event = out_queue.get(timeout=min(drain_remaining, idle_flush_seconds))
-                    if event is None:
-                        if all(not reader.is_alive() for reader in threads):
-                            break
-                        continue
-                    _consume_stream_event(event, stdout_parts, stderr_parts, open_streams)
-
-                for reader in threads:
-                    reader.join(timeout=0.2)
-                streams_joined = True
-
-                _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams)
-            except Exception as exc:
-                _terminate_process(proc, pgid=pgid)
-                return False, f"Process execution error: {exc}"
-            finally:
-                _terminate_process(proc, pgid=pgid)
-                _close_process_streams(proc)
-                if not streams_joined:
-                    for reader in threads:
-                        reader.join(timeout=0.2)
-
-            returncode = _get_returncode(proc)
-            if returncode is not None and returncode != 0:
-                err_msg = "".join(stderr_parts).strip()
-                if not err_msg:
-                    err_msg = (
-                        f"agy exited with code {returncode} "
-                        "(invalid or expired authorization code)."
-                    )
-                return False, f"OAuth token exchange failed: {err_msg}"
+            ok, err_msg = self._run_headless_agy_session(proc, timeout, prompt_fn)
+            if not ok:
+                return False, err_msg
 
             token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             if not token_file.is_file():

@@ -24,8 +24,8 @@ from agy_switcher.models import DiagnosticItem, DiagnosticReport
 from agy_switcher.security import (
     _atomic_write_file,
     _atomic_write_json,
-    _decode_jwt_payload,
     extract_email_from_jwt,
+    has_valid_id_token_or_fallback,
     resolve_token_email,
     validate_token_dict,
     validate_token_file,
@@ -732,13 +732,11 @@ class DoctorEngine:
                     corrupt_secondary.append((acc_name, "Missing required 'auth_method' field."))
                     continue
 
-                id_tok = data.get("id_token")
-                email = resolve_token_email(data)
-                if id_tok is not None and id_tok != "":
-                    if _decode_jwt_payload(id_tok) is None and email is None:
-                        corrupt_secondary.append((acc_name, "Invalid 'id_token' JWT field."))
-                        continue
+                if not has_valid_id_token_or_fallback(data):
+                    corrupt_secondary.append((acc_name, "Invalid 'id_token' JWT field."))
+                    continue
 
+                email = resolve_token_email(data)
                 if email is None:
                     missing_identity_accounts.append(acc_name)
 

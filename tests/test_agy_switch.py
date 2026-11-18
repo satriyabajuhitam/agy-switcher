@@ -78,7 +78,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
     def test_vault_directories_created(self):
         """Engine should automatically create ~/.antigravity-vault/accounts and cache if missing with 0o700."""
         self.assertFalse(self.vault_dir.exists())
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
         self.assertTrue(self.vault_dir.is_dir())
         self.assertTrue((self.vault_dir / "accounts").is_dir())
         self.assertTrue((self.vault_dir / "cache").is_dir())
@@ -115,7 +119,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
 
     def test_get_account_tokens(self):
         """get_account_tokens encapsulates token extraction from token.json."""
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
 
         # 1. Non-existent account
         self.assertIsNone(engine.get_account_tokens("non_existent"))
@@ -191,7 +199,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
 
     def test_token_validation_accepts_valid_and_rejects_invalid(self):
         """Token validation must strictly verify required keys."""
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
 
         # Valid token
         valid = create_sample_token("valid@example.com")
@@ -246,7 +258,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
         """[TOKEN-ID-001] Omitted id_token with id_token_email passes validate_token_dict and validate_token_file."""
         from agy_switcher.security import validate_token_dict, validate_token_file
 
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
         payload = {
             "token": {
                 "access_token": "ya29.sample_access",
@@ -392,7 +408,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
 
     def test_list_accounts_marks_active_account(self):
         """list_accounts() must return all accounts and mark the active account properly."""
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
         for name in ["alpha", "beta", "gamma"]:
             acc_dir = self.vault_dir / "accounts" / name
             acc_dir.mkdir(parents=True, exist_ok=True)

@@ -1580,6 +1580,18 @@ class TestAgySwitchEngine(unittest.TestCase):
                     else:
                         self.assertEqual(result, (True, f"Account '{alias}' successfully logged in"))
 
+    def test_fetch_google_userinfo_email_rejects_invalid_url_scheme_and_netloc(self) -> None:
+        """_fetch_google_userinfo_email rejects non-HTTP(S) schemes or empty netloc before urlopen."""
+        from agy_switcher import vault as vault_mod
+
+        for bad_url in ("file:///etc/passwd", "ftp://example.com/userinfo", "https://", "/relative/path"):
+            with self.subTest(bad_url=bad_url):
+                with patch.object(vault_mod, "GOOGLE_USERINFO_ENDPOINT", bad_url), \
+                     patch("urllib.request.urlopen") as mock_urlopen:
+                    with self.assertRaises(ValueError):
+                        vault_mod._fetch_google_userinfo_email("ya29.valid_token")
+                mock_urlopen.assert_not_called()
+
     def test_harvest_live_tokens_and_switch_tokens_preserve_id_token_email(self) -> None:
         """[IDENTITY-EDGE-002] harvest_live_tokens_if_needed and switch_tokens derive alias and preserve id_token_email atomically."""
         for source_kind in ("desktop", "cli"):

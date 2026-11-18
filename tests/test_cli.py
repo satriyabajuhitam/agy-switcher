@@ -1054,6 +1054,7 @@ class TestCLI(unittest.TestCase):
                 vault_dir=tmp_path / "vault",
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
+                proc_dir=tmp_path / "proc",
             )
             acc_dir = tmp_path / "vault" / "accounts" / "existing-acc"
             acc_dir.mkdir(parents=True, exist_ok=True)
@@ -1187,6 +1188,7 @@ class TestCLI(unittest.TestCase):
                 vault_dir=tmp_path / "vault",
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
+                proc_dir=tmp_path / "proc",
             )
             fake_agy = tmp_path / "fake_agy_eof"
             fake_agy.write_text(
@@ -1235,6 +1237,7 @@ class TestCLI(unittest.TestCase):
                 vault_dir=tmp_path / "vault",
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
+                proc_dir=tmp_path / "proc",
             )
             fake_agy = tmp_path / "fake_agy_real"
             fake_agy.write_text(
@@ -1354,6 +1357,7 @@ class TestCLI(unittest.TestCase):
                 vault_dir=tmp_path / "vault",
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
+                proc_dir=tmp_path / "proc",
             )
             marker_file = tmp_path / "agy_marker.json"
             fake_agy = tmp_path / "fake_agy"
@@ -1414,6 +1418,7 @@ class TestCLI(unittest.TestCase):
                 vault_dir=tmp_path / "vault",
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
+                proc_dir=tmp_path / "proc",
             )
             accounts_dir = tmp_path / "vault" / "accounts"
 
@@ -1464,6 +1469,7 @@ class TestCLI(unittest.TestCase):
                 vault_dir=tmp_path / "vault",
                 gemini_dir=tmp_path / "gemini",
                 legacy_root=tmp_path / "legacy",
+                proc_dir=tmp_path / "proc",
             )
 
             # 1. agy closes stdout/stderr without emitting PKCE URL while staying alive
