@@ -29,8 +29,8 @@ A programmatic standard-library interface exposing account status, quota telemet
 _Avoid_: Direct engine import, internal API, library binding
 
 **Headless Authentication**:
-An OAuth credential acquisition flow designed for non-graphical server environments that captures authorization codes via terminal input or direct parameters.
-_Avoid_: Terminal OAuth, manual login, non-GUI login
+An OAuth credential acquisition flow designed for non-graphical server environments that delegates PKCE URL generation to the Antigravity CLI and captures the resulting authorization code interactively after URL presentation.
+_Avoid_: Terminal OAuth, manual login, non-GUI login, pre-supplied auth code
 
 **Vault Bundle**:
 A compressed archive encapsulating multi-account vault states with restricted POSIX permissions and cryptographic checksum verification for transport.
@@ -83,5 +83,9 @@ _Avoid_: Global fallback, production log leaking, test pollution
 **Refresh-Aware Standby Viability**:
 A diagnostic validation standard that evaluates standby accounts by verifying the structural presence of an OAuth `refresh_token`, categorizing accounts with expired 1-hour access tokens as healthy standby rather than issuing premature authentication failure warnings.
 _Avoid_: Blind timestamp expiry, false warning, superficial token check
+
+**Token Identity**:
+The email identifier associated with a registered OAuth credential profile, resolved from embedded identity claims, credential metadata, or provider userinfo without invalidating otherwise renewable credentials when omitted.
+_Avoid_: Mandatory JWT identity, rigid id_token schema
 
 
