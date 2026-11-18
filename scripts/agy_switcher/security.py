@@ -76,7 +76,12 @@ def extract_email_from_jwt(id_token: str | None) -> str | None:
     return None
 
 
-def validate_token_dict(data: Any, *, return_tuple: bool = False) -> Any:
+def _is_non_empty_str(value: object) -> bool:
+    """Returns True when value is a string containing non-whitespace characters."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
     """Validates that data complies with Google OAuth token JSON schema.
 
     If return_tuple=True, returns tuple[bool, str | None].
@@ -91,16 +96,17 @@ def validate_token_dict(data: Any, *, return_tuple: bool = False) -> Any:
             raise InvalidTokenError("Missing required 'token' object in payload.")
 
         required_token_keys = ("access_token", "refresh_token", "token_type", "expiry")
-        missing_keys = [k for k in required_token_keys if not token_obj.get(k)]
+        missing_keys = [k for k in required_token_keys if not _is_non_empty_str(token_obj.get(k))]
         if missing_keys:
             raise InvalidTokenError(f"Missing required token fields: {', '.join(missing_keys)}")
 
-        if not data.get("auth_method"):
+        if not _is_non_empty_str(data.get("auth_method")):
             raise InvalidTokenError("Missing required 'auth_method' field.")
 
+        # agy 1.5.10 omits id_token or sets it to null/"" in favor of id_token_email
         id_token = data.get("id_token")
-        if not id_token or not isinstance(id_token, str):
-            raise InvalidTokenError("Missing or invalid 'id_token' JWT field.")
+        if id_token is not None and (not isinstance(id_token, str) or (id_token != "" and not id_token.strip())):
+            raise InvalidTokenError("Invalid 'id_token' JWT field.")
 
         if return_tuple:
             return True, None
@@ -126,7 +132,7 @@ def validate_token_file(token_path: Path | str, *, return_tuple: bool = False) -
     try:
         raw = token_path.read_text(encoding="utf-8")
         data = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         err = f"Failed to read/parse token JSON: {e}"
         if return_tuple:
             return False, err, None
@@ -139,7 +145,7 @@ def validate_token_file(token_path: Path | str, *, return_tuple: bool = False) -
     return validate_token_dict(data)
 
 
-def check_token_dict(data: Any) -> tuple[bool, str | None]:
+def check_token_dict(data: object) -> tuple[bool, str | None]:
     """Validates token dictionary returning (is_valid, error_message)."""
     return cast(tuple[bool, str | None], validate_token_dict(data, return_tuple=True))
 
