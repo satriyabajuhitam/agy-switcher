@@ -6182,6 +6182,24 @@ def _validate_ticket_concurrency(
         existing_status = ""
 
     if v._is_status_in_progress(existing_status):
+        # [CLAIM-AUTH-01]: Check if claimed legitimately by Command Center spawner via token
+        feat_dir_cand = ticket_path.parent.parent if ticket_path.parent.name == "issues" else ticket_path.parent
+        spawn_token = feat_dir_cand / f".spawn_claim_{canonical_id}"
+        if spawn_token.is_file():
+            try:
+                spawn_token.unlink(missing_ok=True)
+            except OSError:
+                pass
+            diagnostic = f"✅ Ticket '{canonical_id}' claimed by Command Center tab spawner. Worker execution authorized."
+            return TicketConcurrencyResult(
+                True,
+                diagnostic=diagnostic,
+                ticket_id=canonical_id,
+                status=existing_status,
+                ticket_path=ticket_path,
+                is_conflict=False,
+            )
+
         diagnostic = (
             f"⚠️ [ERR-EXCL-03] Concurrency Advisory: Ticket '{canonical_id}' is already 'in-progress' "
             f"(claimed by another session). Worker execution rejected. "
