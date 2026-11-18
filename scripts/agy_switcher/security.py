@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from agy_switcher.exceptions import InvalidTokenError
 
@@ -57,26 +57,84 @@ def _atomic_write_json(target_path: Path | str, data: Any, mode: int = 0o600, in
     _atomic_write_file(Path(target_path), json.dumps(data, indent=indent) + "\n", mode=mode)
 
 
+_BASE64URL_TRANS = str.maketrans("-_", "+/")
+
+
+def _decode_jwt_payload(id_token: object) -> dict[str, object] | None:
+    """Decodes the second dot-separated JWT segment into a JSON object, or returns None."""
+    if not isinstance(id_token, str) or not id_token.strip():
+        return None
+    parts = id_token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    if not payload or "+" in payload or "/" in payload:
+        return None
+    padded = payload + ("=" * (-len(payload) % 4))
+    try:
+        raw_bytes = base64.b64decode(padded.translate(_BASE64URL_TRANS), validate=True)
+        decoded = json.loads(raw_bytes.decode("utf-8"))
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return cast(dict[str, object], decoded)
+
+
 def extract_email_from_jwt(id_token: str | None) -> str | None:
     """Decodes JWT payload to extract user email without external dependencies."""
-    if not id_token or not isinstance(id_token, str):
+    decoded = _decode_jwt_payload(id_token)
+    if decoded is None:
         return None
-    try:
-        parts = id_token.split(".")
-        if len(parts) >= 2:
-            payload = parts[1]
-            payload += "=" * (-len(payload) % 4)
-            decoded = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")))
-            if isinstance(decoded, dict):
-                email = decoded.get("email")
-                if isinstance(email, str) and email.strip():
-                    return email.strip()
-    except Exception:
-        return None
+    email = decoded.get("email")
+    if isinstance(email, str) and email.strip():
+        return email.strip()
     return None
 
 
-def validate_token_dict(data: Any, *, return_tuple: bool = False) -> Any:
+def resolve_token_email(data: object) -> str | None:
+    """Resolves account email from a token payload without network I/O.
+
+    Prefers a trimmed non-empty email claim from id_token JWT via
+    extract_email_from_jwt(), falling back to a trimmed non-empty string
+    id_token_email field.
+    """
+    if not isinstance(data, Mapping):
+        return None
+
+    id_token = data.get("id_token")
+    if isinstance(id_token, str):
+        jwt_email = extract_email_from_jwt(id_token)
+        if jwt_email is not None:
+            return jwt_email
+
+    fallback_email = data.get("id_token_email")
+    if isinstance(fallback_email, str):
+        trimmed = fallback_email.strip()
+        if trimmed:
+            return trimmed
+    return None
+
+
+def _is_non_empty_str(value: object) -> bool:
+    """Returns True when value is a string containing non-whitespace characters."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def has_valid_id_token_or_fallback(data: Mapping[str, object]) -> bool:
+    """Returns True when id_token is omitted/empty, a valid JWT object, or backed by id_token_email."""
+    # agy 1.5.10 omits id_token or sets it to null/"" in favor of id_token_email.
+    # Present non-empty id_token values must parse as a JWT JSON object unless a
+    # valid trimmed non-empty string id_token_email is provided.
+    id_token = data.get("id_token")
+    if id_token is None or id_token == "":
+        return True
+    if _decode_jwt_payload(id_token) is not None:
+        return True
+    return _is_non_empty_str(data.get("id_token_email"))
+
+
+def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
     """Validates that data complies with Google OAuth token JSON schema.
 
     If return_tuple=True, returns tuple[bool, str | None].
@@ -91,16 +149,15 @@ def validate_token_dict(data: Any, *, return_tuple: bool = False) -> Any:
             raise InvalidTokenError("Missing required 'token' object in payload.")
 
         required_token_keys = ("access_token", "refresh_token", "token_type", "expiry")
-        missing_keys = [k for k in required_token_keys if not token_obj.get(k)]
+        missing_keys = [k for k in required_token_keys if not _is_non_empty_str(token_obj.get(k))]
         if missing_keys:
             raise InvalidTokenError(f"Missing required token fields: {', '.join(missing_keys)}")
 
-        if not data.get("auth_method"):
+        if not _is_non_empty_str(data.get("auth_method")):
             raise InvalidTokenError("Missing required 'auth_method' field.")
 
-        id_token = data.get("id_token")
-        if not id_token or not isinstance(id_token, str):
-            raise InvalidTokenError("Missing or invalid 'id_token' JWT field.")
+        if not has_valid_id_token_or_fallback(data):
+            raise InvalidTokenError("Invalid 'id_token' JWT field.")
 
         if return_tuple:
             return True, None
@@ -126,7 +183,7 @@ def validate_token_file(token_path: Path | str, *, return_tuple: bool = False) -
     try:
         raw = token_path.read_text(encoding="utf-8")
         data = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         err = f"Failed to read/parse token JSON: {e}"
         if return_tuple:
             return False, err, None
@@ -139,7 +196,7 @@ def validate_token_file(token_path: Path | str, *, return_tuple: bool = False) -
     return validate_token_dict(data)
 
 
-def check_token_dict(data: Any) -> tuple[bool, str | None]:
+def check_token_dict(data: object) -> tuple[bool, str | None]:
     """Validates token dictionary returning (is_valid, error_message)."""
     return cast(tuple[bool, str | None], validate_token_dict(data, return_tuple=True))
 
@@ -153,6 +210,8 @@ __all__ = [
     "_atomic_write_file",
     "_atomic_write_json",
     "extract_email_from_jwt",
+    "has_valid_id_token_or_fallback",
+    "resolve_token_email",
     "validate_token_dict",
     "validate_token_file",
     "check_token_dict",

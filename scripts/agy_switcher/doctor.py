@@ -25,6 +25,8 @@ from agy_switcher.security import (
     _atomic_write_file,
     _atomic_write_json,
     extract_email_from_jwt,
+    has_valid_id_token_or_fallback,
+    resolve_token_email,
     validate_token_dict,
     validate_token_file,
 )
@@ -640,6 +642,7 @@ class DoctorEngine:
         expired_active: list[str] = []
         expired_secondary: list[str] = []
         standby_ready: list[str] = []
+        missing_identity_accounts: list[str] = []
 
         for acc in accounts:
             acc_name = acc.name
@@ -697,11 +700,9 @@ class DoctorEngine:
                     corrupt_accounts.append((acc_name, str(e)))
                     continue
 
-                id_tok = data.get("id_token", "")
-                email = self.extract_email_from_jwt(id_tok)
-                if not email:
-                    corrupt_accounts.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
-                    continue
+                email = resolve_token_email(data)
+                if email is None:
+                    missing_identity_accounts.append(acc_name)
 
                 token_obj = data.get("token", {})
                 raw_expiry = token_obj.get("expiry")
@@ -731,15 +732,13 @@ class DoctorEngine:
                     corrupt_secondary.append((acc_name, "Missing required 'auth_method' field."))
                     continue
 
-                id_tok = data.get("id_token")
-                if not id_tok or not isinstance(id_tok, str):
-                    corrupt_secondary.append((acc_name, "Missing or invalid 'id_token' JWT field."))
+                if not has_valid_id_token_or_fallback(data):
+                    corrupt_secondary.append((acc_name, "Invalid 'id_token' JWT field."))
                     continue
 
-                email = self.extract_email_from_jwt(id_tok)
-                if not email:
-                    corrupt_secondary.append((acc_name, "Invalid id_token JWT (unable to extract email)"))
-                    continue
+                email = resolve_token_email(data)
+                if email is None:
+                    missing_identity_accounts.append(acc_name)
 
                 raw_expiry = token_obj.get("expiry")
                 if not self._is_valid_expiry(raw_expiry):
@@ -786,7 +785,7 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        if corrupt_secondary or expired_secondary:
+        if corrupt_secondary or expired_secondary or missing_identity_accounts:
             warn_parts: list[str] = []
             if expired_secondary:
                 warn_parts.append(
@@ -798,7 +797,15 @@ class DoctorEngine:
                 warn_parts.append(
                     f"Secondary account token schema corrupt or invalid: {', '.join(err_details)}"
                 )
-            warn_msg = ". ".join(warn_parts) + ". Re-authenticate with 'agy-switch login <alias>'."
+            if missing_identity_accounts:
+                warn_parts.append(
+                    f"Email identity is unavailable for account(s): {', '.join(missing_identity_accounts)}"
+                )
+            warn_msg = ". ".join(warn_parts)
+            if corrupt_secondary or expired_secondary:
+                warn_msg += ". Re-authenticate with 'agy-switch login <alias>'."
+            else:
+                warn_msg += "."
             return DiagnosticItem(
                 category="token_integrity",
                 name="OAuth Token & JWT Identity Integrity",

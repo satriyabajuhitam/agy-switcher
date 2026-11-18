@@ -78,7 +78,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
     def test_vault_directories_created(self):
         """Engine should automatically create ~/.antigravity-vault/accounts and cache if missing with 0o700."""
         self.assertFalse(self.vault_dir.exists())
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
         self.assertTrue(self.vault_dir.is_dir())
         self.assertTrue((self.vault_dir / "accounts").is_dir())
         self.assertTrue((self.vault_dir / "cache").is_dir())
@@ -115,7 +119,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
 
     def test_get_account_tokens(self):
         """get_account_tokens encapsulates token extraction from token.json."""
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
 
         # 1. Non-existent account
         self.assertIsNone(engine.get_account_tokens("non_existent"))
@@ -191,7 +199,11 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
 
     def test_token_validation_accepts_valid_and_rejects_invalid(self):
         """Token validation must strictly verify required keys."""
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
 
         # Valid token
         valid = create_sample_token("valid@example.com")
@@ -206,7 +218,30 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
         with self.assertRaises(InvalidTokenError):
             engine.validate_token_dict({"token": {"refresh_token": "abc"}, "auth_method": "oauth"})
 
-        # Invalid: missing id_token
+        # Valid in agy 1.5.10: omitted id_token with valid token fields and auth_method
+        no_id_token = {
+            "token": {
+                "access_token": "a",
+                "refresh_token": "b",
+                "token_type": "Bearer",
+                "expiry": "x",
+            },
+            "auth_method": "oauth",
+        }
+        self.assertEqual(engine.validate_token_dict(no_id_token), no_id_token)
+
+        # Invalid: missing auth_method
+        with self.assertRaises(InvalidTokenError):
+            engine.validate_token_dict({
+                "token": {
+                    "access_token": "a",
+                    "refresh_token": "b",
+                    "token_type": "Bearer",
+                    "expiry": "x",
+                },
+            })
+
+        # Invalid: non-string id_token
         with self.assertRaises(InvalidTokenError):
             engine.validate_token_dict({
                 "token": {
@@ -216,11 +251,168 @@ class TestVaultFoundationAndMigration(unittest.TestCase):
                     "expiry": "x",
                 },
                 "auth_method": "oauth",
+                "id_token": 12345,
             })
+
+    def test_validate_token_optional_id_token_with_email_TOKEN_ID_001(self):
+        """[TOKEN-ID-001] Omitted id_token with id_token_email passes validate_token_dict and validate_token_file."""
+        from agy_switcher.security import validate_token_dict, validate_token_file
+
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
+        payload = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "refresh_token": "1//sample_refresh",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": "user@example.com",
+        }
+
+        self.assertEqual(validate_token_dict(payload), payload)
+        self.assertEqual(engine.validate_token_dict(payload), payload)
+
+        token_file = self.base_path / "token_id_email.json"
+        token_file.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(validate_token_file(token_file), payload)
+        self.assertEqual(engine.validate_token_file(token_file), payload)
+
+    def test_validate_token_none_or_empty_id_token_TOKEN_ID_002(self):
+        """[TOKEN-ID-002] Explicit None or empty string id_token returns (True, None) with return_tuple=True."""
+        from agy_switcher.security import validate_token_dict, validate_token_file
+
+        for id_token_val in (None, ""):
+            with self.subTest(id_token=id_token_val):
+                payload = {
+                    "token": {
+                        "access_token": "ya29.sample_access",
+                        "refresh_token": "1//sample_refresh",
+                        "token_type": "Bearer",
+                        "expiry": "2026-09-30T12:00:00Z",
+                    },
+                    "auth_method": "oauth",
+                    "id_token": id_token_val,
+                }
+                self.assertEqual(validate_token_dict(payload, return_tuple=True), (True, None))
+
+                token_file = self.base_path / f"token_{'none' if id_token_val is None else 'empty'}.json"
+                token_file.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertEqual(validate_token_file(token_file, return_tuple=True), (True, None, payload))
+
+    def test_validate_token_missing_both_identity_fields_TOKEN_ID_003(self):
+        """[TOKEN-ID-003] Valid OAuth token missing both id_token and id_token_email passes validation."""
+        from agy_switcher.security import validate_token_dict
+
+        payload = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "refresh_token": "1//sample_refresh",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+        }
+        self.assertNotIn("id_token", payload)
+        self.assertNotIn("id_token_email", payload)
+        self.assertEqual(validate_token_dict(payload), payload)
+
+    def test_validate_token_missing_required_oauth_fields_TOKEN_ID_ERR_002(self):
+        """[TOKEN-ID-ERR-002] Missing refresh_token or auth_method raises InvalidTokenError specifying the field."""
+        from agy_switcher.security import validate_token_dict
+
+        missing_refresh = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+        }
+        with self.assertRaises(InvalidTokenError) as refresh_ctx:
+            validate_token_dict(missing_refresh)
+        self.assertIn("refresh_token", str(refresh_ctx.exception))
+
+        missing_auth = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "refresh_token": "1//sample_refresh",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+        }
+        with self.assertRaises(InvalidTokenError) as auth_ctx:
+            validate_token_dict(missing_auth)
+        self.assertIn("auth_method", str(auth_ctx.exception))
+
+    def test_validate_token_corrupt_id_token_rejected_TOKEN_ID_ERR_001(self):
+        """[TOKEN-ID-ERR-001] Malformed or non-string non-empty id_token without valid id_token_email raises InvalidTokenError."""
+        from agy_switcher.security import validate_token_dict
+
+        for bad_id_token in ("not.a.valid.jwt", 12345):
+            with self.subTest(id_token=bad_id_token):
+                payload = {
+                    "token": {
+                        "access_token": "ya29.sample_access",
+                        "refresh_token": "1//sample_refresh",
+                        "token_type": "Bearer",
+                        "expiry": "2026-09-30T12:00:00Z",
+                    },
+                    "auth_method": "oauth",
+                    "id_token": bad_id_token,
+                }
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict(payload)
+                ok, err = validate_token_dict(payload, return_tuple=True)
+                self.assertFalse(ok)
+                self.assertIsInstance(err, str)
+
+    def test_validate_token_invalid_email_fallback_and_emailless_jwt_TOKEN_ID_EDGE_001(self):
+        """[TOKEN-ID-EDGE-001] Invalid id_token_email does not rescue corrupt id_token; valid JWT without email passes."""
+        from agy_switcher.security import validate_token_dict
+
+        for bad_email in ("   ", 12345):
+            with self.subTest(id_token_email=bad_email):
+                corrupt_payload = {
+                    "token": {
+                        "access_token": "ya29.sample_access",
+                        "refresh_token": "1//sample_refresh",
+                        "token_type": "Bearer",
+                        "expiry": "2026-09-30T12:00:00Z",
+                    },
+                    "auth_method": "oauth",
+                    "id_token": "not.a.valid.jwt",
+                    "id_token_email": bad_email,
+                }
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict(corrupt_payload)
+
+        no_email_claims = json.dumps({"sub": "no_email_user"}).encode("utf-8")
+        no_email_b64 = base64.urlsafe_b64encode(no_email_claims).decode("utf-8").rstrip("=")
+        valid_no_email_payload = {
+            "token": {
+                "access_token": "ya29.sample_access",
+                "refresh_token": "1//sample_refresh",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token": f"header.{no_email_b64}.signature",
+        }
+        self.assertEqual(validate_token_dict(valid_no_email_payload), valid_no_email_payload)
+        self.assertEqual(validate_token_dict(valid_no_email_payload, return_tuple=True), (True, None))
 
     def test_list_accounts_marks_active_account(self):
         """list_accounts() must return all accounts and mark the active account properly."""
-        engine = AgySwitchEngine(vault_dir=self.vault_dir, gemini_dir=self.gemini_dir)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "proc",
+        )
         for name in ["alpha", "beta", "gamma"]:
             acc_dir = self.vault_dir / "accounts" / name
             acc_dir.mkdir(parents=True, exist_ok=True)

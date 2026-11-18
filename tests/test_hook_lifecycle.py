@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for Ticket 01: Basic Hook Lifecycle & Configuration (agy-switch)."""
 
+import base64
 import json
 import os
 import stat
@@ -19,6 +20,11 @@ from agy_switch import (
     AgySwitchEngine,
     main,
 )
+
+
+def _make_jwt(email: str) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"email": email}).encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"header.{payload}.signature"
 
 
 class TestHookLifecycleAndConfig(unittest.TestCase):
@@ -301,7 +307,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -343,7 +349,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -417,7 +423,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -563,7 +569,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -618,7 +624,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -667,7 +673,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -763,7 +769,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -842,7 +848,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -876,7 +882,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -958,7 +964,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1029,7 +1035,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1063,7 +1069,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1097,7 +1103,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1151,7 +1157,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             (acc_dir / "token.json").write_text(json.dumps({
                 "token": {"access_token": f"tok_{acc_name}", "refresh_token": f"ref_{acc_name}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1208,7 +1214,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1247,7 +1253,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1281,7 +1287,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1320,7 +1326,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1366,7 +1372,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1423,7 +1429,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1473,7 +1479,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com\"}}",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1520,7 +1526,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1567,7 +1573,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1617,7 +1623,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1663,7 +1669,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1710,7 +1716,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1757,7 +1763,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1797,7 +1803,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1842,7 +1848,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1889,7 +1895,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1928,7 +1934,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -1975,7 +1981,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 
@@ -2010,7 +2016,7 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                     "expiry": "2026-10-05T12:00:00Z",
                 },
                 "auth_method": "oauth",
-                "id_token": f"header.eyJlbWFpbCI6ICJ{acc_name}@example.com",
+                "id_token": _make_jwt(f"{acc_name}@example.com"),
             }))
         self.engine.set_active_name("acc1")
 

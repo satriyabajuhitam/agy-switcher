@@ -793,6 +793,332 @@ class TestDoctorEngineLayer2(unittest.TestCase):
         self.assertIn("Unlinked stale watch.pid file", fixes)
 
 
+class TestSecurityTokenSchemaValidation(unittest.TestCase):
+    """Unit tests for agy 1.5.10 optional id_token schema in agy_switcher.security."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _base_payload(self) -> dict[str, object]:
+        return {
+            "token": {
+                "access_token": "ya29.valid_access_token",
+                "refresh_token": "1//valid_refresh_token",
+                "token_type": "Bearer",
+                "expiry": "2026-09-30T12:00:00Z",
+            },
+            "auth_method": "oauth",
+        }
+
+    def test_validate_token_omitted_id_token_with_id_token_email_TOKEN_ID_001(self) -> None:
+        """[TOKEN-ID-001] validate_token_dict and validate_token_file accept omitted id_token with id_token_email."""
+        from agy_switcher.security import validate_token_dict, validate_token_file
+
+        payload = self._base_payload()
+        payload["id_token_email"] = "user@example.com"
+
+        self.assertEqual(validate_token_dict(payload), payload)
+
+        token_file = self.base_path / "token.json"
+        token_file.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(validate_token_file(token_file), payload)
+
+    def test_validate_token_none_or_empty_id_token_returns_tuple_TOKEN_ID_002(self) -> None:
+        """[TOKEN-ID-002] validate_token_dict(data, return_tuple=True) returns (True, None) for None or empty id_token."""
+        from agy_switcher.security import validate_token_dict
+
+        for id_token_val in (None, ""):
+            with self.subTest(id_token=id_token_val):
+                payload = self._base_payload()
+                payload["id_token"] = id_token_val
+                self.assertEqual(validate_token_dict(payload, return_tuple=True), (True, None))
+
+    def test_validate_token_missing_both_identity_fields_TOKEN_ID_003(self) -> None:
+        """[TOKEN-ID-003] Valid OAuth token missing both id_token and id_token_email passes structural validation."""
+        from agy_switcher.security import validate_token_dict
+
+        payload = self._base_payload()
+        self.assertNotIn("id_token", payload)
+        self.assertNotIn("id_token_email", payload)
+        self.assertEqual(validate_token_dict(payload), payload)
+        self.assertEqual(validate_token_dict(payload, return_tuple=True), (True, None))
+
+    def test_validate_token_missing_required_fields_specifies_field_TOKEN_ID_ERR_002(self) -> None:
+        """[TOKEN-ID-ERR-002] Missing required token fields or auth_method raises InvalidTokenError naming the field."""
+        from agy_switcher.security import validate_token_dict
+
+        for field in ("access_token", "refresh_token", "token_type", "expiry"):
+            with self.subTest(missing_token_field=field):
+                payload = self._base_payload()
+                raw_token = payload["token"]
+                assert isinstance(raw_token, dict)
+                token_dict = dict(raw_token)
+                del token_dict[field]
+                payload["token"] = token_dict
+
+                with self.assertRaises(InvalidTokenError) as ctx:
+                    validate_token_dict(payload)
+                self.assertIn(field, str(ctx.exception))
+
+                ok, err = validate_token_dict(payload, return_tuple=True)
+                self.assertFalse(ok)
+                self.assertIsNotNone(err)
+                assert err is not None
+                self.assertIn(field, err)
+
+        missing_auth = self._base_payload()
+        del missing_auth["auth_method"]
+        with self.assertRaises(InvalidTokenError) as auth_ctx:
+            validate_token_dict(missing_auth)
+        self.assertIn("auth_method", str(auth_ctx.exception))
+
+        ok_auth, err_auth = validate_token_dict(missing_auth, return_tuple=True)
+        self.assertFalse(ok_auth)
+        self.assertIsNotNone(err_auth)
+        assert err_auth is not None
+        self.assertIn("auth_method", err_auth)
+
+    def test_validate_token_corrupt_jwt_without_fallback_TOKEN_ID_ERR_001(self) -> None:
+        """[TOKEN-ID-ERR-001] Present non-empty malformed or non-string id_token without valid id_token_email raises InvalidTokenError."""
+        from agy_switcher.security import validate_token_dict
+
+        for bad_id in ("not.a.valid.jwt", 12345, "single-segment", "hdr..sig", "hdr.WyIxIl0.sig"):
+            with self.subTest(bad_id=bad_id):
+                payload = self._base_payload()
+                payload["id_token"] = bad_id
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict(payload)
+                ok, err = validate_token_dict(payload, return_tuple=True)
+                self.assertFalse(ok)
+                self.assertIsInstance(err, str)
+
+    def test_validate_token_invalid_email_and_emailless_jwt_TOKEN_ID_EDGE_001(self) -> None:
+        """[TOKEN-ID-EDGE-001] Invalid id_token_email does not rescue corrupt id_token; valid JWT without email claim passes."""
+        import base64
+        from agy_switcher.security import validate_token_dict
+
+        for bad_email in ("   ", 12345):
+            with self.subTest(bad_email=bad_email):
+                corrupt_payload = self._base_payload()
+                corrupt_payload["id_token"] = "not.a.valid.jwt"
+                corrupt_payload["id_token_email"] = bad_email
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict(corrupt_payload)
+                ok, err = validate_token_dict(corrupt_payload, return_tuple=True)
+                self.assertFalse(ok)
+                self.assertIsInstance(err, str)
+
+        no_email_b64 = base64.urlsafe_b64encode(
+            json.dumps({"sub": "no_email_user"}).encode("utf-8")
+        ).decode("utf-8").rstrip("=")
+        valid_payload = self._base_payload()
+        valid_payload["id_token"] = f"header.{no_email_b64}.signature"
+        self.assertEqual(validate_token_dict(valid_payload), valid_payload)
+        self.assertEqual(validate_token_dict(valid_payload, return_tuple=True), (True, None))
+
+    def test_validate_token_rejects_non_string_id_token_and_missing_required_fields(self) -> None:
+        """Non-string id_token and missing required OAuth fields still fail validation."""
+        from agy_switcher.security import validate_token_dict
+
+        bad_non_str = self._base_payload()
+        bad_non_str["id_token"] = 12345
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict(bad_non_str)
+        ok, err = validate_token_dict(bad_non_str, return_tuple=True)
+        self.assertFalse(ok)
+        self.assertIsInstance(err, str)
+
+        bad_bool = self._base_payload()
+        bad_bool["id_token"] = False
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict(bad_bool)
+
+        missing_auth = self._base_payload()
+        del missing_auth["auth_method"]
+        with self.assertRaises(InvalidTokenError):
+            validate_token_dict(missing_auth)
+
+    def test_validate_token_stress_edge_cases(self) -> None:
+        """Stress-test whitespace, non-string subfields, id_token_email tolerance, and binary files."""
+        from agy_switcher.security import validate_token_dict, validate_token_file
+
+        # Whitespace-only, falsy non-string, and malformed JWT id_token values must fail in both modes
+        import base64
+        std_b64_slash = base64.b64encode(json.dumps({"sub": "?>?"}).encode("utf-8")).decode("ascii")
+        non_utf8_b64 = base64.urlsafe_b64encode(b"\xff\xfe\xfd").decode("ascii").rstrip("=")
+        null_json_b64 = base64.urlsafe_b64encode(b"null").decode("ascii").rstrip("=")
+        for bad_id in (
+            "   ",
+            "\t\n",
+            0,
+            False,
+            [],
+            {},
+            123,
+            True,
+            ["jwt"],
+            {"jwt": "x"},
+            f"hdr.{std_b64_slash}.sig",
+            f"hdr.{non_utf8_b64}.sig",
+            f"hdr.{null_json_b64}.sig",
+        ):
+            with self.subTest(bad_id_token=bad_id):
+                payload = self._base_payload()
+                payload["id_token"] = bad_id
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict(payload)
+                ok, err = validate_token_dict(payload, return_tuple=True)
+                self.assertFalse(ok)
+                self.assertIsInstance(err, str)
+
+        # Missing, empty, whitespace, or non-string auth_method must fail
+        for bad_auth in (None, "", "   ", 123, True, [], {}):
+            with self.subTest(bad_auth_method=bad_auth):
+                payload = self._base_payload()
+                payload["auth_method"] = bad_auth
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict(payload)
+                ok, err = validate_token_dict(payload, return_tuple=True)
+                self.assertFalse(ok)
+                self.assertIsInstance(err, str)
+
+        # Missing, non-dict token, or missing/empty/whitespace/non-string required subfields must fail
+        for bad_token_obj in (None, "not-a-dict", [], 123):
+            with self.subTest(bad_token_obj=bad_token_obj):
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict({"token": bad_token_obj, "auth_method": "oauth"})
+
+        for field in ("access_token", "refresh_token", "token_type", "expiry"):
+            missing_payload = self._base_payload()
+            raw_token = missing_payload["token"]
+            assert isinstance(raw_token, dict)
+            token_dict = dict(raw_token)
+            del token_dict[field]
+            missing_payload["token"] = token_dict
+            with self.subTest(missing_field=field):
+                with self.assertRaises(InvalidTokenError):
+                    validate_token_dict(missing_payload)
+
+            for bad_val in (None, "", "   ", 123, True, ["x"], {"k": "v"}):
+                with self.subTest(field=field, bad_val=bad_val):
+                    bad_payload = self._base_payload()
+                    raw_bad_token = bad_payload["token"]
+                    assert isinstance(raw_bad_token, dict)
+                    bad_token = dict(raw_bad_token)
+                    bad_token[field] = bad_val
+                    bad_payload["token"] = bad_token
+                    with self.assertRaises(InvalidTokenError):
+                        validate_token_dict(bad_payload)
+                    ok, err = validate_token_dict(bad_payload, return_tuple=True)
+                    self.assertFalse(ok)
+                    self.assertIsInstance(err, str)
+
+        # Non-string/whitespace id_token_email does not crash when id_token is omitted/None/""
+        for email_val in ("user@example.com", "   ", "", None, 12345, True, [], {}):
+            for id_val in (None, ""):
+                with self.subTest(email_val=email_val, id_val=id_val):
+                    payload = self._base_payload()
+                    payload["id_token"] = id_val
+                    payload["id_token_email"] = email_val
+                    self.assertEqual(validate_token_dict(payload), payload)
+                    self.assertEqual(validate_token_dict(payload, return_tuple=True), (True, None))
+
+        # validate_token_file parity for non-object JSON and non-UTF-8 binary files
+        json_array_file = self.base_path / "array.json"
+        json_array_file.write_text("[]", encoding="utf-8")
+        with self.assertRaises(InvalidTokenError):
+            validate_token_file(json_array_file)
+        self.assertEqual(validate_token_file(json_array_file, return_tuple=True)[0], False)
+        self.assertIsNone(validate_token_file(json_array_file, return_tuple=True)[2])
+
+        binary_file = self.base_path / "binary.json"
+        binary_file.write_bytes(b"\xff\xfe\x00\x01")
+        with self.assertRaises(InvalidTokenError):
+            validate_token_file(binary_file)
+        ok_bin, err_bin, data_bin = validate_token_file(binary_file, return_tuple=True)
+        self.assertFalse(ok_bin)
+        self.assertIsInstance(err_bin, str)
+        self.assertIsNone(data_bin)
+
+    def test_resolve_token_email_prefers_jwt_and_falls_back_IDENTITY_RES_001(self) -> None:
+        """[IDENTITY-RES-001] resolve_token_email prefers id_token JWT email and falls back to id_token_email."""
+        import base64
+        from agy_switcher.security import resolve_token_email
+
+        for omitted_or_empty in (
+            {"id_token_email": "fallback@example.com"},
+            {"id_token": None, "id_token_email": "fallback@example.com"},
+            {"id_token": "", "id_token_email": "  fallback@example.com  "},
+        ):
+            with self.subTest(payload=omitted_or_empty):
+                self.assertEqual(resolve_token_email(omitted_or_empty), "fallback@example.com")
+
+        jwt_payload_b64 = base64.urlsafe_b64encode(
+            json.dumps({"email": "jwt@example.com", "sub": "12345"}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        jwt_with_legacy = {
+            "id_token": f"header.{jwt_payload_b64}.signature",
+            "id_token_email": "legacy@example.com",
+        }
+        self.assertEqual(resolve_token_email(jwt_with_legacy), "jwt@example.com")
+
+        padded_jwt_b64 = base64.urlsafe_b64encode(
+            json.dumps({"email": "  trimmed.jwt@example.com  "}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        self.assertEqual(
+            resolve_token_email({"id_token": f"hdr.{padded_jwt_b64}.sig"}),
+            "trimmed.jwt@example.com",
+        )
+
+    def test_resolve_token_email_edge_cases_and_invalid_fallbacks(self) -> None:
+        """resolve_token_email ignores whitespace/non-string values and non-dict inputs."""
+        import base64
+        from agy_switcher.security import resolve_token_email
+
+        no_email_jwt = base64.urlsafe_b64encode(
+            json.dumps({"sub": "user-123"}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        ws_email_jwt = base64.urlsafe_b64encode(
+            json.dumps({"email": "   "}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+
+        self.assertEqual(
+            resolve_token_email(
+                {"id_token": f"hdr.{no_email_jwt}.sig", "id_token_email": "fb@example.com"}
+            ),
+            "fb@example.com",
+        )
+        self.assertEqual(
+            resolve_token_email(
+                {"id_token": f"hdr.{ws_email_jwt}.sig", "id_token_email": "fb2@example.com"}
+            ),
+            "fb2@example.com",
+        )
+        self.assertEqual(
+            resolve_token_email(
+                {"id_token": "not.a.valid.jwt", "id_token_email": "fb3@example.com"}
+            ),
+            "fb3@example.com",
+        )
+
+        for bad_fallback in (None, "", "   ", "\t\n", 12345, True, ["a@b.com"], {"email": "a@b.com"}):
+            with self.subTest(bad_fallback=bad_fallback):
+                self.assertIsNone(
+                    resolve_token_email(
+                        {"id_token": f"hdr.{no_email_jwt}.sig", "id_token_email": bad_fallback}
+                    )
+                )
+
+        for non_mapping in (None, "", [], 123, True):
+            with self.subTest(non_mapping=non_mapping):
+                self.assertIsNone(resolve_token_email(non_mapping))
+
+
+
 if __name__ == "__main__":
     unittest.main()
 

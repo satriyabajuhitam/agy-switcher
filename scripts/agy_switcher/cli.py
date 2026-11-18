@@ -15,7 +15,6 @@ import signal
 import subprocess
 import sys
 from typing import Any, Callable, cast
-import urllib.parse
 
 from agy_switcher.exceptions import (
     AccountNotFoundError,
@@ -33,9 +32,7 @@ from agy_switcher.formatters import (
 )
 from agy_switcher.models import DiagnosticItem, DiagnosticReport, QuotaStatus
 from agy_switcher.telemetry import (
-    DEFAULT_CLIENT_ID,
     QuotaClient,
-    build_oauth_url,
     fetch_all_accounts_quota,
     normalize_model_name,
     run_quota_pipeline,
@@ -234,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="auth_code",
         type=str,
         default=None,
-        help="OAuth 2.0 authorization code (skips stdin prompt in headless mode)",
+        help="Deprecated: incompatible with dynamic agy PKCE sessions (rejected if provided)",
     )
 
     # Command: config
@@ -323,15 +320,22 @@ def _account_exists(engine: AgySwitchEngine, alias: str) -> bool:
     return bool(engine.has_account(alias))
 
 
-def _get_default_oauth_url() -> str:
-    """Constructs default Google OAuth authorization URL for headless login."""
-    return build_oauth_url(DEFAULT_CLIENT_ID)
-
-
 def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
     """Dispatches login command, supporting interactive headless and browser-based modes."""
     alias = getattr(args, "name", "")
     force = getattr(args, "force", False)
+
+    # Reject deprecated --auth-code immediately before alias overwrite checks or subprocess spawns
+    # because dynamic PKCE sessions bind verifier/state per interactive agy invocation.
+    raw_auth_code = getattr(args, "auth_code", None)
+    if raw_auth_code is not None:
+        target_alias = alias or "<alias>"
+        print(
+            "Error: --auth-code is deprecated and incompatible with dynamic agy PKCE sessions. "
+            f"Run 'agy-switch login {target_alias} --headless' interactively instead.",
+            file=sys.stderr,
+        )
+        return 1
 
     if getattr(args, "headless", False):
         if hasattr(engine, "validate_account_alias") and callable(engine.validate_account_alias):
@@ -346,7 +350,7 @@ def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
         if not force and _account_exists(engine, alias):
             try:
                 confirm = input(f"Account '{alias}' already exists. Overwrite? [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt, OSError):
                 print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
                 return 1
 
@@ -355,45 +359,19 @@ def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
                 return 1
             force = True
 
-        auth_code = getattr(args, "auth_code", None)
-        if not auth_code:
-            oauth_url = None
-            if hasattr(engine, "get_oauth_url") and callable(engine.get_oauth_url):
-                try:
-                    res_url = engine.get_oauth_url()
-                    if isinstance(res_url, str) and res_url:
-                        oauth_url = res_url
-                except Exception:
-                    pass
-
-            if not oauth_url:
-                oauth_url = _get_default_oauth_url()
-
-            print(f"Please visit this URL to authorize this application: {oauth_url}")
-            try:
-                auth_code = input("Enter authorization code: ").strip()
-            except EOFError:
-                print("Error: No authorization code provided and stdin closed.", file=sys.stderr)
-                return 1
-            except KeyboardInterrupt:
-                print("Error: Login process interrupted by user.", file=sys.stderr)
-                return 1
-
-            if not auth_code:
-                print("Error: Authorization code must be a non-empty string.", file=sys.stderr)
-                return 1
-
         agy_binary = getattr(args, "agy_binary", None)
         timeout = getattr(args, "timeout", 600)
 
         try:
             success, msg = engine.login_headless(
                 alias=alias,
-                auth_code=auth_code,
                 force=force,
                 agy_binary=agy_binary,
                 timeout=timeout,
             )
+        except KeyboardInterrupt:
+            print("Error: Login process interrupted by user.", file=sys.stderr)
+            return 1
         except AgySwitchError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -429,6 +407,9 @@ def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
         print(f"  - Status: Standby (Run 'agy-switch switch {res['name']}' to activate)")
         print(f"  - Vault : {engine.accounts_dir / res['name'] / 'token.json'}")
         return 0
+    except KeyboardInterrupt:
+        print("Error: Login process interrupted by user.", file=sys.stderr)
+        return 1
     except AgySwitchError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

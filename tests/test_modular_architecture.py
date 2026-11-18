@@ -632,6 +632,16 @@ class TestReExportLaunchers(unittest.TestCase):
                 f"Symbol identity mismatch for '{symbol}': {pkg_obj} vs {launcher_obj}",
             )
 
+    def test_resolve_token_email_reexport_surface_parity(self):
+        """resolve_token_email is exported identically across security, agy_switcher, and agy_switch."""
+        import agy_switcher.security as security_mod
+
+        self.assertIn("resolve_token_email", security_mod.__all__)
+        self.assertIn("resolve_token_email", agy_switcher.__all__)
+        self.assertIn("resolve_token_email", agy_switch.__all__)
+        self.assertIs(security_mod.resolve_token_email, agy_switcher.resolve_token_email)
+        self.assertIs(agy_switcher.resolve_token_email, agy_switch.resolve_token_email)
+
     def test_watch_launcher_uses_realpath_and_exports(self):
         watch_path = SCRIPTS_DIR / "watch.py"
         source = watch_path.read_text(encoding="utf-8")
