@@ -1444,21 +1444,29 @@ class AgySwitchEngine:
 
                 if pkce_url is None:
                     remaining = deadline - time.monotonic()
+                    streams_closed_without_exit = False
                     if proc.poll() is None:
                         if remaining <= 0:
                             _terminate_process(proc, pgid=pgid)
                             return False, f"Login timed out after {timeout} seconds."
+                        # If all output streams already hit EOF, wait only briefly for exit status
+                        # rather than blocking for the full login timeout if the child stayed alive.
+                        wait_timeout = min(remaining, 0.2) if not open_streams else remaining
                         try:
-                            proc.wait(timeout=remaining)
+                            proc.wait(timeout=wait_timeout)
                         except subprocess.TimeoutExpired:
                             _terminate_process(proc, pgid=pgid)
-                            return False, f"Login timed out after {timeout} seconds."
+                            if open_streams:
+                                return False, f"Login timed out after {timeout} seconds."
+                            streams_closed_without_exit = True
                     _terminate_process(proc, pgid=pgid)
                     _drain_stream_queue(out_queue, stdout_parts, stderr_parts, open_streams, last_activity)
                     returncode = _get_returncode(proc)
                     err_msg = "".join(stderr_parts).strip() or "".join(stdout_parts).strip()
                     if not err_msg:
-                        if returncode is not None and returncode != 0:
+                        if streams_closed_without_exit:
+                            err_msg = "agy closed output streams without emitting a PKCE OAuth URL."
+                        elif returncode is not None and returncode != 0:
                             err_msg = f"agy exited with code {returncode} without emitting a PKCE OAuth URL."
                         else:
                             err_msg = "agy exited without emitting a PKCE OAuth URL."

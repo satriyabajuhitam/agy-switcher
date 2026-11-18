@@ -4,6 +4,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1249,6 +1250,131 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(saved_path.stat().st_mode), 0o600)
             saved_data = json.loads(saved_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_data["token"]["access_token"], "ya29.headless_pkce_access")
+
+    def test_login_headless_cli_missing_binary_and_invalid_alias_real_engine(self):
+        """[HEADLESS-ERR-003] CLI with real engine rejects invalid aliases and missing agy binary before spawn or prompt."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            isolated_home = tmp_path / "empty_home"
+            isolated_home.mkdir(parents=True, exist_ok=True)
+            real_engine = AgySwitchEngine(
+                vault_dir=tmp_path / "vault",
+                gemini_dir=tmp_path / "gemini",
+                legacy_root=tmp_path / "legacy",
+            )
+            accounts_dir = tmp_path / "vault" / "accounts"
+
+            # 1. Invalid aliases ("../bad", "my account")
+            for bad_alias in ("../bad", "my account"):
+                with self.subTest(bad_alias=bad_alias):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+                         patch("subprocess.Popen") as mock_popen, \
+                         patch("builtins.input") as mock_input:
+                        ret = main(["login", bad_alias, "--headless"], engine=real_engine)
+
+                    self.assertEqual(ret, 1)
+                    self.assertEqual(stdout_buf.getvalue(), "")
+                    self.assertIn("Error:", stderr_buf.getvalue())
+                    mock_popen.assert_not_called()
+                    mock_input.assert_not_called()
+                    self.assertEqual(list(accounts_dir.iterdir()), [])
+                    self.assertFalse((tmp_path / "vault" / "bad").exists())
+
+            # 2. Missing agy binary from PATH and ~/.local/bin/agy
+            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+            clean_env["PATH"] = ""
+            clean_env["HOME"] = str(isolated_home)
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch.dict(os.environ, clean_env, clear=True), \
+                 patch("pathlib.Path.home", return_value=isolated_home), \
+                 patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+                 patch("subprocess.Popen") as mock_popen, \
+                 patch("builtins.input") as mock_input:
+                ret = main(["login", "valid-acc", "--headless"], engine=real_engine)
+
+            self.assertEqual(ret, 1)
+            self.assertEqual(stdout_buf.getvalue(), "")
+            self.assertIn("Error:", stderr_buf.getvalue())
+            self.assertIn("not found", stderr_buf.getvalue())
+            mock_popen.assert_not_called()
+            mock_input.assert_not_called()
+            self.assertEqual(list(accounts_dir.iterdir()), [])
+
+    def test_login_headless_cli_stream_eof_and_empty_stdin_terminates_child(self):
+        """[HEADLESS-ERR-004] CLI with real engine aborts cleanly on output stream EOF or empty stdin without hanging."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_engine = AgySwitchEngine(
+                vault_dir=tmp_path / "vault",
+                gemini_dir=tmp_path / "gemini",
+                legacy_root=tmp_path / "legacy",
+            )
+
+            # 1. agy closes stdout/stderr without emitting PKCE URL while staying alive
+            eof_pid_file = tmp_path / "cli_eof_pid.txt"
+            fake_eof_agy = tmp_path / "fake_cli_eof_agy"
+            fake_eof_agy.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, time\n"
+                f"pathlib.Path({str(eof_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "os.close(1)\n"
+                "os.close(2)\n"
+                "time.sleep(10.0)\n",
+                encoding="utf-8",
+            )
+            fake_eof_agy.chmod(0o755)
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            start = time.monotonic()
+            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+                 patch("builtins.input") as mock_input:
+                ret = main(
+                    ["login", "eof-cli-acc", "--headless", "--agy-binary", str(fake_eof_agy), "--timeout", "5"],
+                    engine=real_engine,
+                )
+            elapsed = time.monotonic() - start
+            self.assertEqual(ret, 1)
+            self.assertLess(elapsed, 2.0)
+            self.assertIn("Error:", stderr_buf.getvalue())
+            self.assertNotIn("timed out", stderr_buf.getvalue().lower())
+            mock_input.assert_not_called()
+            self.assertFalse((tmp_path / "vault" / "accounts" / "eof-cli-acc").exists())
+            eof_pid = int(eof_pid_file.read_text(encoding="utf-8").strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(eof_pid, 0)
+
+            # 2. Empty stdin input after PKCE URL terminates child cleanly
+            empty_pid_file = tmp_path / "cli_empty_pid.txt"
+            fake_wait_agy = tmp_path / "fake_cli_wait_agy"
+            fake_wait_agy.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, time\n"
+                f"pathlib.Path({str(empty_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state=empty', flush=True)\n"
+                "time.sleep(10.0)\n",
+                encoding="utf-8",
+            )
+            fake_wait_agy.chmod(0o755)
+
+            stdout_buf2 = io.StringIO()
+            stderr_buf2 = io.StringIO()
+            with patch("sys.stdout", stdout_buf2), patch("sys.stderr", stderr_buf2), \
+                 patch("builtins.input", return_value=""):
+                ret2 = main(
+                    ["login", "empty-cli-acc", "--headless", "--agy-binary", str(fake_wait_agy), "--timeout", "5"],
+                    engine=real_engine,
+                )
+            self.assertEqual(ret2, 1)
+            self.assertIn("https://antigravity.google/oauth-callback", stdout_buf2.getvalue())
+            self.assertIn("Error:", stderr_buf2.getvalue())
+            self.assertFalse((tmp_path / "vault" / "accounts" / "empty-cli-acc").exists())
+            empty_pid = int(empty_pid_file.read_text(encoding="utf-8").strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(empty_pid, 0)
 
     def test_login_standard_browser_dispatch(self):
         """Standard login without --headless preserves backward compatibility with login_account."""

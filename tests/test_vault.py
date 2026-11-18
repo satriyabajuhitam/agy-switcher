@@ -992,6 +992,126 @@ class TestAgySwitchEngine(unittest.TestCase):
 
         self.assertEqual(json.loads(token_path.read_text(encoding="utf-8")), existing_payload)
 
+    def test_login_headless_missing_binary_and_invalid_alias_before_spawn(self) -> None:
+        """[HEADLESS-ERR-003] Missing agy binary or invalid alias fails before subprocess spawn or prompting and leaves vault unmodified."""
+        accounts_dir = self.vault_dir / "accounts"
+        existing_entries = sorted(p.name for p in accounts_dir.iterdir())
+
+        # 1. Missing agy binary across PATH, ~/.local/bin/agy, and AGY_BINARY
+        isolated_home = self.base_path / "no_agy_home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        prompt_calls: list[str] = []
+        clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+        clean_env["PATH"] = ""
+        clean_env["HOME"] = str(isolated_home)
+        with patch.dict(os.environ, clean_env, clear=True), \
+             patch("pathlib.Path.home", return_value=isolated_home), \
+             patch("subprocess.Popen") as mock_popen, \
+             patch("builtins.input") as mock_input:
+            success, msg = self.engine.login_headless(
+                alias="missing-bin-acc",
+                prompt_fn=lambda p: (prompt_calls.append(p) or "unused"),
+            )
+
+        self.assertFalse(success)
+        self.assertIn("not found", msg)
+        self.assertEqual(prompt_calls, [])
+        mock_popen.assert_not_called()
+        mock_input.assert_not_called()
+        self.assertEqual(sorted(p.name for p in accounts_dir.iterdir()), existing_entries)
+
+        # 2. Invalid alias traversal and whitespace characters fail before binary resolution, spawn, or prompt
+        for bad_alias in ("../bad", "my account"):
+            with self.subTest(bad_alias=bad_alias):
+                bad_prompt_calls: list[str] = []
+                with patch.object(self.engine, "resolve_agy_binary") as mock_resolve, \
+                     patch("subprocess.Popen") as mock_popen, \
+                     patch("builtins.input") as mock_input:
+                    bad_success, bad_msg = self.engine.login_headless(
+                        alias=bad_alias,
+                        prompt_fn=lambda p: (bad_prompt_calls.append(p) or "unused"),
+                    )
+
+                self.assertFalse(bad_success)
+                self.assertTrue(bool(bad_msg))
+                self.assertEqual(bad_prompt_calls, [])
+                mock_resolve.assert_not_called()
+                mock_popen.assert_not_called()
+                mock_input.assert_not_called()
+                self.assertEqual(sorted(p.name for p in accounts_dir.iterdir()), existing_entries)
+                self.assertFalse((self.vault_dir / "bad").exists())
+
+    def test_login_headless_stream_eof_without_url_and_stdin_eof_or_empty(self) -> None:
+        """[HEADLESS-ERR-004] Output stream EOF without PKCE URL or stdin EOF/empty input terminates child cleanly without hanging."""
+        # 1. Subprocess closes stdout and stderr (EOF) without emitting PKCE URL while staying alive
+        eof_pid_file = self.base_path / "stream_eof_pid.txt"
+        fake_stream_eof = self.base_path / "fake_agy_stream_eof"
+        fake_stream_eof.write_text(
+            f"#!{sys.executable}\n"
+            "import os, pathlib, sys, time\n"
+            f"pathlib.Path({str(eof_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+            "os.close(1)\n"
+            "os.close(2)\n"
+            "time.sleep(10.0)\n",
+            encoding="utf-8",
+        )
+        fake_stream_eof.chmod(0o755)
+
+        prompt_calls: list[str] = []
+        start = time.monotonic()
+        success1, msg1 = self.engine.login_headless(
+            alias="stream-eof-acc",
+            agy_binary=str(fake_stream_eof),
+            timeout=5.0,
+            prompt_fn=lambda p: (prompt_calls.append(p) or "unused"),
+        )
+        elapsed = time.monotonic() - start
+        self.assertFalse(success1)
+        self.assertLess(elapsed, 2.0, f"login_headless hung on stream EOF ({elapsed:.2f}s): {msg1}")
+        self.assertNotIn("timed out", msg1.lower())
+        self.assertIn("PKCE OAuth URL", msg1)
+        self.assertEqual(prompt_calls, [])
+        self.assertFalse((self.vault_dir / "accounts" / "stream-eof-acc").exists())
+        eof_pid = int(eof_pid_file.read_text(encoding="utf-8").strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(eof_pid, 0)
+
+        # 2. stdin EOF and empty/whitespace input after PKCE URL terminate active child cleanly
+        for mode in ("eof", "empty", "whitespace"):
+            with self.subTest(mode=mode):
+                pid_file = self.base_path / f"stdin_{mode}_pid.txt"
+                fake_wait_stdin = self.base_path / f"fake_agy_stdin_{mode}"
+                fake_wait_stdin.write_text(
+                    f"#!{sys.executable}\n"
+                    "import os, pathlib, sys, time\n"
+                    f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+                    f"print('https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https://antigravity.google/oauth-callback&state={mode}', flush=True)\n"
+                    "time.sleep(10.0)\n",
+                    encoding="utf-8",
+                )
+                fake_wait_stdin.chmod(0o755)
+
+                input_side_effect: object = EOFError if mode == "eof" else ("" if mode == "empty" else "   ")
+                alias_name = f"stdin-{mode}-acc"
+                stdout_buf = io.StringIO()
+                with patch("sys.stdout", stdout_buf), \
+                     patch("builtins.input", side_effect=input_side_effect) if mode == "eof" else patch("builtins.input", return_value=input_side_effect):
+                    sub_start = time.monotonic()
+                    sub_ok, sub_msg = self.engine.login_headless(
+                        alias=alias_name,
+                        agy_binary=str(fake_wait_stdin),
+                        timeout=5.0,
+                    )
+                    sub_elapsed = time.monotonic() - sub_start
+
+                self.assertFalse(sub_ok)
+                self.assertLess(sub_elapsed, 2.0, f"login_headless hung on stdin {mode}: {sub_msg}")
+                self.assertIn("https://antigravity.google/oauth-callback", stdout_buf.getvalue())
+                self.assertFalse((self.vault_dir / "accounts" / alias_name).exists())
+                child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+
     def _run_registration_path(
         self,
         method: str,
