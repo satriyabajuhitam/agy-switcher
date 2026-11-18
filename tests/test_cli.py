@@ -873,23 +873,20 @@ class TestCLI(unittest.TestCase):
                 engine.set_quota_threshold("not_a_number")
 
     def test_login_headless_interactive_prompt_success(self):
-        """[OOB-RETIRE-003] Interactive login reads code from stdin without emitting OOB URL."""
+        """[OOB-RETIRE-003] Headless login delegates interactive flow to engine.login_headless without auth_code or OOB URL."""
         self.engine.has_account.return_value = False
         self.engine.accounts_dir = Path("/mock/vault/accounts")
         self.engine.login_headless.return_value = (True, "Account 'myacc' successfully logged in")
 
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-             patch("builtins.input", return_value="4/1AY0e-valid-code") as mock_input:
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
             ret = main(["login", "myacc", "--headless"], engine=self.engine)
 
         self.assertEqual(ret, 0)
-        mock_input.assert_called_once_with("Enter authorization code: ")
         self.assertFalse(hasattr(self.engine, "get_oauth_url"))
         self.engine.login_headless.assert_called_once_with(
             alias="myacc",
-            auth_code="4/1AY0e-valid-code",
             force=False,
             agy_binary=None,
             timeout=600,
@@ -919,9 +916,10 @@ class TestCLI(unittest.TestCase):
         self.assertIn("agy-switch login bot-acc --headless", err)
 
     def test_login_headless_rejects_empty_and_force_auth_code_before_overwrite(self):
-        """[OOB-RETIRE-001] [OOB-RETIRE-ERR-001] Empty, equals-syntax, non-headless, or --force --auth-code rejects before overwrite prompt or spawn."""
+        """[OOB-RETIRE-001] [OOB-RETIRE-ERR-001] Empty, whitespace, equals-syntax, non-headless, or --force --auth-code rejects before overwrite prompt or spawn."""
         cases = [
             ["login", "bot-acc", "--headless", "--auth-code", ""],
+            ["login", "bot-acc", "--headless", "--auth-code", "   "],
             ["login", "bot-acc", "--headless", "--auth-code=4/1AY0e"],
             ["login", "bot-acc", "--headless", "--force", "--auth-code", ""],
             ["login", "bot-acc", "--headless", "--force", "--auth-code", "4/1AY0e-stale"],
@@ -938,12 +936,14 @@ class TestCLI(unittest.TestCase):
                 stdout_buf = io.StringIO()
                 stderr_buf = io.StringIO()
                 with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-                     patch("builtins.input") as mock_input:
+                     patch("builtins.input") as mock_input, \
+                     patch("subprocess.Popen") as mock_popen:
                     ret = main(argv, engine=self.engine)
 
                 self.assertEqual(ret, 1)
                 self.assertEqual(stdout_buf.getvalue(), "")
                 mock_input.assert_not_called()
+                mock_popen.assert_not_called()
                 self.engine.validate_account_alias.assert_not_called()
                 self.engine.has_account.assert_not_called()
                 self.engine.login_headless.assert_not_called()
@@ -981,28 +981,22 @@ class TestCLI(unittest.TestCase):
         self.assertIn("Error: Account 'existing_acc' already exists in vault. Overwrite aborted.", stderr_buf.getvalue())
 
     def test_login_headless_collision_confirmed_overwrites(self):
-        """[REQ-3-EDGE-001] Confirming overwrite passes force=True to login_headless."""
+        """[REQ-3-EDGE-001] Confirming overwrite passes force=True to login_headless without auth_code."""
         self.engine.has_account.return_value = True
         self.engine.accounts_dir = Path("/mock/vault/accounts")
         self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
 
         stdout_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("builtins.input", side_effect=["y", "valid-code"]) as mock_input:
+        with patch("sys.stdout", stdout_buf), patch("builtins.input", return_value="y") as mock_input:
             ret = main(
                 ["login", "existing_acc", "--headless"],
                 engine=self.engine,
             )
 
         self.assertEqual(ret, 0)
-        self.assertEqual(mock_input.call_count, 2)
-        self.assertEqual(
-            mock_input.call_args_list[0].args,
-            ("Account 'existing_acc' already exists. Overwrite? [y/N]: ",),
-        )
-        self.assertEqual(mock_input.call_args_list[1].args, ("Enter authorization code: ",))
+        mock_input.assert_called_once_with("Account 'existing_acc' already exists. Overwrite? [y/N]: ")
         self.engine.login_headless.assert_called_once_with(
             alias="existing_acc",
-            auth_code="valid-code",
             force=True,
             agy_binary=None,
             timeout=600,
@@ -1015,36 +1009,111 @@ class TestCLI(unittest.TestCase):
         self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
 
         stdout_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("builtins.input", return_value="valid-code") as mock_input:
+        with patch("sys.stdout", stdout_buf), patch("builtins.input") as mock_input:
             ret = main(
                 ["login", "existing_acc", "--headless", "--force"],
                 engine=self.engine,
             )
 
         self.assertEqual(ret, 0)
-        mock_input.assert_called_once_with("Enter authorization code: ")
+        mock_input.assert_not_called()
         self.engine.login_headless.assert_called_once_with(
             alias="existing_acc",
-            auth_code="valid-code",
             force=True,
             agy_binary=None,
             timeout=600,
         )
 
     def test_login_headless_stdin_closed_eof(self):
-        """[REQ-3-EDGE-003] EOF on authorization code prompt prints clean error and exits with 1."""
-        self.engine.has_account.return_value = False
-        self.engine.login_headless = MagicMock()
+        """[REQ-3-EDGE-003] EOF on authorization code prompt in real engine prints clean error and exits with 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_engine = AgySwitchEngine(
+                vault_dir=tmp_path / "vault",
+                gemini_dir=tmp_path / "gemini",
+                legacy_root=tmp_path / "legacy",
+            )
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+                 patch("builtins.input", side_effect=EOFError), \
+                 patch("subprocess.Popen") as mock_popen:
+                ret = main(["login", "myacc", "--headless"], engine=real_engine)
 
-        stdout_buf = io.StringIO()
-        stderr_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
-             patch("builtins.input", side_effect=EOFError):
-            ret = main(["login", "myacc", "--headless"], engine=self.engine)
+            self.assertEqual(ret, 1)
+            mock_popen.assert_not_called()
+            self.assertIn("Error: Failed to read authorization code from stdin.", stderr_buf.getvalue())
 
-        self.assertEqual(ret, 1)
-        self.engine.login_headless.assert_not_called()
-        self.assertIn("Error: No authorization code provided and stdin closed.", stderr_buf.getvalue())
+    def test_login_headless_real_engine_interactive_and_force_auth_code_rejection(self):
+        """[OOB-RETIRE-002] [OOB-RETIRE-ERR-001] Real engine succeeds interactively without auth_code and rejects --force --auth-code on existing vault account."""
+        import base64
+
+        payload_b64 = base64.urlsafe_b64encode(
+            json.dumps({"email": "real@example.com", "sub": "123"}).encode("utf-8")
+        ).decode("utf-8").rstrip("=")
+        token_payload = {
+            "token": {
+                "access_token": "ya29.real_access",
+                "token_type": "Bearer",
+                "refresh_token": "1//real_refresh",
+                "expiry": "2026-12-31T23:59:59Z",
+            },
+            "auth_method": "oauth",
+            "id_token": f"header.{payload_b64}.signature",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_engine = AgySwitchEngine(
+                vault_dir=tmp_path / "vault",
+                gemini_dir=tmp_path / "gemini",
+                legacy_root=tmp_path / "legacy",
+            )
+
+            def fake_popen(cmd, **kwargs):
+                temp_home = Path(kwargs["env"]["HOME"])
+                token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                token_file.parent.mkdir(parents=True, exist_ok=True)
+                token_file.write_text(json.dumps(token_payload), encoding="utf-8")
+                proc = MagicMock()
+                proc.returncode = 0
+                proc.communicate.return_value = (b"", b"")
+                return proc
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", side_effect=fake_popen), \
+                 patch("builtins.input", return_value="4/1AY0e-valid-code"):
+                ret = main(["login", "bot-acc", "--headless"], engine=real_engine)
+
+            self.assertEqual(ret, 0, f"stderr: {stderr_buf.getvalue()}")
+            saved_path = tmp_path / "vault" / "accounts" / "bot-acc" / "token.json"
+            self.assertTrue(saved_path.is_file())
+            saved_before = saved_path.read_text(encoding="utf-8")
+
+            # Existing account with --force --auth-code "" or ="" must reject before overwrite prompt or agy spawn
+            for argv in (
+                ["login", "bot-acc", "--headless", "--force", "--auth-code", ""],
+                ["login", "bot-acc", "--headless", "--force", "--auth-code="],
+                ["login", "bot-acc", "--headless", "--force", "--auth-code", "4/1AY0e-stale"],
+            ):
+                with self.subTest(argv=argv):
+                    stdout_rej = io.StringIO()
+                    stderr_rej = io.StringIO()
+                    with patch("sys.stdout", stdout_rej), patch("sys.stderr", stderr_rej), \
+                         patch("builtins.input") as mock_input, \
+                         patch("subprocess.Popen") as mock_popen:
+                        rej_ret = main(argv, engine=real_engine)
+
+                    self.assertEqual(rej_ret, 1)
+                    self.assertEqual(stdout_rej.getvalue(), "")
+                    mock_input.assert_not_called()
+                    mock_popen.assert_not_called()
+                    self.assertIn("--auth-code", stderr_rej.getvalue())
+                    self.assertIn("PKCE", stderr_rej.getvalue())
+                    self.assertEqual(saved_path.read_text(encoding="utf-8"), saved_before)
 
     def test_login_headless_exchange_failure_stderr(self):
         """[REQ-3-ERR-001] Exchange failure from engine writes error to stderr and exits with 1."""
@@ -1055,7 +1124,7 @@ class TestCLI(unittest.TestCase):
         )
 
         stderr_buf = io.StringIO()
-        with patch("sys.stderr", stderr_buf), patch("builtins.input", return_value="invalid-expired-code"):
+        with patch("sys.stderr", stderr_buf):
             ret = main(
                 ["login", "bad-acc", "--headless"],
                 engine=self.engine,

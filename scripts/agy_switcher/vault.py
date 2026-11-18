@@ -1008,10 +1008,19 @@ class AgySwitchEngine:
     ) -> tuple[bool, str]:
         """Performs headless OAuth token exchange, saving credentials to vault with 0600 mode.
 
-        Supports non-interactive code injection and interactive stdin/prompt fallback.
-        Note: `name` and `code` are legacy parameter aliases for `alias` and `auth_code`.
+        Requires interactive stdin or a post-URL `prompt_fn` callback; pre-supplied
+        `auth_code` or legacy `code` arguments are rejected as incompatible with
+        dynamic PKCE sessions.
+        Note: `name` is a legacy parameter alias for `alias`.
         Returns tuple[bool, str] representing (success, message).
         """
+        if auth_code is not None or code is not None:
+            return (
+                False,
+                "Pre-supplied authorization codes (auth_code/code) cannot be used with dynamic PKCE sessions. "
+                "Use interactive stdin or pass prompt_fn to capture the code after URL generation.",
+            )
+
         raw_alias = alias or name or ""
         try:
             clean_alias = self.validate_account_alias(raw_alias)
@@ -1020,18 +1029,16 @@ class AgySwitchEngine:
         except Exception as exc:
             return False, f"Invalid account alias: {exc}"
 
-        raw_code = auth_code if auth_code is not None else code
-        if raw_code is None:
-            if prompt_fn is not None:
-                try:
-                    raw_code = prompt_fn("Enter authorization code: ")
-                except Exception as exc:
-                    return False, f"Failed to prompt for authorization code: {exc}"
-            else:
-                try:
-                    raw_code = input("Enter authorization code: ")
-                except (EOFError, OSError):
-                    return False, "Failed to read authorization code from stdin."
+        if prompt_fn is not None:
+            try:
+                raw_code = prompt_fn("Enter authorization code: ")
+            except Exception as exc:
+                return False, f"Failed to prompt for authorization code: {exc}"
+        else:
+            try:
+                raw_code = input("Enter authorization code: ")
+            except (EOFError, OSError):
+                return False, "Failed to read authorization code from stdin."
 
         if not isinstance(raw_code, str) or not raw_code.strip():
             return False, "Authorization code must be a non-empty string."

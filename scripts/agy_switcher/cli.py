@@ -359,30 +359,19 @@ def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
                 return 1
             force = True
 
-        try:
-            auth_code = input("Enter authorization code: ").strip()
-        except EOFError:
-            print("Error: No authorization code provided and stdin closed.", file=sys.stderr)
-            return 1
-        except KeyboardInterrupt:
-            print("Error: Login process interrupted by user.", file=sys.stderr)
-            return 1
-
-        if not auth_code:
-            print("Error: Authorization code must be a non-empty string.", file=sys.stderr)
-            return 1
-
         agy_binary = getattr(args, "agy_binary", None)
         timeout = getattr(args, "timeout", 600)
 
         try:
             success, msg = engine.login_headless(
                 alias=alias,
-                auth_code=auth_code,
                 force=force,
                 agy_binary=agy_binary,
                 timeout=timeout,
             )
+        except KeyboardInterrupt:
+            print("Error: Login process interrupted by user.", file=sys.stderr)
+            return 1
         except AgySwitchError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1

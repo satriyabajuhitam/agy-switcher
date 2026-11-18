@@ -118,7 +118,7 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_login_headless_success(self) -> None:
-        """[REQ-3-SCN-002] Non-interactive headless login with valid auth code writes token with 0600 permissions."""
+        """[REQ-3-SCN-002] Headless login via interactive stdin writes token with 0600 permissions."""
         def mock_popen(args: list[str], **kwargs: object) -> MockSubprocess:
             env = kwargs.get("env")
             assert isinstance(env, dict)
@@ -126,10 +126,10 @@ class TestAgySwitchEngine(unittest.TestCase):
             return MockSubprocess(temp_home=temp_home, should_succeed=True)
 
         with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
-             patch("subprocess.Popen", side_effect=mock_popen):
+             patch("subprocess.Popen", side_effect=mock_popen), \
+             patch("builtins.input", return_value="4/0AWgav-valid-code"):
             success, msg = self.engine.login_headless(
                 "remote_acc",
-                auth_code="4/0AWgav-valid-code",
                 force=False,
             )
 
@@ -165,8 +165,8 @@ class TestAgySwitchEngine(unittest.TestCase):
              patch("subprocess.Popen", side_effect=mock_popen):
             success, msg = self.engine.login_headless(
                 "remote_acc",
-                auth_code="invalid_code",
                 force=False,
+                prompt_fn=lambda _: "invalid_code",
             )
 
         self.assertFalse(success)
@@ -179,18 +179,18 @@ class TestAgySwitchEngine(unittest.TestCase):
     def test_login_headless_malformed_code(self) -> None:
         """[REQ-3-ERR-006] Malformed authorization codes with newlines/control chars rejected before subprocess."""
         # Contains newline
-        success, msg = self.engine.login_headless("remote_acc", auth_code="malformed\ncode")
+        success, msg = self.engine.login_headless("remote_acc", prompt_fn=lambda _: "malformed\ncode")
         self.assertFalse(success)
         self.assertIn("Invalid authorization code format", msg)
 
         # Empty string
-        success, msg = self.engine.login_headless("remote_acc", auth_code="")
+        success, msg = self.engine.login_headless("remote_acc", prompt_fn=lambda _: "")
         self.assertFalse(success)
         self.assertIn("Authorization code must be a non-empty string", msg)
 
         # Exceeds 1024 characters
         long_code = "a" * 1025
-        success, msg = self.engine.login_headless("remote_acc", auth_code=long_code)
+        success, msg = self.engine.login_headless("remote_acc", prompt_fn=lambda _: long_code)
         self.assertFalse(success)
         self.assertIn("Invalid authorization code format", msg)
 
@@ -199,16 +199,16 @@ class TestAgySwitchEngine(unittest.TestCase):
 
     def test_login_headless_invalid_alias(self) -> None:
         """[REQ-3-ERR-003] Path traversal or invalid characters in alias rejected defensively."""
-        success, msg = self.engine.login_headless("../bad", auth_code="4/0AWgav-valid-code")
+        success, msg = self.engine.login_headless("../bad", prompt_fn=lambda _: "4/0AWgav-valid-code")
         self.assertFalse(success)
         self.assertIn("invalid path traversal element", msg)
 
-        success, msg = self.engine.login_headless("my account", auth_code="4/0AWgav-valid-code")
+        success, msg = self.engine.login_headless("my account", prompt_fn=lambda _: "4/0AWgav-valid-code")
         self.assertFalse(success)
         self.assertIn("Invalid account alias", msg)
 
         # Traversal with dots
-        success, msg = self.engine.login_headless("..", auth_code="4/0AWgav-valid-code")
+        success, msg = self.engine.login_headless("..", prompt_fn=lambda _: "4/0AWgav-valid-code")
         self.assertFalse(success)
         self.assertIn("invalid path traversal element", msg)
 
@@ -218,7 +218,11 @@ class TestAgySwitchEngine(unittest.TestCase):
         acc_dir.mkdir(parents=True, exist_ok=True)
         (acc_dir / "token.json").write_text(json.dumps(make_valid_token_payload()), encoding="utf-8")
 
-        success, msg = self.engine.login_headless("existing_acc", auth_code="4/0AWgav-valid-code", force=False)
+        success, msg = self.engine.login_headless(
+            "existing_acc",
+            force=False,
+            prompt_fn=lambda _: "4/0AWgav-valid-code",
+        )
         self.assertFalse(success)
         self.assertIn("already exists in vault", msg)
 
@@ -238,7 +242,11 @@ class TestAgySwitchEngine(unittest.TestCase):
 
         with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
              patch("subprocess.Popen", side_effect=mock_popen):
-            success, msg = self.engine.login_headless("existing_acc", auth_code="4/0AWgav-valid-code", force=True)
+            success, msg = self.engine.login_headless(
+                "existing_acc",
+                force=True,
+                prompt_fn=lambda _: "4/0AWgav-valid-code",
+            )
 
         self.assertTrue(success, f"login_headless failed: {msg}")
         token_data = json.loads((acc_dir / "token.json").read_text(encoding="utf-8"))
@@ -251,7 +259,10 @@ class TestAgySwitchEngine(unittest.TestCase):
             "resolve_agy_binary",
             side_effect=AgySwitchError("Antigravity CLI binary ('agy') not found in ~/.local/bin/agy or system PATH."),
         ):
-            success, msg = self.engine.login_headless("remote_acc", auth_code="4/0AWgav-valid-code")
+            success, msg = self.engine.login_headless(
+                "remote_acc",
+                prompt_fn=lambda _: "4/0AWgav-valid-code",
+            )
         self.assertFalse(success)
         self.assertIn("not found in ~/.local/bin/agy or system PATH", msg)
 
@@ -267,8 +278,8 @@ class TestAgySwitchEngine(unittest.TestCase):
              patch("subprocess.Popen", side_effect=mock_popen):
             success, msg = self.engine.login_headless(
                 "remote_acc",
-                auth_code="4/0AWgav-valid-code",
                 timeout=0.1,  # 100ms timeout
+                prompt_fn=lambda _: "4/0AWgav-valid-code",
             )
 
         self.assertFalse(success)
@@ -276,7 +287,7 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertFalse((self.vault_dir / "accounts" / "remote_acc").exists())
 
     def test_login_headless_prompt_fn_and_named_params(self) -> None:
-        """Verifies prompt_fn invocation and name/code named parameter fallback."""
+        """Verifies prompt_fn invocation and legacy name parameter fallback."""
         def mock_popen(args: list[str], **kwargs: object) -> MockSubprocess:
             env = kwargs.get("env")
             assert isinstance(env, dict)
@@ -299,9 +310,9 @@ class TestAgySwitchEngine(unittest.TestCase):
 
             success2, msg2 = self.engine.login_headless(
                 name="named_acc",
-                code="4/0AWgav-named-code",
+                prompt_fn=custom_prompt,
             )
-            self.assertTrue(success2, f"login_headless with name/code failed: {msg2}")
+            self.assertTrue(success2, f"login_headless with name failed: {msg2}")
 
     def test_oob_oauth_retired_and_vault_structure(self) -> None:
         """[OOB-RETIRE-003] Verifies OOB OAuth builders are retired while DEFAULT_CLIENT_ID remains."""
@@ -312,6 +323,56 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertFalse(hasattr(telemetry_mod, "build_oauth_url"))
         self.assertTrue(bool(DEFAULT_CLIENT_ID))
         self.assertFalse(hasattr(self.engine, "vault"))
+
+    def test_login_headless_rejects_presupplied_auth_code(self) -> None:
+        """[OOB-RETIRE-002] Pre-supplied auth_code or legacy code is rejected with PKCE guidance."""
+        acc_dir = self.vault_dir / "accounts" / "bot-acc"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        existing_payload = make_valid_token_payload("existing@example.com")
+        token_path = acc_dir / "token.json"
+        token_path.write_text(json.dumps(existing_payload), encoding="utf-8")
+
+        cases: list[dict[str, object]] = [
+            {"alias": "bot-acc", "auth_code": "4/1AY0e-stale"},
+            {"alias": "bot-acc", "auth_code": ""},
+            {"alias": "bot-acc", "auth_code": "   "},
+            {"alias": "bot-acc", "auth_code": "4/1AY0e-stale", "force": True},
+            {"alias": "bot-acc", "code": "4/1AY0e-legacy"},
+            {"name": "bot-acc", "code": ""},
+            {"alias": "bot-acc", "code": "4/1AY0e-legacy", "force": True},
+            {"alias": "bot-acc", "auth_code": "4/1AY0e-stale", "code": "4/1AY0e-legacy"},
+            {"alias": "bot-acc", "auth_code": "4/1AY0e-stale", "use_prompt_fn": False},
+        ]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                prompt_calls: list[str] = []
+                prompt_cb = (
+                    None
+                    if kwargs.get("use_prompt_fn") is False
+                    else (lambda p: (prompt_calls.append(p) or "unused"))
+                )
+                with patch.object(self.engine, "resolve_agy_binary") as mock_resolve, \
+                     patch("subprocess.Popen") as mock_popen, \
+                     patch("builtins.input") as mock_input:
+                    success, msg = self.engine.login_headless(
+                        alias=str(kwargs.get("alias", "")),
+                        name=str(kwargs["name"]) if "name" in kwargs else None,
+                        auth_code=str(kwargs["auth_code"]) if "auth_code" in kwargs else None,
+                        code=str(kwargs["code"]) if "code" in kwargs else None,
+                        force=bool(kwargs.get("force", False)),
+                        prompt_fn=prompt_cb,
+                    )
+
+                self.assertFalse(success)
+                self.assertIn("PKCE", msg)
+                self.assertIn("stdin", msg)
+                self.assertIn("prompt_fn", msg)
+                self.assertEqual(prompt_calls, [])
+                mock_input.assert_not_called()
+                mock_resolve.assert_not_called()
+                mock_popen.assert_not_called()
+
+        self.assertEqual(json.loads(token_path.read_text(encoding="utf-8")), existing_payload)
 
 
 if __name__ == "__main__":
