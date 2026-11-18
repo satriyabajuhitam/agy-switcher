@@ -618,6 +618,226 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         self.assertFalse(direct_empty.can_fix)
         self.assertIn(missing_alias, direct_empty.message)
 
+    def test_DOCTOR_ID_001_id_token_email_without_id_token_passes(self) -> None:
+        """[DOCTOR-ID-001] Accounts with id_token_email and omitted id_token resolve identity cleanly as [PASS]."""
+        for standby_expiry_hours, id_token_mode in [
+            (24, "omitted"),
+            (-2, "omitted"),
+            (-2, "none"),
+            (-2, "empty"),
+        ]:
+            with self.subTest(standby_expiry_hours=standby_expiry_hours, id_token_mode=id_token_mode):
+                self._setup_pristine_environment()
+                shutil.rmtree(self.vault_dir / "accounts" / "acc_primary")
+
+                def _make_1510_token(email: str, expiry_hours: int) -> dict[str, Any]:
+                    tok = create_sample_token(email=email, expiry_offset_hours=expiry_hours)
+                    if id_token_mode == "omitted":
+                        tok.pop("id_token", None)
+                    elif id_token_mode == "none":
+                        tok["id_token"] = None
+                    else:
+                        tok["id_token"] = ""
+                    tok["id_token_email"] = email
+                    return tok
+
+                primary_dir = self.vault_dir / "accounts" / "primary-acc"
+                primary_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(primary_dir, 0o700)
+                primary_tok = _make_1510_token("user@example.com", 24)
+                (primary_dir / "token.json").write_text(json.dumps(primary_tok), encoding="utf-8")
+                os.chmod(primary_dir / "token.json", 0o600)
+                self.engine.set_active_name("primary-acc")
+                os.chmod(self.engine.active_file, 0o600)
+
+                standby_dir = self.vault_dir / "accounts" / "standby-1510"
+                standby_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(standby_dir, 0o700)
+                standby_tok = _make_1510_token("user@example.com", standby_expiry_hours)
+                (standby_dir / "token.json").write_text(json.dumps(standby_tok), encoding="utf-8")
+                os.chmod(standby_dir / "token.json", 0o600)
+
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(direct_item.status, "PASS", f"Expected PASS, got {direct_item.status}: {direct_item.message}")
+                self.assertFalse(direct_item.can_fix)
+
+                report = self.engine.run_diagnostics()
+                token_item = next(it for it in report.items if it.category == "token_integrity")
+                self.assertEqual(token_item.status, "PASS", f"Expected PASS, got {token_item.status}: {token_item.message}")
+                self.assertFalse(token_item.can_fix)
+
+    def test_DOCTOR_ID_002_missing_email_identity_emits_non_fatal_warn(self) -> None:
+        """[DOCTOR-ID-002] Valid OAuth account lacking both id_token and id_token_email emits non-fatal [WARN]."""
+        no_email_payload = base64.urlsafe_b64encode(
+            json.dumps({"sub": "12345", "aud": "test_aud"}).encode("utf-8")
+        ).decode("utf-8").rstrip("=")
+        jwt_without_email = f"header.{no_email_payload}.signature"
+
+        cases: list[tuple[str, bool, Callable[[dict[str, Any]], None]]] = [
+            ("active_both_absent", True, lambda t: t.pop("id_token", None)),
+            ("active_both_none", True, lambda t: t.update({"id_token": None, "id_token_email": None})),
+            ("active_both_empty", True, lambda t: t.update({"id_token": "", "id_token_email": ""})),
+            ("active_jwt_no_email_claim", True, lambda t: t.update({"id_token": jwt_without_email})),
+            ("standby_both_absent", False, lambda t: t.pop("id_token", None)),
+            ("standby_both_none", False, lambda t: t.update({"id_token": None, "id_token_email": None})),
+            ("standby_both_empty", False, lambda t: t.update({"id_token": "", "id_token_email": ""})),
+            ("standby_jwt_no_email_claim", False, lambda t: t.update({"id_token": jwt_without_email})),
+        ]
+
+        for label, is_active_target, mutator in cases:
+            with self.subTest(label=label):
+                self._setup_pristine_environment()
+                if is_active_target:
+                    tok = create_sample_token(email="active@example.com", expiry_offset_hours=24)
+                    mutator(tok)
+                    acc_path = self.vault_dir / "accounts" / "acc_primary" / "token.json"
+                    acc_path.write_text(json.dumps(tok), encoding="utf-8")
+                    target_alias = "acc_primary"
+                else:
+                    standby_dir = self.vault_dir / "accounts" / "standby-no-id"
+                    standby_dir.mkdir(parents=True, exist_ok=True)
+                    os.chmod(standby_dir, 0o700)
+                    tok = create_sample_token(email="standby@example.com", expiry_offset_hours=-2)
+                    mutator(tok)
+                    (standby_dir / "token.json").write_text(json.dumps(tok), encoding="utf-8")
+                    os.chmod(standby_dir / "token.json", 0o600)
+                    target_alias = "standby-no-id"
+
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(direct_item.status, "WARN", f"Expected WARN for {label}, got {direct_item.status}: {direct_item.message}")
+                self.assertFalse(direct_item.can_fix)
+                self.assertIn(target_alias, direct_item.message)
+                self.assertIn("email", direct_item.message.lower())
+                self.assertIn("unavailable", direct_item.message.lower())
+                self.assertNotIn("corrupt", direct_item.message.lower())
+
+                report = self.engine.run_diagnostics()
+                token_item = next(it for it in report.items if it.category == "token_integrity")
+                self.assertEqual(token_item.status, "WARN")
+                self.assertFalse(token_item.can_fix)
+                self.assertIn(target_alias, token_item.message)
+                self.assertIn("unavailable", token_item.message.lower())
+                self.assertNotIn("corrupt", token_item.message.lower())
+
+        with self.subTest(label="expired_active_supersedes_missing_email_warn"):
+            self._setup_pristine_environment()
+            tok = create_sample_token(email="active@example.com", expiry_offset_hours=-2)
+            tok.pop("id_token", None)
+            acc_path = self.vault_dir / "accounts" / "acc_primary" / "token.json"
+            acc_path.write_text(json.dumps(tok), encoding="utf-8")
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertIn("expired", direct_item.message.lower())
+
+    def test_DOCTOR_ID_ERR_001_and_EDGE_001_malformed_jwt_and_invalid_email_fallback(self) -> None:
+        """[DOCTOR-ID-ERR-001] & [DOCTOR-ID-EDGE-001] Malformed id_token remains corrupt; invalid id_token_email emits WARN."""
+        with self.subTest(case="active_malformed_id_token_fails"):
+            self._setup_pristine_environment()
+            tok = create_sample_token(email="active@example.com")
+            tok["id_token"] = "malformed-not-jwt"
+            (self.vault_dir / "accounts" / "acc_primary" / "token.json").write_text(json.dumps(tok), encoding="utf-8")
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertIn("id_token", direct_item.message)
+
+        with self.subTest(case="secondary_malformed_id_token_warns_corrupt"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            sec_dir = self.vault_dir / "accounts" / "standby-bad-jwt"
+            sec_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(sec_dir, 0o700)
+            tok = create_sample_token(email="sec@example.com")
+            tok["id_token"] = "malformed-not-jwt"
+            (sec_dir / "token.json").write_text(json.dumps(tok), encoding="utf-8")
+            os.chmod(sec_dir / "token.json", 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "WARN")
+            self.assertIn("standby-bad-jwt", direct_item.message)
+            self.assertIn("id_token", direct_item.message)
+
+        for label, bad_email in [
+            ("whitespace_only", "   "),
+            ("non_string_int", 12345),
+            ("non_string_bool", True),
+            ("non_string_list", []),
+        ]:
+            for is_active_target in (True, False):
+                target_role = "active" if is_active_target else "standby"
+                with self.subTest(case=f"edge_invalid_id_token_email_{target_role}_{label}"):
+                    shutil.rmtree(self.vault_dir, ignore_errors=True)
+                    self._setup_pristine_environment()
+                    if is_active_target:
+                        tok = create_sample_token(email="active@example.com")
+                        tok.pop("id_token", None)
+                        tok["id_token_email"] = bad_email
+                        (self.vault_dir / "accounts" / "acc_primary" / "token.json").write_text(
+                            json.dumps(tok), encoding="utf-8"
+                        )
+                    else:
+                        sec_dir = self.vault_dir / "accounts" / "standby-bad-email"
+                        sec_dir.mkdir(parents=True, exist_ok=True)
+                        os.chmod(sec_dir, 0o700)
+                        tok = create_sample_token(email="sec@example.com", expiry_offset_hours=-2)
+                        tok.pop("id_token", None)
+                        tok["id_token_email"] = bad_email
+                        (sec_dir / "token.json").write_text(json.dumps(tok), encoding="utf-8")
+                        os.chmod(sec_dir / "token.json", 0o600)
+
+                    direct_item = self.engine.doctor._check_token_integrity()
+                    self.assertEqual(direct_item.status, "WARN")
+                    self.assertFalse(direct_item.can_fix)
+                    self.assertIn("email", direct_item.message.lower())
+
+        for target_role in ("active", "standby"):
+            with self.subTest(case=f"malformed_id_token_with_valid_id_token_email_{target_role}"):
+                shutil.rmtree(self.vault_dir, ignore_errors=True)
+                self._setup_pristine_environment()
+                if target_role == "active":
+                    tok = create_sample_token(email="active@example.com")
+                    tok["id_token"] = "malformed-not-jwt"
+                    tok["id_token_email"] = "fallback@example.com"
+                    (self.vault_dir / "accounts" / "acc_primary" / "token.json").write_text(
+                        json.dumps(tok), encoding="utf-8"
+                    )
+                else:
+                    sec_dir = self.vault_dir / "accounts" / "standby-fallback"
+                    sec_dir.mkdir(parents=True, exist_ok=True)
+                    os.chmod(sec_dir, 0o700)
+                    tok = create_sample_token(email="sec@example.com", expiry_offset_hours=-2)
+                    tok["id_token"] = "malformed-not-jwt"
+                    tok["id_token_email"] = "fallback@example.com"
+                    (sec_dir / "token.json").write_text(json.dumps(tok), encoding="utf-8")
+                    os.chmod(sec_dir / "token.json", 0o600)
+
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(
+                    direct_item.status,
+                    "PASS",
+                    f"Expected PASS for {target_role} with valid id_token_email fallback, got {direct_item.status}: {direct_item.message}",
+                )
+                self.assertFalse(direct_item.can_fix)
+
+        with self.subTest(case="unexpired_standby_missing_identity_warns"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            sec_dir = self.vault_dir / "accounts" / "standby-unexpired-no-id"
+            sec_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(sec_dir, 0o700)
+            tok = create_sample_token(email="sec@example.com", expiry_offset_hours=24)
+            tok.pop("id_token", None)
+            (sec_dir / "token.json").write_text(json.dumps(tok), encoding="utf-8")
+            os.chmod(sec_dir / "token.json", 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "WARN")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("standby-unexpired-no-id", direct_item.message)
+            self.assertIn("unavailable", direct_item.message.lower())
+
+
 
     def test_layer2_expired_secondary_token_with_valid_refresh_token(self):
         """Expired non-active secondary account token with valid refresh token passes as Standby Ready."""
