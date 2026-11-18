@@ -223,16 +223,6 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing account without confirmation prompt"
     )
-    login_parser.add_argument(
-        "--headless", action="store_true", help="Headless OAuth 2.0 credential acquisition flow"
-    )
-    login_parser.add_argument(
-        "--auth-code",
-        dest="auth_code",
-        type=str,
-        default=None,
-        help="Deprecated: incompatible with dynamic agy PKCE sessions (rejected if provided)",
-    )
 
     # Command: config
     config_parser = subparsers.add_parser("config", help="Manage vault configuration")
@@ -321,77 +311,9 @@ def _account_exists(engine: AgySwitchEngine, alias: str) -> bool:
 
 
 def handle_login(args: argparse.Namespace, engine: AgySwitchEngine) -> int:
-    """Dispatches login command, supporting interactive headless and browser-based modes."""
+    """Dispatches interactive TTY Google OAuth login command to engine.login_account()."""
     alias = getattr(args, "name", "")
     force = getattr(args, "force", False)
-
-    # Reject deprecated --auth-code immediately before alias overwrite checks or subprocess spawns
-    # because dynamic PKCE sessions bind verifier/state per interactive agy invocation.
-    raw_auth_code = getattr(args, "auth_code", None)
-    if raw_auth_code is not None:
-        target_alias = alias or "<alias>"
-        print(
-            "Error: --auth-code is deprecated and incompatible with dynamic agy PKCE sessions. "
-            f"Run 'agy-switch login {target_alias} --headless' interactively instead.",
-            file=sys.stderr,
-        )
-        return 1
-
-    if getattr(args, "headless", False):
-        if hasattr(engine, "validate_account_alias") and callable(engine.validate_account_alias):
-            try:
-                res_alias = engine.validate_account_alias(alias)
-                if isinstance(res_alias, str):
-                    alias = res_alias
-            except AgySwitchError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 1
-
-        if not force and _account_exists(engine, alias):
-            try:
-                confirm = input(f"Account '{alias}' already exists. Overwrite? [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt, OSError):
-                print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
-                return 1
-
-            if confirm not in ("y", "yes"):
-                print(f"Error: Account '{alias}' already exists in vault. Overwrite aborted.", file=sys.stderr)
-                return 1
-            force = True
-
-        agy_binary = getattr(args, "agy_binary", None)
-        timeout = getattr(args, "timeout", 600)
-
-        try:
-            success, msg = engine.login_headless(
-                alias=alias,
-                force=force,
-                agy_binary=agy_binary,
-                timeout=timeout,
-            )
-        except KeyboardInterrupt:
-            print("Error: Login process interrupted by user.", file=sys.stderr)
-            return 1
-        except AgySwitchError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        except Exception as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-
-        if success:
-            print(f"[agy-switch] Account '{alias}' successfully logged in and saved to vault.")
-            print(f"  - Status: Standby (Run 'agy-switch switch {alias}' to activate)")
-            if hasattr(engine, "accounts_dir") and engine.accounts_dir:
-                print(f"  - Vault : {engine.accounts_dir / alias / 'token.json'}")
-            return 0
-        else:
-            err_msg = str(msg)
-            if err_msg.startswith("Error:"):
-                print(err_msg, file=sys.stderr)
-            else:
-                print(f"Error: {err_msg}", file=sys.stderr)
-            return 1
 
     try:
         res = engine.login_account(
