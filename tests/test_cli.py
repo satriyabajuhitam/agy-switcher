@@ -1,4 +1,5 @@
 import io
+import itertools
 import json
 import stat
 import subprocess
@@ -1252,6 +1253,182 @@ class TestCLI(unittest.TestCase):
             mock_popen_force.assert_called_once()
             self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
             self.assertEqual(json.loads(existing_token.read_text(encoding="utf-8"))["token"]["access_token"], "ya29.cli_force")
+
+    def test_login_cli_missing_binary_tokenless_timeout_interrupt_and_corrupt_cleanup(self):
+        """[TTY-LOGIN-ERR-003][TTY-LOGIN-ERR-004] main(['login', ...]) exits 1 to stderr and leaves no partial account dir."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            fail_dir = real_engine.accounts_dir / "fail-acc"
+            bad_dir = real_engine.accounts_dir / "bad-tok"
+
+            # 1. Missing agy binary
+            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+            stdout_missing = io.StringIO()
+            stderr_missing = io.StringIO()
+            with patch.dict(os.environ, clean_env, clear=True), \
+                 patch("agy_switcher.vault.Path.home", return_value=base), \
+                 patch("agy_switcher.vault.shutil.which", return_value=None), \
+                 patch("sys.stdout", stdout_missing), \
+                 patch("sys.stderr", stderr_missing), \
+                 patch("subprocess.Popen") as mock_popen:
+                ret_missing = main(["login", "fail-acc"], engine=real_engine)
+
+            self.assertEqual(ret_missing, 1)
+            self.assertEqual(stdout_missing.getvalue(), "")
+            self.assertIn("Error:", stderr_missing.getvalue())
+            mock_popen.assert_not_called()
+            self.assertFalse(fail_dir.exists())
+
+            class _StubProc:
+                def __init__(self, returncode=0):
+                    self.returncode = returncode
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            # 2. agy exits 0 or non-zero without producing a token file
+            for exit_code in (0, 1):
+                with self.subTest(exit_code=exit_code):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", return_value=_StubProc(returncode=exit_code)):
+                        ret = main(["login", "fail-acc"], engine=real_engine)
+                    self.assertEqual(ret, 1)
+                    self.assertEqual(stdout_buf.getvalue(), "")
+                    self.assertIn("Error:", stderr_buf.getvalue())
+                    self.assertFalse(fail_dir.exists())
+
+            # 3. Timeout and KeyboardInterrupt terminate/kill/reap stubborn child cleanly
+            class _StubbornProc:
+                def __init__(self):
+                    self.terminated = False
+                    self.killed = False
+                    self.wait_calls = 0
+
+                def poll(self):
+                    return None
+
+                def terminate(self):
+                    self.terminated = True
+
+                def wait(self, timeout=None):
+                    self.wait_calls += 1
+                    if self.wait_calls == 1:
+                        raise subprocess.TimeoutExpired(cmd="agy", timeout=timeout or 3)
+                    return -9
+
+                def kill(self):
+                    self.killed = True
+
+            timeout_proc = _StubbornProc()
+            stdout_to = io.StringIO()
+            stderr_to = io.StringIO()
+            with patch("sys.stdout", stdout_to), \
+                 patch("sys.stderr", stderr_to), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", return_value=timeout_proc), \
+                 patch("time.sleep", return_value=None), \
+                 patch("time.time", side_effect=itertools.chain([0.0], itertools.repeat(100.0))):
+                ret_to = main(["login", "fail-acc", "--timeout", "5"], engine=real_engine)
+
+            self.assertEqual(ret_to, 1)
+            self.assertEqual(stdout_to.getvalue(), "")
+            self.assertIn("Error:", stderr_to.getvalue())
+            self.assertTrue(timeout_proc.terminated)
+            self.assertTrue(timeout_proc.killed)
+            self.assertEqual(timeout_proc.wait_calls, 2)
+            self.assertFalse(fail_dir.exists())
+
+            interrupt_proc = _StubbornProc()
+            stdout_int = io.StringIO()
+            stderr_int = io.StringIO()
+            with patch("sys.stdout", stdout_int), \
+                 patch("sys.stderr", stderr_int), \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                 patch("subprocess.Popen", return_value=interrupt_proc), \
+                 patch("time.sleep", side_effect=KeyboardInterrupt):
+                ret_int = main(["login", "fail-acc"], engine=real_engine)
+
+            self.assertEqual(ret_int, 1)
+            self.assertEqual(stdout_int.getvalue(), "")
+            self.assertIn("Error:", stderr_int.getvalue())
+            self.assertTrue(interrupt_proc.terminated)
+            self.assertTrue(interrupt_proc.killed)
+            self.assertEqual(interrupt_proc.wait_calls, 2)
+            self.assertFalse(fail_dir.exists())
+
+            # 4. Corrupt token JSON / missing OAuth fields
+            for bad_body in ("{not-json", json.dumps({"token": {"access_token": "ya29.only"}})):
+                with self.subTest(bad_body=bad_body):
+                    def _mock_popen_bad_tok(args, *, _body=bad_body, **kwargs):
+                        temp_home = Path(kwargs["env"]["HOME"])
+                        tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                        tok.parent.mkdir(parents=True, exist_ok=True)
+                        tok.write_text(_body, encoding="utf-8")
+                        return _StubProc(returncode=0)
+
+                    stdout_bad = io.StringIO()
+                    stderr_bad = io.StringIO()
+                    with patch("sys.stdout", stdout_bad), \
+                         patch("sys.stderr", stderr_bad), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", side_effect=_mock_popen_bad_tok):
+                        ret_bad = main(["login", "bad-tok"], engine=real_engine)
+
+                    self.assertEqual(ret_bad, 1)
+                    self.assertEqual(stdout_bad.getvalue(), "")
+                    self.assertIn("Error:", stderr_bad.getvalue())
+                    self.assertFalse(bad_dir.exists())
+
+            # 5. Vault write PermissionError / OSError aborts cleanly without partial accounts/bad-tok dir
+            def _mock_popen_valid_tok(args, **kwargs):
+                temp_home = Path(kwargs["env"]["HOME"])
+                tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                tok.parent.mkdir(parents=True, exist_ok=True)
+                tok.write_text(
+                    json.dumps({
+                        "token": {
+                            "access_token": "ya29.badtok",
+                            "token_type": "Bearer",
+                            "refresh_token": "1//badtok",
+                            "expiry": "2026-12-31T23:59:59Z",
+                        },
+                        "auth_method": "oauth",
+                        "id_token_email": "badtok@example.com",
+                    }),
+                    encoding="utf-8",
+                )
+                return _StubProc(returncode=0)
+
+            for patch_target, err in (
+                ("agy_switcher.security.os.replace", PermissionError("simulated permission denied")),
+                ("agy_switcher.security.tempfile.mkstemp", OSError("simulated os error")),
+            ):
+                with self.subTest(patch_target=patch_target):
+                    stdout_perm = io.StringIO()
+                    stderr_perm = io.StringIO()
+                    with patch("sys.stdout", stdout_perm), \
+                         patch("sys.stderr", stderr_perm), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", side_effect=_mock_popen_valid_tok), \
+                         patch(patch_target, side_effect=err):
+                        ret_perm = main(["login", "bad-tok"], engine=real_engine)
+
+                    self.assertEqual(ret_perm, 1)
+                    self.assertEqual(stdout_perm.getvalue(), "")
+                    self.assertIn("Error:", stderr_perm.getvalue())
+                    self.assertFalse(bad_dir.exists())
 
 
     def test_vault_export_and_import_routing(self):

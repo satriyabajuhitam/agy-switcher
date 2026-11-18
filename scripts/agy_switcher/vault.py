@@ -729,9 +729,18 @@ class AgySwitchEngine:
     ) -> str | None:
         """Enriches registration Token Identity and writes accounts/<alias>/token.json atomically (0600)."""
         email = self._resolve_and_enrich_registration_email(token_data)
-        acc_dir.mkdir(parents=True, exist_ok=True)
-        dest_token = acc_dir / "token.json"
-        self._atomic_write_json(dest_token, token_data)
+        pre_existing = acc_dir.exists() or acc_dir.is_symlink()
+        succeeded = False
+        try:
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            dest_token = acc_dir / "token.json"
+            self._atomic_write_json(dest_token, token_data)
+            succeeded = True
+        except OSError as exc:
+            raise AgySwitchError(f"Failed to persist account '{acc_dir.name}' in vault: {exc}") from exc
+        finally:
+            if not succeeded and not pre_existing and (acc_dir.exists() or acc_dir.is_symlink()):
+                shutil.rmtree(acc_dir, ignore_errors=True)
         return email
 
     def add_account(self, name: str, token_path: Path) -> dict[str, Any]:
@@ -1010,6 +1019,31 @@ class AgySwitchEngine:
 
         raise AgySwitchError("Antigravity CLI binary ('agy') not found in ~/.local/bin/agy or system PATH.")
 
+    @staticmethod
+    def _terminate_login_process(proc: subprocess.Popen[bytes]) -> None:
+        """Gracefully terminates and reaps a still-running login subprocess."""
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=3)
+            return
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass
+        except OSError:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
+            pass
+
     def login_account(
         self,
         name: str,
@@ -1058,25 +1092,16 @@ class AgySwitchEngine:
             except Exception as exc:
                 raise AgySwitchError(f"Failed to spawn agy login process: {exc}") from exc
 
-            start_time = time.time()
             try:
+                start_time = time.time()
                 while proc.poll() is None:
                     if time.time() - start_time > timeout:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
                         raise AgySwitchError(f"Login timed out after {timeout} seconds.")
                     time.sleep(0.3)
-            except KeyboardInterrupt:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                raise AgySwitchError("Login process interrupted by user.")
+            except KeyboardInterrupt as exc:
+                raise AgySwitchError("Login process interrupted by user.") from exc
+            finally:
+                self._terminate_login_process(proc)
 
             token_file = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             if not token_file.is_file():
