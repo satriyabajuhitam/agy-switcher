@@ -873,10 +873,9 @@ class TestCLI(unittest.TestCase):
                 engine.set_quota_threshold("not_a_number")
 
     def test_login_headless_interactive_prompt_success(self):
-        """[REQ-3-SCN-001] Interactive login displays OAuth URL, reads code from stdin, delegates to engine."""
+        """[OOB-RETIRE-003] Interactive login reads code from stdin without emitting OOB URL."""
         self.engine.has_account.return_value = False
         self.engine.accounts_dir = Path("/mock/vault/accounts")
-        self.engine.get_oauth_url.return_value = "https://accounts.google.com/o/oauth2/auth?client_id=test"
         self.engine.login_headless.return_value = (True, "Account 'myacc' successfully logged in")
 
         stdout_buf = io.StringIO()
@@ -887,6 +886,7 @@ class TestCLI(unittest.TestCase):
 
         self.assertEqual(ret, 0)
         mock_input.assert_called_once_with("Enter authorization code: ")
+        self.assertFalse(hasattr(self.engine, "get_oauth_url"))
         self.engine.login_headless.assert_called_once_with(
             alias="myacc",
             auth_code="4/1AY0e-valid-code",
@@ -894,29 +894,65 @@ class TestCLI(unittest.TestCase):
             agy_binary=None,
             timeout=600,
         )
-        self.assertIn("https://accounts.google.com/o/oauth2/auth", stdout_buf.getvalue())
+        self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_buf.getvalue())
+        self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stderr_buf.getvalue())
         self.assertIn("Account 'myacc' successfully logged in and saved to vault.", stdout_buf.getvalue())
 
-    def test_login_headless_non_interactive_auth_code_flag(self):
-        """[REQ-3-SCN-002] Non-interactive login with --auth-code skips stdin prompt."""
+    def test_login_headless_rejects_auth_code_flag(self):
+        """[OOB-RETIRE-001] Deprecated --auth-code is rejected with PKCE guidance and exit code 1."""
         self.engine.has_account.return_value = False
-        self.engine.accounts_dir = Path("/mock/vault/accounts")
-        self.engine.login_headless.return_value = (True, "Account 'bot-acc' successfully logged in")
+        self.engine.login_headless = MagicMock()
 
         stdout_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("builtins.input") as mock_input:
-            ret = main(["login", "bot-acc", "--headless", "--auth-code", "4/1AY0e-auto-code"], engine=self.engine)
+        stderr_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+             patch("builtins.input") as mock_input:
+            ret = main(["login", "bot-acc", "--headless", "--auth-code", "4/1AY0e-stale"], engine=self.engine)
 
-        self.assertEqual(ret, 0)
+        self.assertEqual(ret, 1)
         mock_input.assert_not_called()
-        self.engine.login_headless.assert_called_once_with(
-            alias="bot-acc",
-            auth_code="4/1AY0e-auto-code",
-            force=False,
-            agy_binary=None,
-            timeout=600,
-        )
-        self.assertIn("Account 'bot-acc' successfully logged in and saved to vault.", stdout_buf.getvalue())
+        self.engine.login_headless.assert_not_called()
+        self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_buf.getvalue())
+        err = stderr_buf.getvalue()
+        self.assertIn("--auth-code", err)
+        self.assertIn("PKCE", err)
+        self.assertIn("agy-switch login bot-acc --headless", err)
+
+    def test_login_headless_rejects_empty_and_force_auth_code_before_overwrite(self):
+        """[OOB-RETIRE-001] [OOB-RETIRE-ERR-001] Empty, equals-syntax, non-headless, or --force --auth-code rejects before overwrite prompt or spawn."""
+        cases = [
+            ["login", "bot-acc", "--headless", "--auth-code", ""],
+            ["login", "bot-acc", "--headless", "--auth-code=4/1AY0e"],
+            ["login", "bot-acc", "--headless", "--force", "--auth-code", ""],
+            ["login", "bot-acc", "--headless", "--force", "--auth-code", "4/1AY0e-stale"],
+            ["login", "bot-acc", "--auth-code", "4/1AY0e-stale"],
+            ["login", "bot-acc", "--force", "--auth-code", ""],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                self.engine.reset_mock()
+                self.engine.has_account.return_value = True
+                self.engine.login_headless = MagicMock()
+                self.engine.login_account = MagicMock()
+                self.engine.validate_account_alias = MagicMock()
+                stdout_buf = io.StringIO()
+                stderr_buf = io.StringIO()
+                with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf), \
+                     patch("builtins.input") as mock_input:
+                    ret = main(argv, engine=self.engine)
+
+                self.assertEqual(ret, 1)
+                self.assertEqual(stdout_buf.getvalue(), "")
+                mock_input.assert_not_called()
+                self.engine.validate_account_alias.assert_not_called()
+                self.engine.has_account.assert_not_called()
+                self.engine.login_headless.assert_not_called()
+                self.engine.login_account.assert_not_called()
+                err = stderr_buf.getvalue()
+                self.assertIn("--auth-code", err)
+                self.assertIn("PKCE", err)
+                self.assertIn("agy-switch login bot-acc --headless", err)
+                self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", err)
 
     def test_login_headless_collision_abort_when_declined(self):
         """[REQ-3-EDGE-001] Declining overwrite on existing account aborts safely."""
@@ -951,14 +987,19 @@ class TestCLI(unittest.TestCase):
         self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
 
         stdout_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("builtins.input", return_value="y") as mock_input:
+        with patch("sys.stdout", stdout_buf), patch("builtins.input", side_effect=["y", "valid-code"]) as mock_input:
             ret = main(
-                ["login", "existing_acc", "--headless", "--auth-code", "valid-code"],
+                ["login", "existing_acc", "--headless"],
                 engine=self.engine,
             )
 
         self.assertEqual(ret, 0)
-        mock_input.assert_called_once_with("Account 'existing_acc' already exists. Overwrite? [y/N]: ")
+        self.assertEqual(mock_input.call_count, 2)
+        self.assertEqual(
+            mock_input.call_args_list[0].args,
+            ("Account 'existing_acc' already exists. Overwrite? [y/N]: ",),
+        )
+        self.assertEqual(mock_input.call_args_list[1].args, ("Enter authorization code: ",))
         self.engine.login_headless.assert_called_once_with(
             alias="existing_acc",
             auth_code="valid-code",
@@ -974,14 +1015,14 @@ class TestCLI(unittest.TestCase):
         self.engine.login_headless.return_value = (True, "Account 'existing_acc' successfully logged in")
 
         stdout_buf = io.StringIO()
-        with patch("sys.stdout", stdout_buf), patch("builtins.input") as mock_input:
+        with patch("sys.stdout", stdout_buf), patch("builtins.input", return_value="valid-code") as mock_input:
             ret = main(
-                ["login", "existing_acc", "--headless", "--force", "--auth-code", "valid-code"],
+                ["login", "existing_acc", "--headless", "--force"],
                 engine=self.engine,
             )
 
         self.assertEqual(ret, 0)
-        mock_input.assert_not_called()
+        mock_input.assert_called_once_with("Enter authorization code: ")
         self.engine.login_headless.assert_called_once_with(
             alias="existing_acc",
             auth_code="valid-code",
@@ -1014,9 +1055,9 @@ class TestCLI(unittest.TestCase):
         )
 
         stderr_buf = io.StringIO()
-        with patch("sys.stderr", stderr_buf):
+        with patch("sys.stderr", stderr_buf), patch("builtins.input", return_value="invalid-expired-code"):
             ret = main(
-                ["login", "bad-acc", "--headless", "--auth-code", "invalid-expired-code"],
+                ["login", "bad-acc", "--headless"],
                 engine=self.engine,
             )
 
@@ -1339,9 +1380,11 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(ret, 0)
             self.assertTrue(nested_bundle.is_file())
 
-    def test_account_exists_and_oauth_helpers(self):
-        """Verifies _account_exists delegates directly to engine.has_account and _get_default_oauth_url uses centralized builder."""
-        from agy_switcher.cli import _account_exists, _get_default_oauth_url
+    def test_account_exists_and_oob_oauth_retired(self):
+        """[OOB-RETIRE-003] Verifies _account_exists delegates to engine.has_account and OOB helpers are retired."""
+        import agy_switcher.cli as cli_mod
+        import agy_switcher.telemetry as telemetry_mod
+        from agy_switcher.cli import _account_exists
         from agy_switcher.telemetry import DEFAULT_CLIENT_ID
 
         mock_engine = MagicMock(spec=AgySwitchEngine)
@@ -1352,9 +1395,9 @@ class TestCLI(unittest.TestCase):
         mock_engine.has_account.return_value = False
         self.assertFalse(_account_exists(mock_engine, "nonexistent"))
 
-        url = _get_default_oauth_url()
-        self.assertIn(DEFAULT_CLIENT_ID, url)
-        self.assertIn("accounts.google.com/o/oauth2/auth", url)
+        self.assertFalse(hasattr(cli_mod, "_get_default_oauth_url"))
+        self.assertFalse(hasattr(telemetry_mod, "build_oauth_url"))
+        self.assertTrue(bool(DEFAULT_CLIENT_ID))
 
 
 if __name__ == '__main__':

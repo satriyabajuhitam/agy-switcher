@@ -29,7 +29,6 @@ import tarfile
 import tempfile
 import time
 from typing import Any, Callable, cast
-import urllib.parse
 
 from agy_switcher.exceptions import (
     AccountNotFoundError,
@@ -48,9 +47,7 @@ from agy_switcher.security import (
 )
 from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.telemetry import (
-    DEFAULT_CLIENT_ID,
     _parse_timestamp_defensive,
-    build_oauth_url,
     normalize_model_name,
 )
 from agy_switcher.doctor import DoctorEngine
@@ -1158,10 +1155,6 @@ class AgySwitchEngine:
             return (self.accounts_dir / clean).is_dir()
         except Exception:
             return (self.accounts_dir / name).is_dir()
-
-    def get_oauth_url(self) -> str:
-        """Returns the Google OAuth 2.0 authorization URL for headless login."""
-        return build_oauth_url(DEFAULT_CLIENT_ID)
 
     def locate_language_server_pid(self) -> int | None:
         """Finds running language_server PID by scanning /proc or pgrep."""

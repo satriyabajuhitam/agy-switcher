@@ -303,12 +303,14 @@ class TestAgySwitchEngine(unittest.TestCase):
             )
             self.assertTrue(success2, f"login_headless with name/code failed: {msg2}")
 
-    def test_get_oauth_url_and_vault_structure(self) -> None:
-        """Verifies get_oauth_url contains DEFAULT_CLIENT_ID and engine does not retain redundant self.vault."""
+    def test_oob_oauth_retired_and_vault_structure(self) -> None:
+        """[OOB-RETIRE-003] Verifies OOB OAuth builders are retired while DEFAULT_CLIENT_ID remains."""
+        import agy_switcher.telemetry as telemetry_mod
         from agy_switcher.telemetry import DEFAULT_CLIENT_ID
-        oauth_url = self.engine.get_oauth_url()
-        self.assertIn(DEFAULT_CLIENT_ID, oauth_url)
-        self.assertIn("accounts.google.com/o/oauth2/auth", oauth_url)
+
+        self.assertFalse(hasattr(self.engine, "get_oauth_url"))
+        self.assertFalse(hasattr(telemetry_mod, "build_oauth_url"))
+        self.assertTrue(bool(DEFAULT_CLIENT_ID))
         self.assertFalse(hasattr(self.engine, "vault"))
 
 
