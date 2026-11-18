@@ -13,6 +13,9 @@ from unittest.mock import MagicMock, patch
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
 
+# Initialize test patterns and environment hooks
+import tests.test_agy_switch  # noqa: F401
+
 from agy_switch import (
     main,
     AgySwitchEngine,
@@ -1725,6 +1728,72 @@ class TestCLI(unittest.TestCase):
         self.assertFalse(hasattr(cli_mod, "_get_default_oauth_url"))
         self.assertFalse(hasattr(telemetry_mod, "build_oauth_url"))
         self.assertTrue(bool(DEFAULT_CLIENT_ID))
+
+    def test_login_failure_never_emits_oob_or_static_oauth_urls_OOB_RETIRE_EDGE_001(self):
+        """[OOB-RETIRE-EDGE-001] TTY login failure never falls back to OOB URLs or static OAuth URLs on stdout/stderr."""
+        import agy_switcher.cli as cli_mod
+        import agy_switcher.telemetry as telemetry_mod
+        from agy_switcher.telemetry import DEFAULT_CLIENT_ID
+
+        self.assertTrue(bool(DEFAULT_CLIENT_ID))
+        self.assertFalse(hasattr(cli_mod, "_get_default_oauth_url"))
+        self.assertFalse(hasattr(telemetry_mod, "build_oauth_url"))
+        self.assertFalse(hasattr(AgySwitchEngine, "get_oauth_url"))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            self.assertFalse(hasattr(real_engine, "get_oauth_url"))
+
+            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+            stdout_missing = io.StringIO()
+            stderr_missing = io.StringIO()
+            with patch.dict(os.environ, clean_env, clear=True), \
+                 patch("agy_switcher.vault.Path.home", return_value=base), \
+                 patch("agy_switcher.vault.shutil.which", return_value=None), \
+                 patch("sys.stdout", stdout_missing), \
+                 patch("sys.stderr", stderr_missing):
+                ret_missing = main(["login", "fail-acc"], engine=real_engine)
+
+            self.assertEqual(ret_missing, 1)
+            stdout_missing_val = stdout_missing.getvalue()
+            stderr_missing_val = stderr_missing.getvalue()
+            self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_missing_val)
+            self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stderr_missing_val)
+            self.assertNotIn("accounts.google.com/o/oauth2", stdout_missing_val)
+            self.assertNotIn("accounts.google.com/o/oauth2", stderr_missing_val)
+
+            class _StubProc:
+                def __init__(self, returncode: int = 0) -> None:
+                    self.returncode = returncode
+
+                def poll(self) -> int:
+                    return self.returncode
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return self.returncode
+
+            for exit_code in (0, 1):
+                with self.subTest(exit_code=exit_code):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+                         patch("subprocess.Popen", return_value=_StubProc(returncode=exit_code)):
+                        ret = main(["login", "fail-acc"], engine=real_engine)
+
+                    self.assertEqual(ret, 1)
+                    stdout_val = stdout_buf.getvalue()
+                    stderr_val = stderr_buf.getvalue()
+                    self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stdout_val)
+                    self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stderr_val)
+                    self.assertNotIn("accounts.google.com/o/oauth2", stdout_val)
+                    self.assertNotIn("accounts.google.com/o/oauth2", stderr_val)
 
 
 if __name__ == '__main__':

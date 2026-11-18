@@ -187,6 +187,8 @@ class TestAgySwitchEngine(unittest.TestCase):
 
     def test_add_account_and_login_userinfo_persists_id_token_email(self) -> None:
         """[IDENTITY-RES-002] Missing id_token/id_token_email resolves email via Google UserInfo and writes 0600 id_token_email."""
+        self.assertFalse(hasattr(self.engine, "login_headless"))
+        self.assertFalse(hasattr(AgySwitchEngine, "login_headless"))
         for method in ("add_account", "login_account"):
             with self.subTest(method=method):
                 alias = f"ui_{method}"
