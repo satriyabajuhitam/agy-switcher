@@ -31,6 +31,7 @@ _EXPORTS: dict[str, str] = {
     "_atomic_write_file": "agy_switcher.security",
     "_atomic_write_json": "agy_switcher.security",
     "extract_email_from_jwt": "agy_switcher.security",
+    "resolve_token_email": "agy_switcher.security",
     "validate_token_dict": "agy_switcher.security",
     "validate_token_file": "agy_switcher.security",
     "check_token_dict": "agy_switcher.security",

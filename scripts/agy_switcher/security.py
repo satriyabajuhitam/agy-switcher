@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from agy_switcher.exceptions import InvalidTokenError
 
@@ -89,6 +89,30 @@ def extract_email_from_jwt(id_token: str | None) -> str | None:
     email = decoded.get("email")
     if isinstance(email, str) and email.strip():
         return email.strip()
+    return None
+
+
+def resolve_token_email(data: object) -> str | None:
+    """Resolves account email from a token payload without network I/O.
+
+    Prefers a trimmed non-empty email claim from id_token JWT via
+    extract_email_from_jwt(), falling back to a trimmed non-empty string
+    id_token_email field.
+    """
+    if not isinstance(data, Mapping):
+        return None
+
+    id_token = data.get("id_token")
+    if isinstance(id_token, str):
+        jwt_email = extract_email_from_jwt(id_token)
+        if jwt_email is not None:
+            return jwt_email
+
+    fallback_email = data.get("id_token_email")
+    if isinstance(fallback_email, str):
+        trimmed = fallback_email.strip()
+        if trimmed:
+            return trimmed
     return None
 
 
@@ -179,6 +203,7 @@ __all__ = [
     "_atomic_write_file",
     "_atomic_write_json",
     "extract_email_from_jwt",
+    "resolve_token_email",
     "validate_token_dict",
     "validate_token_file",
     "check_token_dict",

@@ -1044,6 +1044,80 @@ class TestSecurityTokenSchemaValidation(unittest.TestCase):
         self.assertIsInstance(err_bin, str)
         self.assertIsNone(data_bin)
 
+    def test_resolve_token_email_prefers_jwt_and_falls_back_IDENTITY_RES_001(self) -> None:
+        """[IDENTITY-RES-001] resolve_token_email prefers id_token JWT email and falls back to id_token_email."""
+        import base64
+        from agy_switcher.security import resolve_token_email
+
+        for omitted_or_empty in (
+            {"id_token_email": "fallback@example.com"},
+            {"id_token": None, "id_token_email": "fallback@example.com"},
+            {"id_token": "", "id_token_email": "  fallback@example.com  "},
+        ):
+            with self.subTest(payload=omitted_or_empty):
+                self.assertEqual(resolve_token_email(omitted_or_empty), "fallback@example.com")
+
+        jwt_payload_b64 = base64.urlsafe_b64encode(
+            json.dumps({"email": "jwt@example.com", "sub": "12345"}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        jwt_with_legacy = {
+            "id_token": f"header.{jwt_payload_b64}.signature",
+            "id_token_email": "legacy@example.com",
+        }
+        self.assertEqual(resolve_token_email(jwt_with_legacy), "jwt@example.com")
+
+        padded_jwt_b64 = base64.urlsafe_b64encode(
+            json.dumps({"email": "  trimmed.jwt@example.com  "}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        self.assertEqual(
+            resolve_token_email({"id_token": f"hdr.{padded_jwt_b64}.sig"}),
+            "trimmed.jwt@example.com",
+        )
+
+    def test_resolve_token_email_edge_cases_and_invalid_fallbacks(self) -> None:
+        """resolve_token_email ignores whitespace/non-string values and non-dict inputs."""
+        import base64
+        from agy_switcher.security import resolve_token_email
+
+        no_email_jwt = base64.urlsafe_b64encode(
+            json.dumps({"sub": "user-123"}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        ws_email_jwt = base64.urlsafe_b64encode(
+            json.dumps({"email": "   "}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+
+        self.assertEqual(
+            resolve_token_email(
+                {"id_token": f"hdr.{no_email_jwt}.sig", "id_token_email": "fb@example.com"}
+            ),
+            "fb@example.com",
+        )
+        self.assertEqual(
+            resolve_token_email(
+                {"id_token": f"hdr.{ws_email_jwt}.sig", "id_token_email": "fb2@example.com"}
+            ),
+            "fb2@example.com",
+        )
+        self.assertEqual(
+            resolve_token_email(
+                {"id_token": "not.a.valid.jwt", "id_token_email": "fb3@example.com"}
+            ),
+            "fb3@example.com",
+        )
+
+        for bad_fallback in (None, "", "   ", "\t\n", 12345, True, ["a@b.com"], {"email": "a@b.com"}):
+            with self.subTest(bad_fallback=bad_fallback):
+                self.assertIsNone(
+                    resolve_token_email(
+                        {"id_token": f"hdr.{no_email_jwt}.sig", "id_token_email": bad_fallback}
+                    )
+                )
+
+        for non_mapping in (None, "", [], 123, True):
+            with self.subTest(non_mapping=non_mapping):
+                self.assertIsNone(resolve_token_email(non_mapping))
+
+
 
 if __name__ == "__main__":
     unittest.main()
