@@ -1,5 +1,6 @@
 import io
 import json
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1051,6 +1052,206 @@ class TestCLI(unittest.TestCase):
             self.assertIn("Error:", stderr_buf.getvalue())
             self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_json)
             self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+    def test_login_standard_interactive_tty_end_to_end(self):
+        """[TTY-LOGIN-001] main(['login', 'work-acc']) invokes login_account, inherits TTY stdio in temp HOME, and saves 0600 Standby token."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            # Pre-populate an active account to prove login leaves active pointer untouched
+            active_dir = real_engine.accounts_dir / "active-acc"
+            active_dir.mkdir(parents=True, exist_ok=True)
+            (active_dir / "token.json").write_text('{"active": true}', encoding="utf-8")
+            real_engine.active_file.write_text("active-acc\n", encoding="utf-8")
+
+            bin_dir = base / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            agy_bin = bin_dir / "agy"
+            agy_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            agy_bin.chmod(0o755)
+
+            observed_popen = {}
+
+            class _StubProc:
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def mock_popen(args, **kwargs):
+                temp_home = Path(kwargs["env"]["HOME"])
+                observed_popen["args"] = args
+                observed_popen["stdin_is_sys"] = kwargs.get("stdin") is sys.stdin
+                observed_popen["stdout_is_sys"] = kwargs.get("stdout") is sys.stdout
+                observed_popen["stderr_is_sys"] = kwargs.get("stderr") is sys.stderr
+                observed_popen["cwd"] = kwargs.get("cwd")
+                observed_popen["temp_home"] = temp_home
+                observed_popen["temp_home_exists_during_spawn"] = temp_home.is_dir()
+
+                tok = temp_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                tok.parent.mkdir(parents=True, exist_ok=True)
+                tok.write_text(
+                    json.dumps({
+                        "token": {
+                            "access_token": "ya29.tty_work",
+                            "token_type": "Bearer",
+                            "refresh_token": "1//tty_work",
+                            "expiry": "2026-12-31T23:59:59Z",
+                        },
+                        "auth_method": "oauth",
+                        "id_token_email": "work@example.com",
+                    }),
+                    encoding="utf-8",
+                )
+                return _StubProc()
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            clean_env = {k: v for k, v in os.environ.items() if k != "AGY_BINARY"}
+            clean_env["PATH"] = str(bin_dir)
+            clean_env["HOME"] = str(base)
+
+            with patch.dict(os.environ, clean_env, clear=True), \
+                 patch.object(real_engine, "login_account", wraps=real_engine.login_account) as spy_login, \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf), \
+                 patch("subprocess.Popen", side_effect=mock_popen):
+                ret = main(["login", "work-acc"], engine=real_engine)
+
+            self.assertEqual(ret, 0)
+            self.assertEqual(stderr_buf.getvalue(), "")
+            spy_login.assert_called_once_with("work-acc", agy_binary=None, timeout=600, force=False)
+            self.assertEqual(observed_popen["args"], [str(agy_bin)])
+            self.assertTrue(observed_popen["stdin_is_sys"])
+            self.assertTrue(observed_popen["stdout_is_sys"])
+            self.assertTrue(observed_popen["stderr_is_sys"])
+            self.assertTrue(observed_popen["temp_home_exists_during_spawn"])
+            self.assertNotEqual(observed_popen["temp_home"], base)
+            self.assertEqual(observed_popen["cwd"], str(observed_popen["temp_home"]))
+            self.assertFalse(observed_popen["temp_home"].exists())
+
+            saved_token = real_engine.accounts_dir / "work-acc" / "token.json"
+            self.assertTrue(saved_token.is_file())
+            self.assertEqual(stat.S_IMODE(saved_token.stat().st_mode), 0o600)
+            saved_data = json.loads(saved_token.read_text(encoding="utf-8"))
+            self.assertEqual(saved_data["token"]["access_token"], "ya29.tty_work")
+            self.assertEqual(saved_data["id_token_email"], "work@example.com")
+            self.assertEqual(real_engine.get_active_name(), "active-acc")
+            self.assertIn("Status: Standby", stdout_buf.getvalue())
+            self.assertIn(str(saved_token), stdout_buf.getvalue())
+
+    def test_login_overwrite_confirmation_cli_lifecycle_and_jetski_fallback(self):
+        """[TTY-LOGIN-EDGE-001] CLI overwrite decline/EOF/KeyboardInterrupt exits 1 before agy spawn; confirm/force accepts jetski fallback."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            real_engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=base / ".gemini",
+                legacy_root=base / ".agy-cli-manager",
+            )
+            existing_dir = real_engine.accounts_dir / "existing-acc"
+            existing_dir.mkdir(parents=True, exist_ok=True)
+            existing_token = existing_dir / "token.json"
+            prior_json = json.dumps({
+                "token": {
+                    "access_token": "ya29.prior",
+                    "token_type": "Bearer",
+                    "refresh_token": "1//prior",
+                    "expiry": "2026-12-31T23:59:59Z",
+                },
+                "auth_method": "oauth",
+                "id_token_email": "prior@example.com",
+            })
+            existing_token.write_text(prior_json, encoding="utf-8")
+            existing_token.chmod(0o600)
+
+            for label, side_eff in (("n", "n"), ("empty", ""), ("eof", EOFError()), ("sigint", KeyboardInterrupt())):
+                with self.subTest(decline=label):
+                    stdout_buf = io.StringIO()
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stdout", stdout_buf), \
+                         patch("sys.stderr", stderr_buf), \
+                         patch("builtins.input", side_effect=[side_eff]) as mock_input, \
+                         patch.object(real_engine, "resolve_agy_binary") as mock_resolve, \
+                         patch("subprocess.Popen") as mock_popen:
+                        ret = main(["login", "existing-acc"], engine=real_engine)
+
+                    self.assertEqual(ret, 1)
+                    self.assertEqual(stdout_buf.getvalue(), "")
+                    self.assertIn("Error:", stderr_buf.getvalue())
+                    mock_input.assert_called_once()
+                    mock_resolve.assert_not_called()
+                    mock_popen.assert_not_called()
+                    self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_json)
+                    self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+
+            class _StubProc:
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def make_jetski_popen(access_tok: str, email: str):
+                def _mock_popen(args, **kwargs):
+                    temp_home = Path(kwargs["env"]["HOME"])
+                    jetski_tok = temp_home / ".gemini" / "jetski-standalone-oauth-token"
+                    jetski_tok.parent.mkdir(parents=True, exist_ok=True)
+                    jetski_tok.write_text(
+                        json.dumps({
+                            "token": {
+                                "access_token": access_tok,
+                                "token_type": "Bearer",
+                                "refresh_token": f"1//{access_tok}",
+                                "expiry": "2026-12-31T23:59:59Z",
+                            },
+                            "auth_method": "oauth",
+                            "id_token_email": email,
+                        }),
+                        encoding="utf-8",
+                    )
+                    return _StubProc()
+
+                return _mock_popen
+
+            stdout_confirm = io.StringIO()
+            stderr_confirm = io.StringIO()
+            with patch("sys.stdout", stdout_confirm), \
+                 patch("sys.stderr", stderr_confirm), \
+                 patch("builtins.input", return_value="y") as mock_input_yes, \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy") as mock_resolve_yes, \
+                 patch("subprocess.Popen", side_effect=make_jetski_popen("ya29.cli_confirm", "cli-confirm@example.com")) as mock_popen_yes:
+                ret_yes = main(["login", "existing-acc"], engine=real_engine)
+
+            self.assertEqual(ret_yes, 0)
+            self.assertEqual(stderr_confirm.getvalue(), "")
+            mock_input_yes.assert_called_once()
+            mock_resolve_yes.assert_called_once_with(None)
+            mock_popen_yes.assert_called_once()
+            self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(existing_token.read_text(encoding="utf-8"))["token"]["access_token"], "ya29.cli_confirm")
+
+            stdout_force = io.StringIO()
+            stderr_force = io.StringIO()
+            with patch("sys.stdout", stdout_force), \
+                 patch("sys.stderr", stderr_force), \
+                 patch("builtins.input") as mock_input_force, \
+                 patch.object(real_engine, "resolve_agy_binary", return_value="/bin/mock_agy") as mock_resolve_force, \
+                 patch("subprocess.Popen", side_effect=make_jetski_popen("ya29.cli_force", "cli-force@example.com")) as mock_popen_force:
+                ret_force = main(["login", "existing-acc", "--force"], engine=real_engine)
+
+            self.assertEqual(ret_force, 0)
+            self.assertEqual(stderr_force.getvalue(), "")
+            mock_input_force.assert_not_called()
+            mock_resolve_force.assert_called_once_with(None)
+            mock_popen_force.assert_called_once()
+            self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(existing_token.read_text(encoding="utf-8"))["token"]["access_token"], "ya29.cli_force")
 
 
     def test_vault_export_and_import_routing(self):

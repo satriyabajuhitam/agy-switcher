@@ -925,6 +925,83 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
         self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
 
+    def test_login_account_overwrite_lifecycle_and_jetski_fallback(self) -> None:
+        """[TTY-LOGIN-EDGE-001] Overwrite prompt decline/EOF/KeyboardInterrupt aborts before agy spawn; confirm/force accepts jetski fallback."""
+        existing_dir = self.vault_dir / "accounts" / "existing-acc"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        existing_token = existing_dir / "token.json"
+        prior_content = json.dumps(make_valid_token_payload("prior@example.com"))
+        existing_token.write_text(prior_content, encoding="utf-8")
+        existing_token.chmod(0o600)
+
+        decline_inputs: list[tuple[str, object]] = [
+            ("n", "n"),
+            ("empty", ""),
+            ("eof", EOFError()),
+            ("sigint", KeyboardInterrupt()),
+        ]
+        for label, side_eff in decline_inputs:
+            with self.subTest(decline=label):
+                with patch("builtins.input", side_effect=[side_eff]) as mock_input, \
+                     patch.object(self.engine, "resolve_agy_binary") as mock_resolve, \
+                     patch("subprocess.Popen") as mock_popen:
+                    with self.assertRaises(AgySwitchError):
+                        self.engine.login_account("existing-acc", force=False)
+
+                mock_input.assert_called_once()
+                mock_resolve.assert_not_called()
+                mock_popen.assert_not_called()
+                self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
+                self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+
+        jetski_confirm_payload = make_valid_token_payload("confirmed-jetski@example.com")
+        jetski_force_payload = make_valid_token_payload("forced-jetski@example.com")
+
+        def make_jetski_popen(payload: dict[str, object]) -> object:
+            def _mock_popen(args: list[str], **kwargs: object) -> _StubLoginProcess:
+                env = kwargs.get("env")
+                assert isinstance(env, dict)
+                temp_home = Path(env["HOME"])
+                # Intentionally omit antigravity-oauth-token to exercise jetski fallback
+                jetski_target = temp_home / ".gemini" / "jetski-standalone-oauth-token"
+                jetski_target.parent.mkdir(parents=True, exist_ok=True)
+                jetski_target.write_text(json.dumps(payload), encoding="utf-8")
+                return _StubLoginProcess(returncode=0)
+
+            return _mock_popen
+
+        with patch("builtins.input", return_value="y") as mock_input, \
+             patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy") as mock_resolve, \
+             patch("subprocess.Popen", side_effect=make_jetski_popen(jetski_confirm_payload)) as mock_popen:
+            res_confirm = self.engine.login_account("existing-acc", force=False)
+
+        mock_input.assert_called_once()
+        mock_resolve.assert_called_once_with(None)
+        mock_popen.assert_called_once()
+        self.assertEqual(res_confirm["name"], "existing-acc")
+        self.assertEqual(res_confirm["email"], "confirmed-jetski@example.com")
+        self.assertEqual(res_confirm["status"], "standby")
+        self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+        self.assertEqual(
+            json.loads(existing_token.read_text(encoding="utf-8"))["token"]["access_token"],
+            "ya29.sample_token_for_confirmed-jetski@example.com",
+        )
+
+        with patch("builtins.input") as mock_input_force, \
+             patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy") as mock_resolve_force, \
+             patch("subprocess.Popen", side_effect=make_jetski_popen(jetski_force_payload)) as mock_popen_force:
+            res_force = self.engine.login_account("existing-acc", force=True)
+
+        mock_input_force.assert_not_called()
+        mock_resolve_force.assert_called_once_with(None)
+        mock_popen_force.assert_called_once()
+        self.assertEqual(res_force["email"], "forced-jetski@example.com")
+        self.assertEqual(stat.S_IMODE(existing_token.stat().st_mode), 0o600)
+        self.assertEqual(
+            json.loads(existing_token.read_text(encoding="utf-8"))["token"]["access_token"],
+            "ya29.sample_token_for_forced-jetski@example.com",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

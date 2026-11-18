@@ -1024,13 +1024,14 @@ class AgySwitchEngine:
         acc_dir = self.accounts_dir / clean_name
         if acc_dir.is_dir() and not force:
             prompt_msg = f"Account '{clean_name}' already exists in vault. Overwrite? [y/N]: "
-            if prompt_fn is not None:
-                resp = prompt_fn(prompt_msg)
-            else:
-                try:
-                    resp = input(prompt_msg)
-                except (EOFError, OSError):
-                    resp = "n"
+            try:
+                resp = prompt_fn(prompt_msg) if prompt_fn is not None else input(prompt_msg)
+            except (EOFError, OSError):
+                resp = "n"
+            except KeyboardInterrupt as exc:
+                raise AgySwitchError(
+                    f"Account '{clean_name}' already exists in vault. Overwrite aborted."
+                ) from exc
             if str(resp).strip().lower() not in {"y", "yes"}:
                 raise AgySwitchError(f"Account '{clean_name}' already exists in vault. Overwrite aborted.")
 
