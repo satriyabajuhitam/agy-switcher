@@ -3,13 +3,22 @@
 # 3-Tier Multi-Quality Verification Gate for agy-switch
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+if command -v realpath >/dev/null 2>&1; then
+    RESOLVED_SOURCE="$(realpath "$SCRIPT_SOURCE" 2>/dev/null || echo "$SCRIPT_SOURCE")"
+elif command -v readlink >/dev/null 2>&1; then
+    RESOLVED_SOURCE="$(readlink -f "$SCRIPT_SOURCE" 2>/dev/null || echo "$SCRIPT_SOURCE")"
+else
+    RESOLVED_SOURCE="$SCRIPT_SOURCE"
+fi
+SCRIPT_DIR="$(cd "$(dirname "${RESOLVED_SOURCE}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 LOGICAL_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ==============================================================================
 # Fast-Path Zero-Overhead Workspace Guard (<5ms)
 # Seam: workspace_guard_resilience
+# Seam: workspace_guard_paths
 # ==============================================================================
 is_agy_switcher_path() {
     local target="$1"
@@ -25,15 +34,37 @@ is_agy_switcher_path() {
             ;;
     esac
 
+    # Resolve realpath if target exists to handle symlinks, relative subpaths, and canonical paths
+    local resolved_target="$target"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if command -v realpath >/dev/null 2>&1; then
+            resolved_target="$(realpath "$target" 2>/dev/null || echo "$target")"
+        elif command -v readlink >/dev/null 2>&1; then
+            resolved_target="$(readlink -f "$target" 2>/dev/null || echo "$target")"
+        fi
+    fi
+
+    # Check 1b: Match resolved target against REPO_ROOT
+    if [ "$resolved_target" = "$REPO_ROOT" ] || [ "$resolved_target" = "$LOGICAL_REPO_ROOT" ]; then
+        return 0
+    fi
+    case "$resolved_target" in
+        "$REPO_ROOT"/*|"$LOGICAL_REPO_ROOT"/*)
+            return 0
+            ;;
+    esac
+
     # Check 2: Directory name matching common repo aliases
     local base="${target##*/}"
-    if [ "$base" = "agy-switcher" ] || [ "$base" = "agy-switch" ]; then
+    local resolved_base="${resolved_target##*/}"
+    if [ "$base" = "agy-switcher" ] || [ "$base" = "agy-switch" ] || \
+       [ "$resolved_base" = "agy-switcher" ] || [ "$resolved_base" = "agy-switch" ]; then
         return 0
     fi
 
-    # Check 3: If target exists on disk, resolve realpath and check for marker pyproject.toml
-    if [ -e "$target" ]; then
-        local cur="$target"
+    # Check 3: If target exists on disk, walk up parent hierarchy checking for marker pyproject.toml
+    if [ -e "$resolved_target" ]; then
+        local cur="$resolved_target"
         if [ ! -d "$cur" ]; then
             cur="${cur%/*}"
             [ -z "$cur" ] && cur="/"

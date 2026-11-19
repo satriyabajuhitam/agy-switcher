@@ -327,6 +327,190 @@ class TestVerifyBuildWorkspaceGuard(unittest.TestCase):
         self.assertIn("Verifying 5-layer AST modular architecture", proc.stdout)
         self.assertIn("Tier 1 gate passed cleanly", proc.stdout)
 
+    def test_workspace_guard_paths(self) -> None:
+        """[WS-GUARD-EDGE-001] & [WS-GUARD-EDGE-002] Subpath, symlink & multi-root resolution."""
+        # Seam Check: verify scripts/verify-build.sh declares workspace_guard_paths seam
+        script_content = VERIFY_BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "workspace_guard_paths",
+            script_content,
+            "scripts/verify-build.sh must declare workspace_guard_paths seam",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            # --- [WS-GUARD-EDGE-001]: Symlinked verify-build.sh execution ---
+            # Symlinked script invoked from a repository sub-directory (parent contains pyproject.toml)
+            # must resolve REPO_ROOT realpath and permit Tier 1 gate to execute and pass.
+            symlink_script = tmppath / "verify-symlink.sh"
+            symlink_script.symlink_to(VERIFY_BUILD_SCRIPT)
+
+            proc_symlink_script = subprocess.run(
+                ["bash", str(symlink_script)],
+                cwd=str(REPO_ROOT / "tests"),
+                capture_output=True,
+                text=True,
+                env={**os.environ, "AGY_VERIFY_MAX_TIER": "1"},
+                check=False,
+            )
+            self.assertEqual(
+                proc_symlink_script.returncode,
+                0,
+                f"Symlinked script must resolve REPO_ROOT and exit 0. Stderr: {proc_symlink_script.stderr}",
+            )
+            self.assertIn("Tier 1 gate passed cleanly", proc_symlink_script.stdout)
+
+            # --- [WS-GUARD-EDGE-001]: Subpath & Symlinked workspace directories ---
+            # Subpath invocation from inside repository (tests/ and scripts/)
+            for subpath in [REPO_ROOT / "tests", REPO_ROOT / "scripts"]:
+                proc_sub, _ = self._run_script(
+                    stdin_data=None,
+                    cwd=subpath,
+                    env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+                )
+                self.assertEqual(proc_sub.returncode, 0)
+                self.assertIn("[GUARD_PASSED]", proc_sub.stdout)
+
+            # Symlink pointing to the repository root
+            symlink_repo = tmppath / "symlink-repo-root"
+            symlink_repo.symlink_to(REPO_ROOT)
+            proc_sym_repo, _ = self._run_script(
+                stdin_data=None,
+                cwd=symlink_repo,
+                env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+            )
+            self.assertEqual(proc_sym_repo.returncode, 0)
+            self.assertIn("[GUARD_PASSED]", proc_sym_repo.stdout)
+
+            # Symlink pointing to a subpath inside the repository (e.g. tests/)
+            symlink_subpath = tmppath / "symlink-to-tests"
+            symlink_subpath.symlink_to(REPO_ROOT / "tests")
+            proc_sym_sub, _ = self._run_script(
+                stdin_data=None,
+                cwd=symlink_subpath,
+                env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+            )
+            self.assertEqual(proc_sym_sub.returncode, 0)
+            self.assertIn("[GUARD_PASSED]", proc_sym_sub.stdout)
+
+            # Symlinked subpath inside an external clone with pyproject.toml marker
+            ext_worktree = tmppath / "ext-worktree"
+            ext_worktree.mkdir()
+            (ext_worktree / "pyproject.toml").write_text(
+                '[project]\nname = "agy-switch"\n',
+                encoding="utf-8",
+            )
+            (ext_worktree / "subdir").mkdir()
+            symlink_ext_sub = tmppath / "symlink-to-ext-sub"
+            symlink_ext_sub.symlink_to(ext_worktree / "subdir")
+
+            proc_sym_ext, _ = self._run_script(
+                stdin_data=None,
+                cwd=symlink_ext_sub,
+                env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+            )
+            self.assertEqual(proc_sym_ext.returncode, 0)
+            self.assertIn("[GUARD_PASSED]", proc_sym_ext.stdout)
+
+            # --- [WS-GUARD-EDGE-002]: Multi-root workspace sessions ---
+            # Foreign cwd, but workspacePaths includes agy-switcher repo root
+            multi_root_payload = json.dumps({
+                "cwd": "/home/user/foreign-app",
+                "workspacePaths": [
+                    "/home/user/foreign-app",
+                    str(REPO_ROOT),
+                ],
+            })
+            proc_mr_root, _ = self._run_script(
+                stdin_data=multi_root_payload,
+                cwd="/tmp",
+                env_extra={"AGY_VERIFY_MAX_TIER": "1"},
+            )
+            self.assertEqual(proc_mr_root.returncode, 0)
+            self.assertIn("Tier 1 gate passed cleanly", proc_mr_root.stdout)
+
+            # Foreign cwd, workspacePaths includes a symlink to agy-switcher repo
+            multi_root_sym_repo = json.dumps({
+                "cwd": "/home/user/foreign-app",
+                "workspacePaths": [
+                    "/home/user/foreign-app",
+                    str(symlink_repo),
+                ],
+            })
+            proc_mr_sym_repo, _ = self._run_script(
+                stdin_data=multi_root_sym_repo,
+                cwd="/tmp",
+                env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+            )
+            self.assertEqual(proc_mr_sym_repo.returncode, 0)
+            self.assertIn("[GUARD_PASSED]", proc_mr_sym_repo.stdout)
+
+            # Foreign cwd, workspacePaths includes a subpath inside agy-switcher (e.g. scripts/)
+            multi_root_subpath = json.dumps({
+                "cwd": "/home/user/foreign-app",
+                "workspacePaths": [
+                    "/home/user/foreign-app",
+                    str(REPO_ROOT / "scripts"),
+                ],
+            })
+            proc_mr_sub, _ = self._run_script(
+                stdin_data=multi_root_subpath,
+                cwd="/tmp",
+                env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+            )
+            self.assertEqual(proc_mr_sub.returncode, 0)
+            self.assertIn("[GUARD_PASSED]", proc_mr_sub.stdout)
+
+            # Foreign cwd, workspacePaths includes a symlink to a subpath inside agy-switcher
+            multi_root_sym_sub = json.dumps({
+                "cwd": "/home/user/foreign-app",
+                "workspacePaths": [
+                    "/home/user/foreign-app",
+                    str(symlink_subpath),
+                ],
+            })
+            proc_mr_sym_sub, _ = self._run_script(
+                stdin_data=multi_root_sym_sub,
+                cwd="/tmp",
+                env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+            )
+            self.assertEqual(proc_mr_sym_sub.returncode, 0)
+            self.assertIn("[GUARD_PASSED]", proc_mr_sym_sub.stdout)
+
+            # Foreign cwd, workspacePaths includes external worktree with marker
+            multi_root_ext = json.dumps({
+                "cwd": "/home/user/foreign-app",
+                "workspacePaths": [
+                    "/home/user/foreign-app",
+                    str(symlink_ext_sub),
+                ],
+            })
+            proc_mr_ext, _ = self._run_script(
+                stdin_data=multi_root_ext,
+                cwd="/tmp",
+                env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+            )
+            self.assertEqual(proc_mr_ext.returncode, 0)
+            self.assertIn("[GUARD_PASSED]", proc_mr_ext.stdout)
+
+            # Negative case: Foreign cwd and workspacePaths containing only foreign paths
+            multi_root_foreign_only = json.dumps({
+                "cwd": "/home/user/foreign-app",
+                "workspacePaths": [
+                    "/home/user/foreign-app",
+                    "/home/user/another-project",
+                ],
+            })
+            proc_mr_foreign, _ = self._run_script(
+                stdin_data=multi_root_foreign_only,
+                cwd="/tmp",
+                env_extra={"AGY_VERIFY_MAX_TIER": "1"},
+            )
+            self.assertEqual(proc_mr_foreign.returncode, 0)
+            self.assertNotIn("Tier 1 gate passed cleanly", proc_mr_foreign.stdout)
+            self.assertNotIn("[GUARD_PASSED]", proc_mr_foreign.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
