@@ -84,4 +84,12 @@ _Avoid_: Blind timestamp expiry, false warning, superficial token check
 The email identifier associated with a registered OAuth credential profile, resolved from embedded identity claims, credential metadata, or provider userinfo without invalidating otherwise renewable credentials when omitted.
 _Avoid_: Mandatory JWT identity, rigid id_token schema
 
+**Workspace Guard**:
+A zero-overhead pre-execution validation gate within lifecycle hooks or verification scripts that inspects caller session metadata or directory paths, instantly terminating as a no-op (exit 0) when invoked outside the target repository.
+_Avoid_: CWD check, path filter, repo detector
+
+**Plugin Hook Scoping**:
+The architectural separation between machine-wide plugin lifecycle hooks (such as global multi-account quota rotation) and workspace-specific quality gates (which must remain disabled by default in plugin bundles to avoid cross-project execution delays).
+_Avoid_: Hook filtering, selective execution
+
 
