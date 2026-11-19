@@ -54,15 +54,7 @@ is_agy_switcher_path() {
             ;;
     esac
 
-    # Check 2: Directory name matching common repo aliases
-    local base="${target##*/}"
-    local resolved_base="${resolved_target##*/}"
-    if [ "$base" = "agy-switcher" ] || [ "$base" = "agy-switch" ] || \
-       [ "$resolved_base" = "agy-switcher" ] || [ "$resolved_base" = "agy-switch" ]; then
-        return 0
-    fi
-
-    # Check 3: If target exists on disk, walk up parent hierarchy checking for marker pyproject.toml
+    # Check 2: If target exists on disk, walk up parent hierarchy checking for marker pyproject.toml
     if [ -e "$resolved_target" ]; then
         local cur="$resolved_target"
         if [ ! -d "$cur" ]; then

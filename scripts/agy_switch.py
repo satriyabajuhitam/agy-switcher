@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pathlib import Path
     from typing import Any, Callable
+    from agy_switcher.vault import AgySwitchEngine
 
 # Ensure physical script dir and repo root are in sys.path (resolving symlinks)
 _real_script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -51,7 +52,7 @@ def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> An
 
 def hook_pre_invocation_dispatch(
     argv: list[str] | None = None,
-    engine: Any | None = None,
+    engine: AgySwitchEngine | None = None,
 ) -> int:
     """Fast-path dispatch for Antigravity PreInvocation hook (<40ms cold start).
 

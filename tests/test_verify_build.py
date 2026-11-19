@@ -511,6 +511,45 @@ class TestVerifyBuildWorkspaceGuard(unittest.TestCase):
             self.assertNotIn("Tier 1 gate passed cleanly", proc_mr_foreign.stdout)
             self.assertNotIn("[GUARD_PASSED]", proc_mr_foreign.stdout)
 
+    def test_workspace_guard_rejects_foreign_directory_with_alias_name(self) -> None:
+        """Prevent bare basename false positives when foreign directory is named agy-switch or agy-switcher."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            for alias in ("agy-switch", "agy-switcher"):
+                foreign_alias_dir = tmppath / alias
+                foreign_alias_dir.mkdir(parents=True)
+                # 1. Unrelated pyproject.toml
+                foreign_pyproject = foreign_alias_dir / "pyproject.toml"
+                foreign_pyproject.write_text('[project]\nname = "unrelated-app"\n', encoding="utf-8")
+
+                # Foreign workspace payload with alias basename
+                payload = json.dumps({
+                    "cwd": str(foreign_alias_dir),
+                    "workspacePaths": [str(foreign_alias_dir)],
+                })
+                proc, elapsed = self._run_script(
+                    stdin_data=payload,
+                    cwd=foreign_alias_dir,
+                    env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+                )
+                self.assertEqual(proc.returncode, 0)
+                self.assertNotIn("[GUARD_PASSED]", proc.stdout)
+                self.assertNotIn("Tier 1 gate passed cleanly", proc.stdout)
+                self.assertLess(elapsed, 0.25)
+
+                # 2. Foreign alias dir without pyproject.toml at all
+                foreign_empty_alias = tmppath / f"empty-{alias}" / alias
+                foreign_empty_alias.mkdir(parents=True)
+                proc_empty, elapsed_empty = self._run_script(
+                    stdin_data=None,
+                    cwd=foreign_empty_alias,
+                    env_extra={"AGY_VERIFY_DRY_RUN": "1"},
+                )
+                self.assertEqual(proc_empty.returncode, 0)
+                self.assertNotIn("[GUARD_PASSED]", proc_empty.stdout)
+                self.assertNotIn("Tier 1 gate passed cleanly", proc_empty.stdout)
+                self.assertLess(elapsed_empty, 0.25)
+
 
 if __name__ == "__main__":
     unittest.main()
