@@ -3058,6 +3058,157 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
                 mock_qc.return_value = "mocked_client"
                 self.assertEqual(agy_switch.QuotaClient(), "mocked_client")
 
+    def test_re_export_parity(self):
+        """Scenarios [PREINV-FAST-ERR-001] and [PREINV-FAST-EDGE-002]:
+
+        Validates corrupt cache resilience and 100% symbol re-export & dynamic patch parity.
+        """
+        import io
+        from unittest.mock import MagicMock, patch
+        script_path = REPO_ROOT / "scripts" / "agy_switch.py"
+
+        # -------------------------------------------------------------------------
+        # Scenario 1: [PREINV-FAST-ERR-001] Corrupt Cache Resilience
+        # -------------------------------------------------------------------------
+        corrupt_payloads = [
+            ("truncated_json", '{"accounts": {"acc1": {"quota": 90, "cached_at": '),
+            ("empty_file", ""),
+            ("whitespace_only", "   \n\t  \n"),
+            ("non_obj_list", json.dumps([1, 2, 3])),
+            ("non_obj_string", json.dumps("unexpected string payload")),
+            ("non_obj_int", json.dumps(12345)),
+            ("non_obj_bool", json.dumps(True)),
+            ("non_obj_null", json.dumps(None)),
+            ("malformed_accounts_scalar", json.dumps({"accounts": "invalid_scalar"})),
+            ("malformed_account_entry", json.dumps({"accounts": {"acc1": "not_a_dict"}})),
+            ("malformed_cached_at_str", json.dumps({"accounts": {"acc1": {"gemini": {"quota": 90}, "cached_at": "not-a-timestamp"}}})),
+            ("malformed_cached_at_nan", '{"accounts": {"acc1": {"gemini": {"quota": 90}, "cached_at": NaN}}}'),
+            ("malformed_quota_val", json.dumps({"accounts": {"acc1": {"gemini": {"quota": [1, 2, 3]}, "cached_at": 1000.0}}})),
+        ]
+
+        for label, payload in corrupt_payloads:
+            with self.subTest(scenario="corrupt_cache_matrix", corrupt_type=label):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vault_path = Path(tmpdir)
+                    config_path = vault_path / "config.json"
+                    config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                    active_path = vault_path / "active"
+                    active_path.write_text("acc1\n", encoding="utf-8")
+
+                    # Write corrupt cache file
+                    cache_file = vault_path / "quota_summary.json"
+                    cache_file.write_text(payload, encoding="utf-8")
+
+                    env = dict(os.environ)
+                    env["AGY_VAULT_DIR"] = str(vault_path)
+                    env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                    proc = subprocess.run(
+                        [sys.executable, str(script_path), "hook-pre-invocation"],
+                        input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=5,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"[{label}] Stderr: {proc.stderr}")
+                    self.assertIn("Warning: Corrupted or unparseable Tier 1 quota cache file", proc.stderr)
+                    out_data = json.loads(proc.stdout)
+                    self.assertIsInstance(out_data, dict)
+
+        # -------------------------------------------------------------------------
+        # Scenario 2: [PREINV-FAST-EDGE-002] Symbol Re-Export Parity & Resolution
+        # -------------------------------------------------------------------------
+        with self.subTest(scenario="all_symbols_resolvable"):
+            import agy_switch
+            if str(REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(REPO_ROOT))
+            import scripts.agy_switch as scripts_agy_switch
+
+            # 1. Assert __all__ is non-empty and every symbol is resolvable
+            self.assertGreater(len(agy_switch.__all__), 40)
+            for sym in agy_switch.__all__:
+                self.assertTrue(
+                    hasattr(agy_switch, sym),
+                    f"Symbol '{sym}' from __all__ not resolvable via hasattr on agy_switch",
+                )
+                val_pkg = getattr(agy_switch, sym)
+                self.assertIsNotNone(val_pkg, f"Symbol '{sym}' resolved to None on agy_switch")
+
+                self.assertTrue(
+                    hasattr(scripts_agy_switch, sym),
+                    f"Symbol '{sym}' from __all__ not resolvable via hasattr on scripts.agy_switch",
+                )
+                val_mod = getattr(scripts_agy_switch, sym)
+                self.assertIsNotNone(val_mod, f"Symbol '{sym}' resolved to None on scripts.agy_switch")
+
+            # 2. Assert dir() contains all symbols from __all__
+            dir_symbols = set(dir(agy_switch))
+            for sym in agy_switch.__all__:
+                self.assertIn(sym, dir_symbols, f"Symbol '{sym}' not in dir(agy_switch)")
+
+        # -------------------------------------------------------------------------
+        # Scenario 3: [PREINV-FAST-EDGE-002] Dynamic Patchability & Bridge Parity
+        # -------------------------------------------------------------------------
+        with self.subTest(scenario="dynamic_patching_parity"):
+            import agy_switch
+            import scripts.agy_switch as scripts_agy_switch
+
+            # Verify patching directly on agy_switch
+            with patch("agy_switch.AgySwitchEngine") as mock_engine:
+                mock_engine.return_value = "mock_engine_instance"
+                self.assertEqual(agy_switch.AgySwitchEngine(), "mock_engine_instance")
+
+            # Verify patching directly on scripts.agy_switch
+            with patch("scripts.agy_switch.AgySwitchEngine") as mock_engine:
+                mock_engine.return_value = "mock_scripts_engine_instance"
+                self.assertEqual(scripts_agy_switch.AgySwitchEngine(), "mock_scripts_engine_instance")
+
+            # Verify patching datetime, QuotaClient, RotationEngine
+            with patch("agy_switch.datetime") as mock_dt:
+                mock_dt.now.return_value = "mock_now"
+                self.assertEqual(agy_switch.datetime.now(), "mock_now")
+
+            with patch("scripts.agy_switch.QuotaClient") as mock_qc:
+                mock_qc.return_value = "mock_qc_instance"
+                self.assertEqual(scripts_agy_switch.QuotaClient(), "mock_qc_instance")
+
+            with patch("agy_switch.RotationEngine") as mock_rot:
+                mock_rot.return_value = "mock_rot_instance"
+                self.assertEqual(agy_switch.RotationEngine(), "mock_rot_instance")
+
+            # Verify that patched symbols in scripts.agy_switch intercept hook_pre_invocation_dispatch fallback
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_dir = Path(tmpdir)
+                (vault_dir / "config.json").write_text(json.dumps({"auto_switch": True}), encoding="utf-8")
+                (vault_dir / "active").write_text("acc1\n", encoding="utf-8")
+
+                mock_eng_cls = MagicMock()
+                mock_eng_inst = MagicMock()
+                mock_eng_cls.return_value = mock_eng_inst
+                mock_eng_inst._vault_dir = str(vault_dir)
+                mock_eng_inst.get_auto_switch.return_value = True
+                mock_eng_inst.get_active_name.return_value = "acc1"
+
+                orig_stdin = sys.stdin
+                orig_env_vault = os.environ.get("AGY_VAULT_DIR")
+                try:
+                    os.environ["AGY_VAULT_DIR"] = str(vault_dir)
+                    sys.stdin = io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))
+
+                    with patch("scripts.agy_switch.AgySwitchEngine", mock_eng_cls), \
+                         patch("scripts.agy_switch.handle_pre_invocation_hook", return_value=123) as mock_hook:
+                        ret = scripts_agy_switch.hook_pre_invocation_dispatch([])
+                        self.assertEqual(ret, 123)
+                        self.assertTrue(mock_hook.called)
+                        self.assertTrue(mock_eng_cls.called)
+                finally:
+                    sys.stdin = orig_stdin
+                    if orig_env_vault is not None:
+                        os.environ["AGY_VAULT_DIR"] = orig_env_vault
+                    else:
+                        os.environ.pop("AGY_VAULT_DIR", None)
+
 
 
 

@@ -29,11 +29,23 @@ if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
 
+# Register bidirectional module aliases in sys.modules for backward compatibility and mock test interception
+_curr_mod = sys.modules.get(__name__)
+if _curr_mod is not None:
+    sys.modules.setdefault("agy_switch", _curr_mod)
+    sys.modules.setdefault("scripts.agy_switch", _curr_mod)
+
+
 def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> Any:
-    """Resolves symbol from sys.modules['agy_switch'] if mocked/present; falls back to sub-package default."""
-    mod = sys.modules.get("agy_switch")
-    if mod and hasattr(mod, symbol_name):
-        return getattr(mod, symbol_name)
+    """Resolves symbol from sys.modules['agy_switch'], 'scripts.agy_switch', or caller module if mocked/present; falls back to sub-package default."""
+    for mod_name in ("agy_switch", "scripts.agy_switch", __name__):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and symbol_name in mod.__dict__:
+            return mod.__dict__[symbol_name]
+    for mod_name in ("agy_switch", "scripts.agy_switch", __name__):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, symbol_name):
+            return getattr(mod, symbol_name)
     return fallback_factory()
 
 
@@ -166,60 +178,89 @@ def hook_pre_invocation_dispatch(
         try:
             with open(target_cache, "r", encoding="utf-8") as fp:
                 cache_raw = fp.read()
+            if not cache_raw.strip():
+                raise ValueError("Cache file is empty")
             cached_data = json.loads(cache_raw)
             if not isinstance(cached_data, dict):
                 raise ValueError(f"Cache root must be an object, got {type(cached_data).__name__}")
+
+            # Validate accounts container schema
+            accounts_val = cached_data.get("accounts")
+            if accounts_val is not None and not isinstance(accounts_val, dict):
+                raise ValueError(f"Cache 'accounts' must be an object, got {type(accounts_val).__name__}")
+
+            accounts_cache = accounts_val if isinstance(accounts_val, dict) else cached_data
+
+            if active_name:
+                active_val = accounts_cache.get(active_name)
+                if active_val is not None and not isinstance(active_val, dict):
+                    raise ValueError(f"Cache entry for '{active_name}' must be an object, got {type(active_val).__name__}")
+                active_cache = active_val
+
+                if isinstance(active_cache, dict):
+                    raw_cached_at = active_cache.get("cached_at")
+                    if raw_cached_at is None or isinstance(raw_cached_at, (bool, str, list, dict)):
+                        raise ValueError(f"Invalid 'cached_at' timestamp: {raw_cached_at!r}")
+                    try:
+                        cached_at_val = float(raw_cached_at)
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        raise ValueError(f"Unparseable 'cached_at' timestamp: {exc}") from exc
+
+                    if not math.isfinite(cached_at_val) or cached_at_val <= 0:
+                        raise ValueError(f"Non-finite or non-positive 'cached_at' timestamp: {cached_at_val}")
+
+                    candidate_m = active_cache.get(model_key)
+                    if candidate_m is not None and not isinstance(candidate_m, dict):
+                        raise ValueError(f"Model entry for '{model_key}' must be an object, got {type(candidate_m).__name__}")
+                    if isinstance(candidate_m, dict):
+                        raw_q = candidate_m.get("quota") if candidate_m.get("quota") is not None else candidate_m.get("fraction")
+                        if raw_q is not None and not isinstance(raw_q, (bool, int, float, str)):
+                            raise ValueError(f"Unexpected quota data type in model '{model_key}': {type(raw_q).__name__}")
+
+                    now = time.time()
+                    is_fresh = (-5.0 <= (now - cached_at_val) <= 300.0)
+                    if is_fresh:
+                        target_info: dict[str, Any] | None = None
+                        candidate_m = active_cache.get(model_key)
+                        if candidate_m is not None and not isinstance(candidate_m, dict):
+                            raise ValueError(f"Model entry for '{model_key}' must be an object, got {type(candidate_m).__name__}")
+                        if isinstance(candidate_m, dict):
+                            target_info = candidate_m
+                        elif (
+                            ("quota" in active_cache or "fraction" in active_cache)
+                            and not isinstance(active_cache.get("quota"), dict)
+                            and model_key == "gemini"
+                        ):
+                            target_info = active_cache
+
+                        if target_info is not None:
+                            q_val = target_info.get("quota") if target_info.get("quota") is not None else target_info.get("fraction")
+                            fraction = 0.0
+                            if isinstance(q_val, bool):
+                                fraction = 0.0
+                            elif isinstance(q_val, (int, float)):
+                                val_f = float(q_val)
+                                if not math.isfinite(val_f):
+                                    raise ValueError(f"Quota value is not finite: {val_f}")
+                                fraction = val_f / 100.0 if val_f > 1.0 else max(0.0, val_f)
+                            elif isinstance(q_val, str):
+                                try:
+                                    s_val = float(q_val.strip().rstrip("%"))
+                                    if not math.isfinite(s_val):
+                                        raise ValueError(f"Quota string is not finite: {s_val}")
+                                    fraction = max(0.0, min(1.0, s_val / 100.0 if s_val > 1.0 else s_val))
+                                except ValueError as exc:
+                                    raise ValueError(f"Unparseable quota string: {q_val!r}") from exc
+                            elif q_val is not None:
+                                raise ValueError(f"Unexpected quota data type: {type(q_val).__name__}")
+
+                            if fraction >= tier1_threshold:
+                                tier1_passed = True
         except Exception as exc:
             corrupted_cache_warning = (
                 f"[agy-switch hook] Warning: Corrupted or unparseable Tier 1 quota cache file '{target_cache}': {exc}\n"
             )
-            cached_data = None
-
-        if cached_data is not None and active_name:
-            accounts_cache = (
-                cached_data.get("accounts", {})
-                if isinstance(cached_data.get("accounts"), dict)
-                else cached_data
-            )
-            active_cache = accounts_cache.get(active_name)
-            if isinstance(active_cache, dict):
-                try:
-                    cached_at_val = float(active_cache.get("cached_at", 0))
-                except (ValueError, TypeError, OverflowError):
-                    cached_at_val = 0.0
-
-                now = time.time()
-                is_fresh = math.isfinite(cached_at_val) and cached_at_val > 0 and (-5.0 <= (now - cached_at_val) <= 300.0)
-                if is_fresh:
-                    target_info: dict[str, Any] | None = None
-                    candidate_m = active_cache.get(model_key)
-                    if isinstance(candidate_m, dict):
-                        target_info = candidate_m
-                    elif (
-                        ("quota" in active_cache or "fraction" in active_cache)
-                        and not isinstance(active_cache.get("quota"), dict)
-                        and model_key == "gemini"
-                    ):
-                        target_info = active_cache
-
-                    if target_info is not None:
-                        q_val = target_info.get("quota") if target_info.get("quota") is not None else target_info.get("fraction")
-                        fraction = 0.0
-                        if isinstance(q_val, bool):
-                            fraction = 0.0
-                        elif isinstance(q_val, int):
-                            fraction = max(0.0, min(1.0, float(q_val) / 100.0))
-                        elif isinstance(q_val, float):
-                            fraction = float(q_val) / 100.0 if q_val > 1.0 else (max(0.0, q_val) if q_val >= 0.0 else 0.0)
-                        elif isinstance(q_val, str):
-                            try:
-                                s_val = float(q_val.strip().rstrip("%"))
-                                fraction = max(0.0, min(1.0, s_val / 100.0 if s_val > 1.0 else s_val))
-                            except ValueError:
-                                fraction = 0.0
-
-                        if fraction >= tier1_threshold:
-                            tier1_passed = True
+            tier1_passed = False
 
     if tier1_passed:
         # Tier 1 Cache Hit: 0ms overhead, strictly sub-40ms execution
@@ -243,8 +284,15 @@ def hook_pre_invocation_dispatch(
         "handle_pre_invocation_hook",
         lambda: importlib.import_module("agy_switcher.hook").handle_pre_invocation_hook,
     )
-    engine_inst = engine if engine is not None else engine_cls()
-    return int(hook_fn(engine_inst))
+    try:
+        engine_inst = engine if engine is not None else engine_cls()
+        return int(hook_fn(engine_inst))
+    except Exception as exc:
+        sys.stderr.write(f"[agy-switch hook] Error during hook failover execution: {exc}\n")
+        sys.stderr.flush()
+        sys.stdout.write(json.dumps({}) + "\n")
+        sys.stdout.flush()
+        return 0
 
 
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
@@ -392,32 +440,66 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
+    val: Any = None
+    resolved = False
+
     if name in _LAZY_EXPORTS:
         mod_name, attr_name = _LAZY_EXPORTS[name]
         mod = importlib.import_module(mod_name)
         val = getattr(mod, attr_name) if attr_name else mod
-        globals()[name] = val
-        return val
+        resolved = True
 
-    try:
-        import agy_switcher
-        if hasattr(agy_switcher, name):
-            val = getattr(agy_switcher, name)
-            globals()[name] = val
-            return val
-    except Exception:
-        pass
+    if not resolved:
+        try:
+            import agy_switcher
+            if hasattr(agy_switcher, name):
+                val = getattr(agy_switcher, name)
+                resolved = True
+        except Exception:
+            pass
 
-    try:
-        mod = importlib.import_module("agy_switcher.exceptions")
-        if hasattr(mod, name):
-            val = getattr(mod, name)
-            globals()[name] = val
-            return val
-    except Exception:
-        pass
+    if not resolved:
+        try:
+            mod = importlib.import_module("agy_switcher.exceptions")
+            if hasattr(mod, name):
+                val = getattr(mod, name)
+                resolved = True
+        except Exception:
+            pass
 
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if not resolved:
+        for submod in (
+            "agy_switcher.models",
+            "agy_switcher.security",
+            "agy_switcher.supervisor",
+            "agy_switcher.formatters",
+            "agy_switcher.telemetry",
+            "agy_switcher.vault",
+            "agy_switcher.rotation",
+            "agy_switcher.doctor",
+            "agy_switcher.watcher",
+            "agy_switcher.hook",
+            "agy_switcher.api",
+            "agy_switcher.cli",
+        ):
+            try:
+                mod = importlib.import_module(submod)
+                if hasattr(mod, name):
+                    val = getattr(mod, name)
+                    resolved = True
+                    break
+            except Exception:
+                pass
+
+    if not resolved:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    globals()[name] = val
+    for alias_name in ("agy_switch", "scripts.agy_switch"):
+        alias_mod = sys.modules.get(alias_name)
+        if alias_mod is not None:
+            alias_mod.__dict__[name] = val
+    return val
 
 
 def __dir__() -> list[str]:
