@@ -2877,6 +2877,188 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
             self.assertEqual(len(scheduled_pre_c), 1)
             self.assertEqual(scheduled_pre_c[0]["id"], "agy-switch-auto-rotate")
 
+    def test_pre_invocation_fast_path(self):
+        """Scenarios [PREINV-FAST-001], [PREINV-FAST-EDGE-001], [PREINV-FAST-ERR-001], [PREINV-FAST-EDGE-002]."""
+        import time
+        script_path = REPO_ROOT / "scripts" / "agy_switch.py"
+
+        # 1. Scenario [PREINV-FAST-001]: Sub-40ms execution on Tier 1 cache hit for hook-pre-invocation
+        with self.subTest(scenario="tier1_cache_hit_sub_40ms"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_path = Path(tmpdir)
+                config_path = vault_path / "config.json"
+                config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                active_path = vault_path / "active"
+                active_path.write_text("acc1\n", encoding="utf-8")
+
+                now_ts = time.time()
+                quota_cache = {
+                    "timestamp": now_ts,
+                    "accounts": {
+                        "acc1": {
+                            "gemini": {
+                                "quota": 90,
+                                "reset_time": int(now_ts + 7200),
+                            },
+                            "cached_at": now_ts,
+                        }
+                    }
+                }
+                summary_path = vault_path / "quota_summary.json"
+                summary_path.write_text(json.dumps(quota_cache), encoding="utf-8")
+
+                env = dict(os.environ)
+                env["AGY_VAULT_DIR"] = str(vault_path)
+                env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                # Warmup run to ensure OS file buffers and pyc cache are populated
+                subprocess.run(
+                    [sys.executable, str(script_path), "hook-pre-invocation"],
+                    input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+
+                # Measure cold-start spawn duration over 5 runs (best of 5 to account for container scheduling noise)
+                durations: list[float] = []
+                last_proc = None
+                for _ in range(5):
+                    t0 = time.perf_counter()
+                    proc = subprocess.run(
+                        [sys.executable, str(script_path), "hook-pre-invocation"],
+                        input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=5,
+                    )
+                    t1 = time.perf_counter()
+                    durations.append((t1 - t0) * 1000.0)
+                    last_proc = proc
+
+                assert last_proc is not None
+                self.assertEqual(last_proc.returncode, 0, f"Stderr: {last_proc.stderr}")
+                out_data = json.loads(last_proc.stdout)
+                self.assertEqual(out_data, {})
+
+                best_duration = min(durations)
+                self.assertLess(
+                    best_duration,
+                    40.0,
+                    f"Cold-start execution duration {best_duration:.2f}ms exceeds target (<40ms): {durations}",
+                )
+
+                # Verify module isolation: heavy modules must NOT be loaded on Tier 1 cache hit
+                check_cmd = [
+                    sys.executable,
+                    "-c",
+                    "import sys, json, os\n"
+                    "from pathlib import Path\n"
+                    "import agy_switch\n"
+                    "sys.stdin = open(os.devnull)\n"
+                    "code = agy_switch.hook_pre_invocation_dispatch(['hook-pre-invocation'])\n"
+                    "assert code == 0\n"
+                    "assert 'agy_switcher.doctor' not in sys.modules, 'doctor leaked into sys.modules'\n"
+                    "assert 'agy_switcher.formatters' not in sys.modules, 'formatters leaked into sys.modules'\n"
+                    "assert 'urllib.request' not in sys.modules, 'urllib.request leaked into sys.modules'\n"
+                    "print('MODULE_ISOLATION_OK')\n"
+                ]
+                proc_mod = subprocess.run(
+                    check_cmd,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+                self.assertEqual(proc_mod.returncode, 0, f"Module isolation check failed: {proc_mod.stderr}")
+                self.assertIn("MODULE_ISOLATION_OK", proc_mod.stdout)
+
+        # 2. Scenario [PREINV-FAST-EDGE-001]: Full module lazy-loading when quota refresh or rotation required
+        with self.subTest(scenario="stale_or_low_quota_dynamic_import_failover"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_path = Path(tmpdir)
+                config_path = vault_path / "config.json"
+                config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                active_path = vault_path / "active"
+                active_path.write_text("acc1\n", encoding="utf-8")
+
+                # Cache is stale (>5 minutes old)
+                stale_ts = time.time() - 600.0
+                stale_cache = {
+                    "timestamp": stale_ts,
+                    "accounts": {
+                        "acc1": {
+                            "gemini": {
+                                "quota": 10,
+                                "reset_time": int(stale_ts + 7200),
+                            },
+                            "cached_at": stale_ts,
+                        }
+                    }
+                }
+                (vault_path / "quota_summary.json").write_text(json.dumps(stale_cache), encoding="utf-8")
+
+                env = dict(os.environ)
+                env["AGY_VAULT_DIR"] = str(vault_path)
+                env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                proc = subprocess.run(
+                    [sys.executable, str(script_path), "hook-pre-invocation"],
+                    input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+                self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
+                out_data = json.loads(proc.stdout)
+                self.assertIsInstance(out_data, dict)
+
+        # 3. Scenario [PREINV-FAST-ERR-001]: Fallback on corrupted or unparseable Tier 1 quota cache file
+        with self.subTest(scenario="corrupted_cache_fallback_warning"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_path = Path(tmpdir)
+                config_path = vault_path / "config.json"
+                config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                active_path = vault_path / "active"
+                active_path.write_text("acc1\n", encoding="utf-8")
+
+                # Corrupted cache file
+                (vault_path / "quota_summary.json").write_text('{"accounts": INVALID_JSON', encoding="utf-8")
+
+                env = dict(os.environ)
+                env["AGY_VAULT_DIR"] = str(vault_path)
+                env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                proc = subprocess.run(
+                    [sys.executable, str(script_path), "hook-pre-invocation"],
+                    input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+                self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
+                self.assertIn("Warning: Corrupted or unparseable Tier 1 quota cache file", proc.stderr)
+                out_data = json.loads(proc.stdout)
+                self.assertIsInstance(out_data, dict)
+
+        # 4. Scenario [PREINV-FAST-EDGE-002]: Symbol re-export and mock bridge compatibility
+        with self.subTest(scenario="symbol_reexport_and_mock_patch"):
+            import agy_switch
+            self.assertTrue(hasattr(agy_switch, "hook_pre_invocation_dispatch"))
+            self.assertTrue(hasattr(agy_switch, "QuotaClient"))
+            self.assertTrue(hasattr(agy_switch, "RotationEngine"))
+            self.assertTrue(hasattr(agy_switch, "DoctorEngine"))
+
+            from unittest.mock import patch
+            with patch("agy_switch.QuotaClient") as mock_qc:
+                mock_qc.return_value = "mocked_client"
+                self.assertEqual(agy_switch.QuotaClient(), "mocked_client")
+
+
 
 
 
