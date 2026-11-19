@@ -323,6 +323,189 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         tmp_files = list(hooks_dir.glob(f".{hooks_file.name}.tmp.*"))
         self.assertEqual(tmp_files, [])
 
+    def test_install_sh_prunes_stale_gate(self):
+        """[HOOK-CLEAN-EDGE-001] install.sh fallback hook registration removes build-quality-gate while leaving user hooks intact."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_hooks = {
+            "agy-switch-auto-rotate": {
+                "enabled": True,
+                "PreInvocation": [{"type": "command", "command": "old-cmd"}],
+            },
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks, indent=2), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        res = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"Command failed: {res.stderr}\n{res.stdout}")
+
+        file_mode = stat.S_IMODE(os.stat(hooks_file).st_mode)
+        self.assertEqual(file_mode, 0o600)
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        self.assertNotIn("build-quality-gate", data)
+        self.assertIn("custom-hook", data)
+        self.assertIn("agy-switch-auto-rotate", data)
+        self.assertTrue(data["agy-switch-auto-rotate"]["enabled"])
+        self.assertEqual(
+            data["agy-switch-auto-rotate"]["PreInvocation"][0]["command"],
+            "~/.local/bin/agy-switch hook-pre-invocation",
+        )
+
+    def test_install_sh_prunes_stale_gate_idempotent_multi_run(self):
+        """[HOOK-CLEAN-EDGE-002] Multiple repeated invocations of install.sh fallback remain idempotent without duplicate backups."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_hooks = {
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks, indent=2), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        for run_idx in range(3):
+            res = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, f"Run {run_idx + 1} failed: {res.stderr}\n{res.stdout}")
+
+        bak_files = list(hooks_dir.glob("hooks.json.bak.*"))
+        self.assertEqual(bak_files, [], f"Expected zero backup files, found: {bak_files}")
+
+        file_mode = stat.S_IMODE(os.stat(hooks_file).st_mode)
+        self.assertEqual(file_mode, 0o600)
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        self.assertNotIn("build-quality-gate", data)
+        self.assertIn("custom-hook", data)
+        self.assertIn("agy-switch-auto-rotate", data)
+
+    def test_install_sh_prunes_stale_gate_permission_denied_file(self):
+        """[HOOK-CLEAN-ERR-001] Read-only hooks.json reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_file, 0o400)
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        try:
+            res = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            os.chmod(hooks_file, 0o600)
+
+        self.assertIn("Permission denied", res.stderr)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_dir.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_install_sh_prunes_stale_gate_permission_denied_directory(self):
+        """[HOOK-CLEAN-ERR-001] Read-only directory reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_dir, 0o500)
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        try:
+            res = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            os.chmod(hooks_dir, 0o700)
+
+        self.assertIn("Permission denied", res.stderr)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_dir.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_install_sh_prunes_stale_gate_global_install(self):
+        """[HOOK-CLEAN-EDGE-001] install.sh --global prunes build-quality-gate and preserves custom hooks."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_hooks = {
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks, indent=2), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        res = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh"), "--global"],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(res.returncode, 0, f"install.sh --global failed: {res.stderr}\n{res.stdout}")
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        self.assertNotIn("build-quality-gate", data)
+        self.assertIn("custom-hook", data)
+        self.assertIn("agy-switch-auto-rotate", data)
+
     def test_cli_hook_install(self):
         """CLI command 'hook install' should register hook."""
         ret = main(["hook", "install"], engine=self.engine)
