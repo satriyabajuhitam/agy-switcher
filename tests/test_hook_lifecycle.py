@@ -228,6 +228,101 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         script_path = str(REPO_ROOT / "scripts" / "agy_switch.py")
         self.assertIn(script_path, pre_inv[0]["command"])
 
+    def test_install_hook_prunes_stale_gate(self):
+        """[HOOK-CLEAN-001] install_hook deletes build-quality-gate and sets 0o600 permissions."""
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        initial_hooks = {
+            "agy-switch-auto-rotate": {
+                "enabled": True,
+                "PreInvocation": [{"type": "command", "command": "old-cmd"}],
+            },
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks), encoding="utf-8")
+
+        res_path = self.engine.install_hook(hooks_file=hooks_file)
+        self.assertEqual(res_path, hooks_file)
+        self.assertTrue(hooks_file.is_file())
+
+        # Check permissions: 0o600
+        file_mode = stat.S_IMODE(os.stat(hooks_file).st_mode)
+        self.assertEqual(file_mode, 0o600)
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        # Explicitly deletes build-quality-gate
+        self.assertNotIn("build-quality-gate", data)
+        # Preserves custom hooks
+        self.assertIn("custom-hook", data)
+        # Updates agy-switch-auto-rotate with PreInvocation
+        self.assertIn("agy-switch-auto-rotate", data)
+        hook_obj = data["agy-switch-auto-rotate"]
+        self.assertTrue(hook_obj.get("enabled"))
+        self.assertIn("PreInvocation", hook_obj)
+        self.assertEqual(hook_obj["PreInvocation"][0]["timeout"], 5)
+
+    def test_install_hook_prunes_stale_gate_permission_denied_file(self):
+        """[HOOK-CLEAN-ERR-001] Read-only hooks.json reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_file, 0o400)
+
+        import io
+        stderr_capture = io.StringIO()
+        try:
+            with patch("sys.stderr", stderr_capture):
+                res_path = self.engine.install_hook(hooks_file=hooks_file)
+        finally:
+            os.chmod(hooks_file, 0o600)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_file.parent.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_install_hook_prunes_stale_gate_permission_denied_directory(self):
+        """[HOOK-CLEAN-ERR-001] Read-only directory reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_dir, 0o500)
+
+        import io
+        stderr_capture = io.StringIO()
+        try:
+            with patch("sys.stderr", stderr_capture):
+                res_path = self.engine.install_hook(hooks_file=hooks_file)
+        finally:
+            os.chmod(hooks_dir, 0o700)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_dir.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
     def test_cli_hook_install(self):
         """CLI command 'hook install' should register hook."""
         ret = main(["hook", "install"], engine=self.engine)

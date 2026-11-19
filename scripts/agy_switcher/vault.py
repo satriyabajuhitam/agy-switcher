@@ -492,7 +492,29 @@ class AgySwitchEngine:
     ) -> Path:
         """Installs the PreInvocation lifecycle hook into hooks.json via deep JSON merge."""
         target_hooks = Path(hooks_file or (self.gemini_dir / "config" / "hooks.json")).expanduser()
-        target_hooks.parent.mkdir(parents=True, exist_ok=True)
+
+        if target_hooks.parent.exists() and not os.access(target_hooks.parent, os.W_OK):
+            print(
+                f"[agy-switch] Error: Permission denied modifying hooks file '{target_hooks}': enclosing directory is read-only.",
+                file=sys.stderr,
+            )
+            return target_hooks
+
+        if target_hooks.exists() and not os.access(target_hooks, os.W_OK):
+            print(
+                f"[agy-switch] Error: Permission denied modifying hooks file '{target_hooks}': hooks file is read-only.",
+                file=sys.stderr,
+            )
+            return target_hooks
+
+        try:
+            target_hooks.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"[agy-switch] Error: Permission denied creating directory '{target_hooks.parent}': {exc}",
+                file=sys.stderr,
+            )
+            return target_hooks
 
         existing: dict[str, Any] = {}
         if target_hooks.is_file():
@@ -567,8 +589,25 @@ class AgySwitchEngine:
             ],
         }
 
+        existing.pop("build-quality-gate", None)
         existing["agy-switch-auto-rotate"] = hook_def
-        self._atomic_write_json(target_hooks, existing)
+        try:
+            self._atomic_write_json(target_hooks, existing)
+        except OSError as exc:
+            print(
+                f"[agy-switch] Error: Permission denied writing hooks file '{target_hooks}': {exc}",
+                file=sys.stderr,
+            )
+            try:
+                if target_hooks.parent.is_dir() and os.access(target_hooks.parent, os.W_OK):
+                    for dangling in target_hooks.parent.glob(f".{target_hooks.name}.tmp.*"):
+                        try:
+                            dangling.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            return target_hooks
         return target_hooks
 
     def install_pre_invocation_hook(
