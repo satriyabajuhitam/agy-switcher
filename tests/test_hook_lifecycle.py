@@ -27,6 +27,122 @@ def _make_jwt(email: str) -> str:
     return f"header.{payload}.signature"
 
 
+def load_hook_declarations(
+    hooks_path: Path | str | None,
+    warning_sink: list[str] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Loads and validates hook declarations from a hooks.json file.
+
+    Resiliently handles missing, unreadable, corrupt, non-object JSON declarations,
+    logging diagnostic warnings and defaulting unparsable hooks to disabled.
+    """
+    def _warn(msg: str) -> None:
+        if warning_sink is not None:
+            warning_sink.append(msg)
+        sys.stderr.write(f"[agy-switch hook] {msg}\n")
+        sys.stderr.flush()
+
+    if hooks_path is None:
+        _warn("Warning: Lifecycle hooks path is None; defaulting build-quality-gate to disabled.")
+        return {}
+
+    target = Path(hooks_path)
+    if not target.exists():
+        _warn(f"Warning: Lifecycle hooks file not found at '{target}'; defaulting build-quality-gate to disabled.")
+        return {}
+
+    if target.is_dir():
+        _warn(f"Warning: Lifecycle hooks path '{target}' is a directory, not a file; defaulting build-quality-gate to disabled.")
+        return {}
+
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        _warn(f"Warning: Lifecycle hooks file '{target}' is not valid UTF-8 text: {exc}; defaulting build-quality-gate to disabled.")
+        return {}
+    except OSError as exc:
+        _warn(f"Warning: Could not read lifecycle hooks file '{target}': {exc}; defaulting build-quality-gate to disabled.")
+        return {}
+
+    trimmed = content.strip()
+    if not trimmed:
+        _warn(f"Warning: Lifecycle hooks file '{target}' is empty (0 bytes); defaulting build-quality-gate to disabled.")
+        return {}
+
+    try:
+        raw_data: object = json.loads(trimmed)
+    except Exception as exc:
+        _warn(f"Warning: Malformed JSON syntax in lifecycle hooks file '{target}': {exc}; defaulting build-quality-gate to disabled.")
+        return {}
+
+    if not isinstance(raw_data, dict):
+        _warn(
+            f"Warning: Malformed hooks file '{target}': root JSON element must be an object, "
+            f"got {type(raw_data).__name__}; defaulting build-quality-gate to disabled."
+        )
+        return {}
+
+    validated_hooks: dict[str, dict[str, object]] = {}
+    for hook_name, hook_def in raw_data.items():
+        if not isinstance(hook_def, dict):
+            _warn(
+                f"Warning: Malformed hook declaration '{hook_name}' in '{target}': entry must be an object, "
+                f"got {type(hook_def).__name__}; defaulting hook to disabled."
+            )
+            continue
+
+        entry: dict[str, object] = {str(k): v for k, v in hook_def.items()}
+        # For build-quality-gate, ensure enabled is explicitly a boolean
+        if hook_name == "build-quality-gate":
+            if "enabled" not in entry or not isinstance(entry["enabled"], bool):
+                _warn(
+                    f"Warning: 'build-quality-gate' in '{target}' lacks boolean 'enabled' attribute; defaulting to disabled."
+                )
+                entry["enabled"] = False
+        validated_hooks[str(hook_name)] = entry
+
+    return validated_hooks
+
+
+def resolve_effective_hooks(
+    plugin_hooks: dict[str, dict[str, object]],
+    workspace_hooks: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Resolves effective hooks by layering workspace overrides over plugin-level hooks."""
+    effective: dict[str, dict[str, object]] = {}
+    for k, v in plugin_hooks.items():
+        if isinstance(v, dict):
+            effective[k] = dict(v)
+    for k, v in workspace_hooks.items():
+        if isinstance(v, dict):
+            if k in effective:
+                merged_entry = dict(effective[k])
+                merged_entry.update(v)
+                effective[k] = merged_entry
+            else:
+                effective[k] = dict(v)
+    return effective
+
+
+def get_scheduled_hooks(
+    config: dict[str, dict[str, object]],
+    event_name: str,
+) -> list[dict[str, object]]:
+    """Filters hooks scheduled to execute for a specific lifecycle event (e.g., Stop or PreInvocation)."""
+    scheduled: list[dict[str, object]] = []
+    for hook_id, hook_def in config.items():
+        if not isinstance(hook_def, dict):
+            continue
+        if not hook_def.get("enabled", True):
+            continue
+        # For build-quality-gate, enabled must be boolean True
+        if hook_id == "build-quality-gate" and hook_def.get("enabled") is not True:
+            continue
+        if event_name in hook_def:
+            scheduled.append({"id": hook_id, "definition": hook_def})
+    return scheduled
+
+
 class TestHookLifecycleAndConfig(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2242,6 +2358,248 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "Stop")), 0)
         self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "PreInvocation")), 1)
         self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "PostToolUse")), 1)
+
+    def test_corrupt_hooks_json(self) -> None:
+        """[HOOK-SCOPE-ERR-001] Missing, unreadable, or syntactically invalid hooks.json fallback resilience."""
+        # 1. Non-existent path returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="missing_hooks_file"):
+            missing_path = self.base_path / "nonexistent_hooks.json"
+            warnings: list[str] = []
+            hooks = load_hook_declarations(missing_path, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("not found", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            scheduled_stop = get_scheduled_hooks(hooks, "Stop")
+            self.assertEqual(scheduled_stop, [])
+
+        # 2. None path returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="none_hooks_path"):
+            warnings = []
+            hooks = load_hook_declarations(None, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("path is none", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 3. 0-byte empty file returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="empty_0_byte_hooks_file"):
+            empty_file = self.base_path / "empty_hooks.json"
+            empty_file.write_bytes(b"")
+            warnings = []
+            hooks = load_hook_declarations(empty_file, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("empty (0 bytes)", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 4. Whitespace-only file returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="whitespace_only_hooks_file"):
+            ws_file = self.base_path / "whitespace_hooks.json"
+            ws_file.write_text("   \n\t  \n  ", encoding="utf-8")
+            warnings = []
+            hooks = load_hook_declarations(ws_file, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("empty (0 bytes)", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 5. Syntactically invalid JSON: truncated, trailing commas, garbage text
+        corrupt_syntax_cases: list[tuple[str, str]] = [
+            ("truncated_json", '{"build-quality-gate": {"enabled": true, "Stop": ['),
+            ("trailing_comma", '{"build-quality-gate": {"enabled": true,}, }'),
+            ("unquoted_keys", '{build-quality-gate: true}'),
+            ("random_binary_garbage", '<<< ANTIGRAVITY_CORRUPT_BUFFER >>>\x00\x01\x02'),
+        ]
+        for name, bad_content in corrupt_syntax_cases:
+            with self.subTest(scenario=f"malformed_syntax_{name}"):
+                bad_file = self.base_path / f"corrupt_{name}.json"
+                bad_file.write_text(bad_content, encoding="utf-8", errors="replace")
+                warnings = []
+                hooks = load_hook_declarations(bad_file, warning_sink=warnings)
+                self.assertEqual(hooks, {})
+                self.assertTrue(len(warnings) > 0)
+                self.assertIn("malformed json syntax", warnings[0].lower())
+                self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+                self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 6. Non-object root JSON elements (lists, strings, numbers, booleans, null)
+        non_object_cases: list[tuple[str, str]] = [
+            ("list_root", '["build-quality-gate", "agy-switch-auto-rotate"]'),
+            ("string_root", '"build-quality-gate"'),
+            ("int_root", '42'),
+            ("float_root", '3.14159'),
+            ("bool_root", 'true'),
+            ("null_root", 'null'),
+        ]
+        for name, bad_content in non_object_cases:
+            with self.subTest(scenario=f"non_object_root_{name}"):
+                non_obj_file = self.base_path / f"non_obj_{name}.json"
+                non_obj_file.write_text(bad_content, encoding="utf-8")
+                warnings = []
+                hooks = load_hook_declarations(non_obj_file, warning_sink=warnings)
+                self.assertEqual(hooks, {})
+                self.assertTrue(len(warnings) > 0)
+                self.assertIn("root json element must be an object", warnings[0].lower())
+                self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+                self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 7. Corrupted individual hook entries (non-object values in valid root dictionary)
+        with self.subTest(scenario="corrupted_entry_types"):
+            entry_corrupt_file = self.base_path / "corrupt_entries.json"
+            entry_corrupt_file.write_text(
+                json.dumps({
+                    "build-quality-gate": "corrupted_string_value",
+                    "agy-switch-auto-rotate": [1, 2, 3],
+                    "valid-custom-hook": {"enabled": False, "PostToolUse": []},
+                }),
+                encoding="utf-8",
+            )
+            warnings = []
+            hooks = load_hook_declarations(entry_corrupt_file, warning_sink=warnings)
+            self.assertIn("valid-custom-hook", hooks)
+            self.assertNotIn("build-quality-gate", hooks)
+            self.assertNotIn("agy-switch-auto-rotate", hooks)
+            self.assertTrue(len(warnings) >= 2)
+            self.assertTrue(any("build-quality-gate" in w and "must be an object" in w for w in warnings))
+            self.assertTrue(any("agy-switch-auto-rotate" in w and "must be an object" in w for w in warnings))
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 8. Non-boolean enabled attribute in build-quality-gate coerces to disabled
+        with self.subTest(scenario="non_boolean_enabled_coercion"):
+            non_bool_file = self.base_path / "non_bool_enabled.json"
+            non_bool_file.write_text(
+                json.dumps({
+                    "build-quality-gate": {
+                        "enabled": "true",  # string, not bool
+                        "Stop": [{"type": "command", "command": "bash /scripts/verify-build.sh"}],
+                    }
+                }),
+                encoding="utf-8",
+            )
+            warnings = []
+            hooks = load_hook_declarations(non_bool_file, warning_sink=warnings)
+            self.assertIn("build-quality-gate", hooks)
+            self.assertIs(hooks["build-quality-gate"].get("enabled"), False)
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("lacks boolean 'enabled' attribute", warnings[0])
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 9. Path is a directory instead of a file
+        with self.subTest(scenario="directory_path_resilience"):
+            dir_hooks = self.base_path / "hooks_dir_target"
+            dir_hooks.mkdir(parents=True, exist_ok=True)
+            warnings = []
+            hooks = load_hook_declarations(dir_hooks, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("is a directory, not a file", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 10. Unreadable file permissions / OS read failure
+        with self.subTest(scenario="unreadable_file_permissions"):
+            unreadable_file = self.base_path / "unreadable_hooks.json"
+            unreadable_file.write_text('{"build-quality-gate": {"enabled": true}}', encoding="utf-8")
+            try:
+                unreadable_file.chmod(0o000)
+                warnings = []
+                if not os.access(unreadable_file, os.R_OK):
+                    hooks = load_hook_declarations(unreadable_file, warning_sink=warnings)
+                    self.assertEqual(hooks, {})
+                    self.assertTrue(len(warnings) > 0)
+                    self.assertIn("could not read lifecycle hooks file", warnings[0].lower())
+                    self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+                else:
+                    # In environments running as root where chmod 0o000 is still readable,
+                    # test unreadable directory traversal
+                    sub_unreadable = self.base_path / "denied_dir" / "hooks.json"
+                    sub_unreadable.parent.mkdir(parents=True, exist_ok=True)
+                    sub_unreadable.write_text("{}", encoding="utf-8")
+                    sub_unreadable.parent.chmod(0o000)
+                    try:
+                        if not os.access(sub_unreadable, os.R_OK):
+                            hooks = load_hook_declarations(sub_unreadable, warning_sink=warnings)
+                            self.assertEqual(hooks, {})
+                            self.assertTrue(len(warnings) > 0)
+                    finally:
+                        sub_unreadable.parent.chmod(0o755)
+            finally:
+                unreadable_file.chmod(0o644)
+
+        # 11. Malformed non-UTF-8 byte sequences
+        with self.subTest(scenario="invalid_utf8_encoding"):
+            bad_utf8_file = self.base_path / "bad_utf8.json"
+            bad_utf8_file.write_bytes(b"\x80\x81\xff\xfe\xaa\xbb\xcc")
+            warnings = []
+            hooks = load_hook_declarations(bad_utf8_file, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("not valid utf-8 text", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 12. Workspace override fallback resilience
+        with self.subTest(scenario="workspace_override_fallback_layering"):
+            # Sub-scenario 12a: Corrupted plugin hooks + valid workspace override
+            corrupt_plugin_file = self.base_path / "corrupt_plugin_hooks.json"
+            corrupt_plugin_file.write_text('{"build-quality-gate": INVALID_SYNTAX', encoding="utf-8")
+            valid_ws_file = self.base_path / "valid_ws_hooks.json"
+            valid_ws_file.write_text(
+                json.dumps({
+                    "build-quality-gate": {
+                        "enabled": True,
+                        "Stop": [{"type": "command", "command": "bash /srv/agy-workspaces/booster/agy-switcher/scripts/verify-build.sh"}],
+                    }
+                }),
+                encoding="utf-8",
+            )
+            warn_plugin: list[str] = []
+            warn_ws: list[str] = []
+            p_hooks = load_hook_declarations(corrupt_plugin_file, warning_sink=warn_plugin)
+            w_hooks = load_hook_declarations(valid_ws_file, warning_sink=warn_ws)
+            self.assertEqual(p_hooks, {})
+            self.assertTrue(len(warn_plugin) > 0)
+            self.assertEqual(len(warn_ws), 0)
+
+            effective_a = resolve_effective_hooks(p_hooks, w_hooks)
+            self.assertIn("build-quality-gate", effective_a)
+            self.assertIs(effective_a["build-quality-gate"].get("enabled"), True)
+            scheduled_stop_a = get_scheduled_hooks(effective_a, "Stop")
+            self.assertEqual(len(scheduled_stop_a), 1)
+            self.assertEqual(scheduled_stop_a[0]["id"], "build-quality-gate")
+
+            # Sub-scenario 12b: Corrupted plugin hooks + corrupted workspace override
+            corrupt_ws_file = self.base_path / "corrupt_ws_hooks.json"
+            corrupt_ws_file.write_text('["not", "a", "dict"]', encoding="utf-8")
+            warn_ws_corrupt: list[str] = []
+            w_corrupt_hooks = load_hook_declarations(corrupt_ws_file, warning_sink=warn_ws_corrupt)
+            self.assertEqual(w_corrupt_hooks, {})
+            self.assertTrue(len(warn_ws_corrupt) > 0)
+
+            effective_b = resolve_effective_hooks(p_hooks, w_corrupt_hooks)
+            self.assertEqual(effective_b, {})
+            scheduled_stop_b = get_scheduled_hooks(effective_b, "Stop")
+            self.assertEqual(scheduled_stop_b, [])
+
+            # Sub-scenario 12c: Valid plugin root hooks + corrupted workspace override
+            root_hooks_path = REPO_ROOT / "hooks.json"
+            warn_root: list[str] = []
+            root_hooks = load_hook_declarations(root_hooks_path, warning_sink=warn_root)
+            self.assertEqual(len(warn_root), 0)
+            self.assertIs(root_hooks["build-quality-gate"].get("enabled"), False)
+            self.assertIs(root_hooks["agy-switch-auto-rotate"].get("enabled"), True)
+
+            effective_c = resolve_effective_hooks(root_hooks, w_corrupt_hooks)
+            self.assertIs(effective_c["build-quality-gate"].get("enabled"), False)
+            self.assertIs(effective_c["agy-switch-auto-rotate"].get("enabled"), True)
+            self.assertEqual(get_scheduled_hooks(effective_c, "Stop"), [])
+            scheduled_pre_c = get_scheduled_hooks(effective_c, "PreInvocation")
+            self.assertEqual(len(scheduled_pre_c), 1)
+            self.assertEqual(scheduled_pre_c[0]["id"], "agy-switch-auto-rotate")
+
+
 
 
 if __name__ == "__main__":
