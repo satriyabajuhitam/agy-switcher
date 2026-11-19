@@ -27,6 +27,122 @@ def _make_jwt(email: str) -> str:
     return f"header.{payload}.signature"
 
 
+def load_hook_declarations(
+    hooks_path: Path | str | None,
+    warning_sink: list[str] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Loads and validates hook declarations from a hooks.json file.
+
+    Resiliently handles missing, unreadable, corrupt, non-object JSON declarations,
+    logging diagnostic warnings and defaulting unparsable hooks to disabled.
+    """
+    def _warn(msg: str) -> None:
+        if warning_sink is not None:
+            warning_sink.append(msg)
+        sys.stderr.write(f"[agy-switch hook] {msg}\n")
+        sys.stderr.flush()
+
+    if hooks_path is None:
+        _warn("Warning: Lifecycle hooks path is None; defaulting build-quality-gate to disabled.")
+        return {}
+
+    target = Path(hooks_path)
+    if not target.exists():
+        _warn(f"Warning: Lifecycle hooks file not found at '{target}'; defaulting build-quality-gate to disabled.")
+        return {}
+
+    if target.is_dir():
+        _warn(f"Warning: Lifecycle hooks path '{target}' is a directory, not a file; defaulting build-quality-gate to disabled.")
+        return {}
+
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        _warn(f"Warning: Lifecycle hooks file '{target}' is not valid UTF-8 text: {exc}; defaulting build-quality-gate to disabled.")
+        return {}
+    except OSError as exc:
+        _warn(f"Warning: Could not read lifecycle hooks file '{target}': {exc}; defaulting build-quality-gate to disabled.")
+        return {}
+
+    trimmed = content.strip()
+    if not trimmed:
+        _warn(f"Warning: Lifecycle hooks file '{target}' is empty (0 bytes); defaulting build-quality-gate to disabled.")
+        return {}
+
+    try:
+        raw_data: object = json.loads(trimmed)
+    except Exception as exc:
+        _warn(f"Warning: Malformed JSON syntax in lifecycle hooks file '{target}': {exc}; defaulting build-quality-gate to disabled.")
+        return {}
+
+    if not isinstance(raw_data, dict):
+        _warn(
+            f"Warning: Malformed hooks file '{target}': root JSON element must be an object, "
+            f"got {type(raw_data).__name__}; defaulting build-quality-gate to disabled."
+        )
+        return {}
+
+    validated_hooks: dict[str, dict[str, object]] = {}
+    for hook_name, hook_def in raw_data.items():
+        if not isinstance(hook_def, dict):
+            _warn(
+                f"Warning: Malformed hook declaration '{hook_name}' in '{target}': entry must be an object, "
+                f"got {type(hook_def).__name__}; defaulting hook to disabled."
+            )
+            continue
+
+        entry: dict[str, object] = {str(k): v for k, v in hook_def.items()}
+        # For build-quality-gate, ensure enabled is explicitly a boolean
+        if hook_name == "build-quality-gate":
+            if "enabled" not in entry or not isinstance(entry["enabled"], bool):
+                _warn(
+                    f"Warning: 'build-quality-gate' in '{target}' lacks boolean 'enabled' attribute; defaulting to disabled."
+                )
+                entry["enabled"] = False
+        validated_hooks[str(hook_name)] = entry
+
+    return validated_hooks
+
+
+def resolve_effective_hooks(
+    plugin_hooks: dict[str, dict[str, object]],
+    workspace_hooks: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Resolves effective hooks by layering workspace overrides over plugin-level hooks."""
+    effective: dict[str, dict[str, object]] = {}
+    for k, v in plugin_hooks.items():
+        if isinstance(v, dict):
+            effective[k] = dict(v)
+    for k, v in workspace_hooks.items():
+        if isinstance(v, dict):
+            if k in effective:
+                merged_entry = dict(effective[k])
+                merged_entry.update(v)
+                effective[k] = merged_entry
+            else:
+                effective[k] = dict(v)
+    return effective
+
+
+def get_scheduled_hooks(
+    config: dict[str, dict[str, object]],
+    event_name: str,
+) -> list[dict[str, object]]:
+    """Filters hooks scheduled to execute for a specific lifecycle event (e.g., Stop or PreInvocation)."""
+    scheduled: list[dict[str, object]] = []
+    for hook_id, hook_def in config.items():
+        if not isinstance(hook_def, dict):
+            continue
+        if not hook_def.get("enabled", True):
+            continue
+        # For build-quality-gate, enabled must be boolean True
+        if hook_id == "build-quality-gate" and hook_def.get("enabled") is not True:
+            continue
+        if event_name in hook_def:
+            scheduled.append({"id": hook_id, "definition": hook_def})
+    return scheduled
+
+
 class TestHookLifecycleAndConfig(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -111,6 +227,284 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         # Verify script path in command is absolute
         script_path = str(REPO_ROOT / "scripts" / "agy_switch.py")
         self.assertIn(script_path, pre_inv[0]["command"])
+
+    def test_install_hook_prunes_stale_gate(self):
+        """[HOOK-CLEAN-001] install_hook deletes build-quality-gate and sets 0o600 permissions."""
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        initial_hooks = {
+            "agy-switch-auto-rotate": {
+                "enabled": True,
+                "PreInvocation": [{"type": "command", "command": "old-cmd"}],
+            },
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks), encoding="utf-8")
+
+        res_path = self.engine.install_hook(hooks_file=hooks_file)
+        self.assertEqual(res_path, hooks_file)
+        self.assertTrue(hooks_file.is_file())
+
+        # Check permissions: 0o600
+        file_mode = stat.S_IMODE(os.stat(hooks_file).st_mode)
+        self.assertEqual(file_mode, 0o600)
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        # Explicitly deletes build-quality-gate
+        self.assertNotIn("build-quality-gate", data)
+        # Preserves custom hooks
+        self.assertIn("custom-hook", data)
+        # Updates agy-switch-auto-rotate with PreInvocation
+        self.assertIn("agy-switch-auto-rotate", data)
+        hook_obj = data["agy-switch-auto-rotate"]
+        self.assertTrue(hook_obj.get("enabled"))
+        self.assertIn("PreInvocation", hook_obj)
+        self.assertEqual(hook_obj["PreInvocation"][0]["timeout"], 5)
+
+    def test_install_hook_prunes_stale_gate_permission_denied_file(self):
+        """[HOOK-CLEAN-ERR-001] Read-only hooks.json reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_file = self.gemini_dir / "config" / "hooks.json"
+        hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_file, 0o400)
+
+        import io
+        stderr_capture = io.StringIO()
+        try:
+            with patch("sys.stderr", stderr_capture):
+                res_path = self.engine.install_hook(hooks_file=hooks_file)
+        finally:
+            os.chmod(hooks_file, 0o600)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_file.parent.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_install_hook_prunes_stale_gate_permission_denied_directory(self):
+        """[HOOK-CLEAN-ERR-001] Read-only directory reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_dir, 0o500)
+
+        import io
+        stderr_capture = io.StringIO()
+        try:
+            with patch("sys.stderr", stderr_capture):
+                res_path = self.engine.install_hook(hooks_file=hooks_file)
+        finally:
+            os.chmod(hooks_dir, 0o700)
+
+        err_output = stderr_capture.getvalue()
+        self.assertIn("Permission denied", err_output)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_dir.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_install_sh_prunes_stale_gate(self):
+        """[HOOK-CLEAN-EDGE-001] install.sh fallback hook registration removes build-quality-gate while leaving user hooks intact."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_hooks = {
+            "agy-switch-auto-rotate": {
+                "enabled": True,
+                "PreInvocation": [{"type": "command", "command": "old-cmd"}],
+            },
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks, indent=2), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        res = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"Command failed: {res.stderr}\n{res.stdout}")
+
+        file_mode = stat.S_IMODE(os.stat(hooks_file).st_mode)
+        self.assertEqual(file_mode, 0o600)
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        self.assertNotIn("build-quality-gate", data)
+        self.assertIn("custom-hook", data)
+        self.assertIn("agy-switch-auto-rotate", data)
+        self.assertTrue(data["agy-switch-auto-rotate"]["enabled"])
+        self.assertEqual(
+            data["agy-switch-auto-rotate"]["PreInvocation"][0]["command"],
+            "~/.local/bin/agy-switch hook-pre-invocation",
+        )
+
+    def test_install_sh_prunes_stale_gate_idempotent_multi_run(self):
+        """[HOOK-CLEAN-EDGE-002] Multiple repeated invocations of install.sh fallback remain idempotent without duplicate backups."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_hooks = {
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks, indent=2), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        for run_idx in range(3):
+            res = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, f"Run {run_idx + 1} failed: {res.stderr}\n{res.stdout}")
+
+        bak_files = list(hooks_dir.glob("hooks.json.bak.*"))
+        self.assertEqual(bak_files, [], f"Expected zero backup files, found: {bak_files}")
+
+        file_mode = stat.S_IMODE(os.stat(hooks_file).st_mode)
+        self.assertEqual(file_mode, 0o600)
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        self.assertNotIn("build-quality-gate", data)
+        self.assertIn("custom-hook", data)
+        self.assertIn("agy-switch-auto-rotate", data)
+
+    def test_install_sh_prunes_stale_gate_permission_denied_file(self):
+        """[HOOK-CLEAN-ERR-001] Read-only hooks.json reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_file, 0o400)
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        try:
+            res = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            os.chmod(hooks_file, 0o600)
+
+        self.assertIn("Permission denied", res.stderr)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_dir.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_install_sh_prunes_stale_gate_permission_denied_directory(self):
+        """[HOOK-CLEAN-ERR-001] Read-only directory reports error to stderr, leaves file unmodified without dangling tmp files."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_content = json.dumps({
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./verify.sh"}],
+            }
+        })
+        hooks_file.write_text(initial_content, encoding="utf-8")
+        os.chmod(hooks_dir, 0o500)
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        try:
+            res = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "__register_pre_invocation_hook", str(self.base_path / "nonexistent")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            os.chmod(hooks_dir, 0o700)
+
+        self.assertIn("Permission denied", res.stderr)
+        self.assertEqual(hooks_file.read_text(encoding="utf-8"), initial_content)
+        tmp_files = list(hooks_dir.glob(f".{hooks_file.name}.tmp.*"))
+        self.assertEqual(tmp_files, [])
+
+    def test_install_sh_prunes_stale_gate_global_install(self):
+        """[HOOK-CLEAN-EDGE-001] install.sh --global prunes build-quality-gate and preserves custom hooks."""
+        hooks_dir = self.gemini_dir / "config"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hooks_file = hooks_dir / "hooks.json"
+        initial_hooks = {
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [{"type": "command", "command": "./scripts/verify-build.sh"}],
+            },
+            "custom-hook": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            },
+        }
+        hooks_file.write_text(json.dumps(initial_hooks, indent=2), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HOME"] = str(self.base_path)
+
+        res = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh"), "--global"],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(res.returncode, 0, f"install.sh --global failed: {res.stderr}\n{res.stdout}")
+
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        self.assertNotIn("build-quality-gate", data)
+        self.assertIn("custom-hook", data)
+        self.assertIn("agy-switch-auto-rotate", data)
 
     def test_cli_hook_install(self):
         """CLI command 'hook install' should register hook."""
@@ -2055,6 +2449,768 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         # Check specific guard symmetry in Tier 3
         expected_guard = 'elif active_name and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error"))):'
         self.assertIn(expected_guard, source)
+
+    def test_hooks_json_scoping(self) -> None:
+        """[HOOK-SCOPE-001] [HOOK-SCOPE-EDGE-001] Scoped lifecycle hooks in root hooks.json and workspace overrides."""
+        root_hooks_path = REPO_ROOT / "hooks.json"
+        self.assertTrue(root_hooks_path.is_file(), f"Repository root hooks.json must exist at {root_hooks_path}")
+
+        raw_content = root_hooks_path.read_text(encoding="utf-8")
+        try:
+            hooks_data_raw = json.loads(raw_content)
+        except Exception as exc:
+            self.fail(f"Root hooks.json must be valid JSON: {exc}")
+
+        self.assertIsInstance(hooks_data_raw, dict)
+        assert isinstance(hooks_data_raw, dict)
+
+        hooks_data: dict[str, dict[str, object]] = {}
+        for k, v in hooks_data_raw.items():
+            self.assertIsInstance(v, dict, f"Hook entry {k} must be an object")
+            assert isinstance(v, dict)
+            hooks_data[str(k)] = {str(inner_k): inner_v for inner_k, inner_v in v.items()}
+
+        # [HOOK-SCOPE-001] build-quality-gate must be disabled by default; agy-switch-auto-rotate enabled
+        self.assertIn("build-quality-gate", hooks_data, "build-quality-gate must be declared in root hooks.json")
+        self.assertIn("agy-switch-auto-rotate", hooks_data, "agy-switch-auto-rotate must be declared in root hooks.json")
+
+        gate_hook = hooks_data["build-quality-gate"]
+        auto_rotate_hook = hooks_data["agy-switch-auto-rotate"]
+
+        self.assertIs(
+            gate_hook.get("enabled"),
+            False,
+            "build-quality-gate must have 'enabled': false by default to prevent triggering in foreign workspaces",
+        )
+        self.assertIs(
+            auto_rotate_hook.get("enabled"),
+            True,
+            "agy-switch-auto-rotate must have 'enabled': true by default",
+        )
+
+        # Verify command structures and target hooks
+        self.assertIn("Stop", gate_hook, "build-quality-gate must define a Stop lifecycle hook")
+        gate_stop = gate_hook.get("Stop")
+        self.assertIsInstance(gate_stop, list)
+        assert isinstance(gate_stop, list)
+        self.assertTrue(len(gate_stop) > 0, "build-quality-gate Stop hook list must not be empty")
+        gate_stop_first = gate_stop[0]
+        self.assertIsInstance(gate_stop_first, dict)
+        assert isinstance(gate_stop_first, dict)
+        self.assertIn("verify-build.sh", str(gate_stop_first.get("command", "")))
+
+        self.assertIn("PreInvocation", auto_rotate_hook, "agy-switch-auto-rotate must define a PreInvocation hook")
+        auto_rotate_pre = auto_rotate_hook.get("PreInvocation")
+        self.assertIsInstance(auto_rotate_pre, list)
+        assert isinstance(auto_rotate_pre, list)
+        self.assertTrue(len(auto_rotate_pre) > 0, "agy-switch-auto-rotate PreInvocation list must not be empty")
+        auto_rotate_first = auto_rotate_pre[0]
+        self.assertIsInstance(auto_rotate_first, dict)
+        assert isinstance(auto_rotate_first, dict)
+        self.assertIn("hook-pre-invocation", str(auto_rotate_first.get("command", "")))
+
+        # Scheduling evaluation: build-quality-gate must not be scheduled automatically on agent turn Stop events
+        def get_scheduled_hooks(config: dict[str, dict[str, object]], event_name: str) -> list[dict[str, object]]:
+            scheduled: list[dict[str, object]] = []
+            for hook_id, hook_def in config.items():
+                if not isinstance(hook_def, dict):
+                    continue
+                if not hook_def.get("enabled", True):
+                    continue
+                if event_name in hook_def:
+                    scheduled.append({"id": hook_id, "definition": hook_def})
+            return scheduled
+
+        plugin_scheduled_stop = get_scheduled_hooks(hooks_data, "Stop")
+        self.assertEqual(
+            plugin_scheduled_stop,
+            [],
+            "build-quality-gate must not be scheduled or invoked automatically on agent turn Stop events when disabled",
+        )
+
+        plugin_scheduled_pre = get_scheduled_hooks(hooks_data, "PreInvocation")
+        self.assertEqual(len(plugin_scheduled_pre), 1)
+        self.assertEqual(plugin_scheduled_pre[0]["id"], "agy-switch-auto-rotate")
+
+        # [HOOK-SCOPE-EDGE-001] Workspace-level local opt-in override preservation
+        def resolve_effective_hooks(
+            plugin_hooks: dict[str, dict[str, object]],
+            workspace_hooks: dict[str, dict[str, object]],
+        ) -> dict[str, dict[str, object]]:
+            effective: dict[str, dict[str, object]] = {}
+            for k, v in plugin_hooks.items():
+                effective[k] = dict(v)
+            for k, v in workspace_hooks.items():
+                if k in effective:
+                    merged_entry = dict(effective[k])
+                    merged_entry.update(v)
+                    effective[k] = merged_entry
+                else:
+                    effective[k] = dict(v)
+            return effective
+
+        # Scenario A: Workspace overrides with .agents/hooks.json setting enabled: True
+        agents_workspace_config: dict[str, dict[str, object]] = {
+            "build-quality-gate": {
+                "enabled": True,
+            }
+        }
+        resolved_agents = resolve_effective_hooks(hooks_data, agents_workspace_config)
+        resolved_gate_agents = resolved_agents["build-quality-gate"]
+        self.assertIsInstance(resolved_gate_agents, dict)
+        assert isinstance(resolved_gate_agents, dict)
+        self.assertIs(resolved_gate_agents.get("enabled"), True)
+        scheduled_stop_agents = get_scheduled_hooks(resolved_agents, "Stop")
+        self.assertEqual(len(scheduled_stop_agents), 1)
+        self.assertEqual(scheduled_stop_agents[0]["id"], "build-quality-gate")
+        gate_stop_def = scheduled_stop_agents[0]["definition"]
+        self.assertIsInstance(gate_stop_def, dict)
+        assert isinstance(gate_stop_def, dict)
+        gate_stop_handlers = gate_stop_def.get("Stop")
+        self.assertIsInstance(gate_stop_handlers, list)
+        assert isinstance(gate_stop_handlers, list)
+        self.assertIn("verify-build.sh", str(gate_stop_handlers[0].get("command", "")))
+
+        # Scenario B: Workspace overrides with .gemini/hooks.json setting enabled: True and custom Stop command
+        gemini_workspace_config: dict[str, dict[str, object]] = {
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [
+                    {
+                        "type": "command",
+                        "command": "bash /srv/agy-workspaces/booster/agy-switcher/scripts/verify-build.sh",
+                        "timeout": 45,
+                    }
+                ],
+            }
+        }
+        resolved_gemini = resolve_effective_hooks(hooks_data, gemini_workspace_config)
+        resolved_gate_gemini = resolved_gemini["build-quality-gate"]
+        self.assertIsInstance(resolved_gate_gemini, dict)
+        assert isinstance(resolved_gate_gemini, dict)
+        self.assertIs(resolved_gate_gemini.get("enabled"), True)
+        scheduled_stop_gemini = get_scheduled_hooks(resolved_gemini, "Stop")
+        self.assertEqual(len(scheduled_stop_gemini), 1)
+        self.assertEqual(scheduled_stop_gemini[0]["id"], "build-quality-gate")
+
+        # Scenario C: Foreign workspace without override keeps build-quality-gate disabled
+        foreign_workspace_config: dict[str, dict[str, object]] = {}
+        resolved_foreign = resolve_effective_hooks(hooks_data, foreign_workspace_config)
+        resolved_gate_foreign = resolved_foreign["build-quality-gate"]
+        self.assertIsInstance(resolved_gate_foreign, dict)
+        assert isinstance(resolved_gate_foreign, dict)
+        self.assertIs(resolved_gate_foreign.get("enabled"), False)
+        self.assertEqual(get_scheduled_hooks(resolved_foreign, "Stop"), [])
+
+        # Scenario D: Workspace explicitly disables agy-switch-auto-rotate
+        disable_auto_rotate_config: dict[str, dict[str, object]] = {
+            "agy-switch-auto-rotate": {
+                "enabled": False,
+            }
+        }
+        resolved_disabled_auto = resolve_effective_hooks(hooks_data, disable_auto_rotate_config)
+        self.assertIs(resolved_disabled_auto["agy-switch-auto-rotate"].get("enabled"), False)
+        self.assertEqual(get_scheduled_hooks(resolved_disabled_auto, "PreInvocation"), [])
+
+        # Scenario E: Workspace explicitly maintains build-quality-gate disabled
+        explicit_disabled_gate_config: dict[str, dict[str, object]] = {
+            "build-quality-gate": {
+                "enabled": False,
+            }
+        }
+        resolved_explicit_disabled = resolve_effective_hooks(hooks_data, explicit_disabled_gate_config)
+        self.assertIs(resolved_explicit_disabled["build-quality-gate"].get("enabled"), False)
+        self.assertEqual(get_scheduled_hooks(resolved_explicit_disabled, "Stop"), [])
+
+        # Scenario F: Workspace introduces a new unrelated hook without clobbering existing scoping
+        unrelated_workspace_config: dict[str, dict[str, object]] = {
+            "custom-linter": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            }
+        }
+        resolved_unrelated = resolve_effective_hooks(hooks_data, unrelated_workspace_config)
+        self.assertIn("custom-linter", resolved_unrelated)
+        self.assertIs(resolved_unrelated["build-quality-gate"].get("enabled"), False)
+        self.assertIs(resolved_unrelated["agy-switch-auto-rotate"].get("enabled"), True)
+        self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "Stop")), 0)
+        self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "PreInvocation")), 1)
+        self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "PostToolUse")), 1)
+
+    def test_corrupt_hooks_json(self) -> None:
+        """[HOOK-SCOPE-ERR-001] Missing, unreadable, or syntactically invalid hooks.json fallback resilience."""
+        # 1. Non-existent path returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="missing_hooks_file"):
+            missing_path = self.base_path / "nonexistent_hooks.json"
+            warnings: list[str] = []
+            hooks = load_hook_declarations(missing_path, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("not found", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            scheduled_stop = get_scheduled_hooks(hooks, "Stop")
+            self.assertEqual(scheduled_stop, [])
+
+        # 2. None path returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="none_hooks_path"):
+            warnings = []
+            hooks = load_hook_declarations(None, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("path is none", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 3. 0-byte empty file returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="empty_0_byte_hooks_file"):
+            empty_file = self.base_path / "empty_hooks.json"
+            empty_file.write_bytes(b"")
+            warnings = []
+            hooks = load_hook_declarations(empty_file, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("empty (0 bytes)", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 4. Whitespace-only file returns empty dict, logs diagnostic warning, Stop hooks empty
+        with self.subTest(scenario="whitespace_only_hooks_file"):
+            ws_file = self.base_path / "whitespace_hooks.json"
+            ws_file.write_text("   \n\t  \n  ", encoding="utf-8")
+            warnings = []
+            hooks = load_hook_declarations(ws_file, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("empty (0 bytes)", warnings[0].lower())
+            self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 5. Syntactically invalid JSON: truncated, trailing commas, garbage text
+        corrupt_syntax_cases: list[tuple[str, str]] = [
+            ("truncated_json", '{"build-quality-gate": {"enabled": true, "Stop": ['),
+            ("trailing_comma", '{"build-quality-gate": {"enabled": true,}, }'),
+            ("unquoted_keys", '{build-quality-gate: true}'),
+            ("random_binary_garbage", '<<< ANTIGRAVITY_CORRUPT_BUFFER >>>\x00\x01\x02'),
+        ]
+        for name, bad_content in corrupt_syntax_cases:
+            with self.subTest(scenario=f"malformed_syntax_{name}"):
+                bad_file = self.base_path / f"corrupt_{name}.json"
+                bad_file.write_text(bad_content, encoding="utf-8", errors="replace")
+                warnings = []
+                hooks = load_hook_declarations(bad_file, warning_sink=warnings)
+                self.assertEqual(hooks, {})
+                self.assertTrue(len(warnings) > 0)
+                self.assertIn("malformed json syntax", warnings[0].lower())
+                self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+                self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 6. Non-object root JSON elements (lists, strings, numbers, booleans, null)
+        non_object_cases: list[tuple[str, str]] = [
+            ("list_root", '["build-quality-gate", "agy-switch-auto-rotate"]'),
+            ("string_root", '"build-quality-gate"'),
+            ("int_root", '42'),
+            ("float_root", '3.14159'),
+            ("bool_root", 'true'),
+            ("null_root", 'null'),
+        ]
+        for name, bad_content in non_object_cases:
+            with self.subTest(scenario=f"non_object_root_{name}"):
+                non_obj_file = self.base_path / f"non_obj_{name}.json"
+                non_obj_file.write_text(bad_content, encoding="utf-8")
+                warnings = []
+                hooks = load_hook_declarations(non_obj_file, warning_sink=warnings)
+                self.assertEqual(hooks, {})
+                self.assertTrue(len(warnings) > 0)
+                self.assertIn("root json element must be an object", warnings[0].lower())
+                self.assertIn("defaulting build-quality-gate to disabled", warnings[0].lower())
+                self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 7. Corrupted individual hook entries (non-object values in valid root dictionary)
+        with self.subTest(scenario="corrupted_entry_types"):
+            entry_corrupt_file = self.base_path / "corrupt_entries.json"
+            entry_corrupt_file.write_text(
+                json.dumps({
+                    "build-quality-gate": "corrupted_string_value",
+                    "agy-switch-auto-rotate": [1, 2, 3],
+                    "valid-custom-hook": {"enabled": False, "PostToolUse": []},
+                }),
+                encoding="utf-8",
+            )
+            warnings = []
+            hooks = load_hook_declarations(entry_corrupt_file, warning_sink=warnings)
+            self.assertIn("valid-custom-hook", hooks)
+            self.assertNotIn("build-quality-gate", hooks)
+            self.assertNotIn("agy-switch-auto-rotate", hooks)
+            self.assertTrue(len(warnings) >= 2)
+            self.assertTrue(any("build-quality-gate" in w and "must be an object" in w for w in warnings))
+            self.assertTrue(any("agy-switch-auto-rotate" in w and "must be an object" in w for w in warnings))
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 8. Non-boolean enabled attribute in build-quality-gate coerces to disabled
+        with self.subTest(scenario="non_boolean_enabled_coercion"):
+            non_bool_file = self.base_path / "non_bool_enabled.json"
+            non_bool_file.write_text(
+                json.dumps({
+                    "build-quality-gate": {
+                        "enabled": "true",  # string, not bool
+                        "Stop": [{"type": "command", "command": "bash /scripts/verify-build.sh"}],
+                    }
+                }),
+                encoding="utf-8",
+            )
+            warnings = []
+            hooks = load_hook_declarations(non_bool_file, warning_sink=warnings)
+            self.assertIn("build-quality-gate", hooks)
+            self.assertIs(hooks["build-quality-gate"].get("enabled"), False)
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("lacks boolean 'enabled' attribute", warnings[0])
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 9. Path is a directory instead of a file
+        with self.subTest(scenario="directory_path_resilience"):
+            dir_hooks = self.base_path / "hooks_dir_target"
+            dir_hooks.mkdir(parents=True, exist_ok=True)
+            warnings = []
+            hooks = load_hook_declarations(dir_hooks, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("is a directory, not a file", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 10. Unreadable file permissions / OS read failure
+        with self.subTest(scenario="unreadable_file_permissions"):
+            unreadable_file = self.base_path / "unreadable_hooks.json"
+            unreadable_file.write_text('{"build-quality-gate": {"enabled": true}}', encoding="utf-8")
+            try:
+                unreadable_file.chmod(0o000)
+                warnings = []
+                if not os.access(unreadable_file, os.R_OK):
+                    hooks = load_hook_declarations(unreadable_file, warning_sink=warnings)
+                    self.assertEqual(hooks, {})
+                    self.assertTrue(len(warnings) > 0)
+                    self.assertIn("could not read lifecycle hooks file", warnings[0].lower())
+                    self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+                else:
+                    # In environments running as root where chmod 0o000 is still readable,
+                    # test unreadable directory traversal
+                    sub_unreadable = self.base_path / "denied_dir" / "hooks.json"
+                    sub_unreadable.parent.mkdir(parents=True, exist_ok=True)
+                    sub_unreadable.write_text("{}", encoding="utf-8")
+                    sub_unreadable.parent.chmod(0o000)
+                    try:
+                        if not os.access(sub_unreadable, os.R_OK):
+                            hooks = load_hook_declarations(sub_unreadable, warning_sink=warnings)
+                            self.assertEqual(hooks, {})
+                            self.assertTrue(len(warnings) > 0)
+                    finally:
+                        sub_unreadable.parent.chmod(0o755)
+            finally:
+                unreadable_file.chmod(0o644)
+
+        # 11. Malformed non-UTF-8 byte sequences
+        with self.subTest(scenario="invalid_utf8_encoding"):
+            bad_utf8_file = self.base_path / "bad_utf8.json"
+            bad_utf8_file.write_bytes(b"\x80\x81\xff\xfe\xaa\xbb\xcc")
+            warnings = []
+            hooks = load_hook_declarations(bad_utf8_file, warning_sink=warnings)
+            self.assertEqual(hooks, {})
+            self.assertTrue(len(warnings) > 0)
+            self.assertIn("not valid utf-8 text", warnings[0].lower())
+            self.assertEqual(get_scheduled_hooks(hooks, "Stop"), [])
+
+        # 12. Workspace override fallback resilience
+        with self.subTest(scenario="workspace_override_fallback_layering"):
+            # Sub-scenario 12a: Corrupted plugin hooks + valid workspace override
+            corrupt_plugin_file = self.base_path / "corrupt_plugin_hooks.json"
+            corrupt_plugin_file.write_text('{"build-quality-gate": INVALID_SYNTAX', encoding="utf-8")
+            valid_ws_file = self.base_path / "valid_ws_hooks.json"
+            valid_ws_file.write_text(
+                json.dumps({
+                    "build-quality-gate": {
+                        "enabled": True,
+                        "Stop": [{"type": "command", "command": "bash /srv/agy-workspaces/booster/agy-switcher/scripts/verify-build.sh"}],
+                    }
+                }),
+                encoding="utf-8",
+            )
+            warn_plugin: list[str] = []
+            warn_ws: list[str] = []
+            p_hooks = load_hook_declarations(corrupt_plugin_file, warning_sink=warn_plugin)
+            w_hooks = load_hook_declarations(valid_ws_file, warning_sink=warn_ws)
+            self.assertEqual(p_hooks, {})
+            self.assertTrue(len(warn_plugin) > 0)
+            self.assertEqual(len(warn_ws), 0)
+
+            effective_a = resolve_effective_hooks(p_hooks, w_hooks)
+            self.assertIn("build-quality-gate", effective_a)
+            self.assertIs(effective_a["build-quality-gate"].get("enabled"), True)
+            scheduled_stop_a = get_scheduled_hooks(effective_a, "Stop")
+            self.assertEqual(len(scheduled_stop_a), 1)
+            self.assertEqual(scheduled_stop_a[0]["id"], "build-quality-gate")
+
+            # Sub-scenario 12b: Corrupted plugin hooks + corrupted workspace override
+            corrupt_ws_file = self.base_path / "corrupt_ws_hooks.json"
+            corrupt_ws_file.write_text('["not", "a", "dict"]', encoding="utf-8")
+            warn_ws_corrupt: list[str] = []
+            w_corrupt_hooks = load_hook_declarations(corrupt_ws_file, warning_sink=warn_ws_corrupt)
+            self.assertEqual(w_corrupt_hooks, {})
+            self.assertTrue(len(warn_ws_corrupt) > 0)
+
+            effective_b = resolve_effective_hooks(p_hooks, w_corrupt_hooks)
+            self.assertEqual(effective_b, {})
+            scheduled_stop_b = get_scheduled_hooks(effective_b, "Stop")
+            self.assertEqual(scheduled_stop_b, [])
+
+            # Sub-scenario 12c: Valid plugin root hooks + corrupted workspace override
+            root_hooks_path = REPO_ROOT / "hooks.json"
+            warn_root: list[str] = []
+            root_hooks = load_hook_declarations(root_hooks_path, warning_sink=warn_root)
+            self.assertEqual(len(warn_root), 0)
+            self.assertIs(root_hooks["build-quality-gate"].get("enabled"), False)
+            self.assertIs(root_hooks["agy-switch-auto-rotate"].get("enabled"), True)
+
+            effective_c = resolve_effective_hooks(root_hooks, w_corrupt_hooks)
+            self.assertIs(effective_c["build-quality-gate"].get("enabled"), False)
+            self.assertIs(effective_c["agy-switch-auto-rotate"].get("enabled"), True)
+            self.assertEqual(get_scheduled_hooks(effective_c, "Stop"), [])
+            scheduled_pre_c = get_scheduled_hooks(effective_c, "PreInvocation")
+            self.assertEqual(len(scheduled_pre_c), 1)
+            self.assertEqual(scheduled_pre_c[0]["id"], "agy-switch-auto-rotate")
+
+    def test_pre_invocation_fast_path(self):
+        """Scenarios [PREINV-FAST-001], [PREINV-FAST-EDGE-001], [PREINV-FAST-ERR-001], [PREINV-FAST-EDGE-002]."""
+        import time
+        script_path = REPO_ROOT / "scripts" / "agy_switch.py"
+
+        # 1. Scenario [PREINV-FAST-001]: Sub-40ms execution on Tier 1 cache hit for hook-pre-invocation
+        with self.subTest(scenario="tier1_cache_hit_sub_40ms"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_path = Path(tmpdir)
+                config_path = vault_path / "config.json"
+                config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                active_path = vault_path / "active"
+                active_path.write_text("acc1\n", encoding="utf-8")
+
+                now_ts = time.time()
+                quota_cache = {
+                    "timestamp": now_ts,
+                    "accounts": {
+                        "acc1": {
+                            "gemini": {
+                                "quota": 90,
+                                "reset_time": int(now_ts + 7200),
+                            },
+                            "cached_at": now_ts,
+                        }
+                    }
+                }
+                summary_path = vault_path / "quota_summary.json"
+                summary_path.write_text(json.dumps(quota_cache), encoding="utf-8")
+
+                env = dict(os.environ)
+                env["AGY_VAULT_DIR"] = str(vault_path)
+                env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                # Warmup run to ensure OS file buffers and pyc cache are populated
+                subprocess.run(
+                    [sys.executable, str(script_path), "hook-pre-invocation"],
+                    input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+
+                # Measure cold-start spawn duration over 5 runs (best of 5 to account for container scheduling noise)
+                durations: list[float] = []
+                last_proc = None
+                for _ in range(5):
+                    t0 = time.perf_counter()
+                    proc = subprocess.run(
+                        [sys.executable, str(script_path), "hook-pre-invocation"],
+                        input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=5,
+                    )
+                    t1 = time.perf_counter()
+                    durations.append((t1 - t0) * 1000.0)
+                    last_proc = proc
+
+                assert last_proc is not None
+                self.assertEqual(last_proc.returncode, 0, f"Stderr: {last_proc.stderr}")
+                out_data = json.loads(last_proc.stdout)
+                self.assertEqual(out_data, {})
+
+                best_duration = min(durations)
+                self.assertLess(
+                    best_duration,
+                    40.0,
+                    f"Cold-start execution duration {best_duration:.2f}ms exceeds target (<40ms): {durations}",
+                )
+
+                # Verify module isolation: heavy modules must NOT be loaded on Tier 1 cache hit
+                check_cmd = [
+                    sys.executable,
+                    "-c",
+                    "import sys, json, os\n"
+                    "from pathlib import Path\n"
+                    "import agy_switch\n"
+                    "sys.stdin = open(os.devnull)\n"
+                    "code = agy_switch.hook_pre_invocation_dispatch(['hook-pre-invocation'])\n"
+                    "assert code == 0\n"
+                    "assert 'agy_switcher.doctor' not in sys.modules, 'doctor leaked into sys.modules'\n"
+                    "assert 'agy_switcher.formatters' not in sys.modules, 'formatters leaked into sys.modules'\n"
+                    "assert 'urllib.request' not in sys.modules, 'urllib.request leaked into sys.modules'\n"
+                    "print('MODULE_ISOLATION_OK')\n"
+                ]
+                proc_mod = subprocess.run(
+                    check_cmd,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+                self.assertEqual(proc_mod.returncode, 0, f"Module isolation check failed: {proc_mod.stderr}")
+                self.assertIn("MODULE_ISOLATION_OK", proc_mod.stdout)
+
+        # 2. Scenario [PREINV-FAST-EDGE-001]: Full module lazy-loading when quota refresh or rotation required
+        with self.subTest(scenario="stale_or_low_quota_dynamic_import_failover"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_path = Path(tmpdir)
+                config_path = vault_path / "config.json"
+                config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                active_path = vault_path / "active"
+                active_path.write_text("acc1\n", encoding="utf-8")
+
+                # Cache is stale (>5 minutes old)
+                stale_ts = time.time() - 600.0
+                stale_cache = {
+                    "timestamp": stale_ts,
+                    "accounts": {
+                        "acc1": {
+                            "gemini": {
+                                "quota": 10,
+                                "reset_time": int(stale_ts + 7200),
+                            },
+                            "cached_at": stale_ts,
+                        }
+                    }
+                }
+                (vault_path / "quota_summary.json").write_text(json.dumps(stale_cache), encoding="utf-8")
+
+                env = dict(os.environ)
+                env["AGY_VAULT_DIR"] = str(vault_path)
+                env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                proc = subprocess.run(
+                    [sys.executable, str(script_path), "hook-pre-invocation"],
+                    input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+                self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
+                out_data = json.loads(proc.stdout)
+                self.assertIsInstance(out_data, dict)
+
+        # 3. Scenario [PREINV-FAST-ERR-001]: Fallback on corrupted or unparseable Tier 1 quota cache file
+        with self.subTest(scenario="corrupted_cache_fallback_warning"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_path = Path(tmpdir)
+                config_path = vault_path / "config.json"
+                config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                active_path = vault_path / "active"
+                active_path.write_text("acc1\n", encoding="utf-8")
+
+                # Corrupted cache file
+                (vault_path / "quota_summary.json").write_text('{"accounts": INVALID_JSON', encoding="utf-8")
+
+                env = dict(os.environ)
+                env["AGY_VAULT_DIR"] = str(vault_path)
+                env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                proc = subprocess.run(
+                    [sys.executable, str(script_path), "hook-pre-invocation"],
+                    input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+                self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
+                self.assertIn("Warning: Corrupted or unparseable Tier 1 quota cache file", proc.stderr)
+                out_data = json.loads(proc.stdout)
+                self.assertIsInstance(out_data, dict)
+
+        # 4. Scenario [PREINV-FAST-EDGE-002]: Symbol re-export and mock bridge compatibility
+        with self.subTest(scenario="symbol_reexport_and_mock_patch"):
+            import agy_switch
+            self.assertTrue(hasattr(agy_switch, "hook_pre_invocation_dispatch"))
+            self.assertTrue(hasattr(agy_switch, "QuotaClient"))
+            self.assertTrue(hasattr(agy_switch, "RotationEngine"))
+            self.assertTrue(hasattr(agy_switch, "DoctorEngine"))
+
+            from unittest.mock import patch
+            with patch("agy_switch.QuotaClient") as mock_qc:
+                mock_qc.return_value = "mocked_client"
+                self.assertEqual(agy_switch.QuotaClient(), "mocked_client")
+
+    def test_re_export_parity(self):
+        """Scenarios [PREINV-FAST-ERR-001] and [PREINV-FAST-EDGE-002]:
+
+        Validates corrupt cache resilience and 100% symbol re-export & dynamic patch parity.
+        """
+        import io
+        from unittest.mock import MagicMock, patch
+        script_path = REPO_ROOT / "scripts" / "agy_switch.py"
+
+        # -------------------------------------------------------------------------
+        # Scenario 1: [PREINV-FAST-ERR-001] Corrupt Cache Resilience
+        # -------------------------------------------------------------------------
+        corrupt_payloads = [
+            ("truncated_json", '{"accounts": {"acc1": {"quota": 90, "cached_at": '),
+            ("empty_file", ""),
+            ("whitespace_only", "   \n\t  \n"),
+            ("non_obj_list", json.dumps([1, 2, 3])),
+            ("non_obj_string", json.dumps("unexpected string payload")),
+            ("non_obj_int", json.dumps(12345)),
+            ("non_obj_bool", json.dumps(True)),
+            ("non_obj_null", json.dumps(None)),
+            ("malformed_accounts_scalar", json.dumps({"accounts": "invalid_scalar"})),
+            ("malformed_account_entry", json.dumps({"accounts": {"acc1": "not_a_dict"}})),
+            ("malformed_cached_at_str", json.dumps({"accounts": {"acc1": {"gemini": {"quota": 90}, "cached_at": "not-a-timestamp"}}})),
+            ("malformed_cached_at_nan", '{"accounts": {"acc1": {"gemini": {"quota": 90}, "cached_at": NaN}}}'),
+            ("malformed_quota_val", json.dumps({"accounts": {"acc1": {"gemini": {"quota": [1, 2, 3]}, "cached_at": 1000.0}}})),
+        ]
+
+        for label, payload in corrupt_payloads:
+            with self.subTest(scenario="corrupt_cache_matrix", corrupt_type=label):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vault_path = Path(tmpdir)
+                    config_path = vault_path / "config.json"
+                    config_path.write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                    active_path = vault_path / "active"
+                    active_path.write_text("acc1\n", encoding="utf-8")
+
+                    # Write corrupt cache file
+                    cache_file = vault_path / "quota_summary.json"
+                    cache_file.write_text(payload, encoding="utf-8")
+
+                    env = dict(os.environ)
+                    env["AGY_VAULT_DIR"] = str(vault_path)
+                    env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+
+                    proc = subprocess.run(
+                        [sys.executable, str(script_path), "hook-pre-invocation"],
+                        input=json.dumps({"modelName": "gemini-2.5-pro"}),
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=5,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"[{label}] Stderr: {proc.stderr}")
+                    self.assertIn("Warning: Corrupted or unparseable Tier 1 quota cache file", proc.stderr)
+                    out_data = json.loads(proc.stdout)
+                    self.assertIsInstance(out_data, dict)
+
+        # -------------------------------------------------------------------------
+        # Scenario 2: [PREINV-FAST-EDGE-002] Symbol Re-Export Parity & Resolution
+        # -------------------------------------------------------------------------
+        with self.subTest(scenario="all_symbols_resolvable"):
+            import agy_switch
+            if str(REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(REPO_ROOT))
+            import scripts.agy_switch as scripts_agy_switch
+
+            # 1. Assert __all__ is non-empty and every symbol is resolvable
+            self.assertGreater(len(agy_switch.__all__), 40)
+            for sym in agy_switch.__all__:
+                self.assertTrue(
+                    hasattr(agy_switch, sym),
+                    f"Symbol '{sym}' from __all__ not resolvable via hasattr on agy_switch",
+                )
+                val_pkg = getattr(agy_switch, sym)
+                self.assertIsNotNone(val_pkg, f"Symbol '{sym}' resolved to None on agy_switch")
+
+                self.assertTrue(
+                    hasattr(scripts_agy_switch, sym),
+                    f"Symbol '{sym}' from __all__ not resolvable via hasattr on scripts.agy_switch",
+                )
+                val_mod = getattr(scripts_agy_switch, sym)
+                self.assertIsNotNone(val_mod, f"Symbol '{sym}' resolved to None on scripts.agy_switch")
+
+            # 2. Assert dir() contains all symbols from __all__
+            dir_symbols = set(dir(agy_switch))
+            for sym in agy_switch.__all__:
+                self.assertIn(sym, dir_symbols, f"Symbol '{sym}' not in dir(agy_switch)")
+
+        # -------------------------------------------------------------------------
+        # Scenario 3: [PREINV-FAST-EDGE-002] Dynamic Patchability & Bridge Parity
+        # -------------------------------------------------------------------------
+        with self.subTest(scenario="dynamic_patching_parity"):
+            import agy_switch
+            import scripts.agy_switch as scripts_agy_switch
+
+            # Verify patching directly on agy_switch
+            with patch("agy_switch.AgySwitchEngine") as mock_engine:
+                mock_engine.return_value = "mock_engine_instance"
+                self.assertEqual(agy_switch.AgySwitchEngine(), "mock_engine_instance")
+
+            # Verify patching directly on scripts.agy_switch
+            with patch("scripts.agy_switch.AgySwitchEngine") as mock_engine:
+                mock_engine.return_value = "mock_scripts_engine_instance"
+                self.assertEqual(scripts_agy_switch.AgySwitchEngine(), "mock_scripts_engine_instance")
+
+            # Verify patching datetime, QuotaClient, RotationEngine
+            with patch("agy_switch.datetime") as mock_dt:
+                mock_dt.now.return_value = "mock_now"
+                self.assertEqual(agy_switch.datetime.now(), "mock_now")
+
+            with patch("scripts.agy_switch.QuotaClient") as mock_qc:
+                mock_qc.return_value = "mock_qc_instance"
+                self.assertEqual(scripts_agy_switch.QuotaClient(), "mock_qc_instance")
+
+            with patch("agy_switch.RotationEngine") as mock_rot:
+                mock_rot.return_value = "mock_rot_instance"
+                self.assertEqual(agy_switch.RotationEngine(), "mock_rot_instance")
+
+            # Verify that patched symbols in scripts.agy_switch intercept hook_pre_invocation_dispatch fallback
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vault_dir = Path(tmpdir)
+                (vault_dir / "config.json").write_text(json.dumps({"auto_switch": True}), encoding="utf-8")
+                (vault_dir / "active").write_text("acc1\n", encoding="utf-8")
+
+                mock_eng_cls = MagicMock()
+                mock_eng_inst = MagicMock()
+                mock_eng_cls.return_value = mock_eng_inst
+                mock_eng_inst._vault_dir = str(vault_dir)
+                mock_eng_inst.get_auto_switch.return_value = True
+                mock_eng_inst.get_active_name.return_value = "acc1"
+
+                orig_stdin = sys.stdin
+                orig_env_vault = os.environ.get("AGY_VAULT_DIR")
+                try:
+                    os.environ["AGY_VAULT_DIR"] = str(vault_dir)
+                    sys.stdin = io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))
+
+                    with patch("scripts.agy_switch.AgySwitchEngine", mock_eng_cls), \
+                         patch("scripts.agy_switch.handle_pre_invocation_hook", return_value=123) as mock_hook:
+                        ret = scripts_agy_switch.hook_pre_invocation_dispatch([])
+                        self.assertEqual(ret, 123)
+                        self.assertTrue(mock_hook.called)
+                        self.assertTrue(mock_eng_cls.called)
+                finally:
+                    sys.stdin = orig_stdin
+                    if orig_env_vault is not None:
+                        os.environ["AGY_VAULT_DIR"] = orig_env_vault
+                    else:
+                        os.environ.pop("AGY_VAULT_DIR", None)
+
+
+
 
 
 if __name__ == "__main__":
