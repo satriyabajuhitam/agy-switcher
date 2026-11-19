@@ -9,6 +9,7 @@ LOGICAL_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ==============================================================================
 # Fast-Path Zero-Overhead Workspace Guard (<5ms)
+# Seam: workspace_guard_resilience
 # ==============================================================================
 is_agy_switcher_path() {
     local target="$1"
@@ -58,9 +59,9 @@ workspace_guard() {
     local STDIN_PAYLOAD=""
     local HAS_STDIN=0
 
-    # Non-blocking read of stdin when piped or redirected
+    # Non-blocking read of stdin when piped or redirected (bounded to 64KB for resilience)
     if [ ! -t 0 ]; then
-        read -r -d '' STDIN_PAYLOAD || true
+        read -r -n 65536 -d '' STDIN_PAYLOAD || true
         if [ -n "$STDIN_PAYLOAD" ]; then
             HAS_STDIN=1
         fi
@@ -72,24 +73,28 @@ workspace_guard() {
     if [ "$HAS_STDIN" -eq 1 ]; then
         local HOOK_CWD=""
         local HAS_CWD=0
-        if [[ "$STDIN_PAYLOAD" =~ \"cwd\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+        if [[ "$STDIN_PAYLOAD" =~ \"cwd\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
             HOOK_CWD="${BASH_REMATCH[1]}"
-            HAS_CWD=1
-            if is_agy_switcher_path "$HOOK_CWD"; then
-                TARGET_IDENTIFIED=1
+            if [ -n "$HOOK_CWD" ]; then
+                HAS_CWD=1
+                if is_agy_switcher_path "$HOOK_CWD"; then
+                    TARGET_IDENTIFIED=1
+                fi
             fi
         fi
 
         local HAS_WP=0
         if [[ "$STDIN_PAYLOAD" =~ \"workspacePaths\"[[:space:]]*:[[:space:]]*\[([^\]]*)\] ]]; then
-            HAS_WP=1
             local WP_CONTENT="${BASH_REMATCH[1]}"
-            while [[ "$WP_CONTENT" =~ ^[^\"]*\"([^\"]+)\"(.*)$ ]]; do
+            while [[ "$WP_CONTENT" =~ ^[^\"]*\"([^\"]*)\"(.*)$ ]]; do
                 local WP_PATH="${BASH_REMATCH[1]}"
                 WP_CONTENT="${BASH_REMATCH[2]}"
-                if is_agy_switcher_path "$WP_PATH"; then
-                    TARGET_IDENTIFIED=1
-                    break
+                if [ -n "$WP_PATH" ]; then
+                    HAS_WP=1
+                    if is_agy_switcher_path "$WP_PATH"; then
+                        TARGET_IDENTIFIED=1
+                        break
+                    fi
                 fi
             done
         fi
