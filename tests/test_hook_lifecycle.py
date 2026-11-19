@@ -2056,6 +2056,193 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         expected_guard = 'elif active_name and (probe_error is not None or (isinstance(active_quota, dict) and active_quota.get("error"))):'
         self.assertIn(expected_guard, source)
 
+    def test_hooks_json_scoping(self) -> None:
+        """[HOOK-SCOPE-001] [HOOK-SCOPE-EDGE-001] Scoped lifecycle hooks in root hooks.json and workspace overrides."""
+        root_hooks_path = REPO_ROOT / "hooks.json"
+        self.assertTrue(root_hooks_path.is_file(), f"Repository root hooks.json must exist at {root_hooks_path}")
+
+        raw_content = root_hooks_path.read_text(encoding="utf-8")
+        try:
+            hooks_data_raw = json.loads(raw_content)
+        except Exception as exc:
+            self.fail(f"Root hooks.json must be valid JSON: {exc}")
+
+        self.assertIsInstance(hooks_data_raw, dict)
+        assert isinstance(hooks_data_raw, dict)
+
+        hooks_data: dict[str, dict[str, object]] = {}
+        for k, v in hooks_data_raw.items():
+            self.assertIsInstance(v, dict, f"Hook entry {k} must be an object")
+            assert isinstance(v, dict)
+            hooks_data[str(k)] = {str(inner_k): inner_v for inner_k, inner_v in v.items()}
+
+        # [HOOK-SCOPE-001] build-quality-gate must be disabled by default; agy-switch-auto-rotate enabled
+        self.assertIn("build-quality-gate", hooks_data, "build-quality-gate must be declared in root hooks.json")
+        self.assertIn("agy-switch-auto-rotate", hooks_data, "agy-switch-auto-rotate must be declared in root hooks.json")
+
+        gate_hook = hooks_data["build-quality-gate"]
+        auto_rotate_hook = hooks_data["agy-switch-auto-rotate"]
+
+        self.assertIs(
+            gate_hook.get("enabled"),
+            False,
+            "build-quality-gate must have 'enabled': false by default to prevent triggering in foreign workspaces",
+        )
+        self.assertIs(
+            auto_rotate_hook.get("enabled"),
+            True,
+            "agy-switch-auto-rotate must have 'enabled': true by default",
+        )
+
+        # Verify command structures and target hooks
+        self.assertIn("Stop", gate_hook, "build-quality-gate must define a Stop lifecycle hook")
+        gate_stop = gate_hook.get("Stop")
+        self.assertIsInstance(gate_stop, list)
+        assert isinstance(gate_stop, list)
+        self.assertTrue(len(gate_stop) > 0, "build-quality-gate Stop hook list must not be empty")
+        gate_stop_first = gate_stop[0]
+        self.assertIsInstance(gate_stop_first, dict)
+        assert isinstance(gate_stop_first, dict)
+        self.assertIn("verify-build.sh", str(gate_stop_first.get("command", "")))
+
+        self.assertIn("PreInvocation", auto_rotate_hook, "agy-switch-auto-rotate must define a PreInvocation hook")
+        auto_rotate_pre = auto_rotate_hook.get("PreInvocation")
+        self.assertIsInstance(auto_rotate_pre, list)
+        assert isinstance(auto_rotate_pre, list)
+        self.assertTrue(len(auto_rotate_pre) > 0, "agy-switch-auto-rotate PreInvocation list must not be empty")
+        auto_rotate_first = auto_rotate_pre[0]
+        self.assertIsInstance(auto_rotate_first, dict)
+        assert isinstance(auto_rotate_first, dict)
+        self.assertIn("hook-pre-invocation", str(auto_rotate_first.get("command", "")))
+
+        # Scheduling evaluation: build-quality-gate must not be scheduled automatically on agent turn Stop events
+        def get_scheduled_hooks(config: dict[str, dict[str, object]], event_name: str) -> list[dict[str, object]]:
+            scheduled: list[dict[str, object]] = []
+            for hook_id, hook_def in config.items():
+                if not isinstance(hook_def, dict):
+                    continue
+                if not hook_def.get("enabled", True):
+                    continue
+                if event_name in hook_def:
+                    scheduled.append({"id": hook_id, "definition": hook_def})
+            return scheduled
+
+        plugin_scheduled_stop = get_scheduled_hooks(hooks_data, "Stop")
+        self.assertEqual(
+            plugin_scheduled_stop,
+            [],
+            "build-quality-gate must not be scheduled or invoked automatically on agent turn Stop events when disabled",
+        )
+
+        plugin_scheduled_pre = get_scheduled_hooks(hooks_data, "PreInvocation")
+        self.assertEqual(len(plugin_scheduled_pre), 1)
+        self.assertEqual(plugin_scheduled_pre[0]["id"], "agy-switch-auto-rotate")
+
+        # [HOOK-SCOPE-EDGE-001] Workspace-level local opt-in override preservation
+        def resolve_effective_hooks(
+            plugin_hooks: dict[str, dict[str, object]],
+            workspace_hooks: dict[str, dict[str, object]],
+        ) -> dict[str, dict[str, object]]:
+            effective: dict[str, dict[str, object]] = {}
+            for k, v in plugin_hooks.items():
+                effective[k] = dict(v)
+            for k, v in workspace_hooks.items():
+                if k in effective:
+                    merged_entry = dict(effective[k])
+                    merged_entry.update(v)
+                    effective[k] = merged_entry
+                else:
+                    effective[k] = dict(v)
+            return effective
+
+        # Scenario A: Workspace overrides with .agents/hooks.json setting enabled: True
+        agents_workspace_config: dict[str, dict[str, object]] = {
+            "build-quality-gate": {
+                "enabled": True,
+            }
+        }
+        resolved_agents = resolve_effective_hooks(hooks_data, agents_workspace_config)
+        resolved_gate_agents = resolved_agents["build-quality-gate"]
+        self.assertIsInstance(resolved_gate_agents, dict)
+        assert isinstance(resolved_gate_agents, dict)
+        self.assertIs(resolved_gate_agents.get("enabled"), True)
+        scheduled_stop_agents = get_scheduled_hooks(resolved_agents, "Stop")
+        self.assertEqual(len(scheduled_stop_agents), 1)
+        self.assertEqual(scheduled_stop_agents[0]["id"], "build-quality-gate")
+        gate_stop_def = scheduled_stop_agents[0]["definition"]
+        self.assertIsInstance(gate_stop_def, dict)
+        assert isinstance(gate_stop_def, dict)
+        gate_stop_handlers = gate_stop_def.get("Stop")
+        self.assertIsInstance(gate_stop_handlers, list)
+        assert isinstance(gate_stop_handlers, list)
+        self.assertIn("verify-build.sh", str(gate_stop_handlers[0].get("command", "")))
+
+        # Scenario B: Workspace overrides with .gemini/hooks.json setting enabled: True and custom Stop command
+        gemini_workspace_config: dict[str, dict[str, object]] = {
+            "build-quality-gate": {
+                "enabled": True,
+                "Stop": [
+                    {
+                        "type": "command",
+                        "command": "bash /srv/agy-workspaces/booster/agy-switcher/scripts/verify-build.sh",
+                        "timeout": 45,
+                    }
+                ],
+            }
+        }
+        resolved_gemini = resolve_effective_hooks(hooks_data, gemini_workspace_config)
+        resolved_gate_gemini = resolved_gemini["build-quality-gate"]
+        self.assertIsInstance(resolved_gate_gemini, dict)
+        assert isinstance(resolved_gate_gemini, dict)
+        self.assertIs(resolved_gate_gemini.get("enabled"), True)
+        scheduled_stop_gemini = get_scheduled_hooks(resolved_gemini, "Stop")
+        self.assertEqual(len(scheduled_stop_gemini), 1)
+        self.assertEqual(scheduled_stop_gemini[0]["id"], "build-quality-gate")
+
+        # Scenario C: Foreign workspace without override keeps build-quality-gate disabled
+        foreign_workspace_config: dict[str, dict[str, object]] = {}
+        resolved_foreign = resolve_effective_hooks(hooks_data, foreign_workspace_config)
+        resolved_gate_foreign = resolved_foreign["build-quality-gate"]
+        self.assertIsInstance(resolved_gate_foreign, dict)
+        assert isinstance(resolved_gate_foreign, dict)
+        self.assertIs(resolved_gate_foreign.get("enabled"), False)
+        self.assertEqual(get_scheduled_hooks(resolved_foreign, "Stop"), [])
+
+        # Scenario D: Workspace explicitly disables agy-switch-auto-rotate
+        disable_auto_rotate_config: dict[str, dict[str, object]] = {
+            "agy-switch-auto-rotate": {
+                "enabled": False,
+            }
+        }
+        resolved_disabled_auto = resolve_effective_hooks(hooks_data, disable_auto_rotate_config)
+        self.assertIs(resolved_disabled_auto["agy-switch-auto-rotate"].get("enabled"), False)
+        self.assertEqual(get_scheduled_hooks(resolved_disabled_auto, "PreInvocation"), [])
+
+        # Scenario E: Workspace explicitly maintains build-quality-gate disabled
+        explicit_disabled_gate_config: dict[str, dict[str, object]] = {
+            "build-quality-gate": {
+                "enabled": False,
+            }
+        }
+        resolved_explicit_disabled = resolve_effective_hooks(hooks_data, explicit_disabled_gate_config)
+        self.assertIs(resolved_explicit_disabled["build-quality-gate"].get("enabled"), False)
+        self.assertEqual(get_scheduled_hooks(resolved_explicit_disabled, "Stop"), [])
+
+        # Scenario F: Workspace introduces a new unrelated hook without clobbering existing scoping
+        unrelated_workspace_config: dict[str, dict[str, object]] = {
+            "custom-linter": {
+                "enabled": True,
+                "PostToolUse": [{"type": "command", "command": "./lint.sh"}],
+            }
+        }
+        resolved_unrelated = resolve_effective_hooks(hooks_data, unrelated_workspace_config)
+        self.assertIn("custom-linter", resolved_unrelated)
+        self.assertIs(resolved_unrelated["build-quality-gate"].get("enabled"), False)
+        self.assertIs(resolved_unrelated["agy-switch-auto-rotate"].get("enabled"), True)
+        self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "Stop")), 0)
+        self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "PreInvocation")), 1)
+        self.assertEqual(len(get_scheduled_hooks(resolved_unrelated, "PostToolUse")), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

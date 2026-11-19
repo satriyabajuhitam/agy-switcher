@@ -10,7 +10,7 @@
     ]
   },
   "build-quality-gate": {
-    "enabled": true,
+    "enabled": false,
     "Stop": [
       {
         "type": "command",
