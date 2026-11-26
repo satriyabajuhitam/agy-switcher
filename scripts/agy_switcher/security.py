@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 from pathlib import Path
+import stat
 import tempfile
 from typing import Any, Mapping, cast
 
 from agy_switcher.exceptions import InvalidTokenError
+from agy_switcher.models import PendingReloadPayload
 
 
 def _atomic_write_file(target_path: Path | str, content: str | bytes, mode: int = 0o600) -> None:
@@ -50,6 +53,132 @@ def _atomic_write_file(target_path: Path | str, content: str | bytes, mode: int 
                 os.unlink(tmp_file)
             except OSError:
                 pass
+
+
+def read_json_dict_nofollow(path: Path | str) -> tuple[dict[str, object] | None, str]:
+    """Reads a regular JSON object file atomically without following symlinks.
+
+    Returns (decoded_dict_or_none, status) where status is one of:
+    'ok', 'missing', 'non_regular', 'io_error', 'parse_error', 'not_dict'.
+    """
+    target = Path(path)
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "io_error"
+
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None, "non_regular"
+
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, open_flags)
+    except OSError:
+        return None, "io_error"
+
+    try:
+        fd_stat = os.fstat(fd)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, "io_error"
+
+    if not stat.S_ISREG(fd_stat.st_mode):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, "non_regular"
+
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            loaded: object = json.load(handle)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError):
+        return None, "parse_error"
+    except OSError:
+        return None, "io_error"
+
+    if not isinstance(loaded, dict):
+        return None, "not_dict"
+    return cast(dict[str, object], loaded), "ok"
+
+
+def read_json_dict_safe(path: Path | str) -> tuple[dict[str, object] | None, bool]:
+    """Reads a regular JSON object file without following symlinks.
+
+    Returns (decoded_dict_or_none, path_exists_on_disk).
+    """
+    loaded, status = read_json_dict_nofollow(path)
+    return loaded, status != "missing"
+
+
+def is_safe_account_alias(name: object) -> bool:
+    """Returns True when name is a non-empty account alias free of path traversal or NUL bytes."""
+    if not isinstance(name, str):
+        return False
+    clean = name.strip()
+    return bool(
+        clean
+        and "/" not in clean
+        and "\\" not in clean
+        and ".." not in clean
+        and "\x00" not in clean
+        and clean not in (".", "..")
+    )
+
+
+def parse_positive_finite_float(value: object) -> float | None:
+    """Returns a finite float > 0, rejecting bools, non-numeric values, and overflows."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def parse_pending_reload_payload(raw_payload: object) -> PendingReloadPayload | None:
+    """Validates pending_reload.json schema, returning a normalized PendingReloadPayload or None."""
+    if not isinstance(raw_payload, dict):
+        return None
+
+    raw_target = raw_payload.get("target_account")
+    if not isinstance(raw_target, str) or not raw_target.strip():
+        return None
+
+    requested_at = parse_positive_finite_float(raw_payload.get("requested_at"))
+    if requested_at is None:
+        return None
+
+    raw_ttl = raw_payload.get("ttl_seconds")
+    ttl_val: float | int
+    if raw_ttl is None:
+        ttl_val = 120
+    else:
+        parsed_ttl = parse_positive_finite_float(raw_ttl)
+        if parsed_ttl is None:
+            return None
+        ttl_val = raw_ttl if isinstance(raw_ttl, int) else parsed_ttl
+
+    raw_reason = raw_payload.get("reason")
+    reason = (
+        raw_reason.strip()
+        if isinstance(raw_reason, str) and raw_reason.strip()
+        else "in_turn_deferred_reload"
+    )
+    return {
+        "target_account": raw_target.strip(),
+        "requested_at": requested_at,
+        "ttl_seconds": ttl_val,
+        "reason": reason,
+    }
 
 
 def _atomic_write_json(target_path: Path | str, data: Any, mode: int = 0o600, indent: int = 2) -> None:
@@ -134,7 +263,12 @@ def has_valid_id_token_or_fallback(data: Mapping[str, object]) -> bool:
     return _is_non_empty_str(data.get("id_token_email"))
 
 
-def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
+def validate_token_dict(
+    data: object,
+    *,
+    return_tuple: bool = False,
+    require_refresh_token: bool = True,
+) -> Any:
     """Validates that data complies with Google OAuth token JSON schema.
 
     If return_tuple=True, returns tuple[bool, str | None].
@@ -148,7 +282,11 @@ def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
         if not isinstance(token_obj, dict):
             raise InvalidTokenError("Missing required 'token' object in payload.")
 
-        required_token_keys = ("access_token", "refresh_token", "token_type", "expiry")
+        required_token_keys: tuple[str, ...] = (
+            ("access_token", "refresh_token", "token_type", "expiry")
+            if require_refresh_token
+            else ("access_token", "token_type", "expiry")
+        )
         missing_keys = [k for k in required_token_keys if not _is_non_empty_str(token_obj.get(k))]
         if missing_keys:
             raise InvalidTokenError(f"Missing required token fields: {', '.join(missing_keys)}")
@@ -168,7 +306,12 @@ def validate_token_dict(data: object, *, return_tuple: bool = False) -> Any:
         raise
 
 
-def validate_token_file(token_path: Path | str, *, return_tuple: bool = False) -> Any:
+def validate_token_file(
+    token_path: Path | str,
+    *,
+    return_tuple: bool = False,
+    require_refresh_token: bool = True,
+) -> Any:
     """Reads and validates a token file from disk.
 
     If return_tuple=True, returns tuple[bool, str | None, dict | None].
@@ -190,10 +333,14 @@ def validate_token_file(token_path: Path | str, *, return_tuple: bool = False) -
         raise InvalidTokenError(err) from e
 
     if return_tuple:
-        ok, msg = validate_token_dict(data, return_tuple=True)
+        ok, msg = validate_token_dict(
+            data,
+            return_tuple=True,
+            require_refresh_token=require_refresh_token,
+        )
         return ok, msg, data if ok else None
 
-    return validate_token_dict(data)
+    return validate_token_dict(data, require_refresh_token=require_refresh_token)
 
 
 def check_token_dict(data: object) -> tuple[bool, str | None]:
@@ -209,6 +356,11 @@ def check_token_file(token_path: Path | str) -> tuple[bool, str | None, dict[str
 __all__ = [
     "_atomic_write_file",
     "_atomic_write_json",
+    "read_json_dict_nofollow",
+    "read_json_dict_safe",
+    "is_safe_account_alias",
+    "parse_positive_finite_float",
+    "parse_pending_reload_payload",
     "extract_email_from_jwt",
     "has_valid_id_token_or_fallback",
     "resolve_token_email",

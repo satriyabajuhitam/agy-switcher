@@ -19,7 +19,6 @@ from typing import Any, Callable, cast
 
 from agy_switcher.exceptions import AgySwitchError
 from agy_switcher.models import QuotaStatus
-from agy_switcher.presence import _resolve_vault_log_path, append_secure_log_entry
 from agy_switcher.telemetry import (
     HTTP_SERVER_ERROR_PATTERN,
     _has_auth_indicator,
@@ -61,7 +60,7 @@ def _get_rotation_engine_class() -> Any:
     )
 
 
-_DEFAULT_APPEND_SECURE_LOG_ENTRY = append_secure_log_entry
+append_secure_log_entry: Callable[[Path | str, str], None] | None = None
 
 
 def _get_error_classifiers() -> tuple[Callable[..., Any], Callable[..., Any]]:
@@ -72,14 +71,15 @@ def _get_error_classifiers() -> tuple[Callable[..., Any], Callable[..., Any]]:
 
 
 def _get_append_secure_log_entry() -> Callable[[Path | str, str], None]:
-    if append_secure_log_entry is not _DEFAULT_APPEND_SECURE_LOG_ENTRY:
+    if append_secure_log_entry is not None:
         return append_secure_log_entry
     mod = sys.modules.get("agy_switch")
     if mod is not None and "append_secure_log_entry" in mod.__dict__:
         candidate = mod.__dict__["append_secure_log_entry"]
         if callable(candidate):
             return cast(Callable[[Path | str, str], None], candidate)
-    return append_secure_log_entry
+    from agy_switcher.presence import append_secure_log_entry as real_append
+    return real_append
 
 
 def _extract_http_status(payload: object) -> int | None:
@@ -206,6 +206,7 @@ def _persist_failover_audit(
     clean_reason = " ".join(reason.split()) if reason else ""
 
     try:
+        from agy_switcher.presence import _resolve_vault_log_path
         log_target = _resolve_vault_log_path(engine=engine)
         if log_target is not None:
             if log_target.is_symlink():
@@ -475,7 +476,12 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                 return 0
 
             if target_account and target_account != active_name:
-                engine.switch_tokens(target_account, restart_server=False, force=True)
+                engine.switch_tokens(
+                    target_account,
+                    restart_server=False,
+                    force=True,
+                    clear_failover=False,
+                )
 
                 trigger, reason, error_type = _extract_failover_context(
                     active_name=active_name,

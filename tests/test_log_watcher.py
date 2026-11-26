@@ -1613,7 +1613,7 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
 
             res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
             self.assertTrue(res)
-            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     def test_cooldown_immunity_002_standby_with_depleted_quota_remains_excluded(self):
         """[COOLDOWN-IMMUNITY-002]: Standby account in cooldown with depleted quota (< 70%) remains excluded."""
@@ -1701,7 +1701,7 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
             with patch.object(self.watcher, "_is_turn_quiescent", return_value=True):
                 res = self.watcher._evaluate_proactive_rotation()
                 self.assertTrue(res)
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     def test_boundary_immunity_001_exact_70_percent_quota_granted_immunity(self):
         """[COOLDOWN-EDGE-001]: Account with exact 70.0% quota (fraction == 0.70) is granted cooldown immunity."""
@@ -1747,7 +1747,7 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
 
             res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
             self.assertTrue(res)
-            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     def test_boundary_immunity_002_multi_account_individual_evaluation_highest_quota(self):
         """[COOLDOWN-EDGE-002]: In multi-account fleet in cooldown, each evaluated individually; selects highest quota."""
@@ -1804,7 +1804,7 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
             res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
             self.assertTrue(res)
             # Must strictly switch to acc3 (highest quota: 90% > 75%), never acc1 or acc2
-            self.engine_mock.switch_tokens.assert_called_once_with("acc3", restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with("acc3", restart_server=True, force=True, clear_failover=False)
 
     def test_boundary_immunity_floating_point_and_format_variants(self):
         """Harden boundary conditions for fraction == 0.70 across floating point math and format variants."""
@@ -1850,7 +1850,7 @@ class TestLogWatcherCooldownIntegration(unittest.TestCase):
             with patch.object(self.watcher, "_is_turn_quiescent", return_value=True):
                 proactive_res = self.watcher._evaluate_proactive_rotation()
                 self.assertTrue(proactive_res)
-                self.engine_mock.switch_tokens.assert_called_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
 
 class _StubSwitchEngine:
@@ -1884,6 +1884,7 @@ class _StubSwitchEngine:
         *,
         restart_server: bool = False,
         force: bool = False,
+        clear_failover: bool = True,
     ) -> dict[str, object]:
         self.switch_calls.append((target_account, restart_server, force))
         return {"success": True, "active": target_account, "server_restarted": False}
@@ -2627,7 +2628,7 @@ class TestLogWatcherProcessing(unittest.TestCase):
 
         res = self.watcher.trigger_switch(line="RESOURCE_EXHAUSTED (code 429)")
         self.assertTrue(res)
-        self.engine_mock.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True, clear_failover=False)
 
     @patch("scripts.watch.time.sleep", return_value=None)
     @patch("scripts.watch.RotationEngine")

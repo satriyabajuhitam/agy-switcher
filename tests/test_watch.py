@@ -77,7 +77,7 @@ class TestLogWatcher(unittest.TestCase):
             
             self.watcher.process_line(line)
             
-            self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True, clear_failover=False)
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_trigger_switch_aborts_when_all_exhausted(self, sleep_mock):
@@ -261,7 +261,7 @@ class TestLogWatcher(unittest.TestCase):
             self.watcher.process_line(line)
 
             # Because claude was exhausted, acc3 (80% claude) should be selected, not acc2 (0% claude)
-            self.engine_mock.switch_tokens.assert_called_once_with('acc3', restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with('acc3', restart_server=True, force=True, clear_failover=False)
 
 
     def test_process_line_returns_boolean(self):
@@ -332,7 +332,7 @@ class TestLogWatcher(unittest.TestCase):
 
                 success = self.watcher.handle_exhaustion(line="RESOURCE_EXHAUSTED (code 429)", file_path=f1)
                 self.assertTrue(success)
-                self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True, clear_failover=False)
 
                 # Both cursors must be seeked to their file sizes (EOF)
                 self.assertEqual(self.watcher.file_cursors[f1], os.path.getsize(f1))
@@ -935,7 +935,7 @@ class TestLogWatcher(unittest.TestCase):
         res_depleted = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_depleted)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Adversarial Edge Cases ---
         # 1. Exact boundary at 0.25 (<= 0.25 is not healthy, authorizes rotation)
@@ -954,7 +954,7 @@ class TestLogWatcher(unittest.TestCase):
         res_boundary = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_boundary)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # 2. Healthy boundary just above threshold (0.26 > 0.25 suppresses rotation)
         self.watcher.cooldown_manager.clear_cooldown()
@@ -989,7 +989,7 @@ class TestLogWatcher(unittest.TestCase):
         res_missing = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_missing)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # 4. Active damping window suppresses rotation prior to quota probe
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1043,7 +1043,7 @@ class TestLogWatcher(unittest.TestCase):
         res_boundary = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_boundary)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # Also verify integer percentage quota = 25 (25% <= 25% boundary)
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1061,7 +1061,7 @@ class TestLogWatcher(unittest.TestCase):
         res_boundary_int = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_boundary_int)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- [PRE-PROBE-ERR-001]: Missing last_known_quota.json falls back safely to rotation ---
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1072,7 +1072,7 @@ class TestLogWatcher(unittest.TestCase):
         res_missing = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_missing)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- [PRE-PROBE-ERR-001]: Unparseable/corrupted last_known_quota.json falls back safely to rotation ---
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1083,7 +1083,7 @@ class TestLogWatcher(unittest.TestCase):
         res_corrupt = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_corrupt)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_truncation_resets_cursor_and_clock_skew(self, mock_sleep):
@@ -1195,7 +1195,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1000.0):
                 res = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res)
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 1000.0)
 
@@ -1326,7 +1326,7 @@ class TestLogWatcher(unittest.TestCase):
         with patch("time.time", return_value=1060.0):
             res_60_0 = self.watcher.handle_exhaustion(line=exhaustion_line)
             self.assertTrue(res_60_0, "Exhaustion at elapsed=60.0s must be allowed (elapsed >= damping_seconds)")
-            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
             self.assertIn("primary-acc", self.watcher.get_cooldowns())
             self.assertEqual(self.watcher.last_switch_time, 1060.0)
 
@@ -1337,7 +1337,7 @@ class TestLogWatcher(unittest.TestCase):
         with patch("time.time", return_value=1061.0):
             res_61_0 = self.watcher.handle_exhaustion(line=exhaustion_line)
             self.assertTrue(res_61_0, "[PRE-PROBE-004] Exhaustion at elapsed=61.0s re-arms failover")
-            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
             self.assertIn("primary-acc", self.watcher.get_cooldowns())
             self.assertEqual(self.watcher.last_switch_time, 1061.0)
 
@@ -1391,7 +1391,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1061.0):
                 res = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res, "handle_exhaustion must succeed when damping has expired (61.0s >= 60.0s)")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 1061.0)
 
@@ -1413,7 +1413,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1060.0):
                 switched = self.watcher.process_line(exhaustion_line)
                 self.assertTrue(switched, "process_line must allow failover at exact 60.0s boundary")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 1060.0)
 
@@ -1435,7 +1435,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=2060.0):
                 res = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res, "handle_exhaustion must allow failover at exact 60.0s boundary")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 2060.0)
 
@@ -1525,7 +1525,7 @@ class TestLogWatcher(unittest.TestCase):
                 res_url_err = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res_url_err, "Network URLError during probe must fall back safely to rotation")
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Sub-scenario B: [PRE-PROBE-ERR-002] Stale cache + socket.timeout during probe ---
         with self.subTest("[PRE-PROBE-ERR-002]: stale cache + socket timeout falls back safely to rotation"):
@@ -1548,7 +1548,7 @@ class TestLogWatcher(unittest.TestCase):
                     res_timeout = self.watcher.handle_exhaustion(line=exhaustion_line)
                     self.assertTrue(res_timeout, "Socket timeout during live probe must fall back safely to rotation")
                     self.assertIn("primary-acc", self.watcher.get_cooldowns())
-                    self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                    self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Sub-scenario C: [PRE-PROBE-ERR-002] Missing cache + TimeoutError / OSError during probe ---
         with self.subTest("[PRE-PROBE-ERR-002]: missing cache + TimeoutError / OSError falls back safely"):
@@ -1561,7 +1561,7 @@ class TestLogWatcher(unittest.TestCase):
                 res_to = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res_to, "TimeoutError during live probe must fall back safely to rotation")
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Sub-scenario D: [PRE-PROBE-EDGE-003] Custom damping_seconds = 90.0 suppresses rotation at 75s ---
         with self.subTest("[PRE-PROBE-EDGE-003]: damping_seconds = 90.0 suppresses rotation at elapsed = 75.0s"):
@@ -1614,7 +1614,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1090.0):
                 res_elapsed = custom_watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res_elapsed, "Rotation must be authorized once custom damping window (90.0s) elapses")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", custom_watcher.get_cooldowns())
                 self.assertEqual(custom_watcher.last_switch_time, 1090.0)
 
@@ -2042,7 +2042,7 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         # Safe Turn Boundary is reached -> rotation proceeds!
         res_quiescent = watcher.poll_once()
         self.assertTrue(res_quiescent, "poll_once() must trigger rotation once Safe Turn Boundary is reached")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
 
 class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
@@ -2287,7 +2287,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
             res = watcher.poll_once()
 
         self.assertEqual(res, 0, "poll_once() must return 0 when switch_tokens fails")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         stderr_output = stderr_capture.getvalue()
         self.assertIn("ProcessSupervisor error: language_server failed to terminate cleanly", stderr_output)
@@ -2481,7 +2481,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
 
         self.assertTrue(res, "poll_once() must return truthy/True when proactive rotation succeeds")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
         # File cursors must be updated to EOF
@@ -2538,7 +2538,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res, "Active account quota at exact 20.0% threshold must trigger proactive rotation")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_proactive_rotation_edge_above_threshold_suppresses_rotation(self):
@@ -2605,7 +2605,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res, "Invalid engine threshold method must default to 20% and trigger rotation")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_proactive_rotation_cursor_advancement_when_evaluated_directly(self):
@@ -2715,7 +2715,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res)
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
 
@@ -2905,7 +2905,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res)
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-2", restart_server=True, force=True
+            "standby-2", restart_server=True, force=True, clear_failover=False
         )
 
     def test_standby_qualification_live_telemetry_fallback_when_cache_missing(self):
@@ -2943,7 +2943,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
 
         self.assertTrue(res)
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-2", restart_server=True, force=True
+            "standby-2", restart_server=True, force=True, clear_failover=False
         )
 
 
@@ -3095,7 +3095,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
 
         self.assertTrue(res, "Hard floor <= 5% must override drain window and force rotation")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_drain_window_exact_5_percent_hard_floor_override(self):
@@ -3137,7 +3137,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
 
         self.assertTrue(res, "Exact 5% floor must override drain window and rotate")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_drain_window_outside_30m_rotates_normally(self):
@@ -3179,7 +3179,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
 
         self.assertTrue(res, "Reset outside 30m window does not qualify for drain window; rotates normally")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
 
@@ -3276,7 +3276,7 @@ class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
         self.watcher.last_switch_time = 0.0
         res_depleted = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
         self.assertTrue(res_depleted, "Active account quota of 18% <= configured 20% threshold must authorize rotation")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     def test_threshold_sync_cooldown_err_001_malformed_json_syntax_returns_empty_and_allows_rotation(self):
         """[COOLDOWN-ERR-001]: Corrupted cooldown.json with malformed JSON syntax handles JSONDecodeError
@@ -3307,7 +3307,7 @@ class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
             res = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
 
         self.assertTrue(res, "Corrupted cooldown file must not crash daemon and must allow rotation to healthy standby")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     def test_threshold_sync_cooldown_err_001_truncated_bytes_returns_empty_and_allows_rotation(self):
         """[COOLDOWN-ERR-001]: Corrupted cooldown.json with truncated/invalid bytes handles decode errors
@@ -3338,7 +3338,7 @@ class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
             res = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
 
         self.assertTrue(res, "Truncated bytes in cooldown.json must not crash daemon and must allow rotation to healthy standby")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
 
 class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
@@ -3439,7 +3439,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
 
         self.assertEqual(proactive_switches, 1, "Initial proactive rotation at Safe Turn Boundary must succeed")
         self.assertEqual(watcher.last_switch_time, t0, "Proactive rotation must update unified last_switch_time")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # Simulate active account is now standby-acc, with depleted quota so failover would fire if undamped
         self.engine_mock.get_active_name.return_value = "standby-acc"
@@ -3487,7 +3487,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
 
         self.assertTrue(res_allowed, "handle_exhaustion() must allow rotation once elapsed=60.0s >= 60.0s")
         self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
-        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True, clear_failover=False)
         self.assertEqual(watcher.last_switch_time, t_60)
 
     def test_unified_damping_watch_proactive_edge_003_suppresses_successive_proactive_switches(self):
@@ -3526,7 +3526,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
 
         self.assertEqual(first_switches, 1)
         self.assertEqual(watcher.last_switch_time, t0)
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # Newly active account 'standby-acc' reports cached quota below threshold (15% <= 20%)
         self.engine_mock.get_active_name.return_value = "standby-acc"
@@ -3570,7 +3570,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
             switches_60 = watcher.poll_once()
         self.assertEqual(switches_60, 1, "Proactive rotation must proceed once elapsed=60.0s >= 60.0s")
         self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
-        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True, clear_failover=False)
         self.assertEqual(watcher.last_switch_time, t_60)
 
     @patch("scripts.watch.time.sleep", return_value=None)
@@ -5557,7 +5557,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         switches = watcher.poll_once()
 
         self.assertEqual(switches, 1)
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
         self.engine_mock.restart_language_server.assert_not_called()
         self.assertTrue(pending_file.exists())
 

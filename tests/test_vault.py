@@ -1722,6 +1722,13 @@ class TestAgySwitchEngine(unittest.TestCase):
         self._register_test_account(engine, "base-acc", "base@example.com")
         self._register_test_account(engine, "work-acc", "work@example.com")
         self._register_test_account(engine, "ws-refresh-acc", "ws@example.com", refresh_token="   ")
+        missing_access_dir = engine.accounts_dir / "missing-access-acc"
+        missing_access_dir.mkdir(parents=True, exist_ok=True)
+        missing_access_payload = make_valid_token_payload("missing-access@example.com")
+        del cast(dict[str, object], missing_access_payload["token"])["access_token"]
+        (missing_access_dir / "token.json").write_text(
+            json.dumps(missing_access_payload, indent=2) + "\n", encoding="utf-8"
+        )
         corrupt_dir = engine.accounts_dir / "corrupt-acc"
         corrupt_dir.mkdir(parents=True, exist_ok=True)
         (corrupt_dir / "token.json").write_text("{not-json", encoding="utf-8")
@@ -1737,7 +1744,10 @@ class TestAgySwitchEngine(unittest.TestCase):
             with self.assertRaises(InvalidTokenError):
                 engine.switch_tokens("corrupt-acc", restart_server=False, verify_auth=True)
             with self.assertRaises(InvalidTokenError):
-                engine.switch_tokens("ws-refresh-acc", restart_server=False, verify_auth=True)
+                engine.switch_tokens("missing-access-acc", restart_server=False, verify_auth=True)
+            # Without verify_auth=True, whitespace-only refresh_token still raises InvalidTokenError
+            with self.assertRaises(InvalidTokenError):
+                engine.switch_tokens("ws-refresh-acc", restart_server=False, verify_auth=False)
             mock_urlopen.assert_not_called()
         self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_base)
 
@@ -1758,6 +1768,27 @@ class TestAgySwitchEngine(unittest.TestCase):
             mock_urlopen.assert_not_called()
         self.assertEqual(res_default["active"], "work-acc")
         self.assertIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+        # [AUTH-GATE-EDGE-002]: With verify_auth=True, whitespace-only refresh_token proceeds to probe_account_auth(),
+        # skips QuotaClient.refresh_access_token() on HTTP 401, fails closed with AccountAuthError, and quarantines alias.
+        engine.switch_tokens("base-acc", restart_server=False)
+        desktop_base_edge = engine.desktop_token_file.read_text(encoding="utf-8")
+        err_401_ws = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "Unauthorized",
+            email.message.Message(),
+            io.BytesIO(b"Unauthorized"),
+        )
+        with patch("urllib.request.urlopen", side_effect=err_401_ws) as mock_urlopen, \
+             patch("agy_switcher.telemetry.QuotaClient.refresh_access_token") as mock_refresh:
+            with self.assertRaises(AccountAuthError):
+                engine.switch_tokens("ws-refresh-acc", restart_server=False, verify_auth=True)
+            self.assertEqual(mock_urlopen.call_count, 1)
+            mock_refresh.assert_not_called()
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_base_edge)
+        self.assertEqual(engine.get_active_name(), "base-acc")
+        self.assertIn("ws-refresh-acc", engine.load_failover_state()["auth_errors"])
 
         # Switch back to base-acc before testing verify_auth=True flows
         engine.switch_tokens("base-acc", restart_server=False)
@@ -2672,6 +2703,72 @@ class TestAgySwitchEngine(unittest.TestCase):
                 self.assertNotIn("pending_reload", status_malformed)
                 self.assertIsNone(status_malformed.get("pending_reload"))
                 self.assertIn("standby-acc", engine.load_failover_state()["auth_errors"])
+
+    def test_automated_switch_preserves_last_failover_while_manual_switch_clears_AUDIT_HOOK_EDGE_001(
+        self,
+    ) -> None:
+        """[AUDIT-HOOK-EDGE-001] Automated switch_tokens(..., clear_failover=False) and auto_rotate_on_exhaustion preserve last_failover while manual switch clears it."""
+        from agy_switcher import api
+
+        proc_dir = self.base_path / "proc_auto_preserve"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "automator", "automator@example.com")
+        self._register_test_account(engine, "honey", "honey@example.com")
+        self._register_test_account(engine, "standby-acc", "standby@example.com")
+        engine.switch_tokens("honey", restart_server=False)
+
+        now = 1_800_000_000.0
+        engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 600.0,
+        )
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 300.0,
+        )
+
+        # 1. Automated switch_tokens(..., clear_failover=False) preserves last_failover
+        engine.switch_tokens("standby-acc", restart_server=False, force=True, clear_failover=False)
+        self.assertEqual(engine.get_active_name(), "standby-acc")
+        state_after_auto = engine.load_failover_state()
+        self.assertIsNotNone(state_after_auto["last_failover"])
+        self.assertEqual(state_after_auto["last_failover"]["from_account"], "automator")
+        self.assertIn("automator", state_after_auto["auth_errors"])
+
+        # 2. api.auto_rotate_on_exhaustion() preserves last_failover
+        api._LAST_ROTATION_REGISTRY.clear()
+        cache_payload = {
+            "timestamp": now,
+            "accounts": {
+                "standby-acc": {"gemini": {"quota": 0, "reset_time": now + 3600}},
+                "honey": {"gemini": {"quota": 90, "reset_time": now + 3600}},
+            },
+        }
+        engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        (engine.cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+        rot_res = api.auto_rotate_on_exhaustion(model="gemini", reload_server=False, engine=engine)
+        self.assertTrue(rot_res.success)
+        self.assertEqual(rot_res.new_account, "honey")
+        state_after_api_rot = engine.load_failover_state()
+        self.assertIsNotNone(state_after_api_rot["last_failover"])
+        self.assertEqual(state_after_api_rot["last_failover"]["from_account"], "automator")
+
+        # 3. Successful manual switch (default clear_failover=True) clears last_failover while preserving auth_errors
+        engine.switch_tokens("standby-acc", restart_server=False)
+        state_after_manual = engine.load_failover_state()
+        self.assertIsNone(state_after_manual["last_failover"])
+        self.assertIn("automator", state_after_manual["auth_errors"])
 
 
 if __name__ == "__main__":

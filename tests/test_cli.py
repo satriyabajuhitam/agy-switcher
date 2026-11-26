@@ -2140,6 +2140,57 @@ class TestCLISwitchPreflightAuth(unittest.TestCase):
                     failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
                     self.assertIn("revoked-acc", failover_state.get("auth_errors", {}))
 
+    def test_switch_missing_refresh_token_401_skips_refresh_and_fails_closed_AUTH_GATE_EDGE_002(self) -> None:
+        """[AUTH-GATE-EDGE-002] agy-switch switch no-refresh-acc with empty/whitespace refresh_token and HTTP 401 skips refresh, exits 1, quarantines alias, and preserves live tokens."""
+        for bad_refresh in ("", "   "):
+            with self.subTest(refresh_token=bad_refresh), tempfile.TemporaryDirectory() as tmp_dir:
+                base = Path(tmp_dir)
+                proc_dir = base / "proc"
+                gemini_dir = base / ".gemini"
+                engine = AgySwitchEngine(
+                    vault_dir=base / ".antigravity-vault",
+                    gemini_dir=gemini_dir,
+                    legacy_root=base / ".agy-cli-manager",
+                    proc_dir=proc_dir,
+                )
+                self._register_account(engine, "healthy-acc", "healthy@example.com")
+                no_refresh_payload = self._make_token_payload("norefresh@example.com")
+                tok_dict = no_refresh_payload["token"]
+                assert isinstance(tok_dict, dict)
+                tok_dict["refresh_token"] = bad_refresh
+                no_ref_dir = engine.accounts_dir / "no-refresh-acc"
+                no_ref_dir.mkdir(parents=True, exist_ok=True)
+                (no_ref_dir / "token.json").write_text(
+                    json.dumps(no_refresh_payload, indent=2) + "\n", encoding="utf-8"
+                )
+                engine.switch_tokens("healthy-acc", restart_server=False)
+
+                desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+                cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+                err_401 = urllib.error.HTTPError(
+                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    401,
+                    "Unauthorized",
+                    email.message.Message(),
+                    io.BytesIO(b"Unauthorized"),
+                )
+                stderr_buf = io.StringIO()
+                with patch("urllib.request.urlopen", side_effect=err_401) as mock_urlopen, \
+                     patch("agy_switcher.telemetry.QuotaClient.refresh_access_token") as mock_refresh, \
+                     patch("sys.stderr", stderr_buf):
+                    exit_code = main(["switch", "no-refresh-acc"], engine=engine)
+
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(mock_urlopen.call_count, 1)
+                mock_refresh.assert_not_called()
+                self.assertIn("agy-switch login no-refresh-acc", stderr_buf.getvalue())
+                self.assertEqual(engine.get_active_name(), "healthy-acc")
+                self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+                self.assertIn("no-refresh-acc", failover_state.get("auth_errors", {}))
+
     def test_force_auth_decoupling_and_sdk_default_cli_force_with_skip_auth_check(self) -> None:
         """Combining --force and --skip-auth-check overrides busy turn guard and skips CloudCode auth check independently."""
         with tempfile.TemporaryDirectory() as tmp_dir:

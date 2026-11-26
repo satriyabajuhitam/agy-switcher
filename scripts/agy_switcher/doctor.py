@@ -26,6 +26,7 @@ from agy_switcher.security import (
     _atomic_write_json,
     extract_email_from_jwt,
     has_valid_id_token_or_fallback,
+    read_json_dict_safe,
     resolve_token_email,
     validate_token_dict,
     validate_token_file,
@@ -580,38 +581,8 @@ class DoctorEngine:
 
     def _load_quarantined_accounts(self) -> set[str]:
         """Reads quarantined account aliases from cache/failover_state.json['auth_errors'] safely."""
-        failover_path = self.cache_dir / "failover_state.json"
-        try:
-            st = os.lstat(failover_path)
-        except OSError:
-            return set()
-
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            return set()
-
-        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(failover_path, open_flags)
-        except OSError:
-            return set()
-
-        try:
-            fd_stat = os.fstat(fd)
-        except OSError:
-            os.close(fd)
-            return set()
-
-        if not stat.S_ISREG(fd_stat.st_mode):
-            os.close(fd)
-            return set()
-
-        try:
-            with os.fdopen(fd, "r", encoding="utf-8") as handle:
-                loaded: object = json.load(handle)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError):
-            return set()
-
-        if not isinstance(loaded, dict):
+        loaded, _ = read_json_dict_safe(self.cache_dir / "failover_state.json")
+        if loaded is None:
             return set()
 
         raw_auth_errors: object = loaded.get("auth_errors")

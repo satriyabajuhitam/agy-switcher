@@ -321,7 +321,9 @@ class TestHookLifecycleModular(unittest.TestCase):
                 ret = handle_pre_invocation_hook(self.engine)
 
             self.assertEqual(ret, 0)
-            spy_switch.assert_called_once_with("acc2", restart_server=False, force=True)
+            spy_switch.assert_called_once_with(
+                "acc2", restart_server=False, force=True, clear_failover=False
+            )
 
     def test_hook_source_code_never_contains_restart_server_true(self):
         """Enforces ADR 0010 Bagian 3 invariant: hook.py must never restart language_server."""

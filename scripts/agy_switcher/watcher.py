@@ -5,7 +5,7 @@ Strictly acyclic DAG: Does NOT import vault.py, rotation.py, doctor.py, hook.py,
 
 from __future__ import annotations
 
-import argparse, errno, fcntl, glob, json, logging, math, os, re, shutil, signal, ssl, stat, subprocess, sys, threading, time
+import argparse, errno, fcntl, glob, json, logging, math, os, re, shutil, signal, ssl, subprocess, sys, threading, time
 _real_popen = subprocess.Popen
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +14,11 @@ import urllib.error, urllib.request
 
 from agy_switcher.exceptions import AgySwitchError, DaemonError, DaemonAlreadyRunningError
 from agy_switcher.supervisor import ProcessSupervisor
-from agy_switcher.telemetry import QuotaClient as _RealQuotaClient, fetch_account_quota as _real_fetch_account_quota
+from agy_switcher.telemetry import (
+    QuotaClient as _RealQuotaClient,
+    dispatch_http_post,
+    fetch_account_quota as _real_fetch_account_quota,
+)
 
 RotationEngine: type[object] | None = None
 QuotaClient: type[object] | None = None
@@ -27,70 +31,32 @@ DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
 DEFAULT_MAX_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB read bound
 DEFAULT_DAMPING_SECONDS: float = 60.0
 SYSTEMD_ACTIVE_ERROR_MSG: str = "Error: agy-switch-watcher.service is actively running via systemd. Manage the service via systemd ('systemctl --user stop agy-switch-watcher.service') or run 'agy-switch watch stop' before starting."
-_EXHAUSTION_REGEX: re.Pattern[str] = re.compile(
-    r"resource[_\s-]?exhausted"
-    r"|\b(?:http(?:/\d+(?:\.\d+)?)?(?:_?(?:status|code))?|(?:grpc|response|api|http)_?(?:status|error)(?:_?code)?|error(?:_?code)?|code|status(?:_?code)?)\"?\s*(?:[:=]|\()?\s*\"?429\b"
-    r"|\b429\b\"?\s*\)?\s*(?:[:\-]?\s*(?:quota\s+(?:exceeded|exhausted|reached)|resource\s*exhausted|rate[- ]?limit|too\s+many\s+requests)\b|:\s*quota\b)"
-    r"|\b(?:too\s+many\s+requests|rate[- ]?limit(?:ed|\s+exceeded)?|quota\s+(?:exceeded|exhausted|reached))\s*[:\-]?\s*[\(\[]\s*429\s*[\)\]]"
-    r"|Individual quota reached|weekly quota reached", re.IGNORECASE,
-)
 _ERROR_CODE_KEYS: tuple[str, ...] = ("code", "status_code", "statusCode", "error_code", "errorCode", "http_status", "httpStatus")
-
-def _is_scalar_code(val: object) -> bool:
-    return (isinstance(val, int) and not isinstance(val, bool)) or (isinstance(val, str) and val.strip().isdigit())
-
-def _extract_text_fragments(value: object, max_items: int = 10000) -> list[str]:
-    """Extracts unescaped text fragments and scalar status codes from nested JSON payloads.
-    Guards against cyclic structures and excessive depth via visited tracking.
-    """
-    fragments: list[str] = []
-    stack: list[object] = [value]
-    visited: set[int] = set()
-    items_processed = 0
-
-    while stack and items_processed < max_items:
-        current = stack.pop()
-        items_processed += 1
-        if isinstance(current, str):
-            clean = current.strip()
-            if clean:
-                fragments.append(clean)
-        elif _is_scalar_code(current):
-            fragments.append(str(current).strip())
-        elif isinstance(current, (list, tuple)):
-            c_id = id(current)
-            if c_id in visited:
-                continue
-            visited.add(c_id)
-            stack.extend(reversed(current))
-        elif isinstance(current, dict):
-            c_id = id(current)
-            if c_id in visited:
-                continue
-            visited.add(c_id)
-            for k, v in reversed(list(current.items())):
-                if isinstance(k, str) and _EXHAUSTION_REGEX.search(k):
-                    fragments.append(k.strip())
-                if isinstance(k, str) and _is_scalar_code(v):
-                    stack.append(f"{k}: {str(v).strip()}")
-                elif isinstance(v, (str, list, tuple, dict)) and v:
-                    stack.append(v)
-                elif _is_scalar_code(v):
-                    stack.append(str(v).strip())
-    return fragments
 
 # Re-exported from presence.py (Layer 2)
 from agy_switcher.presence import (
     DEFAULT_GEMINI_DIR,
     PresenceDetector,
+    _EXHAUSTION_REGEX,
+    _extract_text_fragments,
     _is_mock_object,
     _is_prod_vault_path,
+    _is_scalar_code,
     _is_test_runner,
     _open_secure_log_file,
     _resolve_log_file_target,
     _resolve_vault_log_path,
     _write_atomic_file_secure,
     append_secure_log_entry,
+    extract_5h_rolling_reset,
+    format_audit_log_line,
+    format_deferred_reload_audit_line,
+    is_watch_process_cmdline,
+    parse_pending_reload_payload,
+    read_json_dict_nofollow,
+    read_latest_jsonl_record,
+    safe_stderr_write,
+    write_watch_log_line,
 )
 
 _T = TypeVar("_T")
@@ -326,41 +292,8 @@ class CooldownManager:
             return False
 
     def _extract_5h_rolling_reset(self, target_dict: dict[str, Any], now: float) -> float | None:
-        """Extracts valid 5-hour rolling bucket reset timestamp, rejecting weekly timestamps > 5 hours.
-        Adheres to ADR 0016 / [COOLDOWN-CLAMP-001] / [COOLDOWN-CLAMP-003].
-        """
-        max_rolling_window = 18000.0  # 5 hours
-        max_daily_window = 86400.0    # 24 hours (multi-day boundary)
-        raw_buckets = target_dict.get("buckets")
-        def _is_weekly(identifier: str) -> bool:
-            return any(x in identifier for x in ("weekly", "week", "7d", "wk"))
-        def _is_5h_rolling(identifier: str) -> bool:
-            return any(x in identifier for x in ("5h", "five_hour", "five_hours", "5_hour", "5-hour", "rolling_5h"))
-        bucket_items: list[tuple[str, dict[str, Any]]] = []
-        if isinstance(raw_buckets, dict):
-            bucket_items = [(str(k).strip().lower(), b) for k, b in raw_buckets.items() if isinstance(b, dict)]
-        elif isinstance(raw_buckets, list):
-            bucket_items = [(str(b.get("bucketId", "")).strip().lower(), b) for b in raw_buckets if isinstance(b, dict)]
-        if bucket_items:
-            for ident, b in bucket_items:
-                if _is_5h_rolling(ident):
-                    rt_val = self._parse_timestamp(b.get("reset_time", b.get("resetTime")))
-                    if math.isfinite(rt_val) and rt_val - now > 0:
-                        return min(rt_val, now + max_rolling_window)
-            if all(_is_weekly(ident) for ident, _ in bucket_items):
-                return None
-            for ident, b in bucket_items:
-                if not _is_weekly(ident):
-                    rt_val = self._parse_timestamp(b.get("reset_time", b.get("resetTime")))
-                    if math.isfinite(rt_val) and 0 < rt_val - now <= max_daily_window:
-                        return min(rt_val, now + max_rolling_window)
-            if any(_is_weekly(ident) for ident, _ in bucket_items):
-                return None
-        if (top_rt := target_dict.get("reset_time", target_dict.get("resetTime"))) is not None:
-            rt_val = self._parse_timestamp(top_rt)
-            if math.isfinite(rt_val) and 0 < rt_val - now <= max_daily_window:
-                return min(rt_val, now + max_rolling_window)
-        return None
+        """Extracts valid 5-hour rolling bucket reset timestamp, rejecting weekly timestamps > 5 hours."""
+        return extract_5h_rolling_reset(target_dict, now, self._parse_timestamp)
 
     def get_reset_time_from_cache(self, account_name: str, model_hint: str | None = None) -> float | None:
         """Reads quota reset_time for account_name from last_known_quota.json, clamping to 5h rolling bucket."""
@@ -783,29 +716,11 @@ class LogWatcher:
 
     def _write_watch_log_line(self, log_line: str) -> None:
         """Appends a formatted audit line to watch.log with mode 0600 and safe error handling."""
-        try:
-            if (log_dir := self._resolve_audit_log_dir()) is None:
-                return
-            append_secure_log_entry(log_dir / "watch.log", log_line)
-        except OSError as e:
-            msg = (
-                f"[watch] Disk full (ENOSPC): Error appending audit log: {e}\n"
-                if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC))
-                else f"[watch] Error appending audit log: {e}\n"
-            )
-            try:
-                if sys.stderr is not None:
-                    sys.stderr.write(msg)
-                    sys.stderr.flush()
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                if sys.stderr is not None:
-                    sys.stderr.write(f"[watch] Error appending audit log: {e}\n")
-                    sys.stderr.flush()
-            except Exception:
-                pass
+        write_watch_log_line(
+            self._resolve_audit_log_dir(),
+            log_line,
+            append_fn=append_secure_log_entry,
+        )
 
     def _append_audit_log(
         self,
@@ -817,24 +732,16 @@ class LogWatcher:
     ) -> None:
         """Appends structured audit entry to watch.log with mode 0600."""
         try:
-            if not clean_reason and reason and isinstance(reason, str):
-                r = reason.strip()
-                while r.startswith("(") and r.endswith(")") and len(r) >= 2:
-                    r = r[1:-1].strip()
-                clean_reason = r
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            log_reason = clean_reason or reason
-            suffix = " with force-restart language_server" if reloaded else ""
-            prefix = f"Switched from '{old_account}' to '{target_account}'" if old_account else f"Switched to '{target_account}'"
-            log_line = f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n" if (old_account or reloaded) else f"{ts} [watch] {prefix} ({log_reason})\n"
+            log_line = format_audit_log_line(
+                target_account=target_account,
+                old_account=old_account,
+                reason=reason,
+                reloaded=reloaded,
+                clean_reason=clean_reason,
+            )
             self._write_watch_log_line(log_line)
         except Exception as e:
-            try:
-                if sys.stderr is not None:
-                    sys.stderr.write(f"[watch] Error appending audit log: {e}\n")
-                    sys.stderr.flush()
-            except Exception:
-                pass
+            safe_stderr_write(f"[watch] Error appending audit log: {e}")
 
     def _append_deferred_reload_audit_log(
         self,
@@ -842,24 +749,14 @@ class LogWatcher:
         reason: str = "in_turn_deferred_reload",
     ) -> None:
         """Appends structured deferred-reload audit entry to watch.log with mode 0600."""
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        clean_target = " ".join(target_account.split())
-        clean_reason = " ".join(reason.split()) if isinstance(reason, str) and reason.strip() else "in_turn_deferred_reload"
-        log_line = (
-            f"{ts} [watch] Deferred safe-turn reload for '{clean_target}' "
-            f"with force-restart language_server (reason: {clean_reason})\n"
+        self._write_watch_log_line(
+            format_deferred_reload_audit_line(target_account=target_account, reason=reason)
         )
-        self._write_watch_log_line(log_line)
 
     @staticmethod
     def _safe_stderr_write(message: str) -> None:
         """Writes a diagnostic line to sys.stderr without raising on closed streams."""
-        try:
-            if sys.stderr is not None:
-                sys.stderr.write(f"{message}\n")
-                sys.stderr.flush()
-        except Exception:
-            pass
+        safe_stderr_write(message)
 
     def _resolve_pending_reload_path(self) -> Path | None:
         """Resolves cache/pending_reload.json path, guarding production paths under test runners."""
@@ -874,53 +771,6 @@ class LogWatcher:
         if _is_test_runner() and _is_prod_vault_path(candidate):
             return None
         return candidate
-
-    @staticmethod
-    def _parse_positive_finite_float(value: object) -> float | None:
-        """Returns a finite float > 0, rejecting bools, non-numeric values, and overflows."""
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if not math.isfinite(parsed) or parsed <= 0:
-            return None
-        return parsed
-
-    @classmethod
-    def _parse_pending_reload_payload(
-        cls,
-        raw_payload: object,
-    ) -> tuple[str, float, float, str] | None:
-        """Validates pending_reload.json schema, returning (target, requested_at, ttl, reason) or None."""
-        if not isinstance(raw_payload, dict):
-            return None
-
-        raw_target = raw_payload.get("target_account")
-        if not isinstance(raw_target, str) or not raw_target.strip():
-            return None
-
-        requested_at = cls._parse_positive_finite_float(raw_payload.get("requested_at"))
-        if requested_at is None:
-            return None
-
-        raw_ttl = raw_payload.get("ttl_seconds")
-        if raw_ttl is None:
-            ttl_seconds = 120.0
-        else:
-            parsed_ttl = cls._parse_positive_finite_float(raw_ttl)
-            if parsed_ttl is None:
-                return None
-            ttl_seconds = parsed_ttl
-
-        raw_reason = raw_payload.get("reason")
-        reason = (
-            raw_reason.strip()
-            if isinstance(raw_reason, str) and raw_reason.strip()
-            else "in_turn_deferred_reload"
-        )
-        return raw_target.strip(), requested_at, ttl_seconds, reason
 
     def _unlink_pending_reload_safe(
         self,
@@ -944,24 +794,17 @@ class LogWatcher:
         pending_path = self._resolve_pending_reload_path()
         if pending_path is None:
             return False
-        try:
-            st = os.lstat(pending_path)
-        except (FileNotFoundError, OSError):
+        raw_payload, status = read_json_dict_nofollow(pending_path)
+        if status in ("missing", "non_regular", "io_error"):
             return False
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            return False
-        try:
-            raw_payload: object = json.loads(pending_path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError) as exc:
+        if status in ("parse_error", "not_dict"):
             self._safe_stderr_write(
-                f"[watch] Pruning corrupt pending reload marker '{pending_path}': {exc}"
+                f"[watch] Pruning corrupt pending reload marker '{pending_path}': invalid JSON payload"
             )
             self._unlink_pending_reload_safe(pending_path, "corrupt pending reload marker")
             return False
-        except OSError:
-            return False
 
-        parsed = self._parse_pending_reload_payload(raw_payload)
+        parsed = parse_pending_reload_payload(raw_payload)
         if parsed is None:
             self._safe_stderr_write(
                 f"[watch] Pruning corrupt pending reload marker '{pending_path}': invalid payload schema"
@@ -969,7 +812,10 @@ class LogWatcher:
             self._unlink_pending_reload_safe(pending_path, "corrupt pending reload marker")
             return False
 
-        target_account, requested_at, ttl_seconds, reason = parsed
+        target_account = parsed["target_account"]
+        requested_at = parsed["requested_at"]
+        ttl_seconds = float(parsed["ttl_seconds"])
+        reason = parsed["reason"]
         now = float(_get_time().time())
         if now - requested_at > ttl_seconds:
             self._safe_stderr_write(
@@ -1009,25 +855,7 @@ class LogWatcher:
         return True
 
     def _dispatch_http_post(self, url: str, data: bytes, label: str) -> threading.Thread | None:
-        def _send() -> None:
-            try:
-                req = urllib.request.Request(
-                    url, data=data, headers={"Content-Type": "application/json", "User-Agent": "agy-switcher-watcher/1.0"}, method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
-                    resp.read()
-            except (ssl.SSLError, urllib.error.URLError, ValueError, ConnectionError, OSError, Exception) as e:
-                getattr(e, "close", lambda: None)()
-                logger.warning("[watch] %s alert dispatch failed: %s", label, e)
-                print(f"[watch] {label} alert dispatch failed: {e}", file=sys.stderr)
-        try:
-            t = threading.Thread(target=_send, name=f"watcher-{label.lower()}-alert", daemon=True)
-            t.start()
-            return t
-        except Exception as e:
-            logger.warning("[watch] Failed to spawn %s alert thread: %s", label, e)
-            print(f"[watch] Failed to spawn {label} alert thread: {e}", file=sys.stderr)
-            return None
+        return dispatch_http_post(url, data, label, log=logger)
 
     def dispatch_alert(
         self, previous_account: str, new_account: str, model_hint: str | None = None, timestamp: str | None = None
@@ -1213,7 +1041,12 @@ class LogWatcher:
             return False
         print(f"[watch] Switching from '{active_name}' to '{target_account}' mid-turn...", file=sys.stderr)
         try:
-            res = self.engine.switch_tokens(target_account, restart_server=True, force=True)
+            res = self.engine.switch_tokens(
+                target_account,
+                restart_server=True,
+                force=True,
+                clear_failover=False,
+            )
             if self._is_switch_failed(res, target_account):
                 err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
                 print(f"[watch] Failed to switch accounts to '{target_account}': {err_msg}", file=sys.stderr)
@@ -1295,43 +1128,7 @@ class LogWatcher:
                     target_path = None
         if not target_path or not target_path.is_file():
             return None
-        try:
-            size = target_path.stat().st_size
-            if size == 0:
-                return None
-            # Bounded expanding backward window to accommodate large prompts/responses (>64KB)
-            max_read = 4 * 1024 * 1024
-            chunk_size = min(size, 65536)
-            with open(target_path, "rb") as f:
-                while True:
-                    f.seek(max(0, size - chunk_size))
-                    data = f.read(min(chunk_size, size))
-                    lines = data.splitlines()
-                    last_line_str: str | None = None
-                    for line in reversed(lines):
-                        s = line.strip().decode("utf-8", errors="replace")
-                        if s:
-                            last_line_str = s
-                            break
-                    if not last_line_str:
-                        return None
-                    if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
-                        chunk_size = min(size, chunk_size * 4, max_read)
-                        continue
-                    if not last_line_str.startswith("{"):
-                        return None
-                    try:
-                        parsed = json.loads(last_line_str)
-                        if isinstance(parsed, dict):
-                            return cast(dict[str, Any], parsed)
-                        return None
-                    except json.JSONDecodeError:
-                        if chunk_size < size and chunk_size < max_read:
-                            chunk_size = min(size, chunk_size * 4, max_read)
-                            continue
-                        return None
-        except OSError:
-            return None
+        return read_latest_jsonl_record(target_path)
 
     def _is_server_busy(self) -> bool:
         """Checks if language_server has active presence locks or busy child tasks."""
@@ -1500,7 +1297,12 @@ class LogWatcher:
             best_standby, best_quota = candidates[0]
             print(f"[watch] Proactive threshold failover: Active account '{active_name}' quota ({active_quota_fraction * 100:.1f}% <= {threshold * 100:.1f}%) at Safe Turn Boundary. Rotating to '{best_standby}' ({best_quota * 100:.1f}% quota).", file=sys.stderr)
             try:
-                res = self.engine.switch_tokens(best_standby, restart_server=True, force=True)
+                res = self.engine.switch_tokens(
+                    best_standby,
+                    restart_server=True,
+                    force=True,
+                    clear_failover=False,
+                )
                 if self._is_switch_failed(res, best_standby):
                     err_msg = res.get("error", "unsuccessful") if isinstance(res, dict) else f"switch_tokens returned {res}"
                     print(f"[watch] Failed to proactively switch accounts to '{best_standby}': {err_msg}", file=sys.stderr)
@@ -1807,56 +1609,7 @@ class DaemonManager:
 
     def _is_watch_cmdline(self, pid: int) -> bool:
         """Validates /proc/<pid>/cmdline if accessible to prevent killing arbitrary processes."""
-        if not self.proc_dir.is_dir():
-            return True
-        cmdline_file = self.proc_dir / str(pid) / "cmdline"
-        if not cmdline_file.is_file():
-            return False
-        try:
-            raw = cmdline_file.read_bytes()
-        except OSError:
-            return False
-        raw_args = [a for a in raw.split(b"\x00") if a] if raw else []
-        if not raw_args:
-            return False
-        args = [a.decode("utf-8", errors="replace").strip() for a in raw_args]
-        argv0 = os.path.basename(args[0]).lower()
-        is_python = argv0.startswith(("python", "pypy"))
-        is_agyswitch = "agy-switch" in argv0 or "agy_switch" in argv0
-        if not (is_python or is_agyswitch):
-            return False
-        script_name = self.watch_script.name.lower() if self.watch_script else ""
-        if is_python:
-            target_script = None
-            skip_next = False
-            for arg in args[1:]:
-                if skip_next:
-                    skip_next = False
-                elif arg == "-m":
-                    target_script = "-m"
-                    break
-                elif arg == "-c":
-                    return False
-                elif arg.startswith("-"):
-                    if arg in ("-w", "-x"):
-                        skip_next = True
-                    continue
-                else:
-                    target_script = os.path.basename(arg).lower()
-                    break
-            if not target_script:
-                return False
-            full_cmd = " ".join(args).lower()
-            if target_script == "-m":
-                return "watch" in full_cmd and "run" in full_cmd
-            matches_script = (
-                (bool(script_name) and target_script == script_name)
-                or target_script in ("watch.py", "watcher.py", "agy_switch.py")
-                or "agy-switch" in target_script or "agy_switch" in target_script
-            )
-            return matches_script and ("run" in full_cmd or "watch" in full_cmd or bool(script_name and script_name in full_cmd))
-        args_lower = [a.lower() for a in args]
-        return "watch" in args_lower or "run" in args_lower
+        return is_watch_process_cmdline(self.proc_dir, pid, self.watch_script)
 
     def is_process_alive(self, pid: int) -> bool:
         """Checks if PID exists, belongs to current user, and represents an active watch process."""

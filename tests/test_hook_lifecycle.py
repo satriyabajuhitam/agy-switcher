@@ -1401,7 +1401,9 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertEqual(ret, 0)
         # Succeeded in failover to acc2
         self.assertEqual(self.engine.get_active_name(), "acc2")
-        spy_switch.assert_called_once_with("acc2", restart_server=False, force=True)
+        spy_switch.assert_called_once_with(
+            "acc2", restart_server=False, force=True, clear_failover=False
+        )
 
         output = json.loads(out_capture.getvalue())
         self.assertIn("injectSteps", output)
@@ -3281,7 +3283,9 @@ class TestHookFailoverAuditDualPersistence(unittest.TestCase):
 
         self.assertEqual(ret, 0)
         self.assertEqual(self.engine.get_active_name(), "honey")
-        spy_switch.assert_called_once_with("honey", restart_server=False, force=True)
+        spy_switch.assert_called_once_with(
+            "honey", restart_server=False, force=True, clear_failover=False
+        )
 
         # 1. Verify watch.log structured chronological entry (mode 0600)
         watch_log = self.vault_dir / "watch.log"
