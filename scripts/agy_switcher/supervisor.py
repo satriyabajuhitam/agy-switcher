@@ -271,7 +271,7 @@ class ProcessSupervisor:
             if parsed is None:
                 return False
             _, ppid = parsed
-            if ppid <= 0 or ppid == cur_pid:
+            if ppid <= 0 or ppid in visited:
                 return False
             cur_pid = ppid
 

@@ -719,8 +719,10 @@ class TestProcessSupervisor(unittest.TestCase):
         state: str = "S",
         cmdline: bytes | None = None,
         raw_stat: str | None = None,
+        proc_dir: Path | None = None,
     ) -> None:
-        p_dir = self.proc_dir / str(proc_pid)
+        base_dir = proc_dir or self.proc_dir
+        p_dir = base_dir / str(proc_pid)
         p_dir.mkdir(parents=True, exist_ok=True)
         if raw_stat is not None:
             (p_dir / "stat").write_text(raw_stat, encoding="utf-8")
@@ -871,6 +873,72 @@ class TestProcessSupervisor(unittest.TestCase):
 
         # Starting at 1001 puts 1065 at exactly 64 hops -> detected
         self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=1001))
+
+    def test_is_invoked_by_language_server_ancestry_cycle_and_depth_bound(self):
+        """[DEFER-RELOAD-EDGE-001] Terminates deterministically on ppid cycle or >64 hops."""
+        orig_read_bytes = Path.read_bytes
+
+        with self.subTest("cyclic_ppid_loop_100_101_100"):
+            proc_cycle = Path(self.temp_dir.name) / "proc_cycle"
+            proc_cycle.mkdir(parents=True, exist_ok=True)
+            self._write_proc_node(100, ppid=101, comm="loop-a", proc_dir=proc_cycle)
+            self._write_proc_node(101, ppid=100, comm="loop-b", proc_dir=proc_cycle)
+            cycle_sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=proc_cycle)
+
+            read_counts: dict[Path, int] = {}
+
+            def tracked_read_bytes(path_obj: Path) -> bytes:
+                read_counts[path_obj] = read_counts.get(path_obj, 0) + 1
+                return orig_read_bytes(path_obj)
+
+            with patch.object(Path, "read_bytes", side_effect=tracked_read_bytes, autospec=True):
+                self.assertFalse(cycle_sup.is_invoked_by_language_server(current_pid=100))
+
+            self.assertLessEqual(read_counts.get(proc_cycle / "100" / "stat", 0), 1)
+            self.assertLessEqual(read_counts.get(proc_cycle / "101" / "stat", 0), 1)
+            self.assertLessEqual(read_counts.get(proc_cycle / "100" / "cmdline", 0), 1)
+            self.assertLessEqual(read_counts.get(proc_cycle / "101" / "cmdline", 0), 1)
+
+        with self.subTest("ancestry_chain_exceeding_64_hops_from_pid_100"):
+            proc_deep = Path(self.temp_dir.name) / "proc_deep"
+            proc_deep.mkdir(parents=True, exist_ok=True)
+            for cur in range(100, 170):
+                self._write_proc_node(cur, ppid=cur + 1, comm=f"hop-{cur - 100}", proc_dir=proc_deep)
+            self._write_proc_node(170, ppid=1, comm="root", proc_dir=proc_deep)
+            deep_sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=proc_deep)
+
+            # 70-hop chain with no language_server terminates cleanly at hop 64 as False
+            self.assertFalse(deep_sup.is_invoked_by_language_server(current_pid=100))
+
+            # Placing language_server beyond the 64-hop limit (at hop 65 = PID 165) is not reached
+            self._write_proc_node(
+                165,
+                ppid=166,
+                comm="language_server",
+                cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+                proc_dir=proc_deep,
+            )
+            deep_reads: list[Path] = []
+
+            def tracked_deep_reads(path_obj: Path) -> bytes:
+                deep_reads.append(path_obj)
+                return orig_read_bytes(path_obj)
+
+            with patch.object(Path, "read_bytes", side_effect=tracked_deep_reads, autospec=True):
+                self.assertFalse(deep_sup.is_invoked_by_language_server(current_pid=100))
+
+            self.assertNotIn(proc_deep / "164" / "stat", deep_reads)
+            self.assertNotIn(proc_deep / "165" / "cmdline", deep_reads)
+
+            # Placing language_server at exactly 64 hops (PID 164) is within the bound
+            self._write_proc_node(
+                164,
+                ppid=165,
+                comm="language_server",
+                cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+                proc_dir=proc_deep,
+            )
+            self.assertTrue(deep_sup.is_invoked_by_language_server(current_pid=100))
 
     def test_is_invoked_by_language_server_pid_matching_and_non_descendant(self):
         """Matches explicit target pid in lineage and returns False for non-descendants."""
