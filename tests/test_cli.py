@@ -2615,5 +2615,374 @@ class TestCLIInTurnDeferredReload(unittest.TestCase):
             self.assertIn("Restarted language_server", auto_stdout.getvalue())
 
 
+class TestFormatterDesyncVisibility(unittest.TestCase):
+    """Tests for [SYNC-VIS-001..003], [SYNC-VIS-ERR-001/003], and [SYNC-VIS-EDGE-001..003]."""
+
+    def _base_accounts_payload(self, active: str | None = "honey") -> dict:
+        return {
+            "active": active,
+            "accounts": [
+                {
+                    "name": "honey",
+                    "email": "honey@example.com",
+                    "is_active": active == "honey",
+                    "valid": True,
+                },
+                {
+                    "name": "automator",
+                    "email": "automator@example.com",
+                    "is_active": active == "automator",
+                    "valid": True,
+                },
+            ],
+        }
+
+    def test_desync_visibility_synced_status_and_clean_list_outputs(self) -> None:
+        """[SYNC-VIS-001] Synced sync_status renders synced credential status in status and preserves clean list output."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        sync_ok = {
+            "in_sync": True,
+            "desktop_synced": True,
+            "cli_synced": True,
+            "drifted_targets": [],
+            "desktop_email": "honey@example.com",
+            "cli_email": "honey@example.com",
+        }
+        status_payload = {
+            "active": "honey",
+            "email": "honey@example.com",
+            "server_running": True,
+            "server_pid": 4242,
+            "server_busy": False,
+            "sync_status": sync_ok,
+        }
+        status_out = format_status_report(status_payload)
+        self.assertIn("Synced", status_out)
+        self.assertIn("Desktop", status_out)
+        self.assertIn("CLI", status_out)
+        self.assertNotIn("out of sync", status_out.lower())
+        self.assertNotIn("warning", status_out.lower())
+        self.assertNotIn("doctor --fix", status_out)
+        self.assertNotIn("Pending Reload", status_out)
+
+        list_payload = self._base_accounts_payload("honey")
+        list_payload_synced = {**list_payload, "sync_status": sync_ok}
+        self.assertEqual(
+            format_accounts_table(list_payload_synced, show_quota=False),
+            format_accounts_table(list_payload, show_quota=False),
+        )
+        self.assertEqual(
+            format_accounts_listicle(list_payload_synced, show_quota=False),
+            format_accounts_listicle(list_payload, show_quota=False),
+        )
+
+    def test_desync_visibility_desktop_drift_and_pending_reload_across_all_formatters(self) -> None:
+        """[SYNC-VIS-002] [SYNC-VIS-003] Desktop drift + pending_reload renders surface, email, remediation, and Pending Reload."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        sync_desktop_drift = {
+            "in_sync": False,
+            "desktop_synced": False,
+            "cli_synced": True,
+            "drifted_targets": ["desktop"],
+            "desktop_email": "automator@example.com",
+            "cli_email": "honey@example.com",
+        }
+        pending = {
+            "target_account": "honey",
+            "requested_at": 1791200000.0,
+            "ttl_seconds": 1800,
+            "reason": "desktop_drift_on_token_refresh",
+        }
+
+        status_out = format_status_report(
+            {
+                "active": "honey",
+                "email": "honey@example.com",
+                "server_running": True,
+                "server_pid": 4242,
+                "server_busy": True,
+                "sync_status": sync_desktop_drift,
+                "pending_reload": pending,
+            }
+        )
+        list_payload = {
+            **self._base_accounts_payload("honey"),
+            "sync_status": sync_desktop_drift,
+            "pending_reload": pending,
+        }
+        table_out = format_accounts_table(list_payload, show_quota=False)
+        listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+
+        for label, rendered in (
+            ("status", status_out),
+            ("table", table_out),
+            ("listicle", listicle_out),
+            ("table_quota", format_accounts_table(list_payload, show_quota=True)),
+            ("listicle_quota", format_accounts_listicle(list_payload, show_quota=True)),
+        ):
+            with self.subTest(view=label):
+                self.assertIn("Desktop", rendered)
+                self.assertIn("automator@example.com", rendered)
+                self.assertIn("honey", rendered)
+                self.assertIn("agy-switch doctor --fix", rendered)
+                self.assertIn("agy-switch switch honey", rendered)
+                self.assertIn("Pending Reload", rendered)
+                self.assertIn("1800s", rendered)
+                # Verify CLI is not falsely listed as drifted in the warning line
+                warning_lines = [
+                    line for line in rendered.splitlines()
+                    if "out of sync" in line.lower()
+                ]
+                self.assertEqual(len(warning_lines), 1)
+                self.assertNotIn("CLI", warning_lines[0])
+
+    def test_desync_visibility_cli_only_drift_and_cli_subcommands(self) -> None:
+        """CLI-only drift names CLI (not Desktop) and main() status/list render desync and pending_reload cleanly."""
+        sync_cli_drift = {
+            "in_sync": False,
+            "desktop_synced": True,
+            "cli_synced": False,
+            "drifted_targets": ["cli"],
+            "desktop_email": "honey@example.com",
+            "cli_email": "stale-cli@example.com",
+        }
+        pending = {
+            "target_account": "honey",
+            "requested_at": 1791200000.0,
+            "ttl_seconds": 1800,
+            "reason": "in_turn_deferred_reload",
+        }
+        mock_engine = MagicMock(spec=AgySwitchEngine)
+        mock_engine.get_status.return_value = {
+            "active": "honey",
+            "email": "honey@example.com",
+            "server_running": False,
+            "server_pid": None,
+            "server_busy": False,
+            "sync_status": sync_cli_drift,
+            "pending_reload": pending,
+        }
+        mock_engine.list_accounts.return_value = {
+            **self._base_accounts_payload("honey"),
+            "sync_status": sync_cli_drift,
+            "pending_reload": pending,
+        }
+
+        with patch("agy_switch.QuotaClient") as mock_qc_cls:
+            mock_qc = mock_qc_cls.return_value
+            mock_qc.load_cache.return_value = {"timestamp": 10**12, "accounts": {}}
+            for argv in (["status"], ["list"], ["list", "--format", "list"]):
+                buf = io.StringIO()
+                with patch("sys.stdout", buf):
+                    rc = main(argv, engine=mock_engine)
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                warning_lines = [line for line in out.splitlines() if "out of sync" in line.lower()]
+                self.assertEqual(len(warning_lines), 1)
+                self.assertIn("CLI (stale-cli@example.com)", warning_lines[0])
+                self.assertNotIn("Desktop", warning_lines[0])
+                self.assertIn("Pending Reload", out)
+                self.assertIn("1800s", out)
+
+        json_buf = io.StringIO()
+        with patch("sys.stdout", json_buf):
+            rc_json = main(["list", "--json"], engine=mock_engine)
+        self.assertEqual(rc_json, 0)
+        parsed = json.loads(json_buf.getvalue())
+        self.assertEqual(parsed["sync_status"]["drifted_targets"], ["cli"])
+        self.assertEqual(parsed["pending_reload"]["target_account"], "honey")
+
+    def test_desync_visibility_dual_surface_drift_with_and_without_emails(self) -> None:
+        """[SYNC-VIS-EDGE-002] [SYNC-VIS-ERR-001] Dual-surface drift names both Desktop and CLI cleanly."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        for case_name, d_email, c_email in (
+            ("with_emails", "stale@example.com", "stale@example.com"),
+            ("corrupt_or_missing_no_emails", None, None),
+        ):
+            with self.subTest(case=case_name):
+                sync_dual = {
+                    "in_sync": False,
+                    "desktop_synced": False,
+                    "cli_synced": False,
+                    "drifted_targets": ["desktop", "cli"],
+                    "desktop_email": d_email,
+                    "cli_email": c_email,
+                }
+                status_out = format_status_report(
+                    {
+                        "active": "honey",
+                        "email": "honey@example.com",
+                        "server_running": False,
+                        "sync_status": sync_dual,
+                    }
+                )
+                list_payload = {
+                    **self._base_accounts_payload("honey"),
+                    "sync_status": sync_dual,
+                }
+                table_out = format_accounts_table(list_payload, show_quota=False)
+                listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+
+                for view_name, rendered in (
+                    ("status", status_out),
+                    ("table", table_out),
+                    ("listicle", listicle_out),
+                ):
+                    with self.subTest(view=view_name):
+                        warning_lines = [
+                            line for line in rendered.splitlines()
+                            if "out of sync" in line.lower()
+                        ]
+                        self.assertEqual(len(warning_lines), 1)
+                        self.assertIn("Desktop", warning_lines[0])
+                        self.assertIn("CLI", warning_lines[0])
+                        self.assertIn("honey", warning_lines[0])
+                        self.assertIn("agy-switch doctor --fix", rendered)
+                        if d_email:
+                            self.assertIn(d_email, warning_lines[0])
+                        else:
+                            self.assertNotIn("(None)", warning_lines[0])
+
+    def test_pending_reload_rendered_when_disk_in_sync_across_list_and_status(self) -> None:
+        """[SYNC-VIS-EDGE-003] Queued pending_reload renders across table, listicle, and status even when in_sync=True."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        sync_ok = {
+            "in_sync": True,
+            "desktop_synced": True,
+            "cli_synced": True,
+            "drifted_targets": [],
+            "desktop_email": "honey@example.com",
+            "cli_email": "honey@example.com",
+        }
+        pending = {
+            "target_account": "honey",
+            "requested_at": 1791200000.0,
+            "ttl_seconds": 1800,
+            "reason": "in_turn_deferred_reload",
+        }
+        status_out = format_status_report(
+            {
+                "active": "honey",
+                "email": "honey@example.com",
+                "server_running": True,
+                "server_pid": 5150,
+                "server_busy": True,
+                "sync_status": sync_ok,
+                "pending_reload": pending,
+            }
+        )
+        list_payload = {
+            **self._base_accounts_payload("honey"),
+            "sync_status": sync_ok,
+            "pending_reload": pending,
+        }
+        table_out = format_accounts_table(list_payload, show_quota=False)
+        listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+
+        for view_name, rendered in (
+            ("status", status_out),
+            ("table", table_out),
+            ("listicle", listicle_out),
+        ):
+            with self.subTest(view=view_name):
+                self.assertIn("Pending Reload", rendered)
+                self.assertIn("honey", rendered)
+                self.assertIn("1800s", rendered)
+                self.assertNotIn("out of sync", rendered.lower())
+                self.assertNotIn("doctor --fix", rendered)
+
+    def test_desync_visibility_malformed_and_no_active_account_graceful_degradation(self) -> None:
+        """[SYNC-VIS-ERR-003] [SYNC-VIS-EDGE-001] Omitted, None, malformed metadata and missing active account degrade cleanly."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        malformed_variants: list[tuple[str, dict]] = [
+            ("omitted", {}),
+            ("none_values", {"sync_status": None, "pending_reload": None}),
+            ("string_values", {"sync_status": "invalid", "pending_reload": "invalid"}),
+            (
+                "bad_types",
+                {
+                    "sync_status": {"in_sync": "bad", "drifted_targets": 123},
+                    "pending_reload": {"target_account": 123, "ttl_seconds": "bad"},
+                },
+            ),
+            (
+                "contradictory_in_sync_true",
+                {
+                    "sync_status": {"in_sync": True, "drifted_targets": ["desktop"]},
+                    "pending_reload": {"target_account": True},
+                },
+            ),
+            (
+                "empty_drifted_targets_false",
+                {
+                    "sync_status": {"in_sync": False, "drifted_targets": []},
+                    "pending_reload": [],
+                },
+            ),
+        ]
+
+        for label, extra in malformed_variants:
+            with self.subTest(malformed=label):
+                status_out = format_status_report(
+                    {"active": "honey", "email": "honey@example.com", "server_running": False, **extra}
+                )
+                list_payload = {**self._base_accounts_payload("honey"), **extra}
+                table_out = format_accounts_table(list_payload, show_quota=False)
+                listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+                for rendered in (status_out, table_out, listicle_out):
+                    self.assertNotIn("out of sync", rendered.lower())
+                    self.assertNotIn("Pending Reload", rendered)
+                    self.assertNotIn("doctor --fix", rendered)
+
+        for active_val in (None, "", "   "):
+            with self.subTest(active=repr(active_val)):
+                stale_sync = {
+                    "in_sync": False,
+                    "desktop_synced": False,
+                    "cli_synced": False,
+                    "drifted_targets": ["desktop", "cli"],
+                }
+                status_out = format_status_report(
+                    {"active": active_val, "server_running": False, "sync_status": stale_sync}
+                )
+                self.assertIn("None (No account active)", status_out)
+                self.assertNotIn("out of sync", status_out.lower())
+                self.assertNotIn("doctor --fix", status_out)
+
+                list_payload = {**self._base_accounts_payload(None), "active": active_val, "sync_status": stale_sync}
+                for rendered in (
+                    format_accounts_table(list_payload, show_quota=False),
+                    format_accounts_listicle(list_payload, show_quota=False),
+                ):
+                    self.assertIn("No account currently active", rendered)
+                    self.assertNotIn("out of sync", rendered.lower())
+                    self.assertNotIn("doctor --fix", rendered)
+
+
 if __name__ == '__main__':
     unittest.main()
