@@ -42,7 +42,7 @@ or:
 ```bash
 ~/.local/bin/agy-switch status
 ```
-Report the active account and available standby accounts clearly to the user.
+Report the active account and available standby accounts clearly to the user. Both commands perform local-only **Vault-Authoritative Sync** checks against `~/.antigravity-vault/` and surface explicit desync warnings (remediate with `agy-switch doctor --fix` or `agy-switch switch <active>`) or queued `Pending Reload` notices when present.
 
 ### Procedure B: When User asks to check quota (e.g. "Cek kuota", "Berapa sisa kuota?")
 Run via `run_command`:
@@ -71,19 +71,19 @@ Or to let the engine auto-rotate based on intelligent thresholds:
 > [!CAUTION]
 > **Active Turn Safety & Deferred Safe-Turn Reload**:
 > - If Antigravity is actively processing an agent turn or background task, `agy-switch switch <name>` (without `--force`) will return exit code 2. Never pass `--force` unless the user explicitly requests a forced switch or confirms the switch.
-> - When `agy-switch switch <name> --force` or `agy-switch switch --auto` is invoked **inside an active agent turn** (descendant of `language_server`), `agy-switch` automatically activates **Deferred Safe-Turn Reload**: it performs an atomic **Disk-Only Swap** and queues `cache/pending_reload.json` (TTL 120s) without killing the parent `language_server` mid-turn.
+> - When `agy-switch switch <name> --force` or `agy-switch switch --auto` is invoked **inside an active agent turn** (descendant of `language_server`), `agy-switch` automatically activates **Deferred Safe-Turn Reload**: it performs an atomic **Disk-Only Swap** and queues `cache/pending_reload.json` (TTL 1800s (30m)) without killing the parent `language_server` mid-turn.
 > - Do **NOT** pass `--force-restart-now` during an active agent turn—forcing an immediate mid-turn server kill terminates your own `language_server` ancestor and aborts the turn (`--force-restart-now` is strictly reserved as an emergency user override).
 > - If `LogWatcher` is inactive when a deferred switch completes, inform the user that credentials have been updated on disk and advise reloading the Desktop server (or running `agy-switch watch start`) after the turn completes.
 
 ### Procedure D: When User hits quota exhaustion or requests best account
 1. Run `~/.local/bin/agy-switch switch --auto`.
-2. When invoked mid-turn, `switch --auto` safely completes a Disk-Only Swap and writes `cache/pending_reload.json` (TTL 120s) so `LogWatcher` reloads `language_server` at the Safe Turn Boundary—never pass `--force-restart-now` or kill `language_server` mid-turn.
+2. When invoked mid-turn, `switch --auto` safely completes a Disk-Only Swap and writes `cache/pending_reload.json` (TTL 1800s (30m)) so `LogWatcher` reloads `language_server` at the Safe Turn Boundary—never pass `--force-restart-now` or kill `language_server` mid-turn.
 3. Inform the user that the rotation engine has evaluated the quotas and selected the optimal account based on `cache_optimized`, `drain_window`, and `imminent_reset` heuristics. If CLI output notes that `LogWatcher` is inactive, advise the user to reload the Desktop server after the turn completes.
 
 ---
 
 ## 3. Negative Constraints (What NOT To Do)
 
-* ❌ **DO NOT edit token files directly**: Never overwrite `~/.gemini/jetski-standalone-oauth-token` or `~/.gemini/antigravity-cli/antigravity-oauth-token` manually. Always use `agy-switch switch`.
+* ❌ **DO NOT edit token files directly or adopt Desktop state**: `~/.antigravity-vault/` is the single canonical source of truth (**Vault-Authoritative Sync**). Never overwrite `~/.gemini/jetski-standalone-oauth-token` or `~/.gemini/antigravity-cli/antigravity-oauth-token` manually; always use `agy-switch switch` or `agy-switch doctor --fix`.
 * ❌ **DO NOT kill language_server blindly**: Always let `agy-switch` handle `SIGTERM` signals and respawn polling.
 * ❌ **DO NOT delete ~/.antigravity-vault**: Credentials and active markers reside there with `0600` permissions.
