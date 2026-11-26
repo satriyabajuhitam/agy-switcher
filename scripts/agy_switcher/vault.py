@@ -11,6 +11,7 @@ Does not import Layer 3 (hook) or Layer 4 (cli).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -29,12 +30,13 @@ import tarfile
 import tempfile
 import threading
 import time
-from typing import Any, Callable, cast
+from typing import Any, Callable, Iterator, cast
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from agy_switcher.exceptions import (
+    AccountAuthError,
     AccountNotFoundError,
     ActiveTurnRunningError,
     AgySwitchError,
@@ -54,6 +56,7 @@ from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.telemetry import (
     _parse_timestamp_defensive,
     normalize_model_name,
+    probe_account_auth,
 )
 from agy_switcher.doctor import DoctorEngine
 
@@ -947,35 +950,73 @@ class AgySwitchEngine:
             "accounts": accounts,
         }
 
+    def _available_account_names(self) -> list[str]:
+        if not self.accounts_dir.is_dir():
+            return []
+        return sorted(
+            p.name for p in self.accounts_dir.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+
     def switch_tokens(
         self,
         name: str,
         restart_server: bool = True,
         force: bool = False,
+        verify_auth: bool = False,
+        force_restart_now: bool = False,
     ) -> dict[str, Any]:
         """Atomically switches active tokens across both Antigravity 2.0 and CLI surfaces."""
-        acc_dir = self.accounts_dir / name
-        token_file = acc_dir / "token.json"
+        clean_name = name.strip() if isinstance(name, str) else ""
+        is_safe_name = bool(
+            clean_name
+            and "/" not in clean_name
+            and "\\" not in clean_name
+            and ".." not in clean_name
+            and "\x00" not in clean_name
+            and clean_name not in (".", "..")
+        )
+        acc_dir = self.accounts_dir / clean_name if is_safe_name else None
+        token_file = acc_dir / "token.json" if acc_dir is not None else None
 
-        if not acc_dir.is_dir() or not token_file.is_file():
-            available = sorted(
-                p.name for p in self.accounts_dir.iterdir()
-                if p.is_dir() and not p.name.startswith(".")
-            ) if self.accounts_dir.is_dir() else []
+        # Pre-flight (1): Verify target account directory and token.json exist
+        if acc_dir is None or token_file is None or not acc_dir.is_dir() or not token_file.is_file():
+            available = self._available_account_names()
             raise AccountNotFoundError(
-                f"Account '{name}' not found in vault ({self.accounts_dir}). "
+                f"Account '{clean_name or name}' not found in vault ({self.accounts_dir}). "
                 f"Available accounts: {', '.join(available) or 'None'}"
             )
 
-        # Validate token payload before touching live target files
+        # Pre-flight (2): Validate token JSON schema before touching live files or network
         token_data = self.validate_token_file(token_file)
+
+        # Pre-flight (3): Verify turn safety before mutating live target files or vault state
+        if restart_server:
+            self.verify_turn_safety(force=force)
+
+        # Pre-flight (4): Probe CloudCode auth when requested, failing closed on confirmed rejection
+        if verify_auth:
+            probe_res = probe_account_auth(self, clean_name)
+            if not probe_res.get("ok"):
+                err_detail = str(probe_res.get("error") or "CloudCode authentication rejected")
+                err_type = str(probe_res.get("error_type") or "auth")
+                self.record_auth_error(clean_name, error=err_detail, error_type=err_type)
+                raise AccountAuthError(
+                    f"Account '{clean_name}' failed pre-flight authentication ({err_detail}). "
+                    f"Run `agy-switch login {clean_name}` to re-authenticate."
+                )
+            if probe_res.get("refreshed"):
+                token_data = self.validate_token_file(token_file)
+            if not probe_res.get("fail_open"):
+                self.clear_auth_error(clean_name)
+
         token_payload = json.dumps(token_data, indent=2) + "\n"
 
         # 1 & 2. Update Antigravity 2.0 (WSL / Desktop) and CLI tokens atomically
         self._sync_tokens_to_targets(token_payload)
 
         # 3. Update vault active marker
-        self.set_active_name(name)
+        self.set_active_name(clean_name)
 
         # 4. Backward-compatibility bridge: Update ~/.agy-cli-manager/state.json if it exists
         legacy_state_file = self.legacy_root / "state.json"
@@ -983,7 +1024,7 @@ class AgySwitchEngine:
             try:
                 state_data = json.loads(legacy_state_file.read_text(encoding="utf-8"))
                 if isinstance(state_data, dict):
-                    state_data["active"] = name
+                    state_data["active"] = clean_name
                     self._atomic_write_json(legacy_state_file, state_data)
             except Exception:
                 pass
@@ -995,7 +1036,7 @@ class AgySwitchEngine:
             server_restarted = self.restart_language_server(force=force)
 
         return {
-            "active": name,
+            "active": clean_name,
             "email": email,
             "server_restarted": server_restarted,
         }
@@ -1455,6 +1496,32 @@ class AgySwitchEngine:
         """Polls until process with given pid has terminated."""
         return self.supervisor._poll_process_exit(pid, timeout=timeout)
 
+    @contextmanager
+    def _bridged_supervisor(self, attrs: tuple[str, ...]) -> Iterator[None]:
+        """Temporarily bridges instance-level monkey-patched attributes onto self.supervisor."""
+        saved: dict[str, Any] = {}
+        had_instance_attr: set[str] = set()
+        for attr in attrs:
+            if attr in self.__dict__:
+                if attr in self.supervisor.__dict__:
+                    had_instance_attr.add(attr)
+                    saved[attr] = self.supervisor.__dict__[attr]
+                setattr(self.supervisor, attr, getattr(self, attr))
+        try:
+            yield
+        finally:
+            for attr in attrs:
+                if attr in self.__dict__:
+                    if attr in had_instance_attr:
+                        setattr(self.supervisor, attr, saved[attr])
+                    else:
+                        self.supervisor.__dict__.pop(attr, None)
+
+    def verify_turn_safety(self, force: bool = False, pid: int | None = None) -> None:
+        """Validates that language_server is not actively executing a turn."""
+        with self._bridged_supervisor(("locate_language_server_pid", "is_server_busy")):
+            self.supervisor.verify_turn_safety(force=force, pid=pid)
+
     def restart_language_server(self, force: bool = False) -> bool:
         """Restarts language_server gracefully via SIGTERM so WSL Relay auto-respawns it.
 
@@ -1462,23 +1529,8 @@ class AgySwitchEngine:
         instance-level monkey-patched mocks on this engine instance.
         """
         bridge_attrs = ("_send_signal", "_poll_process_exit", "locate_language_server_pid", "is_server_busy")
-        saved = {}
-        had_instance_attr = set()
-        for attr in bridge_attrs:
-            if attr in self.__dict__:
-                if attr in self.supervisor.__dict__:
-                    had_instance_attr.add(attr)
-                    saved[attr] = self.supervisor.__dict__[attr]
-                setattr(self.supervisor, attr, getattr(self, attr))
-        try:
+        with self._bridged_supervisor(bridge_attrs):
             return self.supervisor.restart_language_server(force=force)
-        finally:
-            for attr in bridge_attrs:
-                if attr in self.__dict__:
-                    if attr in had_instance_attr:
-                        setattr(self.supervisor, attr, saved[attr])
-                    else:
-                        self.supervisor.__dict__.pop(attr, None)
 
     def get_status(self) -> dict[str, Any]:
         """Returns health and status of the vault and running language_server."""

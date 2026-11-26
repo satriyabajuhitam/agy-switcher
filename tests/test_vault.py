@@ -25,7 +25,12 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from agy_switcher.exceptions import InvalidTokenError
+from agy_switcher.exceptions import (
+    AccountAuthError,
+    AccountNotFoundError,
+    ActiveTurnRunningError,
+    InvalidTokenError,
+)
 from agy_switcher.vault import AgySwitchEngine, AgySwitchError
 
 
@@ -1521,6 +1526,321 @@ class TestAgySwitchEngine(unittest.TestCase):
              patch("sys.stderr", stderr_buf):
             self.engine.write_pending_reload("io-fail-acc", requested_at=1000.0)
         self.assertIn("Warning:", stderr_buf.getvalue())
+
+    def _register_test_account(
+        self,
+        engine: AgySwitchEngine,
+        alias: str,
+        email: str,
+        *,
+        refresh_token: str | None = None,
+    ) -> dict[str, object]:
+        payload = make_valid_token_payload(email=email)
+        if refresh_token is not None:
+            token_obj = cast(dict[str, object], payload["token"])
+            token_obj["refresh_token"] = refresh_token
+        acc_dir = engine.accounts_dir / alias
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return payload
+
+    def _setup_busy_proc_server(
+        self,
+        proc_dir: Path,
+        gemini_dir: Path,
+        server_pid: int = 45000,
+    ) -> Path:
+        presence_dir = gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / "active-turn.lock"
+        lock_file.write_text(f"pid: {server_pid}\n", encoding="utf-8")
+
+        pid_dir = proc_dir / str(server_pid)
+        fd_dir = pid_dir / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "cmdline").write_bytes(b"/opt/antigravity/bin/language_server\x00--standalone\x00")
+        (pid_dir / "stat").write_text(f"{server_pid} (language_server) S 1 {server_pid} 1 0 -1\n", encoding="utf-8")
+        (fd_dir / "3").symlink_to(lock_file)
+        return lock_file
+
+    def test_atomic_check_before_write_and_auth_gate_active_turn_rejection(self) -> None:
+        """[AUTH-GATE-ERR-001] ActiveTurnRunningError aborts switch_tokens before mutating Desktop/CLI/active/state.json."""
+        proc_dir = self.base_path / "proc_gate_err_001"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "standby-acc", "standby@example.com")
+
+        # Activate primary-acc and seed legacy state.json
+        engine.switch_tokens("primary-acc", restart_server=False)
+        legacy_state_file = self.legacy_root / "state.json"
+        legacy_state_file.write_text(
+            json.dumps({"active": "primary-acc", "accounts": {"primary-acc": {}, "standby-acc": {}}}),
+            encoding="utf-8",
+        )
+
+        desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+        active_before = engine.active_file.read_text(encoding="utf-8")
+        legacy_before = legacy_state_file.read_text(encoding="utf-8")
+
+        # Simulate external invocation while language_server holds an active presence lock
+        self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=45123)
+        self.assertTrue(engine.supervisor.is_server_busy())
+        self.assertFalse(engine.supervisor.is_invoked_by_language_server())
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens(
+                    "standby-acc",
+                    restart_server=True,
+                    force=False,
+                    verify_auth=False,
+                )
+            mock_urlopen.assert_not_called()
+
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+        self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+        self.assertEqual(engine.active_file.read_text(encoding="utf-8"), active_before)
+        self.assertEqual(engine.get_active_name(), "primary-acc")
+        self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+        self.assertFalse(engine.failover_state_file.exists())
+
+    def test_atomic_check_before_write_and_auth_gate_confirmed_rejection(self) -> None:
+        """[AUTH-GATE-ERR-002][AUTH-GATE-ERR-003] Confirmed 401/403 rejects before disk write or server restart."""
+        proc_dir = self.base_path / "proc_gate_err_002"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "healthy-acc", "healthy@example.com")
+        self._register_test_account(engine, "revoked-acc", "revoked@example.com")
+
+        engine.switch_tokens("healthy-acc", restart_server=False)
+        legacy_state_file = self.legacy_root / "state.json"
+        legacy_state_file.write_text(json.dumps({"active": "healthy-acc"}), encoding="utf-8")
+
+        desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+        active_before = engine.active_file.read_text(encoding="utf-8")
+        legacy_before = legacy_state_file.read_text(encoding="utf-8")
+
+        # Case 1: HTTP 403 -> refresh fails with 400 invalid_grant; force=True still enforces verify_auth=True
+        for force_flag in (False, True):
+            with self.subTest(case="http_403_invalid_grant", force=force_flag):
+                engine.failover_state_file.unlink(missing_ok=True)
+                err_403 = urllib.error.HTTPError(
+                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    403,
+                    "Forbidden",
+                    email.message.Message(),
+                    io.BytesIO(b"Forbidden"),
+                )
+                err_400 = urllib.error.HTTPError(
+                    "https://oauth2.googleapis.com/token",
+                    400,
+                    "Bad Request",
+                    email.message.Message(),
+                    io.BytesIO(b'{"error": "invalid_grant", "error_description": "Token has been revoked."}'),
+                )
+                with patch("urllib.request.urlopen", side_effect=[err_403, err_400]), \
+                     patch.object(engine, "restart_language_server") as mock_restart:
+                    with self.assertRaises(AccountAuthError) as ctx:
+                        engine.switch_tokens(
+                            "revoked-acc",
+                            restart_server=True,
+                            force=force_flag,
+                            verify_auth=True,
+                        )
+                    mock_restart.assert_not_called()
+
+                self.assertIn("agy-switch login revoked-acc", str(ctx.exception))
+                self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                self.assertEqual(engine.active_file.read_text(encoding="utf-8"), active_before)
+                self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+
+                self.assertTrue(engine.failover_state_file.is_file())
+                self.assertEqual(stat.S_IMODE(engine.failover_state_file.stat().st_mode), 0o600)
+                failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+                self.assertIn("revoked-acc", failover_state["auth_errors"])
+                self.assertEqual(failover_state["auth_errors"]["revoked-acc"]["error_type"], "auth")
+
+        # Case 2: HTTP 401 -> 1x refresh succeeds -> re-probe still returns 403 -> fails closed
+        engine.failover_state_file.unlink(missing_ok=True)
+        err_401 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "Unauthorized",
+            email.message.Message(),
+            io.BytesIO(b"Unauthorized"),
+        )
+        refresh_ok = _MockHTTPResponse(json.dumps({"access_token": "ya29.still_rejected", "expires_in": 3600}).encode("utf-8"))
+        err_403_retry = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+        with patch("urllib.request.urlopen", side_effect=[err_401, refresh_ok, err_403_retry]) as mock_urlopen, \
+             patch.object(engine, "restart_language_server") as mock_restart:
+            with self.assertRaises(AccountAuthError) as ctx:
+                engine.switch_tokens("revoked-acc", restart_server=True, verify_auth=True)
+            self.assertEqual(mock_urlopen.call_count, 3)
+            mock_restart.assert_not_called()
+
+        self.assertIn("agy-switch login revoked-acc", str(ctx.exception))
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+        self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+        self.assertEqual(engine.active_file.read_text(encoding="utf-8"), active_before)
+        self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+        failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+        self.assertIn("revoked-acc", failover_state["auth_errors"])
+
+    def test_atomic_check_before_write_and_auth_gate_preflight_order_refresh_and_fail_open(self) -> None:
+        """[AUTH-GATE-001][AUTH-GATE-002][AUTH-GATE-003][AUTH-GATE-004][AUTH-GATE-EDGE-001] Ordering, healthy restart, refresh sync, and fail-open."""
+        proc_dir = self.base_path / "proc_gate_order"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "base-acc", "base@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        self._register_test_account(engine, "ws-refresh-acc", "ws@example.com", refresh_token="   ")
+        corrupt_dir = engine.accounts_dir / "corrupt-acc"
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "token.json").write_text("{not-json", encoding="utf-8")
+
+        engine.switch_tokens("base-acc", restart_server=False)
+        desktop_base = engine.desktop_token_file.read_text(encoding="utf-8")
+
+        # 1. Missing, unsafe (path traversal / NUL byte), and invalid-token accounts fail before HTTP probe
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            for bad_alias in ("missing-acc", "../etc", "bad\x00alias"):
+                with self.assertRaises(AccountNotFoundError):
+                    engine.switch_tokens(bad_alias, restart_server=False, verify_auth=True)
+            with self.assertRaises(InvalidTokenError):
+                engine.switch_tokens("corrupt-acc", restart_server=False, verify_auth=True)
+            with self.assertRaises(InvalidTokenError):
+                engine.switch_tokens("ws-refresh-acc", restart_server=False, verify_auth=True)
+            mock_urlopen.assert_not_called()
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_base)
+
+        # 2. ActiveTurnRunningError fails before HTTP probe when restart_server=True, force=False, verify_auth=True
+        lock_file = self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=46000)
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens("work-acc", restart_server=True, force=False, verify_auth=True)
+            mock_urlopen.assert_not_called()
+        self.assertFalse(engine.failover_state_file.exists())
+        lock_file.unlink()
+        (proc_dir / "46000" / "fd" / "3").unlink()
+
+        # 3. Default verify_auth=False performs zero HTTP requests and preserves existing quarantine entries
+        engine.record_auth_error("work-acc", error="prior error", error_type="auth")
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            res_default = engine.switch_tokens("work-acc", restart_server=False)
+            mock_urlopen.assert_not_called()
+        self.assertEqual(res_default["active"], "work-acc")
+        self.assertIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+        # Switch back to base-acc before testing verify_auth=True flows
+        engine.switch_tokens("base-acc", restart_server=False)
+
+        quota_payload = json.dumps({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "five_hour",
+                            "remainingFraction": 0.9,
+                            "resetTime": "2026-12-31T23:59:59Z",
+                        }
+                    ],
+                }
+            ]
+        }).encode("utf-8")
+
+        # 4. [AUTH-GATE-001] Healthy pre-flight auth probe (HTTP 200) permits atomic token switch and server reload
+        with patch("urllib.request.urlopen", return_value=_MockHTTPResponse(quota_payload)) as mock_urlopen, \
+             patch.object(engine, "restart_language_server", return_value=True) as mock_restart:
+            res_healthy = engine.switch_tokens("work-acc", restart_server=True, force=False, verify_auth=True)
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_restart.assert_called_once_with(force=False)
+        self.assertTrue(res_healthy["server_restarted"])
+        self.assertEqual(res_healthy["active"], "work-acc")
+        self.assertNotIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+        # Switch back to base-acc before testing refresh sync and fail-open flows
+        engine.switch_tokens("base-acc", restart_server=False)
+
+        # 5. Expired access_token -> 401 -> refresh 200 -> re-probe 200 persists AND syncs fresh access_token
+        #    and clears any prior quarantine entry for work-acc
+        engine.record_auth_error("work-acc", error="HTTP 401", error_type="auth")
+        err_401 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "Unauthorized",
+            email.message.Message(),
+            io.BytesIO(b"Unauthorized"),
+        )
+        refresh_ok = _MockHTTPResponse(json.dumps({"access_token": "ya29.fresh_synced_token", "expires_in": 3600}).encode("utf-8"))
+        quota_ok = _MockHTTPResponse(quota_payload)
+
+        stderr_refresh = io.StringIO()
+        with patch("urllib.request.urlopen", side_effect=[err_401, refresh_ok, quota_ok]) as mock_urlopen, \
+             patch("sys.stderr", stderr_refresh):
+            res_refreshed = engine.switch_tokens("work-acc", restart_server=False, verify_auth=True)
+        self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertNotIn("failing open", stderr_refresh.getvalue())
+        self.assertEqual(res_refreshed["active"], "work-acc")
+        desktop_after_refresh = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        cli_after_refresh = json.loads(engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_after_refresh["token"]["access_token"], "ya29.fresh_synced_token")
+        self.assertEqual(cli_after_refresh["token"]["access_token"], "ya29.fresh_synced_token")
+        self.assertNotIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+        # 6. Transient HTTP 503, URLError, and TimeoutError fail open with stderr warning and complete switch
+        transient_errors: list[tuple[str, Exception]] = [
+            (
+                "http_503",
+                urllib.error.HTTPError(
+                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    503,
+                    "Service Unavailable",
+                    email.message.Message(),
+                    io.BytesIO(b"Unavailable"),
+                ),
+            ),
+            ("url_error", urllib.error.URLError("Temporary failure in name resolution")),
+            ("timeout_error", TimeoutError("timed out")),
+        ]
+        for label, exc in transient_errors:
+            with self.subTest(transient=label):
+                engine.switch_tokens("base-acc", restart_server=False)
+                engine.record_auth_error("work-acc", error="prior error", error_type="auth")
+                stderr_buf = io.StringIO()
+                with patch("urllib.request.urlopen", side_effect=exc), \
+                     patch("sys.stderr", stderr_buf):
+                    res_fail_open = engine.switch_tokens("work-acc", restart_server=False, verify_auth=True)
+                self.assertEqual(res_fail_open["active"], "work-acc")
+                self.assertIn("Warning:", stderr_buf.getvalue())
+                self.assertEqual(engine.get_active_name(), "work-acc")
+                # Fail-open must NOT clear prior quarantine entry
+                self.assertIn("work-acc", engine.load_failover_state()["auth_errors"])
 
 
 if __name__ == "__main__":
