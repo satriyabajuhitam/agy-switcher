@@ -875,6 +875,66 @@ class LogWatcher:
             return None
         return candidate
 
+    @staticmethod
+    def _parse_positive_finite_float(value: object) -> float | None:
+        """Returns a finite float > 0, rejecting bools, non-numeric values, and overflows."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed) or parsed <= 0:
+            return None
+        return parsed
+
+    @classmethod
+    def _parse_pending_reload_payload(
+        cls,
+        raw_payload: object,
+    ) -> tuple[str, float, float, str] | None:
+        """Validates pending_reload.json schema, returning (target, requested_at, ttl, reason) or None."""
+        if not isinstance(raw_payload, dict):
+            return None
+
+        raw_target = raw_payload.get("target_account")
+        if not isinstance(raw_target, str) or not raw_target.strip():
+            return None
+
+        requested_at = cls._parse_positive_finite_float(raw_payload.get("requested_at"))
+        if requested_at is None:
+            return None
+
+        raw_ttl = raw_payload.get("ttl_seconds")
+        if raw_ttl is None:
+            ttl_seconds = 120.0
+        else:
+            parsed_ttl = cls._parse_positive_finite_float(raw_ttl)
+            if parsed_ttl is None:
+                return None
+            ttl_seconds = parsed_ttl
+
+        raw_reason = raw_payload.get("reason")
+        reason = (
+            raw_reason.strip()
+            if isinstance(raw_reason, str) and raw_reason.strip()
+            else "in_turn_deferred_reload"
+        )
+        return raw_target.strip(), requested_at, ttl_seconds, reason
+
+    def _unlink_pending_reload_safe(
+        self,
+        pending_path: Path,
+        warning_context: str = "pending reload marker",
+    ) -> None:
+        """Best-effort unlink of cache/pending_reload.json without raising on OSError."""
+        try:
+            pending_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._safe_stderr_write(
+                f"[watch] Warning: Failed to unlink {warning_context} '{pending_path}': {exc}"
+            )
+
     def _process_pending_reload(self) -> bool:
         """Consumes a valid unexpired cache/pending_reload.json marker at a verified Safe Turn Boundary.
 
@@ -892,52 +952,35 @@ class LogWatcher:
             return False
         try:
             raw_payload: object = json.loads(pending_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError) as exc:
+            self._safe_stderr_write(
+                f"[watch] Pruning corrupt pending reload marker '{pending_path}': {exc}"
+            )
+            self._unlink_pending_reload_safe(pending_path, "corrupt pending reload marker")
             return False
-        if not isinstance(raw_payload, dict):
+        except OSError:
             return False
 
-        raw_target = raw_payload.get("target_account")
-        if not isinstance(raw_target, str) or not raw_target.strip():
+        parsed = self._parse_pending_reload_payload(raw_payload)
+        if parsed is None:
+            self._safe_stderr_write(
+                f"[watch] Pruning corrupt pending reload marker '{pending_path}': invalid payload schema"
+            )
+            self._unlink_pending_reload_safe(pending_path, "corrupt pending reload marker")
             return False
-        target_account = raw_target.strip()
 
-        raw_req = raw_payload.get("requested_at")
-        if (
-            isinstance(raw_req, bool)
-            or not isinstance(raw_req, (int, float))
-            or not math.isfinite(raw_req)
-            or raw_req <= 0
-        ):
-            return False
-        requested_at = float(raw_req)
-
-        raw_ttl = raw_payload.get("ttl_seconds")
-        if raw_ttl is None:
-            ttl_seconds = 120.0
-        elif (
-            isinstance(raw_ttl, bool)
-            or not isinstance(raw_ttl, (int, float))
-            or not math.isfinite(raw_ttl)
-            or raw_ttl <= 0
-        ):
-            return False
-        else:
-            ttl_seconds = float(raw_ttl)
-
+        target_account, requested_at, ttl_seconds, reason = parsed
         now = float(_get_time().time())
         if now - requested_at > ttl_seconds:
+            self._safe_stderr_write(
+                f"[watch] Pruning expired pending reload marker '{pending_path}' "
+                f"(age={now - requested_at:.1f}s > ttl={ttl_seconds:.1f}s)"
+            )
+            self._unlink_pending_reload_safe(pending_path, "expired pending reload marker")
             return False
 
         if not self._is_turn_quiescent():
             return False
-
-        raw_reason = raw_payload.get("reason")
-        reason = (
-            raw_reason.strip()
-            if isinstance(raw_reason, str) and raw_reason.strip()
-            else "in_turn_deferred_reload"
-        )
 
         try:
             restart_fn = getattr(self.engine, "restart_language_server", None)
@@ -962,12 +1005,7 @@ class LogWatcher:
             target_account=target_account,
             reason=reason,
         )
-        try:
-            pending_path.unlink(missing_ok=True)
-        except OSError as exc:
-            self._safe_stderr_write(
-                f"[watch] Warning: Failed to unlink pending reload marker '{pending_path}': {exc}"
-            )
+        self._unlink_pending_reload_safe(pending_path)
         return True
 
     def _dispatch_http_post(self, url: str, data: bytes, label: str) -> threading.Thread | None:

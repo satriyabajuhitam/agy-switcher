@@ -5237,6 +5237,8 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
     Covers:
     - [WATCH-RELOAD-001]: Valid pending_reload.json consumed at verified Safe Turn Boundary.
     - [WATCH-RELOAD-002]: Valid pending_reload.json deferred while _is_turn_quiescent() is False.
+    - [WATCH-RELOAD-ERR-001]: Malformed or corrupt pending_reload.json unlinked safely without crashing.
+    - [WATCH-RELOAD-EDGE-001]: Expired pending_reload.json exceeding ttl_seconds unlinked without restarting.
     """
 
     def setUp(self) -> None:
@@ -5558,6 +5560,222 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
         self.engine_mock.restart_language_server.assert_not_called()
         self.assertTrue(pending_file.exists())
+
+    def test_pending_reload_prune_corrupt_expired_unlinks_malformed_and_invalid_payloads(self) -> None:
+        """[WATCH-RELOAD-ERR-001]: Invalid JSON, non-UTF8 bytes, non-dict payloads, or invalid
+        target_account / requested_at / ttl_seconds fields are safely unlinked without raising,
+        restarting language_server, or writing an audit log entry.
+        """
+        self._setup_session(
+            "session-reload-corrupt",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-corrupt.lock"
+        pending_file = self.cache_dir / "pending_reload.json"
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        corrupt_cases: list[tuple[str, bytes]] = [
+            ("invalid_json", b"{not valid json"),
+            ("empty_file", b""),
+            ("invalid_utf8", b"\xff\xfe\xfd"),
+            ("json_list", b'["work-acc"]'),
+            ("json_string", b'"work-acc"'),
+            ("json_number", b"12345"),
+            ("json_bool", b"true"),
+            ("json_null", b"null"),
+            ("missing_target_account", json.dumps({"requested_at": 1_700_000_000.0}).encode("utf-8")),
+            ("empty_target_account", json.dumps({"target_account": "   ", "requested_at": 1_700_000_000.0}).encode("utf-8")),
+            ("non_string_target_account", json.dumps({"target_account": 123, "requested_at": 1_700_000_000.0}).encode("utf-8")),
+            ("missing_requested_at", json.dumps({"target_account": "work-acc"}).encode("utf-8")),
+            ("null_requested_at", json.dumps({"target_account": "work-acc", "requested_at": None}).encode("utf-8")),
+            ("string_requested_at", json.dumps({"target_account": "work-acc", "requested_at": "1700000000"}).encode("utf-8")),
+            ("bool_true_requested_at", json.dumps({"target_account": "work-acc", "requested_at": True}).encode("utf-8")),
+            ("bool_false_requested_at", json.dumps({"target_account": "work-acc", "requested_at": False}).encode("utf-8")),
+            ("zero_requested_at", json.dumps({"target_account": "work-acc", "requested_at": 0}).encode("utf-8")),
+            ("negative_requested_at", json.dumps({"target_account": "work-acc", "requested_at": -10.5}).encode("utf-8")),
+            ("nan_requested_at", b'{"target_account": "work-acc", "requested_at": NaN}'),
+            ("inf_requested_at", b'{"target_account": "work-acc", "requested_at": Infinity}'),
+            ("neg_inf_requested_at", b'{"target_account": "work-acc", "requested_at": -Infinity}'),
+            ("overflow_requested_at", f'{{"target_account": "work-acc", "requested_at": {"9" * 400}}}'.encode("utf-8")),
+            ("max_digits_requested_at", f'{{"target_account": "work-acc", "requested_at": {"9" * 4400}}}'.encode("utf-8")),
+            ("deeply_nested_json", (b"[" * 1500) + (b"]" * 1500)),
+            ("bool_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": True}).encode("utf-8")),
+            ("string_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": "120"}).encode("utf-8")),
+            ("zero_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": 0}).encode("utf-8")),
+            ("negative_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": -30}).encode("utf-8")),
+            ("nan_ttl_seconds", b'{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": NaN}'),
+            ("inf_ttl_seconds", b'{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": Infinity}'),
+            ("neg_inf_ttl_seconds", b'{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": -Infinity}'),
+            ("overflow_ttl_seconds", f'{{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": {"9" * 400}}}'.encode("utf-8")),
+        ]
+
+        for label, raw_bytes in corrupt_cases:
+            with self.subTest(case=label):
+                self.engine_mock.restart_language_server.reset_mock()
+                lock_path.touch()
+                pending_file.write_bytes(raw_bytes)
+                os.chmod(pending_file, 0o600)
+
+                switches = watcher.poll_once()
+
+                self.assertEqual(switches, 0)
+                self.engine_mock.restart_language_server.assert_not_called()
+                self.assertFalse(pending_file.exists(), f"Corrupt marker '{label}' must be unlinked")
+                self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_pending_reload_prune_corrupt_expired_unlinks_expired_marker_without_restart(self) -> None:
+        """[WATCH-RELOAD-EDGE-001]: Expired pending_reload.json (now - requested_at > ttl_seconds)
+        when _is_turn_quiescent() is True is unlinked without restarting language_server or writing watch.log.
+        """
+        self._setup_session(
+            "session-reload-expired",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-expired.lock"
+        pending_file = self.cache_dir / "pending_reload.json"
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertTrue(watcher._is_turn_quiescent())
+
+        # Case 1: Explicit ttl_seconds exceeded (120.001s > 120s)
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+                "ttl_seconds": 120,
+                "reason": "in_turn_deferred_reload",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+        lock_path.touch()
+
+        with patch("agy_switcher.watcher.time.time", return_value=1_700_000_120.001):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertFalse(pending_file.exists(), "Expired marker must be unlinked")
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Case 2: Omitted ttl_seconds defaults to 120s and expires when now - requested_at > 120s
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+        lock_path.touch()
+
+        with patch("agy_switcher.watcher.time.time", return_value=1_700_000_121.0):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertFalse(pending_file.exists(), "Expired marker with default ttl_seconds must be unlinked")
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Case 3: Expired marker while _is_turn_quiescent() is False is still unlinked without restart or audit entry
+        transcript_path = (
+            self.gemini_dir
+            / "antigravity"
+            / "brain"
+            / "session-reload-expired"
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Busy..."}) + "\n",
+            encoding="utf-8",
+        )
+        lock_path.touch()
+        self.assertFalse(watcher._is_turn_quiescent())
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+                "ttl_seconds": 60,
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+
+        with patch("agy_switcher.watcher.time.time", return_value=1_700_000_061.0):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertFalse(pending_file.exists(), "Expired marker during busy turn must still be unlinked")
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_pending_reload_prune_corrupt_expired_survives_unlink_oserror_and_non_regular_paths(self) -> None:
+        """[WATCH-RELOAD-ERR-001]: OSError during marker unlink (e.g., read-only cache dir)
+        and non-regular paths (directory or symlink) do not crash poll_once() or restart language_server.
+        """
+        from io import StringIO
+
+        self._setup_session(
+            "session-reload-oserr",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-oserr.lock"
+        pending_file = self.cache_dir / "pending_reload.json"
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Case 1: Directory at pending_reload.json path
+        pending_file.mkdir()
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_dir())
+        pending_file.rmdir()
+
+        # Case 2: Symlink at pending_reload.json path
+        target_file = self.cache_dir / "real_target.json"
+        target_file.write_text('{"target_account": "work-acc", "requested_at": 1700000000.0}', encoding="utf-8")
+        pending_file.symlink_to(target_file)
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_symlink())
+        pending_file.unlink()
+
+        # Case 3: Real OSError on unlink via read-only cache directory (0o555)
+        pending_file.write_bytes(b"{corrupt")
+        os.chmod(pending_file, 0o600)
+        lock_path.touch()
+        stderr_capture = StringIO()
+        try:
+            os.chmod(self.cache_dir, 0o555)
+            with patch("sys.stderr", stderr_capture):
+                switches = watcher.poll_once()
+        finally:
+            os.chmod(self.cache_dir, 0o755)
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertIn("Failed to unlink", stderr_capture.getvalue())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
 
 
 if __name__ == '__main__':
