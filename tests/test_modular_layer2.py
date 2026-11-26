@@ -1118,6 +1118,166 @@ class TestSecurityTokenSchemaValidation(unittest.TestCase):
                 self.assertIsNone(resolve_token_email(non_mapping))
 
 
+class TestPresenceMultiSessionAndAudit(unittest.TestCase):
+    """[GLOBAL-QUIESCENCE-002] & [DRIFT-GUARD-001] tests for agy_switcher.presence."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.gemini_dir = self.base_path / ".gemini"
+        self.proc_dir = self.base_path / "proc"
+        self.desk_presence_dir = self.gemini_dir / "antigravity" / "presence"
+        self.cli_presence_dir = self.gemini_dir / "antigravity-cli" / "presence"
+        self.desk_brain_dir = self.gemini_dir / "antigravity" / "brain"
+        self.cli_brain_dir = self.gemini_dir / "antigravity-cli" / "brain"
+
+        for d in (
+            self.proc_dir,
+            self.desk_presence_dir,
+            self.cli_presence_dir,
+            self.desk_brain_dir,
+            self.cli_brain_dir,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _create_mock_proc_fd_process(
+        self,
+        pid: int,
+        cmdline: bytes,
+        fd_targets: list[Path],
+    ) -> None:
+        pid_dir = self.proc_dir / str(pid)
+        fd_dir = pid_dir / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "cmdline").write_bytes(cmdline)
+        for idx, target in enumerate(fd_targets):
+            os.symlink(str(target), str(fd_dir / str(idx + 10)))
+
+    def test_presence_reexports_security_read_latest_jsonl_record(self) -> None:
+        """[GLOBAL-QUIESCENCE-002] presence.read_latest_jsonl_record is an identical Layer 0 re-export."""
+        import agy_switcher.presence as presence_mod
+        import agy_switcher.security as security_mod
+        import agy_switcher.watcher as watcher_mod
+
+        self.assertIn("read_latest_jsonl_record", security_mod.__all__)
+        self.assertIn("read_latest_jsonl_record", presence_mod.__all__)
+        self.assertIs(presence_mod.read_latest_jsonl_record, security_mod.read_latest_jsonl_record)
+        self.assertIs(watcher_mod.read_latest_jsonl_record, security_mod.read_latest_jsonl_record)
+
+        transcript = self.base_path / "sample.jsonl"
+        transcript.write_text('{"type": "PLANNER_RESPONSE", "status": "DONE"}\n', encoding="utf-8")
+        self.assertEqual(
+            presence_mod.read_latest_jsonl_record(transcript),
+            {"type": "PLANNER_RESPONSE", "status": "DONE"},
+        )
+
+    def test_presence_multi_session_discovery_GLOBAL_QUIESCENCE_002(self) -> None:
+        """[GLOBAL-QUIESCENCE-002] Enumerates live open presence/*.lock fds across Desktop and CLI deterministically."""
+        from agy_switcher.presence import PresenceDetector
+
+        lock_a = self.desk_presence_dir / "tab-a.lock"
+        lock_b = self.cli_presence_dir / "tab-b.lock"
+        stale_lock = self.desk_presence_dir / "stale-tab.lock"
+        for lock in (lock_a, lock_b, stale_lock):
+            lock.touch()
+
+        os.utime(lock_a, (1000.0, 1000.0))
+        os.utime(lock_b, (2000.0, 2000.0))
+        os.utime(stale_lock, (3000.0, 3000.0))
+
+        transcript_a = self.desk_brain_dir / "tab-a" / ".system_generated" / "logs" / "transcript.jsonl"
+        transcript_b = self.cli_brain_dir / "tab-b" / ".system_generated" / "logs" / "transcript.jsonl"
+        stale_transcript = self.desk_brain_dir / "stale-tab" / ".system_generated" / "logs" / "transcript.jsonl"
+        for tr in (transcript_a, transcript_b, stale_transcript):
+            tr.parent.mkdir(parents=True, exist_ok=True)
+            tr.write_text('{"type": "PLANNER_RESPONSE", "status": "DONE"}\n', encoding="utf-8")
+
+        self._create_mock_proc_fd_process(
+            pid=4001,
+            cmdline=b"/usr/local/bin/language_server\x00--standalone\x00",
+            fd_targets=[lock_a, lock_b, lock_a],
+        )
+        self._create_mock_proc_fd_process(
+            pid=4002,
+            cmdline=b"/usr/bin/python3\x00unrelated.py\x00",
+            fd_targets=[stale_lock],
+        )
+
+        detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.assertEqual(detector.get_active_session_ids(), ["tab-b", "tab-a"])
+        self.assertEqual(detector.get_all_active_transcript_paths(), [transcript_b, transcript_a])
+
+        # Equal mtimes tie-break deterministically by session ID ascending
+        os.utime(lock_a, (2500.0, 2500.0))
+        os.utime(lock_b, (2500.0, 2500.0))
+        self.assertEqual(detector.get_active_session_ids(), ["tab-a", "tab-b"])
+        self.assertEqual(detector.get_all_active_transcript_paths(), [transcript_a, transcript_b])
+
+        # Missing or inaccessible /proc returns empty lists safely
+        missing_detector = PresenceDetector(
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.base_path / "missing_proc",
+        )
+        self.assertEqual(missing_detector.get_active_session_ids(), [])
+        self.assertEqual(missing_detector.get_all_active_transcript_paths(), [])
+
+    def test_presence_drift_guard_audit_formatter_DRIFT_GUARD_001(self) -> None:
+        """[DRIFT-GUARD-001] format_drift_guard_audit_line outputs structured timestamped audit lines."""
+        import re
+        import agy_switcher.presence as presence_mod
+
+        self.assertIn("format_drift_guard_audit_line", presence_mod.__all__)
+        line = presence_mod.format_drift_guard_audit_line(
+            target_account="honey",
+            drifted_targets=["desktop"],
+            queued_reload=True,
+        )
+        self.assertTrue(line.endswith("\n"))
+        self.assertEqual(line.count("\n"), 1)
+        self.assertRegex(line, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[watch\] ")
+        self.assertIn("honey", line)
+        self.assertIn("desktop", line)
+        self.assertIn("queued_reload=true", line.lower())
+
+        cli_only_line = presence_mod.format_drift_guard_audit_line(
+            target_account="work\nacc",
+            drifted_targets=("cli", "desktop"),
+            queued_reload=False,
+        )
+        self.assertEqual(cli_only_line.count("\n"), 1)
+        self.assertIn("work acc", cli_only_line)
+        self.assertIn("cli", cli_only_line)
+        self.assertIn("desktop", cli_only_line)
+        self.assertIn("queued_reload=false", cli_only_line.lower())
+        self.assertTrue(re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[watch\] ", cli_only_line))
+
+    def test_presence_imports_only_layer0_dag(self) -> None:
+        """presence.py adheres strictly to Layer 2 DAG rules with no upward or horizontal vault imports."""
+        presence_file = REPO_ROOT / "scripts" / "agy_switcher" / "presence.py"
+        tree = ast.parse(presence_file.read_text(encoding="utf-8"))
+        allowed_modules = {
+            "agy_switcher.exceptions",
+            "agy_switcher.models",
+            "agy_switcher.security",
+            "agy_switcher.supervisor",
+            "agy_switcher.formatters",
+            "agy_switcher.telemetry",
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(
+                        alias.name.startswith(("agy_switcher.vault", "agy_switcher.watcher", "agy_switcher.doctor", "agy_switcher.hook", "agy_switcher.cli", "agy_switcher.api")),
+                        f"presence.py illegally imports {alias.name}",
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if mod.startswith("agy_switcher"):
+                    self.assertIn(mod, allowed_modules, f"presence.py imports disallowed module {mod}")
+
 
 if __name__ == "__main__":
     unittest.main()

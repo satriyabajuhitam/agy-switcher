@@ -581,12 +581,15 @@ class TestReExportLaunchers(unittest.TestCase):
         watcher.py must remain strictly under 1300 lines (< 1500 lines limit).
         """
         import agy_switcher.presence as pres_mod
+        import agy_switcher.security as sec_mod
         import agy_switcher.watcher as watch_mod
 
         self.assertIs(pres_mod.PresenceDetector, watch_mod.PresenceDetector)
         self.assertIs(pres_mod._open_secure_log_file, watch_mod._open_secure_log_file)
         self.assertIs(pres_mod.append_secure_log_entry, watch_mod.append_secure_log_entry)
         self.assertIs(pres_mod.DEFAULT_GEMINI_DIR, watch_mod.DEFAULT_GEMINI_DIR)
+        self.assertIs(pres_mod.read_latest_jsonl_record, sec_mod.read_latest_jsonl_record)
+        self.assertIs(pres_mod.read_latest_jsonl_record, watch_mod.read_latest_jsonl_record)
 
         watcher_path = PACKAGE_DIR / "watcher.py"
         lines = watcher_path.read_text(encoding="utf-8").splitlines()

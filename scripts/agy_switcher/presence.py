@@ -9,19 +9,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import errno
-import json
 import math
 import os
 from pathlib import Path
 import re
 import sys
 import time
-from typing import Any, Callable, cast
+from typing import Any, Callable
 
 from agy_switcher.security import (
     _atomic_write_file,
     parse_pending_reload_payload,
     read_json_dict_nofollow,
+    read_latest_jsonl_record,
 )
 
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
@@ -251,14 +251,13 @@ class PresenceDetector:
         self.cli_log_dir = self.gemini_dir / "antigravity-cli" / "log"
         self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
 
-    def _discover_from_proc(self) -> str | None:
-        """
-        Tier 1: Scans proc_dir/<pid>/fd/* of running language_server or antigravity processes
+    def _collect_proc_session_ids(self) -> list[str]:
+        """Scans proc_dir/<pid>/fd/* of running language_server or antigravity processes
         to find file descriptors referencing presence/*.lock across Desktop and CLI presence directories.
-        Returns the active session ID (or newest if multiple), or None if not found or inaccessible.
+        Returns deduplicated session IDs ordered deterministically (newest mtime first, then session_id).
         """
         if not self.proc_dir.is_dir():
-            return None
+            return []
 
         candidates: list[tuple[float, str, str]] = []
         presence_dirs = [self.presence_dir, self.cli_presence_dir]
@@ -342,13 +341,35 @@ class PresenceDetector:
                 except OSError:
                     continue
         except OSError:
-            return None
+            return []
 
         if not candidates:
-            return None
+            return []
 
         candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
-        return candidates[0][1]
+        session_ids: list[str] = []
+        seen: set[str] = set()
+        for _, sid, _ in candidates:
+            if sid not in seen:
+                seen.add(sid)
+                session_ids.append(sid)
+        return session_ids
+
+    def _discover_from_proc(self) -> str | None:
+        """
+        Tier 1: Scans proc_dir/<pid>/fd/* of running language_server or antigravity processes
+        to find file descriptors referencing presence/*.lock across Desktop and CLI presence directories.
+        Returns the active session ID (or newest if multiple), or None if not found or inaccessible.
+        """
+        session_ids = self._collect_proc_session_ids()
+        return session_ids[0] if session_ids else None
+
+    def get_active_session_ids(self) -> list[str]:
+        """Enumerates all live session IDs tracked via open presence/*.lock fds."""
+        try:
+            return self._collect_proc_session_ids()
+        except OSError:
+            return []
 
     def _discover_from_presence_locks(self) -> str | None:
         """
@@ -470,6 +491,17 @@ class PresenceDetector:
 
         return None
 
+    def get_all_active_transcript_paths(self) -> list[Path]:
+        """Returns deduplicated transcript.jsonl paths for all live open-lock sessions."""
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for session_id in self.get_active_session_ids():
+            transcript_path = self.get_active_transcript_path(session_id=session_id)
+            if transcript_path is not None and transcript_path not in seen:
+                seen.add(transcript_path)
+                paths.append(transcript_path)
+        return paths
+
     def get_watch_targets(self, as_str: bool = False, session_id: str | None = None) -> list[Path] | list[str]:
         """
         Returns list of active log targets to watch:
@@ -545,43 +577,6 @@ def _extract_text_fragments(value: object, max_items: int = 10000) -> list[str]:
     return fragments
 
 
-def read_latest_jsonl_record(target_path: Path) -> dict[str, Any] | None:
-    """Reads and parses the trailing JSON object record from a JSONL transcript file."""
-    try:
-        size = target_path.stat().st_size
-        if size == 0:
-            return None
-        max_read = 4 * 1024 * 1024
-        chunk_size = min(size, 65536)
-        with open(target_path, "rb") as f:
-            while True:
-                f.seek(max(0, size - chunk_size))
-                data = f.read(min(chunk_size, size))
-                last_line_str: str | None = None
-                for line in reversed(data.splitlines()):
-                    s = line.strip().decode("utf-8", errors="replace")
-                    if s:
-                        last_line_str = s
-                        break
-                if not last_line_str:
-                    return None
-                if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
-                    chunk_size = min(size, chunk_size * 4, max_read)
-                    continue
-                if not last_line_str.startswith("{"):
-                    return None
-                try:
-                    parsed = json.loads(last_line_str)
-                    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
-                except json.JSONDecodeError:
-                    if chunk_size < size and chunk_size < max_read:
-                        chunk_size = min(size, chunk_size * 4, max_read)
-                        continue
-                    return None
-    except OSError:
-        return None
-
-
 def safe_stderr_write(message: str) -> None:
     """Writes a diagnostic line to sys.stderr without raising on closed streams."""
     try:
@@ -648,6 +643,28 @@ def format_deferred_reload_audit_line(
     return (
         f"{ts} [watch] Deferred safe-turn reload for '{clean_target}' "
         f"with force-restart language_server (reason: {clean_reason})\n"
+    )
+
+
+def format_drift_guard_audit_line(
+    target_account: str,
+    drifted_targets: tuple[str, ...] | list[str],
+    *,
+    queued_reload: bool = False,
+) -> str:
+    """Formats a structured Continuous Drift Guard audit entry for watch.log."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    clean_target = " ".join(str(target_account).split()) or "unknown"
+    clean_drifted = [
+        " ".join(str(target).split())
+        for target in drifted_targets
+        if str(target).strip()
+    ]
+    targets_label = ", ".join(clean_drifted) if clean_drifted else "none"
+    reload_label = "queued_reload=true" if queued_reload else "queued_reload=false"
+    return (
+        f"{ts} [watch] Drift guard healed targets [{targets_label}] to '{clean_target}' "
+        f"({reload_label})\n"
     )
 
 
@@ -770,6 +787,7 @@ __all__ = [
     "write_watch_log_line",
     "format_audit_log_line",
     "format_deferred_reload_audit_line",
+    "format_drift_guard_audit_line",
     "is_watch_process_cmdline",
     "PresenceDetector",
     "DEFAULT_GEMINI_DIR",
