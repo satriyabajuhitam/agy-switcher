@@ -2443,6 +2443,126 @@ class TestCLIInTurnDeferredReload(unittest.TestCase):
             self.assertFalse(engine.pending_reload_file.exists())
             self.assertIn("Restarted language_server", stdout_buf.getvalue())
 
+    def test_in_turn_force_restart_now_precedence_matrix_DEFER_RELOAD_EDGE_004(self) -> None:
+        """[DEFER-RELOAD-EDGE-004] switch --auto --force-restart-now restarts immediately; manual switch --force-restart-now without --force honors ActiveTurnRunningError (exit 2)."""
+        from agy_switcher.cli import build_parser
+
+        parser = build_parser()
+        auto_args = parser.parse_args(["switch", "--auto", "--force-restart-now"])
+        self.assertTrue(auto_args.auto)
+        self.assertTrue(auto_args.force_restart_now)
+        self.assertFalse(auto_args.force)
+
+        manual_args = parser.parse_args(["switch", "work-acc", "--force-restart-now"])
+        self.assertEqual(manual_args.account, "work-acc")
+        self.assertTrue(manual_args.force_restart_now)
+        self.assertFalse(manual_args.force)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            self._register_account(engine, "best-standby", "best@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            server_pid = 49500
+            child_pid = 49510
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=server_pid, child_pid=child_pid, busy=True
+            )
+
+            desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+            cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+            # 1. Manual switch <name> --force-restart-now WITHOUT --force enforces verify_turn_safety(force=False) -> exit 2
+            manual_stdout = io.StringIO()
+            manual_stderr = io.StringIO()
+            with patch.object(engine, "switch_tokens", wraps=engine.switch_tokens) as spy_switch_manual, \
+                 patch.object(engine, "verify_turn_safety", wraps=engine.verify_turn_safety) as spy_safety, \
+                 patch("os.getpid", return_value=child_pid), \
+                 patch("urllib.request.urlopen", side_effect=AssertionError("Pre-flight auth probe must not run when ActiveTurnRunningError fires")), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not run when ActiveTurnRunningError fires")), \
+                 patch("sys.stdout", manual_stdout), \
+                 patch("sys.stderr", manual_stderr):
+                self.assertTrue(engine.is_invoked_by_language_server())
+                manual_exit = main(["switch", "work-acc", "--force-restart-now"], engine=engine)
+
+            self.assertEqual(manual_exit, 2)
+            spy_switch_manual.assert_called_once_with(
+                "work-acc",
+                restart_server=True,
+                force=False,
+                verify_auth=True,
+                force_restart_now=True,
+            )
+            spy_safety.assert_called_once_with(force=False)
+            self.assertIn("Warning:", manual_stderr.getvalue())
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+            self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+            self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+            self.assertFalse(engine.pending_reload_file.exists())
+
+            # 2. Auto switch --auto --force-restart-now sets force=True & force_restart_now=True -> immediate restart
+            def fake_urlopen(req: object, *_args: object, **_kwargs: object) -> object:
+                headers = getattr(req, "headers", {}) or {}
+                auth = headers.get("Authorization", "")
+                if "best@example.com" in auth:
+                    return self._make_quota_response(0.95)
+                return self._make_quota_response(0.05)
+
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            auto_stdout = io.StringIO()
+            auto_stderr = io.StringIO()
+            with patch.object(engine, "switch_tokens", wraps=engine.switch_tokens) as spy_switch_auto, \
+                 patch.object(engine, "restart_language_server", wraps=engine.restart_language_server) as spy_restart, \
+                 patch("os.getpid", return_value=child_pid), \
+                 patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", auto_stdout), \
+                 patch("sys.stderr", auto_stderr):
+                auto_exit = main(["switch", "--auto", "--force-restart-now"], engine=engine)
+
+            self.assertEqual(auto_exit, 0)
+            spy_switch_auto.assert_called_once_with(
+                "best-standby",
+                restart_server=True,
+                force=True,
+                force_restart_now=True,
+            )
+            spy_restart.assert_called_once_with(force=True)
+            self.assertEqual(len(signals_sent), 1)
+            self.assertEqual(signals_sent[0][0], server_pid)
+            self.assertEqual(engine.get_active_name(), "best-standby")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertIn("Restarted language_server", auto_stdout.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
