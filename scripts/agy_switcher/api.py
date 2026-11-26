@@ -438,7 +438,12 @@ def auto_rotate_on_exhaustion(
                 )
 
         try:
-            switch_res = engine.switch_tokens(target_account, restart_server=reload_server, force=False)
+            switch_res = engine.switch_tokens(
+                target_account,
+                restart_server=reload_server,
+                force=False,
+                clear_failover=False,
+            )
             server_reloaded = bool(switch_res.get("server_restarted", False)) if reload_server else False
         except Exception as exc:
             return RotationResult(

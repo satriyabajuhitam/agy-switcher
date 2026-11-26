@@ -19,6 +19,8 @@ from agy_switcher.exceptions import ActiveTurnRunningError
 class ProcessSupervisor:
     """Supervises the Antigravity language_server process, enforcing turn safety."""
 
+    _MAX_ANCESTRY_HOPS = 64
+
     def __init__(
         self,
         gemini_dir: Path | str | None = None,
@@ -26,6 +28,34 @@ class ProcessSupervisor:
     ) -> None:
         self.gemini_dir = Path(gemini_dir or Path.home() / ".gemini").expanduser()
         self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
+
+    @staticmethod
+    def _has_language_server_cmdline(cmdline_file: Path) -> bool:
+        """Returns True when cmdline contains both language_server and --standalone."""
+        try:
+            cmdline = cmdline_file.read_bytes().replace(b"\x00", b" ")
+        except OSError:
+            return False
+        return b"language_server" in cmdline and b"--standalone" in cmdline
+
+    @staticmethod
+    def _parse_stat_state_and_ppid(stat_file: Path) -> tuple[str, int] | None:
+        """Parses (state, ppid) from /proc/<pid>/stat via rfind(')'), failing safe to None."""
+        try:
+            content = stat_file.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+        lparen = content.find("(")
+        rparen = content.rfind(")")
+        if lparen == -1 or rparen <= lparen:
+            return None
+        rest = content[rparen + 1 :].strip().split()
+        if len(rest) < 2:
+            return None
+        try:
+            return rest[0], int(rest[1])
+        except ValueError:
+            return None
 
     def locate_language_server_pid(self) -> int | None:
         """Finds running language_server PID by scanning /proc or pgrep."""
@@ -36,13 +66,11 @@ class ProcessSupervisor:
                 for pid_dir in proc_path.iterdir():
                     if not pid_dir.name.isdigit():
                         continue
-                    cmdline_file = pid_dir / "cmdline"
-                    try:
-                        cmdline = cmdline_file.read_bytes().replace(b"\x00", b" ")
-                        if b"language_server" in cmdline and b"--standalone" in cmdline:
+                    if self._has_language_server_cmdline(pid_dir / "cmdline"):
+                        try:
                             return int(pid_dir.name)
-                    except (OSError, ValueError):
-                        continue
+                        except ValueError:
+                            continue
             except OSError:
                 pass
 
@@ -201,20 +229,51 @@ class ProcessSupervisor:
                     for p_dir in proc_path.iterdir():
                         if not p_dir.name.isdigit():
                             continue
-                        stat_file = p_dir / "stat"
-                        try:
-                            content = stat_file.read_bytes().decode("utf-8", errors="replace")
-                            rparen = content.rfind(")")
-                            if rparen != -1:
-                                rest = content[rparen + 1:].strip().split()
-                                if len(rest) >= 2 and rest[1] == str(target_pid):
-                                    if rest[0] == "Z":
-                                        continue
-                                    return True
-                        except (OSError, IndexError, ValueError):
-                            continue
+                        parsed = self._parse_stat_state_and_ppid(p_dir / "stat")
+                        if parsed is not None:
+                            state, ppid = parsed
+                            if ppid == target_pid and state != "Z":
+                                return True
                 except OSError:
                     pass
+
+        return False
+
+    def is_invoked_by_language_server(
+        self,
+        pid: int | None = None,
+        current_pid: int | None = None,
+    ) -> bool:
+        """Detects whether current_pid (or its process ancestry) descends from language_server.
+
+        Walks up the ppid chain via ``self.proc_dir / str(cur_pid) / "stat"``,
+        bounded to 64 hops with a visited-PID set for cycle protection. Returns True
+        if the process or any ancestor matches ``pid`` or has a ``cmdline`` containing
+        both ``language_server`` and ``--standalone``. Fails safe to False on missing,
+        malformed, or unreadable ``/proc`` files.
+        """
+        cur_pid = current_pid if current_pid is not None else os.getpid()
+        visited: set[int] = set()
+
+        for hop in range(self._MAX_ANCESTRY_HOPS + 1):
+            if cur_pid <= 0 or cur_pid in visited:
+                return False
+            visited.add(cur_pid)
+
+            if pid is not None and cur_pid == pid:
+                return True
+            if self._has_language_server_cmdline(self.proc_dir / str(cur_pid) / "cmdline"):
+                return True
+            if cur_pid <= 1 or hop == self._MAX_ANCESTRY_HOPS:
+                return False
+
+            parsed = self._parse_stat_state_and_ppid(self.proc_dir / str(cur_pid) / "stat")
+            if parsed is None:
+                return False
+            _, ppid = parsed
+            if ppid <= 0 or ppid in visited:
+                return False
+            cur_pid = ppid
 
         return False
 

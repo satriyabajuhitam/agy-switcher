@@ -93,6 +93,40 @@ def _get_engine_class() -> Any:
     )
 
 
+def _get_daemon_manager_class() -> type[DaemonManager]:
+    mod = sys.modules.get("agy_switch")
+    if mod is not None and "DaemonManager" in mod.__dict__:
+        return cast(type[DaemonManager], mod.__dict__["DaemonManager"])
+    from agy_switcher import watcher as watch_mod
+    if DaemonManager is not watch_mod.DaemonManager:
+        if hasattr(DaemonManager, "assert_called") or hasattr(DaemonManager, "mock_calls"):
+            return DaemonManager
+        return watch_mod.DaemonManager
+    return DaemonManager
+
+
+def _is_log_watcher_active(engine: AgySwitchEngine) -> bool:
+    """Checks whether LogWatcher is active via PID file or user systemd unit."""
+    dm_cls = _get_daemon_manager_class()
+    vault_dir = getattr(engine, "vault_dir", None)
+    proc_dir = getattr(engine, "proc_dir", None)
+    gemini_dir = getattr(engine, "gemini_dir", None)
+    dm = dm_cls(
+        vault_dir=vault_dir if isinstance(vault_dir, (str, Path)) else None,
+        proc_dir=proc_dir if isinstance(proc_dir, (str, Path)) else None,
+        gemini_dir=gemini_dir if isinstance(gemini_dir, (str, Path)) else None,
+    )
+    try:
+        if dm.get_running_pid() is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(dm.is_systemd_active())
+    except Exception:
+        return False
+
+
 def _get_format_accounts_listicle() -> Callable[..., str]:
     return cast(
         Callable[..., str],
@@ -179,6 +213,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     switch_parser.add_argument(
         "--force", action="store_true", help="Force switch even if active turns are detected"
+    )
+    switch_parser.add_argument(
+        "--force-restart-now",
+        action="store_true",
+        help="Emergency override: bypass in-turn deferred reload and restart language_server immediately",
+    )
+    switch_parser.add_argument(
+        "--skip-auth-check",
+        action="store_true",
+        help="Skip pre-flight CloudCode auth check before switching",
     )
     switch_parser.add_argument("--auto", action="store_true", help="Auto-switch to optimal account")
     switch_parser.add_argument(
@@ -677,19 +721,34 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         # switch --auto automatically defaults force=True under ADR 0010; manual switch strictly requires --force
         force_flag = True if is_auto else getattr(args, "force", False)
         restart_flag = not getattr(args, "no_restart", False)
+        verify_auth_flag = not getattr(args, "skip_auth_check", False)
+        force_restart_now_flag = bool(getattr(args, "force_restart_now", False))
+
+        switch_kwargs: dict[str, Any] = {
+            "restart_server": restart_flag,
+            "force": force_flag,
+        }
+        if not is_auto:
+            switch_kwargs["verify_auth"] = verify_auth_flag
+        if force_restart_now_flag:
+            switch_kwargs["force_restart_now"] = True
 
         try:
-            res = engine.switch_tokens(
-                args.account,
-                restart_server=restart_flag,
-                force=force_flag,
-            )
+            res = engine.switch_tokens(args.account, **switch_kwargs)
             print(
                 f"[agy-switch] Successfully switched active account to '{res['active']}' ({res.get('email') or 'unknown'})."
             )
             print("  - Updated: ~/.gemini/jetski-standalone-oauth-token (Antigravity 2.0)")
             print("  - Updated: ~/.gemini/antigravity-cli/antigravity-oauth-token (Antigravity CLI)")
-            if res.get("server_restarted"):
+            if res.get("restart_deferred") is True:
+                print(
+                    "  - Server : Deferred safe-turn reload queued (cache/pending_reload.json, TTL 120s); active agent turn uninterrupted"
+                )
+                if not _is_log_watcher_active(engine):
+                    print(
+                        "  - Note   : LogWatcher is inactive. Reload the Desktop server or run `agy-switch watch start` after the turn completes to apply credentials."
+                    )
+            elif res.get("server_restarted"):
                 print("  - Server : Restarted language_server (new credentials loaded)")
             elif restart_flag:
                 print("  - Server : language_server not running or no restart needed")

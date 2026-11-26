@@ -10,20 +10,24 @@ import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
+import ssl
 import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, cast
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from agy_switcher.exceptions import AgySwitchError
+from agy_switcher.models import AuthProbeResult
+from agy_switcher.security import is_safe_account_alias, read_json_dict_safe
 
 
 def _resolve_symbol(symbol_name: str, fallback_factory: Callable[[], Any]) -> Any:
@@ -66,6 +70,8 @@ DEFAULT_FALLBACK_QUOTA_ENDPOINT = f"{DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT}{QUOTA_
 # Error classification patterns and phrases
 AUTH_ERROR_CODE_PATTERN = re.compile(r"\b(401|403)\b")
 HTTP_SERVER_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
+HTTP_STATUS_CODE_PATTERN = re.compile(r"\bHTTP(?:/[\d.]+|\s+Error)?\s+(\d{3})\b", re.IGNORECASE)
+HTTP_5XX_ERROR_PATTERN = re.compile(r"\bHTTP(?:/[\d.]+|\s+Error)?\s+5\d{2}\b", re.IGNORECASE)
 QUOTA_REGEX = re.compile(
     r"^(Gemini Models|Claude and GPT models)\s+"
     r"(Weekly Limit Remaining|Five Hour Limit Remaining)\s+"
@@ -109,6 +115,26 @@ def _has_auth_indicator(text: Any) -> bool:
     if AUTH_ERROR_CODE_PATTERN.search(lower):
         return True
     return False
+
+
+def _classify_http_error_message(err_msg: str) -> str:
+    """Classifies an HTTP error message into 'auth', 'network', or 'http' with 401/403 precedence."""
+    status_match = HTTP_STATUS_CODE_PATTERN.search(err_msg)
+    if status_match:
+        status_code = int(status_match.group(1))
+        if status_code in (401, 403):
+            return "auth"
+        if 500 <= status_code <= 599 or status_code in (408, 429):
+            return "network"
+        if _has_auth_indicator(err_msg):
+            return "auth"
+        return "http"
+
+    if _has_auth_indicator(err_msg):
+        return "auth"
+    if HTTP_SERVER_ERROR_PATTERN.search(err_msg):
+        return "network"
+    return "http"
 
 
 def _parse_timestamp_defensive(val: Any) -> float:
@@ -184,10 +210,10 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
         if isinstance(code, int):
             if code in (401, 403):
                 return True
-            if code in (500, 502, 503, 504):
+            if 500 <= code <= 599:
                 return False
         err_str = str(error_val.get("error", "")).lower()
-        if raw_type == "http" and _has_auth_indicator(err_str):
+        if raw_type == "http" and _classify_http_error_message(err_str) == "auth":
             return True
         if isinstance(raw_type, str) and raw_type.strip() and raw_type.strip() != "auth":
             return False
@@ -195,9 +221,9 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
         if isinstance(error_val, urllib.error.HTTPError):
             if error_val.code in (401, 403):
                 return True
-            if error_val.code in (500, 502, 503, 504):
+            if 500 <= error_val.code <= 599:
                 return False
-        if isinstance(error_val, (TimeoutError, ConnectionError)):
+        if isinstance(error_val, (TimeoutError, ConnectionError, ssl.SSLError)) or type(error_val).__module__ == "http.client":
             return False
         if isinstance(error_val, urllib.error.URLError) and not isinstance(error_val, urllib.error.HTTPError):
             return False
@@ -227,8 +253,10 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
         return False
     if isinstance(error_val, urllib.error.HTTPError):
         # Only classify 5xx server errors as transient network/transport errors
-        return error_val.code in (500, 502, 503, 504)
-    if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError)):
+        return 500 <= error_val.code <= 599
+    if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError)) or (
+        isinstance(error_val, Exception) and type(error_val).__module__ == "http.client"
+    ):
         return True
     if isinstance(error_val, dict):
         if error_val.get("error_type") == "network":
@@ -237,10 +265,12 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
             return False
         if error_val.get("error_type") == "http":
             code = error_val.get("code") or error_val.get("status_code")
+            if isinstance(code, str) and code.isdigit():
+                code = int(code)
             if isinstance(code, int):
-                return code in (500, 502, 503, 504)
+                return 500 <= code <= 599
             err_str = str(error_val.get("error", "")).lower()
-            return bool(HTTP_SERVER_ERROR_PATTERN.search(err_str))
+            return _classify_http_error_message(err_str) == "network"
         err_str = str(error_val.get("error", "")).lower()
     elif isinstance(error_val, Exception):
         err_str = str(error_val).lower()
@@ -265,7 +295,7 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
             return True
         if isinstance(c_type, str) and c_type == "http":
             c_err = getattr(client, "last_error", None)
-            if isinstance(c_err, str) and bool(HTTP_SERVER_ERROR_PATTERN.search(c_err)):
+            if isinstance(c_err, str) and _classify_http_error_message(c_err) == "network":
                 return True
         c_err = getattr(client, "last_error", None)
         if isinstance(c_err, str):
@@ -735,7 +765,11 @@ class QuotaClient:
 
     def refresh_access_token(self, refresh_token: str) -> dict[str, Any] | None:
         """Refreshes the OAuth access token."""
+        self.last_error = None
+        self.last_error_type = None
         if not refresh_token or not isinstance(refresh_token, str) or not refresh_token.strip():
+            self.last_error = "Missing refresh token"
+            self.last_error_type = "auth"
             return None
         data = urllib.parse.urlencode({
             "client_id": self.client_id,
@@ -749,10 +783,21 @@ class QuotaClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8")
                 token_data = json.loads(body)
-                if not isinstance(token_data, dict) or "error" in token_data:
+                if not isinstance(token_data, dict):
+                    self.last_error = "Token refresh response invalid"
+                    self.last_error_type = "auth"
+                    return None
+                if "error" in token_data:
+                    oauth_err = str(token_data.get("error") or "").strip()
+                    self.last_error = (
+                        f"Token refresh rejected: {oauth_err}" if oauth_err else "Token refresh rejected"
+                    )
+                    self.last_error_type = "auth"
                     return None
                 raw_token = token_data.get("access_token")
                 if not isinstance(raw_token, str) or not raw_token.strip():
+                    self.last_error = "Token refresh response missing access_token"
+                    self.last_error_type = "auth"
                     return None
                 raw_exp = token_data.get("expires_in", 3600)
                 expires_in = _sanitize_expires_in(raw_exp, default=3600)
@@ -760,7 +805,54 @@ class QuotaClient:
                     "access_token": raw_token.strip(),
                     "expires_in": expires_in,
                 }
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        except urllib.error.HTTPError as e:
+            err_detail = f"HTTP Error {e.code}: {e.reason}"
+            body_text = ""
+            try:
+                if getattr(e, "fp", None) is not None:
+                    raw_body = e.read()
+                    if isinstance(raw_body, (bytes, bytearray)):
+                        body_text = bytes(raw_body).decode("utf-8", errors="replace")
+            except Exception:
+                body_text = ""
+            finally:
+                try:
+                    e.close()
+                except Exception:
+                    pass
+            if body_text:
+                try:
+                    err_json = json.loads(body_text)
+                    if isinstance(err_json, dict) and err_json.get("error"):
+                        oauth_err = str(err_json.get("error", "")).strip()
+                        err_detail = f"{err_detail} ({oauth_err})"
+                except Exception:
+                    if "invalid_grant" in body_text.lower():
+                        err_detail = f"{err_detail} (invalid_grant)"
+            if e.code in (400, 401, 403):
+                self.last_error = f"Token refresh rejected: {err_detail}"
+                self.last_error_type = "auth"
+            elif e.code >= 500 or e.code in (408, 429):
+                self.last_error = f"Token refresh network error: {err_detail}"
+                self.last_error_type = "network"
+            elif _has_auth_indicator(err_detail):
+                self.last_error = f"Token refresh rejected: {err_detail}"
+                self.last_error_type = "auth"
+            else:
+                self.last_error = f"Token refresh failed: {err_detail}"
+                self.last_error_type = "http"
+            print(f"[QuotaClient] Failed to refresh token: {err_detail}", file=sys.stderr)
+            return None
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self.last_error = f"Token refresh parse error: {e}"
+            self.last_error_type = "parse"
+            print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
+            return None
+        except Exception as e:
+            if not isinstance(e, (urllib.error.URLError, TimeoutError, OSError)) and type(e).__module__ != "http.client":
+                raise
+            self.last_error = f"Token refresh network error: {e}"
+            self.last_error_type = "network"
             print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
             return None
 
@@ -963,12 +1055,20 @@ class QuotaClient:
                     self.last_error_type = "http"
                     print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
                     return {}
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            except Exception as e:
+                if (
+                    not isinstance(
+                        e,
+                        (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError),
+                    )
+                    and type(e).__module__ != "http.client"
+                ):
+                    raise
                 if has_fallback:
                     print(f"[QuotaClient] Primary endpoint error ({e}). Falling back to {self.fallback_quota_endpoint}", file=sys.stderr)
                     continue
                 self.last_error = f"Network or Parse Error: {e}"
-                self.last_error_type = "network" if isinstance(e, (urllib.error.URLError, TimeoutError)) else "parse"
+                self.last_error_type = "parse" if isinstance(e, (json.JSONDecodeError, UnicodeDecodeError)) else "network"
                 print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
                 return {}
 
@@ -1182,6 +1282,342 @@ class QuotaClient:
                         pass
 
 
+class AuthProbeEngine(Protocol):
+    """Structural interface required from a vault engine during pre-flight auth probing."""
+
+    @property
+    def accounts_dir(self) -> Path: ...
+    def get_account_tokens(self, name: str) -> dict[str, str | None] | None: ...
+    def update_account_access_token(
+        self, name: str, access_token: str, expiry: str | None = None
+    ) -> bool: ...
+
+
+def dispatch_http_post(
+    url: str,
+    data: bytes,
+    label: str,
+    log: logging.Logger | None = None,
+) -> threading.Thread | None:
+    """Dispatches a non-blocking HTTP JSON POST on a daemon thread, catching SSL/network errors."""
+    def _send() -> None:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json", "User-Agent": "agy-switcher-watcher/1.0"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                resp.read()
+        except (ssl.SSLError, urllib.error.URLError, ValueError, ConnectionError, OSError, Exception) as e:
+            getattr(e, "close", lambda: None)()
+            if log is not None:
+                log.warning("[watch] %s alert dispatch failed: %s", label, e)
+            print(f"[watch] {label} alert dispatch failed: {e}", file=sys.stderr)
+
+    try:
+        t = threading.Thread(target=_send, name=f"watcher-{label.lower()}-alert", daemon=True)
+        t.start()
+        return t
+    except Exception as e:
+        if log is not None:
+            log.warning("[watch] Failed to spawn %s alert thread: %s", label, e)
+        print(f"[watch] Failed to spawn {label} alert thread: {e}", file=sys.stderr)
+        return None
+
+
+def _persist_refreshed_token(
+    engine: object,
+    acc_name: str,
+    new_token_data: dict[str, Any] | str,
+) -> str:
+    """Persists a refreshed access token via engine.update_account_access_token and returns the token string."""
+    update_fn = getattr(engine, "update_account_access_token", None)
+    if isinstance(new_token_data, dict):
+        raw_tok = new_token_data.get("access_token")
+        access_tok = raw_tok.strip() if isinstance(raw_tok, str) else ""
+        if not access_tok:
+            return ""
+        raw_exp = new_token_data.get("expires_in", 3600)
+        exp_sec = _sanitize_expires_in(raw_exp, default=3600)
+        dt_cls = _get_datetime()
+        expiry_iso = (dt_cls.now(timezone.utc) + timedelta(seconds=exp_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if callable(update_fn):
+            try:
+                update_fn(acc_name, access_tok, expiry=expiry_iso)
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to persist refreshed token for '{acc_name}': {exc}",
+                    file=sys.stderr,
+                )
+        return access_tok
+
+    access_tok = new_token_data.strip() if isinstance(new_token_data, str) else ""
+    if access_tok and callable(update_fn):
+        try:
+            update_fn(acc_name, access_tok)
+        except OSError as exc:
+            print(
+                f"[agy-switch] Warning: Failed to persist refreshed token for '{acc_name}': {exc}",
+                file=sys.stderr,
+            )
+    return access_tok
+
+
+def _classify_probe_failure(client: Any, exc: Exception | None = None) -> tuple[str, str]:
+    """Classifies a quota probe failure into (error_message, error_type)."""
+    if exc is not None:
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                exc.close()
+            except Exception:
+                pass
+            if exc.code in (401, 403):
+                return str(exc), "auth"
+            if 500 <= exc.code <= 599 or exc.code in (408, 429):
+                return str(exc), "network"
+        err_str = str(exc)
+        err_type = "network" if _is_network_error(exc) else ("auth" if _is_auth_error(exc) else "general")
+        return err_str, err_type
+
+    raw_err = getattr(client, "last_error", None)
+    err_msg = raw_err if isinstance(raw_err, str) and raw_err else "Fetch failed"
+    raw_type = getattr(client, "last_error_type", None)
+    if raw_type == "http":
+        err_type = _classify_http_error_message(err_msg)
+    elif isinstance(raw_type, str) and raw_type:
+        err_type = raw_type
+    else:
+        http_class = _classify_http_error_message(err_msg)
+        if http_class in ("auth", "network"):
+            err_type = http_class
+        else:
+            err_type = "auth" if _has_auth_indicator(err_msg) else "network"
+    return err_msg, err_type
+
+
+def _extract_account_tokens_for_probe(engine: object, acc_name: str) -> tuple[str, str]:
+    """Extracts (access_token, refresh_token) for auth probing, tolerating missing refresh_token on disk."""
+    if not is_safe_account_alias(acc_name):
+        return "", ""
+    clean_name = acc_name.strip()
+
+    tokens: object = None
+    get_tokens_fn = getattr(engine, "get_account_tokens", None)
+    if callable(get_tokens_fn):
+        try:
+            tokens = get_tokens_fn(clean_name)
+        except (AgySwitchError, OSError):
+            tokens = None
+    if isinstance(tokens, dict):
+        raw_access = tokens.get("access_token")
+        raw_refresh = tokens.get("refresh_token")
+        access_tok = raw_access.strip() if isinstance(raw_access, str) else ""
+        refresh_tok = raw_refresh.strip() if isinstance(raw_refresh, str) else ""
+        return access_tok, refresh_tok
+
+    accounts_dir = getattr(engine, "accounts_dir", None)
+    if isinstance(accounts_dir, (Path, str)):
+        raw_data, _ = read_json_dict_safe(Path(accounts_dir) / clean_name / "token.json")
+        if raw_data is not None:
+            token_obj = raw_data.get("token")
+            if isinstance(token_obj, dict):
+                raw_access = token_obj.get("access_token")
+                raw_refresh = token_obj.get("refresh_token")
+                access_tok = raw_access.strip() if isinstance(raw_access, str) else ""
+                refresh_tok = raw_refresh.strip() if isinstance(raw_refresh, str) else ""
+                return access_tok, refresh_tok
+    return "", ""
+
+
+def _probe_quota_once(
+    client: object,
+    access_token: str,
+) -> tuple[dict[str, object] | None, str, str]:
+    """Executes a single quota probe without internal refresh and classifies any failure."""
+    fetch_fn = getattr(client, "fetch_quota", None)
+    if not callable(fetch_fn):
+        return None, "Quota client missing fetch_quota", "general"
+    try:
+        quota_res = fetch_fn(access_token)
+    except Exception as exc:
+        err_msg, err_type = _classify_probe_failure(client, exc=exc)
+        return None, err_msg, err_type
+
+    if isinstance(quota_res, dict) and quota_res:
+        return cast(dict[str, object], quota_res), "", ""
+
+    err_msg, err_type = _classify_probe_failure(client, exc=None)
+    return None, err_msg, err_type
+
+
+def _refresh_failure_verdict(acc_name: str, err_msg: str, err_type: str | None) -> AuthProbeResult:
+    """Builds the probe verdict after a failed refresh_access_token attempt."""
+    resolved_type = _classify_http_error_message(err_msg) if err_type == "http" else err_type
+    is_transient = resolved_type in ("network", "parse", "general") or (
+        resolved_type == "http" and not _has_auth_indicator(err_msg)
+    )
+    if is_transient:
+        print(
+            f"[agy-switch] Warning: Pre-flight token refresh encountered transient error for '{acc_name}' ({err_msg}); failing open.",
+            file=sys.stderr,
+        )
+        return {
+            "ok": True,
+            "account": acc_name,
+            "error": err_msg,
+            "error_type": resolved_type or "network",
+            "refreshed": False,
+            "fail_open": True,
+        }
+    return {
+        "ok": False,
+        "account": acc_name,
+        "error": err_msg,
+        "error_type": "auth",
+        "refreshed": False,
+        "fail_open": False,
+    }
+
+
+def probe_account_auth(
+    engine: AuthProbeEngine,
+    account_name: str,
+    client: QuotaClient | None = None,
+) -> AuthProbeResult:
+    """Probes account credentials against CloudCode without mutating cached quota.
+
+    On HTTP 401/403, executes 1x best-effort QuotaClient.refresh_access_token() when a
+    non-empty refresh_token is available, persists the refreshed access token, and re-probes.
+    Confirmed authentication failures return ok=False with error_type='auth'; transient
+    network/5xx failures emit a stderr warning and fail open (ok=True, fail_open=True).
+    """
+    acc_name = account_name.strip() if isinstance(account_name, str) else ""
+    if not is_safe_account_alias(acc_name):
+        return {
+            "ok": False,
+            "account": "" if not acc_name else acc_name,
+            "error": "Invalid account name",
+            "error_type": "validation",
+            "refreshed": False,
+            "fail_open": False,
+        }
+
+    access_token, refresh_token = _extract_account_tokens_for_probe(engine, acc_name)
+    if not access_token:
+        return {
+            "ok": False,
+            "account": acc_name,
+            "error": "No token",
+            "error_type": "auth",
+            "refreshed": False,
+            "fail_open": False,
+        }
+
+    if client is None:
+        client = _get_quota_client_class()(timeout=2.0, engine=engine)
+
+    quota_res, err_msg, err_type = _probe_quota_once(client, access_token)
+    if quota_res is not None:
+        return {
+            "ok": True,
+            "account": acc_name,
+            "refreshed": False,
+            "fail_open": False,
+            "quota": quota_res,
+        }
+
+    if err_type != "auth":
+        print(
+            f"[agy-switch] Warning: Pre-flight auth probe encountered transient failure for '{acc_name}' ({err_msg}); failing open.",
+            file=sys.stderr,
+        )
+        return {
+            "ok": True,
+            "account": acc_name,
+            "error": err_msg,
+            "error_type": err_type,
+            "refreshed": False,
+            "fail_open": True,
+        }
+
+    if not refresh_token:
+        return {
+            "ok": False,
+            "account": acc_name,
+            "error": err_msg,
+            "error_type": "auth",
+            "refreshed": False,
+            "fail_open": False,
+        }
+
+    try:
+        new_token_data = client.refresh_access_token(refresh_token)
+    except Exception as exc:
+        if isinstance(exc, urllib.error.HTTPError) and exc.code in (400, 401, 403):
+            try:
+                exc.close()
+            except Exception:
+                pass
+            return _refresh_failure_verdict(acc_name, str(exc), "auth")
+        ref_err_msg, ref_err_type = _classify_probe_failure(client, exc=exc)
+        return _refresh_failure_verdict(acc_name, ref_err_msg, ref_err_type)
+
+    if not new_token_data:
+        ref_err_raw = getattr(client, "last_error", None)
+        ref_type_raw = getattr(client, "last_error_type", None)
+        refresh_err_msg = ref_err_raw if isinstance(ref_err_raw, str) and ref_err_raw else err_msg
+        refresh_err_type: str | None = ref_type_raw if isinstance(ref_type_raw, str) and ref_type_raw else None
+        if refresh_err_type is None and isinstance(ref_err_raw, str) and ref_err_raw.strip():
+            _, refresh_err_type = _classify_probe_failure(client, exc=None)
+        return _refresh_failure_verdict(acc_name, refresh_err_msg, refresh_err_type)
+
+    refreshed_access_token = _persist_refreshed_token(engine, acc_name, new_token_data)
+    if not refreshed_access_token:
+        return {
+            "ok": False,
+            "account": acc_name,
+            "error": err_msg,
+            "error_type": "auth",
+            "refreshed": False,
+            "fail_open": False,
+        }
+
+    retry_quota, retry_err_msg, retry_err_type = _probe_quota_once(client, refreshed_access_token)
+    if retry_quota is not None:
+        return {
+            "ok": True,
+            "account": acc_name,
+            "refreshed": True,
+            "fail_open": False,
+            "quota": retry_quota,
+        }
+
+    if retry_err_type == "auth":
+        return {
+            "ok": False,
+            "account": acc_name,
+            "error": retry_err_msg,
+            "error_type": "auth",
+            "refreshed": True,
+            "fail_open": False,
+        }
+
+    print(
+        f"[agy-switch] Warning: Pre-flight auth re-probe encountered transient failure for '{acc_name}' ({retry_err_msg}); failing open.",
+        file=sys.stderr,
+    )
+    return {
+        "ok": True,
+        "account": acc_name,
+        "error": retry_err_msg,
+        "error_type": retry_err_type,
+        "refreshed": True,
+        "fail_open": True,
+    }
+
+
 def fetch_account_quota(
     engine: Any,
     account: dict[str, Any] | str,
@@ -1207,19 +1643,7 @@ def fetch_account_quota(
         return acc_name, {"error": "No token", "error_type": "auth"}
 
     def _on_token_refreshed(new_token_data: dict[str, Any] | str) -> None:
-        if isinstance(new_token_data, dict):
-            access_tok = str(new_token_data.get("access_token", "")).strip()
-            if not access_tok:
-                return
-            raw_exp = new_token_data.get("expires_in", 3600)
-            exp_sec = _sanitize_expires_in(raw_exp, default=3600)
-            dt_cls = _get_datetime()
-            expiry_iso = (dt_cls.now(timezone.utc) + timedelta(seconds=exp_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            if hasattr(engine, "update_account_access_token"):
-                engine.update_account_access_token(acc_name, access_tok, expiry=expiry_iso)
-        else:
-            if hasattr(engine, "update_account_access_token"):
-                engine.update_account_access_token(acc_name, str(new_token_data))
+        _persist_refreshed_token(engine, acc_name, new_token_data)
 
     try:
         try:
@@ -1237,20 +1661,15 @@ def fetch_account_quota(
             else:
                 raise
         if quota_res:
+            if isinstance(quota_res, dict) and "error" not in quota_res:
+                clear_auth_error = getattr(engine, "clear_auth_error", None)
+                if callable(clear_auth_error):
+                    clear_auth_error(acc_name)
             return acc_name, quota_res
-        raw_err = getattr(client, "last_error", None)
-        err_msg = raw_err if isinstance(raw_err, str) and raw_err else "Fetch failed"
-        raw_type = getattr(client, "last_error_type", None)
-        if raw_type == "http" and bool(HTTP_SERVER_ERROR_PATTERN.search(err_msg)):
-            err_type = "network"
-        elif isinstance(raw_type, str) and raw_type:
-            err_type = raw_type
-        else:
-            err_type = "auth" if _has_auth_indicator(err_msg) else "network"
+        err_msg, err_type = _classify_probe_failure(client, exc=None)
         return acc_name, {"error": err_msg, "error_type": err_type}
     except Exception as e:
-        err_str = str(e)
-        err_type = "network" if _is_network_error(e) else ("auth" if _is_auth_error(e) else "general")
+        err_str, err_type = _classify_probe_failure(client, exc=e)
         return acc_name, {"error": err_str, "error_type": err_type}
 
 

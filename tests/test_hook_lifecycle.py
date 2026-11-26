@@ -1401,7 +1401,9 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
         self.assertEqual(ret, 0)
         # Succeeded in failover to acc2
         self.assertEqual(self.engine.get_active_name(), "acc2")
-        spy_switch.assert_called_once_with("acc2", restart_server=False, force=True)
+        spy_switch.assert_called_once_with(
+            "acc2", restart_server=False, force=True, clear_failover=False
+        )
 
         output = json.loads(out_capture.getvalue())
         self.assertIn("injectSteps", output)
@@ -3211,6 +3213,973 @@ class TestHookLifecycleAndConfig(unittest.TestCase):
 
 
 
+
+
+class TestHookFailoverAuditDualPersistence(unittest.TestCase):
+    """Tests for Ticket 16: PreInvocation Hook Dual-Persistence Audit Log & Auth Failover Message."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.gemini_dir = self.base_path / ".gemini"
+        self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.proc_dir = self.base_path / "proc"
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+        self.engine.set_auto_switch(True)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _register_accounts(self, names: list[str], active: str) -> None:
+        for acc_name in names:
+            acc_dir = self.vault_dir / "accounts" / acc_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(
+                json.dumps({
+                    "token": {
+                        "access_token": f"tok_{acc_name}",
+                        "refresh_token": f"ref_{acc_name}",
+                        "token_type": "Bearer",
+                        "expiry": "2026-10-05T12:00:00Z",
+                    },
+                    "auth_method": "oauth",
+                    "id_token": _make_jwt(f"{acc_name}@example.com"),
+                }),
+                encoding="utf-8",
+            )
+        self.engine.set_active_name(active)
+
+    def test_failover_audit_dual_persistence_auth_corruption(self) -> None:
+        """[AUDIT-HOOK-001] Auth corruption failover appends watch.log, writes failover_state.json, keeps quota cache clean, and emits differentiated ephemeralMessage."""
+        import io
+        from agy_switch import handle_pre_invocation_hook
+
+        self._register_accounts(["automator", "honey"], active="automator")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGY_VAULT_DIR", None)
+            with patch("time.time", return_value=1700001000.0):
+                with patch(
+                    "agy_switch.fetch_account_quota",
+                    return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"}),
+                ):
+                    with patch(
+                        "agy_switch.fetch_all_accounts_quota",
+                        return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700005000}}},
+                    ):
+                        with patch.object(self.engine, "switch_tokens", wraps=self.engine.switch_tokens) as spy_switch:
+                            with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                out_capture = io.StringIO()
+                                err_capture = io.StringIO()
+                                with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                    ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "honey")
+        spy_switch.assert_called_once_with(
+            "honey", restart_server=False, force=True, clear_failover=False
+        )
+
+        # 1. Verify watch.log structured chronological entry (mode 0600)
+        watch_log = self.vault_dir / "watch.log"
+        self.assertTrue(watch_log.is_file(), "watch.log must be created on failover")
+        self.assertEqual(stat.S_IMODE(watch_log.stat().st_mode), 0o600)
+        log_text = watch_log.read_text(encoding="utf-8")
+        self.assertIn("2023-11-14 22:30:00", log_text)
+        self.assertIn("trigger: auth_corruption", log_text)
+        self.assertIn("automator", log_text)
+        self.assertIn("honey", log_text)
+        self.assertIn("HTTP 403 Forbidden", log_text)
+
+        # 2. Verify cache/failover_state.json (mode 0600)
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+        self.assertTrue(failover_file.is_file(), "cache/failover_state.json must be created on failover")
+        self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+        failover_data = json.loads(failover_file.read_text(encoding="utf-8"))
+        last_failover = failover_data.get("last_failover")
+        self.assertIsInstance(last_failover, dict)
+        self.assertEqual(last_failover["from_account"], "automator")
+        self.assertEqual(last_failover["to_account"], "honey")
+        self.assertEqual(last_failover["trigger"], "auth_corruption")
+        self.assertIn("HTTP 403 Forbidden", last_failover["reason"])
+        self.assertEqual(last_failover["timestamp"], 1700001000.0)
+
+        auth_errors = failover_data.get("auth_errors")
+        self.assertIsInstance(auth_errors, dict)
+        self.assertIn("automator", auth_errors)
+        self.assertEqual(auth_errors["automator"]["error"], "HTTP 403 Forbidden")
+        self.assertEqual(auth_errors["automator"]["error_type"], "auth")
+        self.assertEqual(auth_errors["automator"]["timestamp"], 1700001000.0)
+
+        # 3. Verify last_known_quota.json contains no failover metadata keys
+        quota_cache_file = self.vault_dir / "cache" / "last_known_quota.json"
+        self.assertTrue(quota_cache_file.is_file())
+        quota_cache = json.loads(quota_cache_file.read_text(encoding="utf-8"))
+        self.assertNotIn("last_failover", quota_cache)
+        self.assertNotIn("auth_errors", quota_cache)
+        self.assertNotIn("trigger", quota_cache)
+
+        # 4. Verify differentiated ephemeralMessage
+        output = json.loads(out_capture.getvalue())
+        self.assertIn("injectSteps", output)
+        msg = output["injectSteps"][0]["ephemeralMessage"]
+        self.assertIn("Auto-rotated to **honey**", msg)
+        self.assertIn("85% remaining", msg)
+        self.assertIn("automator", msg)
+        self.assertIn("HTTP 403 Forbidden", msg)
+        self.assertIn("agy-switch login automator", msg)
+
+        # 5. Credential protection
+        for secret in ("tok_automator", "ref_automator", "tok_honey", "ref_honey"):
+            self.assertNotIn(secret, out_capture.getvalue())
+            self.assertNotIn(secret, err_capture.getvalue())
+            self.assertNotIn(secret, log_text)
+            self.assertNotIn(secret, failover_file.read_text(encoding="utf-8"))
+
+    def test_failover_audit_dual_persistence_quota_rotation(self) -> None:
+        """[AUDIT-HOOK-002] Quota rotation records trigger: quota_rotation in watch.log and failover_state.json without quarantining active account."""
+        import io
+        from agy_switch import handle_pre_invocation_hook
+
+        self._register_accounts(["primary-acc", "standby-acc"], active="primary-acc")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGY_VAULT_DIR", None)
+            with patch("time.time", return_value=1700002000.0):
+                with patch(
+                    "agy_switch.fetch_account_quota",
+                    return_value=("primary-acc", {"gemini": {"quota": 10, "reset_time": 1700005000}}),
+                ):
+                    with patch(
+                        "agy_switch.fetch_all_accounts_quota",
+                        return_value={"standby-acc": {"gemini": {"quota": 90, "reset_time": 1700005000}}},
+                    ):
+                        with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                            out_capture = io.StringIO()
+                            with patch("sys.stdout", out_capture):
+                                ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+
+        watch_log = self.vault_dir / "watch.log"
+        self.assertTrue(watch_log.is_file())
+        self.assertEqual(stat.S_IMODE(watch_log.stat().st_mode), 0o600)
+        log_text = watch_log.read_text(encoding="utf-8")
+        self.assertIn("trigger: quota_rotation", log_text)
+        self.assertIn("primary-acc", log_text)
+        self.assertIn("standby-acc", log_text)
+
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+        self.assertTrue(failover_file.is_file())
+        self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+        failover_data = json.loads(failover_file.read_text(encoding="utf-8"))
+        last_failover = failover_data.get("last_failover")
+        self.assertIsInstance(last_failover, dict)
+        self.assertEqual(last_failover["from_account"], "primary-acc")
+        self.assertEqual(last_failover["to_account"], "standby-acc")
+        self.assertEqual(last_failover["trigger"], "quota_rotation")
+        self.assertNotIn("primary-acc", failover_data.get("auth_errors", {}))
+        self.assertEqual(failover_data.get("auth_errors"), {})
+
+        output = json.loads(out_capture.getvalue())
+        msg = output["injectSteps"][0]["ephemeralMessage"]
+        self.assertIn("Auto-rotated to **standby-acc**", msg)
+        self.assertIn("90% remaining", msg)
+        self.assertNotIn("agy-switch login", msg)
+
+    def test_failover_audit_dual_persistence_corrupt_and_error_resilience(self) -> None:
+        """[AUDIT-HOOK-ERR-001] [AUDIT-HOOK-ERR-002] [AUDIT-HOOK-EDGE-002] Corrupt failover_state.json recovery, symlink safety, OSError tolerance, and Tier 1 zero-write pass."""
+        import errno as errno_mod
+        import io
+        from agy_switch import handle_pre_invocation_hook
+
+        # 1. [AUDIT-HOOK-ERR-001] Corrupt / non-dict failover_state.json recovers gracefully
+        for label, corrupt_payload in (
+            ("truncated_json", '{"last_failover": '),
+            ("json_array", "[]"),
+            ("json_int", "123"),
+        ):
+            with self.subTest(corrupt_case=label):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vdir = Path(tmpdir) / "vault"
+                    gdir = Path(tmpdir) / "gemini"
+                    ldir = Path(tmpdir) / "legacy"
+                    pdir = Path(tmpdir) / "proc"
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                    eng.set_auto_switch(True)
+                    for acc in ("automator", "honey"):
+                        adir = vdir / "accounts" / acc
+                        adir.mkdir(parents=True, exist_ok=True)
+                        (adir / "token.json").write_text(
+                            json.dumps({
+                                "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                                "auth_method": "oauth",
+                                "id_token": _make_jwt(f"{acc}@example.com"),
+                            }),
+                            encoding="utf-8",
+                        )
+                    eng.set_active_name("automator")
+                    (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                    (vdir / "cache" / "failover_state.json").write_text(corrupt_payload, encoding="utf-8")
+
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("AGY_VAULT_DIR", None)
+                        with patch("time.time", return_value=1700003000.0):
+                            with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                                with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 80, "reset_time": 1700005000}}}):
+                                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                        out_capture = io.StringIO()
+                                        with patch("sys.stdout", out_capture):
+                                            ret = handle_pre_invocation_hook(eng)
+
+                    self.assertEqual(ret, 0)
+                    self.assertEqual(eng.get_active_name(), "honey")
+                    state = json.loads((vdir / "cache" / "failover_state.json").read_text(encoding="utf-8"))
+                    self.assertEqual(stat.S_IMODE((vdir / "cache" / "failover_state.json").stat().st_mode), 0o600)
+                    self.assertEqual(state["last_failover"]["trigger"], "auth_corruption")
+                    self.assertIn("automator", state["auth_errors"])
+
+        # 2. [AUDIT-HOOK-ERR-002] Symlink tampering at watch.log and failover_state.json never follows targets
+        with self.subTest(case="symlink_tampering"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                gdir = Path(tmpdir) / "gemini"
+                ldir = Path(tmpdir) / "legacy"
+                pdir = Path(tmpdir) / "proc"
+                pdir.mkdir(parents=True, exist_ok=True)
+                eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                eng.set_auto_switch(True)
+                for acc in ("automator", "honey"):
+                    adir = vdir / "accounts" / acc
+                    adir.mkdir(parents=True, exist_ok=True)
+                    (adir / "token.json").write_text(
+                        json.dumps({
+                            "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                            "auth_method": "oauth",
+                            "id_token": _make_jwt(f"{acc}@example.com"),
+                        }),
+                        encoding="utf-8",
+                    )
+                eng.set_active_name("automator")
+
+                ext_log = Path(tmpdir) / "external_log.txt"
+                ext_log.write_text("UNTOUCHED_LOG\n", encoding="utf-8")
+                ext_state = Path(tmpdir) / "external_state.json"
+                ext_state.write_text('{"untouched": true}\n', encoding="utf-8")
+
+                (vdir / "watch.log").symlink_to(ext_log)
+                (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                (vdir / "cache" / "failover_state.json").symlink_to(ext_state)
+
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("AGY_VAULT_DIR", None)
+                    with patch("time.time", return_value=1700004000.0):
+                        with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                            with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 80, "reset_time": 1700005000}}}):
+                                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                    out_capture = io.StringIO()
+                                    with patch("sys.stdout", out_capture):
+                                        ret = handle_pre_invocation_hook(eng)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(ext_log.read_text(encoding="utf-8"), "UNTOUCHED_LOG\n")
+                self.assertEqual(ext_state.read_text(encoding="utf-8"), '{"untouched": true}\n')
+                self.assertFalse((vdir / "watch.log").is_symlink())
+                self.assertFalse((vdir / "cache" / "failover_state.json").is_symlink())
+
+        # 3. [AUDIT-HOOK-ERR-002] OSError (ENOSPC) during persistence logs warning to stderr without breaking rotation
+        with self.subTest(case="oserror_enospc_resilience"):
+            self._register_accounts(["automator", "honey"], active="automator")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGY_VAULT_DIR", None)
+                with patch("time.time", return_value=1700005000.0):
+                    with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                        with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700009000}}}):
+                            with patch("agy_switcher.hook.append_secure_log_entry", side_effect=OSError(errno_mod.ENOSPC, "No space left on device")):
+                                with patch.object(self.engine, "_atomic_write_json", side_effect=OSError(errno_mod.ENOSPC, "No space left on device")):
+                                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                        out_capture = io.StringIO()
+                                        err_capture = io.StringIO()
+                                        with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                            ret = handle_pre_invocation_hook(self.engine)
+
+            self.assertEqual(ret, 0)
+            self.assertEqual(self.engine.get_active_name(), "honey")
+            output = json.loads(out_capture.getvalue())
+            self.assertIn("Auto-rotated to **honey**", output["injectSteps"][0]["ephemeralMessage"])
+            self.assertIn("Warning", err_capture.getvalue())
+
+        # 4. [AUDIT-HOOK-EDGE-002] Tier 1 healthy fast-path performs zero writes to watch.log or failover_state.json
+        with self.subTest(case="tier1_fast_path_zero_writes"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                gdir = Path(tmpdir) / "gemini"
+                ldir = Path(tmpdir) / "legacy"
+                pdir = Path(tmpdir) / "proc"
+                pdir.mkdir(parents=True, exist_ok=True)
+                eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                eng.set_auto_switch(True)
+                adir = vdir / "accounts" / "honey"
+                adir.mkdir(parents=True, exist_ok=True)
+                (adir / "token.json").write_text(
+                    json.dumps({
+                        "token": {"access_token": "tok_honey", "refresh_token": "ref_honey", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                        "auth_method": "oauth",
+                        "id_token": _make_jwt("honey@example.com"),
+                    }),
+                    encoding="utf-8",
+                )
+                eng.set_active_name("honey")
+                (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                (vdir / "cache" / "last_known_quota.json").write_text(
+                    json.dumps({
+                        "timestamp": 1700006000.0,
+                        "accounts": {
+                            "honey": {"cached_at": 1700006000.0, "gemini": {"quota": 85, "reset_time": 1700009000}},
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("AGY_VAULT_DIR", None)
+                    with patch("time.time", return_value=1700006010.0):
+                        with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                            out_capture = io.StringIO()
+                            with patch("sys.stdout", out_capture):
+                                ret = handle_pre_invocation_hook(eng)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(json.loads(out_capture.getvalue()), {})
+                self.assertFalse((vdir / "watch.log").exists())
+                self.assertFalse((vdir / "cache" / "failover_state.json").exists())
+
+        # 5. [AUDIT-HOOK-ERR-002] Real read-only watch.log (EACCES) fails safe without breaking failover_state or rotation
+        with self.subTest(case="readonly_watch_log_real_eacces"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                gdir = Path(tmpdir) / "gemini"
+                ldir = Path(tmpdir) / "legacy"
+                pdir = Path(tmpdir) / "proc"
+                pdir.mkdir(parents=True, exist_ok=True)
+                eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                eng.set_auto_switch(True)
+                for acc in ("automator", "honey"):
+                    adir = vdir / "accounts" / acc
+                    adir.mkdir(parents=True, exist_ok=True)
+                    (adir / "token.json").write_text(
+                        json.dumps({
+                            "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                            "auth_method": "oauth",
+                            "id_token": _make_jwt(f"{acc}@example.com"),
+                        }),
+                        encoding="utf-8",
+                    )
+                eng.set_active_name("automator")
+                ro_log = vdir / "watch.log"
+                ro_log.write_text("EXISTING\n", encoding="utf-8")
+                os.chmod(ro_log, 0o400)
+                try:
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("AGY_VAULT_DIR", None)
+                        with patch("time.time", return_value=1700007000.0):
+                            with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                                with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700009000}}}):
+                                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                        out_capture = io.StringIO()
+                                        err_capture = io.StringIO()
+                                        with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                            ret = handle_pre_invocation_hook(eng)
+                finally:
+                    os.chmod(ro_log, 0o600)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(eng.get_active_name(), "honey")
+                output = json.loads(out_capture.getvalue())
+                self.assertIn("Auto-rotated to **honey**", output["injectSteps"][0]["ephemeralMessage"])
+                state = eng.load_failover_state()
+                self.assertEqual(state["last_failover"]["trigger"], "auth_corruption")
+                self.assertIn("automator", state["auth_errors"])
+
+    def test_failover_audit_dual_persistence_auth_payload_variants_and_real_probe(self) -> None:
+        """Exercises real fetch_account_quota/QuotaClient boundary, http_status 401/403 variants, multiline sanitization, and auth_errors preservation."""
+        import io
+        from agy_switch import QuotaClient, handle_pre_invocation_hook
+
+        # 1. Real fetch_account_quota + fetch_all_accounts_quota seam with HTTP 403 mocked at QuotaClient.fetch_quota
+        with self.subTest(case="real_fetch_account_quota_403_boundary"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                gdir = Path(tmpdir) / "gemini"
+                ldir = Path(tmpdir) / "legacy"
+                pdir = Path(tmpdir) / "proc"
+                pdir.mkdir(parents=True, exist_ok=True)
+                eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                eng.set_auto_switch(True)
+                for acc in ("automator", "honey"):
+                    adir = vdir / "accounts" / acc
+                    adir.mkdir(parents=True, exist_ok=True)
+                    (adir / "token.json").write_text(
+                        json.dumps({
+                            "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                            "auth_method": "oauth",
+                            "id_token": _make_jwt(f"{acc}@example.com"),
+                        }),
+                        encoding="utf-8",
+                    )
+                eng.set_active_name("automator")
+
+                def _fake_fetch_quota(client_self, access_token: str, refresh_token: str | None = None, on_refresh=None):
+                    if access_token == "tok_automator":
+                        client_self.last_error = "HTTP Error 403: Forbidden"
+                        client_self.last_error_type = "auth"
+                        return {}
+                    client_self.last_error = None
+                    client_self.last_error_type = None
+                    return {"gemini": {"quota": 85, "reset_time": 1700009000}}
+
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("AGY_VAULT_DIR", None)
+                    with patch("time.time", return_value=1700008000.0):
+                        with patch.object(QuotaClient, "fetch_quota", autospec=True, side_effect=_fake_fetch_quota):
+                            with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                out_capture = io.StringIO()
+                                with patch("sys.stdout", out_capture):
+                                    ret = handle_pre_invocation_hook(eng)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(eng.get_active_name(), "honey")
+                state = eng.load_failover_state()
+                self.assertEqual(state["last_failover"]["trigger"], "auth_corruption")
+                self.assertIn("403", state["last_failover"]["reason"])
+                self.assertIn("automator", state["auth_errors"])
+                msg = json.loads(out_capture.getvalue())["injectSteps"][0]["ephemeralMessage"]
+                self.assertIn("Auto-rotated to **honey**", msg)
+                self.assertIn("agy-switch login automator", msg)
+
+        # 2. Auth payload variants (http_status 403 with error_type='http', http_status 401, missing 'error' key, multiline error) + preserving existing auth_errors
+        variants = [
+            ("http_status_403_http_type", {"error": "Upstream access rejected", "http_status": 403, "error_type": "http"}, "Upstream access rejected"),
+            ("http_status_401_no_type", {"error": "Token expired", "http_status": 401}, "Token expired"),
+            ("missing_error_key_auth_type", {"error_type": "auth", "http_status": 403}, "HTTP 403"),
+            ("multiline_error_sanitized", {"error": "HTTP 403\nForbidden\r\nSession revoked", "error_type": "auth"}, "HTTP 403 Forbidden Session revoked"),
+        ]
+        for label, active_err_payload, expected_reason in variants:
+            with self.subTest(auth_variant=label):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vdir = Path(tmpdir) / "vault"
+                    gdir = Path(tmpdir) / "gemini"
+                    ldir = Path(tmpdir) / "legacy"
+                    pdir = Path(tmpdir) / "proc"
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                    eng.set_auto_switch(True)
+                    for acc in ("automator", "honey"):
+                        adir = vdir / "accounts" / acc
+                        adir.mkdir(parents=True, exist_ok=True)
+                        (adir / "token.json").write_text(
+                            json.dumps({
+                                "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                                "auth_method": "oauth",
+                                "id_token": _make_jwt(f"{acc}@example.com"),
+                            }),
+                            encoding="utf-8",
+                        )
+                    eng.set_active_name("automator")
+                    eng.record_auth_error("other-broken", error="Previously revoked", error_type="auth", timestamp=1699999000.0)
+
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("AGY_VAULT_DIR", None)
+                        with patch("time.time", return_value=1700009000.0):
+                            with patch("agy_switch.fetch_account_quota", return_value=("automator", active_err_payload)):
+                                with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700015000}}}):
+                                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                        out_capture = io.StringIO()
+                                        with patch("sys.stdout", out_capture):
+                                            ret = handle_pre_invocation_hook(eng)
+
+                    self.assertEqual(ret, 0)
+                    self.assertEqual(eng.get_active_name(), "honey")
+                    log_lines = (vdir / "watch.log").read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(len(log_lines), 1)
+                    self.assertIn("trigger: auth_corruption", log_lines[0])
+                    self.assertIn(expected_reason, log_lines[0])
+                    state = eng.load_failover_state()
+                    self.assertEqual(state["last_failover"]["trigger"], "auth_corruption")
+                    self.assertEqual(state["last_failover"]["reason"], expected_reason)
+                    self.assertIn("automator", state["auth_errors"])
+                    self.assertEqual(state["auth_errors"]["automator"]["error_type"], "auth")
+                    self.assertIn("other-broken", state["auth_errors"])
+                    msg = json.loads(out_capture.getvalue())["injectSteps"][0]["ephemeralMessage"]
+                    self.assertIn("Auto-rotated to **honey**", msg)
+                    self.assertIn("agy-switch login automator", msg)
+
+    def test_failover_audit_io_resilience_and_tier1_err_002(self) -> None:
+        """[AUDIT-HOOK-ERR-002] Symlink tampering and EACCES/ENOSPC during audit/state persistence fail safe without breaking hook rotation."""
+        import builtins
+        import errno as errno_mod
+        import io
+        from agy_switch import QuotaClient, handle_pre_invocation_hook
+
+        # 1. Symlink tampering (existing targets and dangling targets) never followed
+        for symlink_mode in ("existing_targets", "dangling_targets"):
+            with self.subTest(case="symlink_tampering", mode=symlink_mode):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vdir = Path(tmpdir) / "vault"
+                    gdir = Path(tmpdir) / "gemini"
+                    ldir = Path(tmpdir) / "legacy"
+                    pdir = Path(tmpdir) / "proc"
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                    eng.set_auto_switch(True)
+                    for acc in ("automator", "honey"):
+                        adir = vdir / "accounts" / acc
+                        adir.mkdir(parents=True, exist_ok=True)
+                        (adir / "token.json").write_text(
+                            json.dumps({
+                                "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                                "auth_method": "oauth",
+                                "id_token": _make_jwt(f"{acc}@example.com"),
+                            }),
+                            encoding="utf-8",
+                        )
+                    eng.set_active_name("automator")
+
+                    ext_log = Path(tmpdir) / "external_watch.log"
+                    ext_state = Path(tmpdir) / "external_failover_state.json"
+                    if symlink_mode == "existing_targets":
+                        ext_log.write_text("UNTOUCHED_LOG\n", encoding="utf-8")
+                        ext_state.write_text('{"untouched": true}\n', encoding="utf-8")
+
+                    (vdir / "watch.log").symlink_to(ext_log)
+                    (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                    (vdir / "cache" / "failover_state.json").symlink_to(ext_state)
+
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("AGY_VAULT_DIR", None)
+                        with patch("time.time", return_value=1700010000.0):
+                            with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                                with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700015000}}}):
+                                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                        out_capture = io.StringIO()
+                                        err_capture = io.StringIO()
+                                        with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                            ret = handle_pre_invocation_hook(eng)
+
+                    self.assertEqual(ret, 0)
+                    self.assertEqual(eng.get_active_name(), "honey")
+                    desktop_tok = json.loads(eng.desktop_token_file.read_text(encoding="utf-8"))
+                    cli_tok = json.loads(eng.cli_token_file.read_text(encoding="utf-8"))
+                    self.assertEqual(desktop_tok["token"]["access_token"], "tok_honey")
+                    self.assertEqual(cli_tok["token"]["access_token"], "tok_honey")
+                    output = json.loads(out_capture.getvalue())
+                    self.assertIn("Auto-rotated to **honey**", output["injectSteps"][0]["ephemeralMessage"])
+
+                    if symlink_mode == "existing_targets":
+                        self.assertEqual(ext_log.read_text(encoding="utf-8"), "UNTOUCHED_LOG\n")
+                        self.assertEqual(ext_state.read_text(encoding="utf-8"), '{"untouched": true}\n')
+                    else:
+                        self.assertFalse(ext_log.exists())
+                        self.assertFalse(ext_state.exists())
+
+                    self.assertFalse((vdir / "watch.log").is_symlink())
+                    self.assertFalse((vdir / "cache" / "failover_state.json").is_symlink())
+                    self.assertEqual(stat.S_IMODE((vdir / "watch.log").stat().st_mode), 0o600)
+                    self.assertEqual(stat.S_IMODE((vdir / "cache" / "failover_state.json").stat().st_mode), 0o600)
+
+        # 2. Vault cache directory raises OSError (EACCES / ENOSPC) during persistence (OS boundary)
+        for err_no, err_msg in (
+            (errno_mod.EACCES, "Permission denied"),
+            (errno_mod.ENOSPC, "No space left on device"),
+        ):
+            with self.subTest(case="cache_dir_mkstemp_oserror", errno=err_no):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vdir = Path(tmpdir) / "vault"
+                    gdir = Path(tmpdir) / "gemini"
+                    ldir = Path(tmpdir) / "legacy"
+                    pdir = Path(tmpdir) / "proc"
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                    eng.set_auto_switch(True)
+                    for acc in ("automator", "honey"):
+                        adir = vdir / "accounts" / acc
+                        adir.mkdir(parents=True, exist_ok=True)
+                        (adir / "token.json").write_text(
+                            json.dumps({
+                                "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                                "auth_method": "oauth",
+                                "id_token": _make_jwt(f"{acc}@example.com"),
+                            }),
+                            encoding="utf-8",
+                        )
+                    eng.set_active_name("automator")
+
+                    ro_log = vdir / "watch.log"
+                    ro_log.write_text("PREEXISTING\n", encoding="utf-8")
+                    os.chmod(ro_log, 0o400)
+                    real_mkstemp = tempfile.mkstemp
+                    cache_dir_resolved = (vdir / "cache").resolve()
+
+                    def _faulting_mkstemp(*args: object, **kwargs: object):
+                        target_dir = kwargs.get("dir")
+                        if target_dir is not None and Path(str(target_dir)).resolve() == cache_dir_resolved:
+                            raise OSError(err_no, err_msg)
+                        return real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+
+                    try:
+                        with patch.dict(os.environ, {}, clear=False):
+                            os.environ.pop("AGY_VAULT_DIR", None)
+                            with patch("time.time", return_value=1700011000.0):
+                                with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                                    with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700015000}}}):
+                                        with patch("tempfile.mkstemp", side_effect=_faulting_mkstemp):
+                                            with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                                out_capture = io.StringIO()
+                                                err_capture = io.StringIO()
+                                                with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                                    ret = handle_pre_invocation_hook(eng)
+                    finally:
+                        os.chmod(ro_log, 0o600)
+
+                    self.assertEqual(ret, 0)
+                    self.assertEqual(eng.get_active_name(), "honey")
+                    desktop_tok = json.loads(eng.desktop_token_file.read_text(encoding="utf-8"))
+                    self.assertEqual(desktop_tok["token"]["access_token"], "tok_honey")
+                    output = json.loads(out_capture.getvalue())
+                    self.assertIn("Auto-rotated to **honey**", output["injectSteps"][0]["ephemeralMessage"])
+                    stderr_text = err_capture.getvalue()
+                    self.assertIn("Warning", stderr_text)
+                    self.assertIn("Failed to write audit log entry", stderr_text)
+
+        # 3. Direct OSError raised by QuotaClient.save_cache must not abort hook rotation
+        with self.subTest(case="save_cache_direct_oserror"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                gdir = Path(tmpdir) / "gemini"
+                ldir = Path(tmpdir) / "legacy"
+                pdir = Path(tmpdir) / "proc"
+                pdir.mkdir(parents=True, exist_ok=True)
+                eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                eng.set_auto_switch(True)
+                for acc in ("automator", "honey"):
+                    adir = vdir / "accounts" / acc
+                    adir.mkdir(parents=True, exist_ok=True)
+                    (adir / "token.json").write_text(
+                        json.dumps({
+                            "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                            "auth_method": "oauth",
+                            "id_token": _make_jwt(f"{acc}@example.com"),
+                        }),
+                        encoding="utf-8",
+                    )
+                eng.set_active_name("automator")
+
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("AGY_VAULT_DIR", None)
+                    with patch("time.time", return_value=1700012000.0):
+                        with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                            with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700015000}}}):
+                                with patch.object(QuotaClient, "save_cache", side_effect=OSError(errno_mod.ENOSPC, "No space left on device")):
+                                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                        out_capture = io.StringIO()
+                                        err_capture = io.StringIO()
+                                        with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                            ret = handle_pre_invocation_hook(eng)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(eng.get_active_name(), "honey")
+                output = json.loads(out_capture.getvalue())
+                self.assertIn("Auto-rotated to **honey**", output["injectSteps"][0]["ephemeralMessage"])
+                self.assertIn("Warning", err_capture.getvalue())
+
+        # 4. Symlink unlink OSError (EACCES) on watch.log + symlink failover_state.json under cache ENOSPC never follows symlinks
+        with self.subTest(case="symlink_unlink_oserror_and_cache_enospc"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                gdir = Path(tmpdir) / "gemini"
+                ldir = Path(tmpdir) / "legacy"
+                pdir = Path(tmpdir) / "proc"
+                pdir.mkdir(parents=True, exist_ok=True)
+                eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                eng.set_auto_switch(True)
+                for acc in ("automator", "honey"):
+                    adir = vdir / "accounts" / acc
+                    adir.mkdir(parents=True, exist_ok=True)
+                    (adir / "token.json").write_text(
+                        json.dumps({
+                            "token": {"access_token": f"tok_{acc}", "refresh_token": f"ref_{acc}", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                            "auth_method": "oauth",
+                            "id_token": _make_jwt(f"{acc}@example.com"),
+                        }),
+                        encoding="utf-8",
+                    )
+                eng.set_active_name("automator")
+
+                ext_log = Path(tmpdir) / "external_watch.log"
+                ext_log.write_text("UNTOUCHED_LOG\n", encoding="utf-8")
+                ext_state = Path(tmpdir) / "external_failover_state.json"
+                ext_state.write_text('{"untouched": true}\n', encoding="utf-8")
+
+                watch_log_path = vdir / "watch.log"
+                watch_log_path.symlink_to(ext_log)
+                (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                (vdir / "cache" / "failover_state.json").symlink_to(ext_state)
+
+                real_unlink = Path.unlink
+                real_mkstemp = tempfile.mkstemp
+                cache_dir_resolved = (vdir / "cache").resolve()
+
+                def _faulting_unlink(path_self: Path, missing_ok: bool = False) -> None:
+                    if path_self == watch_log_path:
+                        raise OSError(errno_mod.EACCES, "Permission denied")
+                    real_unlink(path_self, missing_ok=missing_ok)
+
+                def _faulting_mkstemp(*args: object, **kwargs: object):
+                    target_dir = kwargs.get("dir")
+                    if target_dir is not None and Path(str(target_dir)).resolve() == cache_dir_resolved:
+                        raise OSError(errno_mod.ENOSPC, "No space left on device")
+                    return real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("AGY_VAULT_DIR", None)
+                    with patch("time.time", return_value=1700013000.0):
+                        with patch("agy_switch.fetch_account_quota", return_value=("automator", {"error": "HTTP 403 Forbidden", "error_type": "auth"})):
+                            with patch("agy_switch.fetch_all_accounts_quota", return_value={"honey": {"gemini": {"quota": 85, "reset_time": 1700015000}}}):
+                                with patch.object(Path, "unlink", autospec=True, side_effect=_faulting_unlink):
+                                    with patch("tempfile.mkstemp", side_effect=_faulting_mkstemp):
+                                        with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                            out_capture = io.StringIO()
+                                            err_capture = io.StringIO()
+                                            with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                                ret = handle_pre_invocation_hook(eng)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(eng.get_active_name(), "honey")
+                desktop_tok = json.loads(eng.desktop_token_file.read_text(encoding="utf-8"))
+                self.assertEqual(desktop_tok["token"]["access_token"], "tok_honey")
+                output = json.loads(out_capture.getvalue())
+                self.assertIn("Auto-rotated to **honey**", output["injectSteps"][0]["ephemeralMessage"])
+                self.assertEqual(ext_log.read_text(encoding="utf-8"), "UNTOUCHED_LOG\n")
+                self.assertEqual(ext_state.read_text(encoding="utf-8"), '{"untouched": true}\n')
+                self.assertIn("Warning: Failed to append audit log", err_capture.getvalue())
+                self.assertIn("Warning: Failed to persist failover state", err_capture.getvalue())
+
+        # 5. Tier 2 healthy probe with QuotaClient.save_cache raising OSError must return {} with exit code 0
+        with self.subTest(case="tier2_save_cache_direct_oserror"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                gdir = Path(tmpdir) / "gemini"
+                ldir = Path(tmpdir) / "legacy"
+                pdir = Path(tmpdir) / "proc"
+                pdir.mkdir(parents=True, exist_ok=True)
+                eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                eng.set_auto_switch(True)
+                adir = vdir / "accounts" / "honey"
+                adir.mkdir(parents=True, exist_ok=True)
+                (adir / "token.json").write_text(
+                    json.dumps({
+                        "token": {"access_token": "tok_honey", "refresh_token": "ref_honey", "token_type": "Bearer", "expiry": "2026-10-05T12:00:00Z"},
+                        "auth_method": "oauth",
+                        "id_token": _make_jwt("honey@example.com"),
+                    }),
+                    encoding="utf-8",
+                )
+                eng.set_active_name("honey")
+
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("AGY_VAULT_DIR", None)
+                    with patch("time.time", return_value=1700014000.0):
+                        with patch("agy_switch.fetch_account_quota", return_value=("honey", {"gemini": {"quota": 80, "reset_time": 1700018000}})):
+                            with patch.object(QuotaClient, "save_cache", side_effect=OSError(errno_mod.ENOSPC, "No space left on device")):
+                                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                    out_capture = io.StringIO()
+                                    err_capture = io.StringIO()
+                                    with patch("sys.stdout", out_capture), patch("sys.stderr", err_capture):
+                                        ret = handle_pre_invocation_hook(eng)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(json.loads(out_capture.getvalue()), {})
+                self.assertIn("Warning: Failed to persist quota cache", err_capture.getvalue())
+
+    def test_failover_audit_io_resilience_and_tier1_edge_002(self) -> None:
+        """[AUDIT-HOOK-EDGE-002] Tier 1 healthy cache fast-path exits with {} without reading/writing failover_state.json or writing watch.log."""
+        import builtins
+        import io
+        import time
+        from agy_switch import QuotaClient, handle_pre_invocation_hook, hook_pre_invocation_dispatch
+
+        for quota_pct in (35, 85):
+            # 1. hook_pre_invocation_dispatch() fast-path (both engine=None and engine=eng)
+            for use_engine in (False, True):
+                with self.subTest(entrypoint="hook_pre_invocation_dispatch", quota_pct=quota_pct, use_engine=use_engine):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        vdir = Path(tmpdir) / "vault"
+                        gdir = Path(tmpdir) / "gemini"
+                        ldir = Path(tmpdir) / "legacy"
+                        pdir = Path(tmpdir) / "proc"
+                        pdir.mkdir(parents=True, exist_ok=True)
+                        eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                        eng.set_auto_switch(True)
+                        eng.set_active_name("honey")
+
+                        now_ts = 1700020000.0
+                        (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                        (vdir / "cache" / "last_known_quota.json").write_text(
+                            json.dumps({
+                                "timestamp": now_ts,
+                                "accounts": {
+                                    "honey": {
+                                        "cached_at": now_ts,
+                                        "gemini": {"quota": quota_pct, "reset_time": int(now_ts + 3600)},
+                                    }
+                                },
+                            }),
+                            encoding="utf-8",
+                        )
+                        sentinel_state = json.dumps({"last_failover": {"from_account": "a", "to_account": "honey"}, "auth_errors": {}})
+                        failover_file = vdir / "cache" / "failover_state.json"
+                        failover_file.write_text(sentinel_state, encoding="utf-8")
+                        watch_log = vdir / "watch.log"
+                        watch_log.write_text("SENTINEL_LOG\n", encoding="utf-8")
+
+                        opened_paths: list[str] = []
+                        real_open = builtins.open
+
+                        def _spy_open(file: object, *args: object, **kwargs: object):
+                            opened_paths.append(str(file))
+                            return real_open(file, *args, **kwargs)  # type: ignore[arg-type]
+
+                        with patch.dict(os.environ, {"AGY_VAULT_DIR": str(vdir)}, clear=False):
+                            with patch("time.time", return_value=now_ts + 5.0):
+                                with patch("builtins.open", side_effect=_spy_open):
+                                    with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                        out_capture = io.StringIO()
+                                        with patch("sys.stdout", out_capture):
+                                            ret = hook_pre_invocation_dispatch(
+                                                ["hook-pre-invocation"],
+                                                engine=eng if use_engine else None,
+                                            )
+
+                        self.assertEqual(ret, 0)
+                        self.assertEqual(json.loads(out_capture.getvalue()), {})
+                        self.assertFalse(any("failover_state.json" in p for p in opened_paths), f"Unexpected failover_state access: {opened_paths}")
+                        self.assertFalse(any("watch.log" in p for p in opened_paths), f"Unexpected watch.log access: {opened_paths}")
+                        self.assertEqual(failover_file.read_text(encoding="utf-8"), sentinel_state)
+                        self.assertEqual(watch_log.read_text(encoding="utf-8"), "SENTINEL_LOG\n")
+
+            # 2. handle_pre_invocation_hook(engine) fast-path
+            with self.subTest(entrypoint="handle_pre_invocation_hook", quota_pct=quota_pct):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vdir = Path(tmpdir) / "vault"
+                    gdir = Path(tmpdir) / "gemini"
+                    ldir = Path(tmpdir) / "legacy"
+                    pdir = Path(tmpdir) / "proc"
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    eng = AgySwitchEngine(vault_dir=vdir, gemini_dir=gdir, legacy_root=ldir, proc_dir=pdir)
+                    eng.set_auto_switch(True)
+                    eng.set_active_name("honey")
+
+                    now_ts = 1700020000.0
+                    (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                    (vdir / "cache" / "last_known_quota.json").write_text(
+                        json.dumps({
+                            "timestamp": now_ts,
+                            "accounts": {
+                                "honey": {
+                                    "cached_at": now_ts,
+                                    "gemini": {"quota": quota_pct, "reset_time": int(now_ts + 3600)},
+                                }
+                            },
+                        }),
+                        encoding="utf-8",
+                    )
+                    sentinel_state = json.dumps({"last_failover": {"from_account": "a", "to_account": "honey"}, "auth_errors": {}})
+                    failover_file = vdir / "cache" / "failover_state.json"
+                    failover_file.write_text(sentinel_state, encoding="utf-8")
+                    watch_log = vdir / "watch.log"
+                    watch_log.write_text("SENTINEL_LOG\n", encoding="utf-8")
+
+                    opened_paths = []
+                    real_open = builtins.open
+
+                    def _spy_open_hook(file: object, *args: object, **kwargs: object):
+                        opened_paths.append(str(file))
+                        return real_open(file, *args, **kwargs)  # type: ignore[arg-type]
+
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("AGY_VAULT_DIR", None)
+                        with patch("time.time", return_value=now_ts + 5.0):
+                            with patch.object(eng, "load_failover_state", wraps=eng.load_failover_state) as spy_load_fs:
+                                with patch.object(eng, "record_last_failover", wraps=eng.record_last_failover) as spy_rec_lf:
+                                    with patch.object(eng, "record_auth_error", wraps=eng.record_auth_error) as spy_rec_ae:
+                                        with patch.object(QuotaClient, "fetch_quota", side_effect=AssertionError("Must not probe on Tier 1")):
+                                            with patch("builtins.open", side_effect=_spy_open_hook):
+                                                with patch("sys.stdin", io.StringIO(json.dumps({"modelName": "gemini-2.5-pro"}))):
+                                                    out_capture = io.StringIO()
+                                                    with patch("sys.stdout", out_capture):
+                                                        ret = handle_pre_invocation_hook(eng)
+
+                    self.assertEqual(ret, 0)
+                    self.assertEqual(json.loads(out_capture.getvalue()), {})
+                    spy_load_fs.assert_not_called()
+                    spy_rec_lf.assert_not_called()
+                    spy_rec_ae.assert_not_called()
+                    self.assertFalse(any("failover_state.json" in p for p in opened_paths), f"Unexpected failover_state access: {opened_paths}")
+                    self.assertFalse(any("watch.log" in p for p in opened_paths), f"Unexpected watch.log access: {opened_paths}")
+                    self.assertEqual(failover_file.read_text(encoding="utf-8"), sentinel_state)
+                    self.assertEqual(watch_log.read_text(encoding="utf-8"), "SENTINEL_LOG\n")
+
+        # 3. Subprocess module isolation for hook_pre_invocation_dispatch (zero import/read of failover_state.json)
+        with self.subTest(entrypoint="subprocess_module_isolation"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vdir = Path(tmpdir) / "vault"
+                vdir.mkdir(parents=True, exist_ok=True)
+                (vdir / "config.json").write_text(json.dumps({"auto_switch": True, "quota_threshold": 0.25}), encoding="utf-8")
+                (vdir / "active").write_text("honey\n", encoding="utf-8")
+                now_ts = time.time()
+                (vdir / "cache").mkdir(parents=True, exist_ok=True)
+                (vdir / "cache" / "last_known_quota.json").write_text(
+                    json.dumps({
+                        "timestamp": now_ts,
+                        "accounts": {
+                            "honey": {"cached_at": now_ts, "gemini": {"quota": 85, "reset_time": int(now_ts + 3600)}}
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+                env = dict(os.environ)
+                env["AGY_VAULT_DIR"] = str(vdir)
+                env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import io, json, sys\n"
+                        "import agy_switch\n"
+                        "sys.stdin = io.StringIO(json.dumps({'modelName': 'gemini-2.5-pro'}))\n"
+                        "rc = agy_switch.hook_pre_invocation_dispatch(['hook-pre-invocation'])\n"
+                        "assert rc == 0\n"
+                        "assert 'agy_switcher.hook' not in sys.modules\n"
+                        "assert 'agy_switcher.vault' not in sys.modules\n",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=5,
+                )
+                self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
+                self.assertEqual(json.loads(proc.stdout), {})
+                self.assertFalse((vdir / "watch.log").exists())
+                self.assertFalse((vdir / "cache" / "failover_state.json").exists())
 
 
 if __name__ == "__main__":

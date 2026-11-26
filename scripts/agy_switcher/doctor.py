@@ -26,6 +26,7 @@ from agy_switcher.security import (
     _atomic_write_json,
     extract_email_from_jwt,
     has_valid_id_token_or_fallback,
+    read_json_dict_safe,
     resolve_token_email,
     validate_token_dict,
     validate_token_file,
@@ -535,9 +536,15 @@ class DoctorEngine:
         if self.active_file.is_file():
             files_to_check.append(self.active_file)
         if self.cache_dir.is_dir():
-            for cf in self.cache_dir.iterdir():
-                if cf.is_file():
-                    files_to_check.append(cf)
+            try:
+                for cf in self.cache_dir.iterdir():
+                    try:
+                        if not cf.is_symlink() and cf.is_file():
+                            files_to_check.append(cf)
+                    except (PermissionError, OSError):
+                        pass
+            except (PermissionError, OSError):
+                pass
         if self.config_file.is_file():
             files_to_check.append(self.config_file)
         watch_pid = self.vault_dir / "watch.pid"
@@ -571,6 +578,22 @@ class DoctorEngine:
             message="All directory (0700) and file (0600) permissions are secure.",
             can_fix=False,
         )
+
+    def _load_quarantined_accounts(self) -> set[str]:
+        """Reads quarantined account aliases from cache/failover_state.json['auth_errors'] safely."""
+        loaded, _ = read_json_dict_safe(self.cache_dir / "failover_state.json")
+        if loaded is None:
+            return set()
+
+        raw_auth_errors: object = loaded.get("auth_errors")
+        if not isinstance(raw_auth_errors, dict):
+            return set()
+
+        quarantined: set[str] = set()
+        for alias, detail in raw_auth_errors.items():
+            if isinstance(alias, str) and alias.strip() and isinstance(detail, dict):
+                quarantined.add(alias.strip())
+        return quarantined
 
     def _check_token_integrity(self) -> DiagnosticItem:
         """Layer 2: Validates OAuth token JSON schema, extracts JWT identity, and detects expired tokens."""
@@ -636,6 +659,8 @@ class DoctorEngine:
                 can_fix=False,
             )
 
+        quarantined_accounts = self._load_quarantined_accounts()
+
         permission_denied_accounts: list[tuple[str, str, str]] = []
         corrupt_accounts: list[tuple[str, str]] = []
         corrupt_secondary: list[tuple[str, str]] = []
@@ -643,11 +668,18 @@ class DoctorEngine:
         expired_secondary: list[str] = []
         standby_ready: list[str] = []
         missing_identity_accounts: list[str] = []
+        active_quarantined: str | None = None
+        standby_quarantined: list[str] = []
 
         for acc in accounts:
             acc_name = acc.name
             token_path = acc / "token.json"
             is_active = bool(active_account and acc_name == active_account.strip())
+            if acc_name in quarantined_accounts:
+                if is_active:
+                    active_quarantined = acc_name
+                else:
+                    standby_quarantined.append(acc_name)
 
             try:
                 os.scandir(acc).close()
@@ -752,7 +784,8 @@ class DoctorEngine:
 
                 if self._is_token_expired(raw_expiry):
                     if has_valid_refresh:
-                        standby_ready.append(acc_name)
+                        if acc_name not in quarantined_accounts:
+                            standby_ready.append(acc_name)
                     else:
                         expired_secondary.append(acc_name)
 
@@ -776,6 +809,18 @@ class DoctorEngine:
                 can_fix=False,
             )
 
+        if active_quarantined:
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=(
+                    f"Active account '{active_quarantined}' is quarantined due to authentication failure. "
+                    f"Re-authenticate with 'agy-switch login {active_quarantined}'."
+                ),
+                can_fix=False,
+            )
+
         if expired_active:
             return DiagnosticItem(
                 category="token_integrity",
@@ -785,8 +830,17 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        if corrupt_secondary or expired_secondary or missing_identity_accounts:
+        if corrupt_secondary or expired_secondary or missing_identity_accounts or standby_quarantined:
             warn_parts: list[str] = []
+            if standby_quarantined:
+                aliases_str = ", ".join(f"'{alias}'" for alias in standby_quarantined)
+                remediations = ", ".join(f"'agy-switch login {alias}'" for alias in standby_quarantined)
+                noun = "account" if len(standby_quarantined) == 1 else "accounts"
+                verb = "is" if len(standby_quarantined) == 1 else "are"
+                warn_parts.append(
+                    f"Standby {noun} {aliases_str} {verb} quarantined due to authentication failure. "
+                    f"Re-authenticate with {remediations}"
+                )
             if expired_secondary:
                 warn_parts.append(
                     f"Secondary account token(s) expired without a valid refresh token "
@@ -1277,6 +1331,8 @@ class DoctorEngine:
                     def _safe_chmod(target: Path, mode: int) -> None:
                         try:
                             os.chmod(target, mode)
+                        except FileNotFoundError:
+                            return
                         except OSError as e:
                             chmod_errors.append(f"{target.name}: {e}")
 
@@ -1294,9 +1350,15 @@ class DoctorEngine:
                         _safe_chmod(self.active_file, 0o600)
                     if self.cache_dir.is_dir():
                         _safe_chmod(self.cache_dir, 0o700)
-                        for cf in self.cache_dir.iterdir():
-                            if cf.is_file():
-                                _safe_chmod(cf, 0o600)
+                        try:
+                            for cf in self.cache_dir.iterdir():
+                                try:
+                                    if not cf.is_symlink() and cf.is_file():
+                                        _safe_chmod(cf, 0o600)
+                                except (PermissionError, OSError):
+                                    continue
+                        except (PermissionError, OSError) as e:
+                            chmod_errors.append(f"{self.cache_dir.name}: {e}")
                     if self.config_file.is_file():
                         _safe_chmod(self.config_file, 0o600)
                     watch_pid = self.vault_dir / "watch.pid"

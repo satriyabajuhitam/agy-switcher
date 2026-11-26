@@ -711,6 +711,284 @@ class TestProcessSupervisor(unittest.TestCase):
                 endpoint = self.supervisor.get_cloud_code_endpoint(pid=99999)
                 self.assertEqual(endpoint, "https://daily-cloudcode-pa.googleapis.com")
 
+    def _write_proc_node(
+        self,
+        proc_pid: int,
+        ppid: int | None = None,
+        comm: str = "proc",
+        state: str = "S",
+        cmdline: bytes | None = None,
+        raw_stat: str | None = None,
+        proc_dir: Path | None = None,
+    ) -> None:
+        base_dir = proc_dir or self.proc_dir
+        p_dir = base_dir / str(proc_pid)
+        p_dir.mkdir(parents=True, exist_ok=True)
+        if raw_stat is not None:
+            (p_dir / "stat").write_text(raw_stat, encoding="utf-8")
+        elif ppid is not None:
+            (p_dir / "stat").write_text(
+                f"{proc_pid} ({comm}) {state} {ppid} {proc_pid} {proc_pid} 0 -1 4194304",
+                encoding="utf-8",
+            )
+        if cmdline is not None:
+            (p_dir / "cmdline").write_bytes(cmdline)
+
+    def test_is_invoked_by_language_server_err_001_missing_malformed_permission_error(self):
+        """[DEFER-RELOAD-ERR-001] Missing, malformed, or unreadable stat fails safe to False."""
+        # 1. Missing stat file
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9001))
+
+        # 2. Malformed stat: missing ')' delimiter
+        self._write_proc_node(9002, raw_stat="9002 (broken S 100 9002 9002")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9002))
+
+        # 3. Malformed stat: insufficient fields after ')'
+        self._write_proc_node(9003, raw_stat="9003 (truncated) S")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9003))
+
+        # 4. Malformed stat: non-integer ppid
+        self._write_proc_node(9004, raw_stat="9004 (badppid) S not_an_int 9004")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9004))
+
+        # 5. PermissionError reading stat file
+        self._write_proc_node(9005, ppid=100)
+        stat_9005 = self.proc_dir / "9005" / "stat"
+        orig_read_bytes = Path.read_bytes
+
+        def mock_read_bytes(path_obj: Path) -> bytes:
+            if path_obj == stat_9005:
+                raise PermissionError(13, "Permission denied")
+            return orig_read_bytes(path_obj)
+
+        with patch.object(Path, "read_bytes", side_effect=mock_read_bytes, autospec=True):
+            self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9005))
+
+        # 6. Malformed stat: missing '(' or inverted ')('
+        self._write_proc_node(9006, raw_stat="9006 broken) S 100 9006")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9006))
+        self._write_proc_node(9007, raw_stat="9007 )inverted( S 100 9007")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9007))
+
+        # 7. Non-UTF8 bytes in stat ppid and unreadable cmdline on target server
+        self._write_proc_node(9008, ppid=9009)
+        (self.proc_dir / "9008" / "stat").write_bytes(b"9008 (badbytes) S \xff\xfe 9008\n")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9008))
+
+        self._write_proc_node(
+            9010,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+        )
+        self._write_proc_node(9011, ppid=9010, comm="child")
+        cmdline_9010 = self.proc_dir / "9010" / "cmdline"
+        cmdline_9011 = self.proc_dir / "9011" / "cmdline"
+
+        def mock_read_bytes_cmdline(path_obj: Path) -> bytes:
+            if path_obj in (cmdline_9010, cmdline_9011):
+                raise PermissionError(13, "Permission denied")
+            return orig_read_bytes(path_obj)
+
+        with patch.object(Path, "read_bytes", side_effect=mock_read_bytes_cmdline, autospec=True):
+            # Unreadable cmdline on language_server fails safe to False when pid is None
+            self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=9011))
+
+        def mock_read_bytes_intermediate_cmdline(path_obj: Path) -> bytes:
+            if path_obj == cmdline_9011:
+                raise PermissionError(13, "Permission denied")
+            return orig_read_bytes(path_obj)
+
+        with patch.object(Path, "read_bytes", side_effect=mock_read_bytes_intermediate_cmdline, autospec=True):
+            # Unreadable cmdline on intermediate child still traverses stat up to ancestor
+            self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=9011))
+
+        # 8. Non-existent proc_dir fails safe to False
+        missing_proc_sup = ProcessSupervisor(
+            gemini_dir=self.gemini_dir,
+            proc_dir=Path(self.temp_dir.name) / "nonexistent-proc",
+        )
+        self.assertFalse(missing_proc_sup.is_invoked_by_language_server(current_pid=9011))
+
+    def test_is_invoked_by_language_server_edge_003_spaces_and_nested_parens(self):
+        """[DEFER-RELOAD-EDGE-003] Comm with spaces and nested parens parses ppid via rfind(')')."""
+        self._write_proc_node(
+            100,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00--port\x008080\x00",
+        )
+        self._write_proc_node(
+            200,
+            raw_stat="200 (language server (v2)) S 100 200 200 0 -1 4194304",
+        )
+        self._write_proc_node(
+            300,
+            ppid=200,
+            comm="agy-switch",
+            cmdline=b"python3\x00agy-switch\x00switch\x00",
+        )
+
+        self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=200))
+        self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=300))
+
+        # Non-UTF8 bytes inside (comm) and cmdline still parse ppid and match safely
+        self._write_proc_node(
+            105,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--arg=\xff\xfe\x00--standalone\x00",
+        )
+        self._write_proc_node(205, ppid=105)
+        (self.proc_dir / "205" / "stat").write_bytes(b"205 (lang\xff\xfe server (v2)) S 105 205 205\n")
+        self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=205))
+
+    def test_is_invoked_by_language_server_edge_001_cycle_and_depth_bound(self):
+        """[DEFER-RELOAD-EDGE-001] Cyclic ppid loop and >64 hop chains terminate safely as False."""
+        # 1. Two-node cycle: 100 -> 101 -> 100
+        self._write_proc_node(100, ppid=101, comm="loop-a")
+        self._write_proc_node(101, ppid=100, comm="loop-b")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=100))
+
+        # 2. Self-loop: 102 -> 102
+        self._write_proc_node(102, ppid=102, comm="self-loop")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=102))
+
+        # 2b. Non-root cycle entered after initial hop: 103 -> 104 -> 105 -> 104
+        self._write_proc_node(103, ppid=104, comm="entry")
+        self._write_proc_node(104, ppid=105, comm="cycle-1")
+        self._write_proc_node(105, ppid=104, comm="cycle-2")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=103))
+
+        # 3. Chain exceeding 64 hops (65 hops from 1000 to 1065): stops before 1065
+        for cur in range(1000, 1065):
+            self._write_proc_node(cur, ppid=cur + 1, comm=f"hop-{cur - 1000}")
+        self._write_proc_node(
+            1065,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+        )
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=1000))
+
+        # Starting at 1001 puts 1065 at exactly 64 hops -> detected
+        self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=1001))
+
+    def test_is_invoked_by_language_server_ancestry_cycle_and_depth_bound(self):
+        """[DEFER-RELOAD-EDGE-001] Terminates deterministically on ppid cycle or >64 hops."""
+        orig_read_bytes = Path.read_bytes
+
+        with self.subTest("cyclic_ppid_loop_100_101_100"):
+            proc_cycle = Path(self.temp_dir.name) / "proc_cycle"
+            proc_cycle.mkdir(parents=True, exist_ok=True)
+            self._write_proc_node(100, ppid=101, comm="loop-a", proc_dir=proc_cycle)
+            self._write_proc_node(101, ppid=100, comm="loop-b", proc_dir=proc_cycle)
+            cycle_sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=proc_cycle)
+
+            read_counts: dict[Path, int] = {}
+
+            def tracked_read_bytes(path_obj: Path) -> bytes:
+                read_counts[path_obj] = read_counts.get(path_obj, 0) + 1
+                return orig_read_bytes(path_obj)
+
+            with patch.object(Path, "read_bytes", side_effect=tracked_read_bytes, autospec=True):
+                self.assertFalse(cycle_sup.is_invoked_by_language_server(current_pid=100))
+
+            self.assertLessEqual(read_counts.get(proc_cycle / "100" / "stat", 0), 1)
+            self.assertLessEqual(read_counts.get(proc_cycle / "101" / "stat", 0), 1)
+            self.assertLessEqual(read_counts.get(proc_cycle / "100" / "cmdline", 0), 1)
+            self.assertLessEqual(read_counts.get(proc_cycle / "101" / "cmdline", 0), 1)
+
+        with self.subTest("ancestry_chain_exceeding_64_hops_from_pid_100"):
+            proc_deep = Path(self.temp_dir.name) / "proc_deep"
+            proc_deep.mkdir(parents=True, exist_ok=True)
+            for cur in range(100, 170):
+                self._write_proc_node(cur, ppid=cur + 1, comm=f"hop-{cur - 100}", proc_dir=proc_deep)
+            self._write_proc_node(170, ppid=1, comm="root", proc_dir=proc_deep)
+            deep_sup = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=proc_deep)
+
+            # 70-hop chain with no language_server terminates cleanly at hop 64 as False
+            self.assertFalse(deep_sup.is_invoked_by_language_server(current_pid=100))
+
+            # Placing language_server beyond the 64-hop limit (at hop 65 = PID 165) is not reached
+            self._write_proc_node(
+                165,
+                ppid=166,
+                comm="language_server",
+                cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+                proc_dir=proc_deep,
+            )
+            deep_reads: list[Path] = []
+
+            def tracked_deep_reads(path_obj: Path) -> bytes:
+                deep_reads.append(path_obj)
+                return orig_read_bytes(path_obj)
+
+            with patch.object(Path, "read_bytes", side_effect=tracked_deep_reads, autospec=True):
+                self.assertFalse(deep_sup.is_invoked_by_language_server(current_pid=100))
+
+            self.assertNotIn(proc_deep / "164" / "stat", deep_reads)
+            self.assertNotIn(proc_deep / "165" / "cmdline", deep_reads)
+
+            # Placing language_server at exactly 64 hops (PID 164) is within the bound
+            self._write_proc_node(
+                164,
+                ppid=165,
+                comm="language_server",
+                cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+                proc_dir=proc_deep,
+            )
+            self.assertTrue(deep_sup.is_invoked_by_language_server(current_pid=100))
+
+    def test_is_invoked_by_language_server_pid_matching_and_non_descendant(self):
+        """Matches explicit target pid in lineage and returns False for non-descendants."""
+        # Unrelated language_server at PID 999
+        self._write_proc_node(
+            999,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+        )
+        # Process chain 400 -> 300 -> 1 (init)
+        self._write_proc_node(1, ppid=0, comm="systemd", cmdline=b"/sbin/init\x00")
+        self._write_proc_node(300, ppid=1, comm="bash", cmdline=b"/bin/bash\x00")
+        self._write_proc_node(
+            400,
+            ppid=300,
+            comm="language_server_helper",
+            # Contains language_server without --standalone -> must not false-positive
+            cmdline=b"/opt/antigravity/language_server_helper\x00--daemon\x00",
+        )
+
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=400))
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(pid=999, current_pid=400))
+        self.assertTrue(self.supervisor.is_invoked_by_language_server(pid=300, current_pid=400))
+
+        # Default current_pid=None resolves os.getpid() cleanly
+        with patch("os.getpid", return_value=400):
+            self.assertFalse(self.supervisor.is_invoked_by_language_server())
+            self.assertTrue(self.supervisor.is_invoked_by_language_server(pid=300))
+
+        # Invalid/boundary PIDs and PID 1 handling
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=0))
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(pid=0, current_pid=0))
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=-5))
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=1))
+        self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=999))
+
+        # Negative ppid terminates cleanly as False
+        self._write_proc_node(500, ppid=-1, comm="negative-ppid")
+        self.assertFalse(self.supervisor.is_invoked_by_language_server(current_pid=500))
+
+        # Container PID 1 acting as language_server is detected when current_pid=1
+        self._write_proc_node(
+            1,
+            ppid=0,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+        )
+        self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=1))
+
 
 
 

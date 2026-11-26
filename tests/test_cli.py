@@ -1,3 +1,5 @@
+import base64
+import email.message
 import io
 import itertools
 import json
@@ -6,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -149,24 +152,30 @@ class TestCLI(unittest.TestCase):
             exit_code = main(["switch", "acc2"], engine=self.engine)
             self.assertEqual(exit_code, 0)
 
-        # Verify manual switch preserves force=False by default (turn safety)
-        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=False)
+        # Verify manual switch preserves force=False by default (turn safety) and enables verify_auth=True
+        self.engine.switch_tokens.assert_called_once_with(
+            "acc2", restart_server=True, force=False, verify_auth=True
+        )
 
     def test_manual_switch_with_force(self):
         with patch('sys.stdout'):
             exit_code = main(["switch", "acc2", "--force"], engine=self.engine)
             self.assertEqual(exit_code, 0)
 
-        # Verify manual switch with --force passes force=True
-        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=True)
+        # Verify manual switch with --force passes force=True while keeping verify_auth=True
+        self.engine.switch_tokens.assert_called_once_with(
+            "acc2", restart_server=True, force=True, verify_auth=True
+        )
 
     def test_manual_switch_no_restart(self):
         with patch('sys.stdout'):
             exit_code = main(["switch", "acc2", "--no-restart"], engine=self.engine)
             self.assertEqual(exit_code, 0)
 
-        # Verify manual switch with --no-restart passes restart_server=False and force=False
-        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=False, force=False)
+        # Verify manual switch with --no-restart passes restart_server=False, force=False, verify_auth=True
+        self.engine.switch_tokens.assert_called_once_with(
+            "acc2", restart_server=False, force=False, verify_auth=True
+        )
 
     def test_manual_switch_active_turn_error(self):
         self.engine.switch_tokens.side_effect = ActiveTurnRunningError(
@@ -178,15 +187,19 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(exit_code, 2)
 
         self.assertIn("Warning: Active turn running on language_server PID 12345", err_buf.getvalue())
-        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=True, force=False)
+        self.engine.switch_tokens.assert_called_once_with(
+            "acc2", restart_server=True, force=False, verify_auth=True
+        )
 
     def test_manual_switch_with_force_and_no_restart(self):
         with patch('sys.stdout'):
             exit_code = main(["switch", "acc2", "--force", "--no-restart"], engine=self.engine)
             self.assertEqual(exit_code, 0)
 
-        # Verify manual switch with both --force and --no-restart
-        self.engine.switch_tokens.assert_called_once_with("acc2", restart_server=False, force=True)
+        # Verify manual switch with both --force and --no-restart keeps verify_auth=True
+        self.engine.switch_tokens.assert_called_once_with(
+            "acc2", restart_server=False, force=True, verify_auth=True
+        )
 
     @patch('agy_switch.RotationEngine')
     @patch('agy_switch.QuotaClient')
@@ -1794,6 +1807,812 @@ class TestCLI(unittest.TestCase):
                     self.assertNotIn("urn:ietf:wg:oauth:2.0:oob", stderr_val)
                     self.assertNotIn("accounts.google.com/o/oauth2", stdout_val)
                     self.assertNotIn("accounts.google.com/o/oauth2", stderr_val)
+
+
+class TestCLISwitchPreflightAuth(unittest.TestCase):
+    """CLI public seam tests for pre-flight auth gating and --skip-auth-check."""
+
+    @staticmethod
+    def _make_token_payload(email_addr: str) -> dict[str, object]:
+        payload_json = json.dumps(
+            {"email": email_addr, "sub": "12345", "aud": "test_client"}
+        ).encode("utf-8")
+        payload_b64 = base64.urlsafe_b64encode(payload_json).decode("utf-8").rstrip("=")
+        return {
+            "token": {
+                "access_token": f"ya29.token_for_{email_addr}",
+                "token_type": "Bearer",
+                "refresh_token": f"1//refresh_for_{email_addr}",
+                "expiry": "2026-12-31T23:59:59Z",
+            },
+            "auth_method": "oauth",
+            "id_token": f"header.{payload_b64}.signature",
+        }
+
+    @staticmethod
+    def _register_account(engine: AgySwitchEngine, alias: str, email_addr: str) -> dict[str, object]:
+        payload = TestCLISwitchPreflightAuth._make_token_payload(email_addr)
+        acc_dir = engine.accounts_dir / alias
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return payload
+
+    @staticmethod
+    def _setup_proc_server(
+        proc_dir: Path,
+        gemini_dir: Path,
+        *,
+        server_pid: int,
+        busy: bool = False,
+    ) -> Path:
+        pid_dir = proc_dir / str(server_pid)
+        fd_dir = pid_dir / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "cmdline").write_bytes(b"/opt/antigravity/bin/language_server\x00--standalone\x00")
+        (pid_dir / "stat").write_text(
+            f"{server_pid} (language_server) S 1 {server_pid} 1 0 -1\n",
+            encoding="utf-8",
+        )
+        lock_file = gemini_dir / "antigravity" / "presence" / "active-turn.lock"
+        if busy:
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            lock_file.write_text(f"pid: {server_pid}\n", encoding="utf-8")
+            (fd_dir / "3").symlink_to(lock_file)
+        return lock_file
+
+    @staticmethod
+    def _make_quota_response(fraction: float = 0.9) -> object:
+        payload = json.dumps({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "five_hour",
+                            "remainingFraction": fraction,
+                            "resetTime": "2026-12-31T23:59:59Z",
+                        }
+                    ],
+                }
+            ]
+        }).encode("utf-8")
+
+        class _FakeResponse:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+                self.status = 200
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+        return _FakeResponse(payload)
+
+    def test_switch_preflight_auth_healthy_probe_AUTH_GATE_001(self) -> None:
+        """[AUTH-GATE-001] Manual CLI switch defaults verify_auth=True, probes before disk write, activates account, and restarts idle server."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+            cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+            active_before = engine.get_active_name()
+
+            server_pid = 48100
+            self._setup_proc_server(proc_dir, gemini_dir, server_pid=server_pid, busy=False)
+
+            probe_snapshots: list[tuple[str, str, str | None]] = []
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_urlopen(*_args: object, **_kwargs: object) -> object:
+                # Assert pre-flight probe executes BEFORE any live token or active-pointer disk write
+                probe_snapshots.append((
+                    engine.desktop_token_file.read_text(encoding="utf-8"),
+                    engine.cli_token_file.read_text(encoding="utf-8"),
+                    engine.get_active_name(),
+                ))
+                return self._make_quota_response()
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen) as mock_urlopen, \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(["switch", "work-acc"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(mock_urlopen.call_count, 1)
+            self.assertEqual(probe_snapshots, [(desktop_before, cli_before, active_before)])
+            self.assertEqual(engine.get_active_name(), "work-acc")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_work@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_work@example.com",
+            )
+            self.assertEqual(len(signals_sent), 1)
+            self.assertEqual(signals_sent[0][0], server_pid)
+            self.assertIn("Restarted language_server", stdout_buf.getvalue())
+
+    def test_switch_preflight_auth_skip_flag_preserves_turn_safety_AUTH_GATE_003(self) -> None:
+        """[AUTH-GATE-003] --skip-auth-check sets verify_auth=False, bypasses probe_account_auth(), preserves busy protection without --force, and activates when idle."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "offline-acc", "offline@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+            cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+            server_pid = 48200
+            lock_file = self._setup_proc_server(proc_dir, gemini_dir, server_pid=server_pid, busy=True)
+
+            err_403 = urllib.error.HTTPError(
+                "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                403,
+                "Forbidden",
+                email.message.Message(),
+                io.BytesIO(b"Forbidden"),
+            )
+
+            # 1. Busy server without --force still raises ActiveTurnRunningError -> exit 2, no HTTP call, no disk write
+            stderr_busy = io.StringIO()
+            with patch("urllib.request.urlopen", side_effect=err_403) as mock_urlopen, \
+                 patch("sys.stderr", stderr_busy):
+                busy_code = main(["switch", "offline-acc", "--skip-auth-check"], engine=engine)
+
+            self.assertEqual(busy_code, 2)
+            mock_urlopen.assert_not_called()
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+            self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+            self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+
+            # 2. Clear active turn -> idle server activates offline-acc with --skip-auth-check and zero HTTP calls
+            lock_file.unlink()
+            (proc_dir / str(server_pid) / "fd" / "3").unlink()
+
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            stdout_idle = io.StringIO()
+            stderr_idle = io.StringIO()
+            with patch("urllib.request.urlopen", side_effect=err_403) as mock_urlopen, \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", stdout_idle), \
+                 patch("sys.stderr", stderr_idle):
+                idle_code = main(["switch", "offline-acc", "--skip-auth-check"], engine=engine)
+
+            self.assertEqual(idle_code, 0)
+            mock_urlopen.assert_not_called()
+            self.assertEqual(engine.get_active_name(), "offline-acc")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_offline@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_offline@example.com",
+            )
+            self.assertEqual(len(signals_sent), 1)
+
+    def test_switch_preflight_auth_error_exits_one_and_decouples_force(self) -> None:
+        """Manual switch fails closed with exit 1 on AccountAuthError even with --force unless --skip-auth-check is passed."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "healthy-acc", "healthy@example.com")
+            self._register_account(engine, "revoked-acc", "revoked@example.com")
+            engine.switch_tokens("healthy-acc", restart_server=False)
+
+            desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+            cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+            def make_403(*_args: object, **_kwargs: object) -> object:
+                raise urllib.error.HTTPError(
+                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    403,
+                    "Forbidden",
+                    email.message.Message(),
+                    io.BytesIO(b"Forbidden"),
+                )
+
+            stderr_buf = io.StringIO()
+            with patch("urllib.request.urlopen", side_effect=make_403) as mock_urlopen, \
+                 patch("sys.stderr", stderr_buf):
+                code = main(["switch", "revoked-acc", "--force"], engine=engine)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(mock_urlopen.call_count, 2)  # initial 403 + 1x refresh 403
+            self.assertIn("agy-switch login revoked-acc", stderr_buf.getvalue())
+            self.assertEqual(engine.get_active_name(), "healthy-acc")
+            self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+            self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+
+    @staticmethod
+    def _make_http_403(*_args: object, **_kwargs: object) -> object:
+        raise urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+
+    def test_force_auth_decoupling_and_sdk_default_cli_force_preserves_verify_auth_AUTH_GATE_ERR_003(self) -> None:
+        """[AUTH-GATE-ERR-003] agy-switch switch revoked-acc --force keeps verify_auth=True, exits 1 on 403, leaves live tokens untouched, and keeps language_server running."""
+        for busy_state in (False, True):
+            for no_restart in (False, True):
+                with self.subTest(server_busy=busy_state, no_restart=no_restart), tempfile.TemporaryDirectory() as tmp_dir:
+                    base = Path(tmp_dir)
+                    proc_dir = base / "proc"
+                    gemini_dir = base / ".gemini"
+                    engine = AgySwitchEngine(
+                        vault_dir=base / ".antigravity-vault",
+                        gemini_dir=gemini_dir,
+                        legacy_root=base / ".agy-cli-manager",
+                        proc_dir=proc_dir,
+                    )
+                    self._register_account(engine, "healthy-acc", "healthy@example.com")
+                    self._register_account(engine, "revoked-acc", "revoked@example.com")
+                    engine.switch_tokens("healthy-acc", restart_server=False)
+
+                    desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+                    cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+                    server_pid = 48300
+                    self._setup_proc_server(proc_dir, gemini_dir, server_pid=server_pid, busy=busy_state)
+
+                    signals_sent: list[tuple[int, int]] = []
+
+                    def fake_kill(pid: int, sig: int) -> None:
+                        signals_sent.append((pid, sig))
+
+                    argv = ["switch", "revoked-acc", "--force"]
+                    if no_restart:
+                        argv.append("--no-restart")
+
+                    stderr_buf = io.StringIO()
+                    with patch("urllib.request.urlopen", side_effect=self._make_http_403) as mock_urlopen, \
+                         patch("os.kill", side_effect=fake_kill), \
+                         patch("sys.stderr", stderr_buf):
+                        exit_code = main(argv, engine=engine)
+
+                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(mock_urlopen.call_count, 2)  # initial 403 + 1x refresh 403
+                    self.assertIn("agy-switch login revoked-acc", stderr_buf.getvalue())
+                    self.assertEqual(engine.get_active_name(), "healthy-acc")
+                    self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                    self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                    self.assertEqual(signals_sent, [])
+                    self.assertEqual(engine.locate_language_server_pid(), server_pid)
+                    failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+                    self.assertIn("revoked-acc", failover_state.get("auth_errors", {}))
+
+    def test_switch_missing_refresh_token_401_skips_refresh_and_fails_closed_AUTH_GATE_EDGE_002(self) -> None:
+        """[AUTH-GATE-EDGE-002] agy-switch switch no-refresh-acc with empty/whitespace refresh_token and HTTP 401 skips refresh, exits 1, quarantines alias, and preserves live tokens."""
+        for bad_refresh in ("", "   "):
+            with self.subTest(refresh_token=bad_refresh), tempfile.TemporaryDirectory() as tmp_dir:
+                base = Path(tmp_dir)
+                proc_dir = base / "proc"
+                gemini_dir = base / ".gemini"
+                engine = AgySwitchEngine(
+                    vault_dir=base / ".antigravity-vault",
+                    gemini_dir=gemini_dir,
+                    legacy_root=base / ".agy-cli-manager",
+                    proc_dir=proc_dir,
+                )
+                self._register_account(engine, "healthy-acc", "healthy@example.com")
+                no_refresh_payload = self._make_token_payload("norefresh@example.com")
+                tok_dict = no_refresh_payload["token"]
+                assert isinstance(tok_dict, dict)
+                tok_dict["refresh_token"] = bad_refresh
+                no_ref_dir = engine.accounts_dir / "no-refresh-acc"
+                no_ref_dir.mkdir(parents=True, exist_ok=True)
+                (no_ref_dir / "token.json").write_text(
+                    json.dumps(no_refresh_payload, indent=2) + "\n", encoding="utf-8"
+                )
+                engine.switch_tokens("healthy-acc", restart_server=False)
+
+                desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+                cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+                err_401 = urllib.error.HTTPError(
+                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    401,
+                    "Unauthorized",
+                    email.message.Message(),
+                    io.BytesIO(b"Unauthorized"),
+                )
+                stderr_buf = io.StringIO()
+                with patch("urllib.request.urlopen", side_effect=err_401) as mock_urlopen, \
+                     patch("agy_switcher.telemetry.QuotaClient.refresh_access_token") as mock_refresh, \
+                     patch("sys.stderr", stderr_buf):
+                    exit_code = main(["switch", "no-refresh-acc"], engine=engine)
+
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(mock_urlopen.call_count, 1)
+                mock_refresh.assert_not_called()
+                self.assertIn("agy-switch login no-refresh-acc", stderr_buf.getvalue())
+                self.assertEqual(engine.get_active_name(), "healthy-acc")
+                self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+                self.assertIn("no-refresh-acc", failover_state.get("auth_errors", {}))
+
+    def test_force_auth_decoupling_and_sdk_default_cli_force_with_skip_auth_check(self) -> None:
+        """Combining --force and --skip-auth-check overrides busy turn guard and skips CloudCode auth check independently."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "offline-acc", "offline@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            server_pid = 48301
+            self._setup_proc_server(proc_dir, gemini_dir, server_pid=server_pid, busy=True)
+
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("urllib.request.urlopen", side_effect=self._make_http_403) as mock_urlopen, \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(["switch", "offline-acc", "--force", "--skip-auth-check"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            mock_urlopen.assert_not_called()
+            self.assertEqual(engine.get_active_name(), "offline-acc")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_offline@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_offline@example.com",
+            )
+            self.assertEqual(len(signals_sent), 1)
+            self.assertEqual(signals_sent[0][0], server_pid)
+
+
+class TestCLIInTurnDeferredReload(unittest.TestCase):
+    """CLI public seam tests for Ancestor Lineage Self-Kill Guard and Deferred Safe-Turn Reload."""
+
+    @staticmethod
+    def _register_account(engine: AgySwitchEngine, alias: str, email_addr: str) -> None:
+        TestCLISwitchPreflightAuth._register_account(engine, alias, email_addr)
+
+    @staticmethod
+    def _setup_in_turn_proc_lineage(
+        proc_dir: Path,
+        gemini_dir: Path,
+        *,
+        server_pid: int = 49100,
+        child_pid: int = 49110,
+        busy: bool = True,
+    ) -> Path:
+        lock_file = TestCLISwitchPreflightAuth._setup_proc_server(
+            proc_dir, gemini_dir, server_pid=server_pid, busy=busy
+        )
+        init_dir = proc_dir / "1"
+        init_dir.mkdir(parents=True, exist_ok=True)
+        (init_dir / "cmdline").write_bytes(b"/sbin/init\x00")
+        (init_dir / "stat").write_text("1 (systemd) S 0 1 1 0 -1\n", encoding="utf-8")
+
+        child_dir = proc_dir / str(child_pid)
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / "cmdline").write_bytes(b"/bin/bash\x00-c\x00agy-switch\x00")
+        (child_dir / "stat").write_text(
+            f"{child_pid} (bash) S {server_pid} {child_pid} 1 0 -1\n",
+            encoding="utf-8",
+        )
+        return lock_file
+
+    @staticmethod
+    def _make_quota_response(fraction: float) -> object:
+        return TestCLISwitchPreflightAuth._make_quota_response(fraction=fraction)
+
+    def test_in_turn_deferred_reload_auto_switch_DEFER_RELOAD_002(self) -> None:
+        """[DEFER-RELOAD-002] In-turn switch --auto downgrades to Disk-Only Swap and writes pending_reload.json."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "best-standby", "best@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=49100, child_pid=49110, busy=True
+            )
+
+            def fake_urlopen(req: object, *_args: object, **_kwargs: object) -> object:
+                headers = getattr(req, "headers", {}) or {}
+                auth = headers.get("Authorization", "")
+                if "best@example.com" in auth:
+                    return self._make_quota_response(0.95)
+                return self._make_quota_response(0.05)
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch.object(engine, "switch_tokens", wraps=engine.switch_tokens) as spy_switch, \
+                 patch("os.getpid", return_value=49110), \
+                 patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not be called in-turn")), \
+                 patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not be spawned")), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(["switch", "--auto"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            spy_switch.assert_called_once_with("best-standby", restart_server=True, force=True)
+            self.assertEqual(engine.get_active_name(), "best-standby")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+
+            pending_file = engine.pending_reload_file
+            self.assertTrue(pending_file.is_file())
+            self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
+            pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+            self.assertEqual(pending_data["target_account"], "best-standby")
+            self.assertEqual(pending_data["ttl_seconds"], 120)
+
+            out = stdout_buf.getvalue()
+            self.assertIn("Deferred", out)
+            self.assertIn("pending_reload.json", out)
+            self.assertNotIn("not running or no restart needed", out)
+
+    def test_in_turn_deferred_reload_inactive_watcher_guidance_DEFER_RELOAD_004(self) -> None:
+        """[DEFER-RELOAD-004] In-turn deferred switch with inactive LogWatcher prints reload guidance without spawning waiter subprocess."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=49200, child_pid=49210, busy=True
+            )
+            from agy_switcher.watcher import DaemonManager
+
+            dm = DaemonManager(
+                vault_dir=engine.vault_dir,
+                proc_dir=proc_dir,
+                gemini_dir=gemini_dir,
+            )
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("os.getpid", return_value=49210), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not be called in-turn")), \
+                 patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not be spawned")) as mock_popen, \
+                 patch.dict(os.environ, {"AGY_DISABLE_HOST_SYSTEMD": "1"}), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                self.assertIsNone(dm.get_running_pid())
+                self.assertFalse(dm.is_systemd_active())
+                exit_code = main(["switch", "work-acc", "--force"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            mock_popen.assert_not_called()
+            self.assertEqual(engine.get_active_name(), "work-acc")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_work@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_work@example.com",
+            )
+
+            pending_file = engine.pending_reload_file
+            self.assertTrue(pending_file.is_file())
+            pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+            self.assertEqual(pending_data["target_account"], "work-acc")
+            self.assertEqual(pending_data["ttl_seconds"], 120)
+
+            out = stdout_buf.getvalue()
+            self.assertIn("Deferred", out)
+            self.assertIn("LogWatcher is inactive", out)
+            self.assertIn("after the turn completes", out)
+
+    def test_in_turn_deferred_reload_active_watcher_omits_inactive_guidance(self) -> None:
+        """When LogWatcher is active (systemd or PID), deferred reload output omits inactive watcher warning."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=49300, child_pid=49310, busy=True
+            )
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("os.getpid", return_value=49310), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not be called in-turn")), \
+                 patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not be spawned")), \
+                 patch("agy_switcher.watcher.DaemonManager.is_systemd_active", return_value=True), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(["switch", "work-acc", "--force"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            out = stdout_buf.getvalue()
+            self.assertIn("Deferred", out)
+            self.assertNotIn("LogWatcher is inactive", out)
+
+    def test_in_turn_deferred_reload_force_restart_now_override_DEFER_RELOAD_005(self) -> None:
+        """[DEFER-RELOAD-005] --force-restart-now bypasses in-turn deferred reload and restarts language_server synchronously."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            server_pid = 49400
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=server_pid, child_pid=49410, busy=True
+            )
+
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("os.getpid", return_value=49410), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(
+                    ["switch", "work-acc", "--force", "--force-restart-now"],
+                    engine=engine,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(signals_sent), 1)
+            self.assertEqual(signals_sent[0][0], server_pid)
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertIn("Restarted language_server", stdout_buf.getvalue())
+
+    def test_in_turn_force_restart_now_precedence_matrix_DEFER_RELOAD_EDGE_004(self) -> None:
+        """[DEFER-RELOAD-EDGE-004] switch --auto --force-restart-now restarts immediately; manual switch --force-restart-now without --force honors ActiveTurnRunningError (exit 2)."""
+        from agy_switcher.cli import build_parser
+
+        parser = build_parser()
+        auto_args = parser.parse_args(["switch", "--auto", "--force-restart-now"])
+        self.assertTrue(auto_args.auto)
+        self.assertTrue(auto_args.force_restart_now)
+        self.assertFalse(auto_args.force)
+
+        manual_args = parser.parse_args(["switch", "work-acc", "--force-restart-now"])
+        self.assertEqual(manual_args.account, "work-acc")
+        self.assertTrue(manual_args.force_restart_now)
+        self.assertFalse(manual_args.force)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            self._register_account(engine, "best-standby", "best@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            server_pid = 49500
+            child_pid = 49510
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=server_pid, child_pid=child_pid, busy=True
+            )
+
+            desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+            cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+            # 1. Manual switch <name> --force-restart-now WITHOUT --force enforces verify_turn_safety(force=False) -> exit 2
+            manual_stdout = io.StringIO()
+            manual_stderr = io.StringIO()
+            with patch.object(engine, "switch_tokens", wraps=engine.switch_tokens) as spy_switch_manual, \
+                 patch.object(engine, "verify_turn_safety", wraps=engine.verify_turn_safety) as spy_safety, \
+                 patch("os.getpid", return_value=child_pid), \
+                 patch("urllib.request.urlopen", side_effect=AssertionError("Pre-flight auth probe must not run when ActiveTurnRunningError fires")), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not run when ActiveTurnRunningError fires")), \
+                 patch("sys.stdout", manual_stdout), \
+                 patch("sys.stderr", manual_stderr):
+                self.assertTrue(engine.is_invoked_by_language_server())
+                manual_exit = main(["switch", "work-acc", "--force-restart-now"], engine=engine)
+
+            self.assertEqual(manual_exit, 2)
+            spy_switch_manual.assert_called_once_with(
+                "work-acc",
+                restart_server=True,
+                force=False,
+                verify_auth=True,
+                force_restart_now=True,
+            )
+            spy_safety.assert_called_once_with(force=False)
+            self.assertIn("Warning:", manual_stderr.getvalue())
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+            self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+            self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+            self.assertFalse(engine.pending_reload_file.exists())
+
+            # 2. Auto switch --auto --force-restart-now sets force=True & force_restart_now=True -> immediate restart
+            def fake_urlopen(req: object, *_args: object, **_kwargs: object) -> object:
+                headers = getattr(req, "headers", {}) or {}
+                auth = headers.get("Authorization", "")
+                if "best@example.com" in auth:
+                    return self._make_quota_response(0.95)
+                return self._make_quota_response(0.05)
+
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            auto_stdout = io.StringIO()
+            auto_stderr = io.StringIO()
+            with patch.object(engine, "switch_tokens", wraps=engine.switch_tokens) as spy_switch_auto, \
+                 patch.object(engine, "restart_language_server", wraps=engine.restart_language_server) as spy_restart, \
+                 patch("os.getpid", return_value=child_pid), \
+                 patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", auto_stdout), \
+                 patch("sys.stderr", auto_stderr):
+                auto_exit = main(["switch", "--auto", "--force-restart-now"], engine=engine)
+
+            self.assertEqual(auto_exit, 0)
+            spy_switch_auto.assert_called_once_with(
+                "best-standby",
+                restart_server=True,
+                force=True,
+                force_restart_now=True,
+            )
+            spy_restart.assert_called_once_with(force=True)
+            self.assertEqual(len(signals_sent), 1)
+            self.assertEqual(signals_sent[0][0], server_pid)
+            self.assertEqual(engine.get_active_name(), "best-standby")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertIn("Restarted language_server", auto_stdout.getvalue())
 
 
 if __name__ == '__main__':

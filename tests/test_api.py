@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+import signal
 import sys
 import tempfile
 from typing import Any
@@ -753,6 +754,99 @@ class TestSDKFacade(unittest.TestCase):
             mock_locate.assert_not_called()
             mock_busy.assert_not_called()
             mock_restart.assert_not_called()
+
+    def _setup_idle_language_server(self, server_pid: int) -> None:
+        pid_dir = self.proc_dir / str(server_pid)
+        fd_dir = pid_dir / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "cmdline").write_bytes(b"/opt/antigravity/bin/language_server\x00--standalone\x00")
+        (pid_dir / "stat").write_text(
+            f"{server_pid} (language_server) S 1 {server_pid} 1 0 -1\n",
+            encoding="utf-8",
+        )
+
+    def _register_primary_and_standby(self) -> None:
+        for alias, email_addr in (
+            ("primary-acc", "primary@example.com"),
+            ("standby-acc", "standby@example.com"),
+        ):
+            acc_dir = self.engine.accounts_dir / alias
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(
+                json.dumps(create_sample_token(email_addr)), encoding="utf-8"
+            )
+        self.engine.switch_tokens("primary-acc", restart_server=False)
+
+    def _assert_live_tokens_email(self, expected_email: str) -> None:
+        desktop_data = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        cli_data = json.loads(self.engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(extract_email_from_jwt(desktop_data["id_token"]), expected_email)
+        self.assertEqual(extract_email_from_jwt(cli_data["id_token"]), expected_email)
+
+    def test_force_auth_decoupling_and_sdk_default_api_switch_account_zero_http_AUTH_GATE_004(self) -> None:
+        """[AUTH-GATE-004] api.switch_account() defaults to verify_auth=False across Disk-Only Swap and reload_server=True with zero CloudCode HTTP calls."""
+        self._register_primary_and_standby()
+        server_pid = 49100
+        self._setup_idle_language_server(server_pid)
+
+        for label, call_kwargs, expect_restart in (
+            ("explicit_disk_only_swap", {"reload_server": False}, False),
+            ("default_reload_server_omitted", {}, False),
+            ("explicit_reload_server_idle", {"reload_server": True}, True),
+        ):
+            with self.subTest(mode=label):
+                self.engine.switch_tokens("primary-acc", restart_server=False)
+                signals_sent: list[tuple[int, int]] = []
+                terminated = False
+
+                def fake_kill(pid: int, sig: int) -> None:
+                    nonlocal terminated
+                    if sig == 0:
+                        if terminated:
+                            raise ProcessLookupError()
+                        return
+                    signals_sent.append((pid, sig))
+                    terminated = True
+
+                with patch("urllib.request.urlopen", side_effect=AssertionError("Unexpected CloudCode HTTP request")) as mock_urlopen, \
+                     patch("os.kill", side_effect=fake_kill):
+                    res = api.switch_account("standby-acc", engine=self.engine, **call_kwargs)
+
+                self.assertTrue(res)
+                mock_urlopen.assert_not_called()
+                expected_signals = [(server_pid, signal.SIGTERM)] if expect_restart else []
+                self.assertEqual(signals_sent, expected_signals)
+                self.assertEqual(self.engine.get_active_name(), "standby-acc")
+                self._assert_live_tokens_email("standby@example.com")
+
+    def test_force_auth_decoupling_and_sdk_default_engine_switch_tokens_zero_http_AUTH_GATE_004(self) -> None:
+        """[AUTH-GATE-004] engine.switch_tokens('standby-acc') without verify_auth=True switches tokens and restarts idle server with zero CloudCode HTTP calls."""
+        self._register_primary_and_standby()
+        server_pid = 49101
+        self._setup_idle_language_server(server_pid)
+        signals_sent: list[tuple[int, int]] = []
+        terminated = False
+
+        def fake_kill(pid: int, sig: int) -> None:
+            nonlocal terminated
+            if sig == 0:
+                if terminated:
+                    raise ProcessLookupError()
+                return
+            signals_sent.append((pid, sig))
+            terminated = True
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("Unexpected CloudCode HTTP request")) as mock_urlopen, \
+             patch("os.kill", side_effect=fake_kill):
+            res = self.engine.switch_tokens("standby-acc")
+
+        mock_urlopen.assert_not_called()
+        self.assertEqual(res["active"], "standby-acc")
+        self.assertEqual(res["email"], "standby@example.com")
+        self.assertTrue(res["server_restarted"])
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+        self.assertEqual(signals_sent, [(server_pid, signal.SIGTERM)])
+        self._assert_live_tokens_email("standby@example.com")
 
     def test_switch_account_busy_server_raises_active_turn_running_error(self) -> None:
         """[REQ-2-ERR-001] reload_server=True raises ActiveTurnRunningError during active turn and preserves disk tokens."""

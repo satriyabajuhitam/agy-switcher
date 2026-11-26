@@ -182,6 +182,24 @@ def _format_gemini_quota_summary(acc: dict[str, Any], current_timestamp: float |
     return _format_model_quota_summary(acc, model="gemini", current_timestamp=current_timestamp)
 
 
+def _has_auth_error(acc: dict[str, Any]) -> bool:
+    """Returns True when an account dict carries non-empty auth_error metadata."""
+    val = acc.get("auth_error")
+    if isinstance(val, str):
+        return bool(val.strip())
+    return bool(val)
+
+
+def _format_account_status_label(acc: dict[str, Any]) -> str:
+    """Formats the base status label with optional validity and auth quarantine badges."""
+    status = "Active" if acc.get("is_active") else "Standby"
+    if not acc.get("valid", True):
+        status += " (Invalid)"
+    if _has_auth_error(acc):
+        status += " (Auth Error)"
+    return status
+
+
 def format_accounts_listicle(
     result: dict[str, Any] | None,
     show_quota: bool = True,
@@ -210,11 +228,10 @@ def format_accounts_listicle(
 
         if show_quota:
             quota_summary = _format_model_quota_summary(acc, model=model_clean, current_timestamp=current_timestamp)
-            lines.append(f"{prefix} — {model_label}: {quota_summary}")
+            auth_badge = " (Auth Error)" if _has_auth_error(acc) else ""
+            lines.append(f"{prefix}{auth_badge} — {model_label}: {quota_summary}")
         else:
-            status = "Active" if acc.get("is_active") else "Standby"
-            if not acc.get("valid", True):
-                status += " (Invalid)"
+            status = _format_account_status_label(acc)
             lines.append(f"{prefix} [{status}]")
 
     active_acc = result.get("active")
@@ -256,9 +273,7 @@ def format_accounts_table(
         if not isinstance(acc, dict):
             continue
         marker = "* " if acc.get("is_active") else "  "
-        status = "Active" if acc.get("is_active") else "Standby"
-        if not acc.get("valid", True):
-            status += " (Invalid)"
+        status = _format_account_status_label(acc)
         email_str = str(acc.get("email") or "").strip() or "-"
         line = f"{marker}{str(acc.get('name') or ''):<20} {email_str:<30} {status:<15}"
 
@@ -306,6 +321,31 @@ def format_status_report(status: dict[str, Any]) -> str:
             lines.append("Server State      : Idle (Safe to restart)")
     else:
         lines.append("Language Server   : Stopped / Not Found")
+
+    last_failover = status.get("last_failover")
+    if isinstance(last_failover, dict):
+        from_acc = str(last_failover.get("from_account") or "").strip()
+        to_acc = str(last_failover.get("to_account") or "").strip()
+        trigger = str(last_failover.get("trigger") or "").strip()
+        if from_acc or to_acc:
+            route = f"{from_acc or '?'} -> {to_acc or '?'}"
+            trigger_suffix = f" (trigger: {trigger})" if trigger else ""
+            lines.append(f"Last Failover     : {route}{trigger_suffix}")
+
+    pending_reload = status.get("pending_reload")
+    if isinstance(pending_reload, dict):
+        target_acc = str(pending_reload.get("target_account") or "").strip()
+        if target_acc:
+            raw_ttl = pending_reload.get("ttl_seconds")
+            ttl_part = ""
+            if (
+                isinstance(raw_ttl, (int, float))
+                and not isinstance(raw_ttl, bool)
+                and math.isfinite(raw_ttl)
+                and raw_ttl > 0
+            ):
+                ttl_part = f", TTL: {int(round(raw_ttl))}s"
+            lines.append(f"Pending Reload    : {target_acc} (awaiting safe-turn server reload{ttl_part})")
 
     lines.append("-------------------------------------------------------------")
     return "\n".join(lines)

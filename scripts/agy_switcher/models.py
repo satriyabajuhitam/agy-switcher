@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 _LAYER_TO_CATEGORY: dict[int, str] = {
     1: "permissions",
@@ -220,6 +220,55 @@ class FleetQuotaSummary:
         }
 
 
+class AuthErrorEntry(TypedDict, total=False):
+    """Auth failure quarantine metadata persisted under cache/failover_state.json['auth_errors']."""
+
+    timestamp: float
+    error: str
+    error_type: str
+
+
+class LastFailoverEntry(TypedDict, total=False):
+    """Most recent automated hook failover event recorded in cache/failover_state.json."""
+
+    timestamp: float
+    from_account: str
+    to_account: str
+    trigger: str
+    reason: str
+
+
+class FailoverStateDict(TypedDict):
+    """Normalized schema for cache/failover_state.json."""
+
+    last_failover: LastFailoverEntry | None
+    auth_errors: dict[str, AuthErrorEntry]
+
+
+class PendingReloadPayload(TypedDict):
+    """Normalized schema for cache/pending_reload.json."""
+
+    target_account: str
+    requested_at: float
+    ttl_seconds: float | int
+    reason: str
+
+
+class _AuthProbeResultBase(TypedDict):
+    ok: bool
+    account: str
+    refreshed: bool
+    fail_open: bool
+
+
+class AuthProbeResult(_AuthProbeResultBase, total=False):
+    """Structured verdict returned by probe_account_auth()."""
+
+    error: str
+    error_type: str
+    quota: dict[str, object]
+
+
 __all__ = [
     "DiagnosticItem",
     "DiagnosticReport",
@@ -228,4 +277,9 @@ __all__ = [
     "AccountInfo",
     "RotationResult",
     "FleetQuotaSummary",
+    "AuthErrorEntry",
+    "LastFailoverEntry",
+    "FailoverStateDict",
+    "PendingReloadPayload",
+    "AuthProbeResult",
 ]

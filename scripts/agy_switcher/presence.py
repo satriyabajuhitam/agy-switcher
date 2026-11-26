@@ -7,14 +7,22 @@ Strictly acyclic DAG: Does NOT import vault.py, rotation.py, doctor.py, hook.py,
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import errno
+import json
+import math
 import os
 from pathlib import Path
+import re
 import sys
 import time
-from typing import Any
+from typing import Any, Callable, cast
 
-from agy_switcher.security import _atomic_write_file
+from agy_switcher.security import (
+    _atomic_write_file,
+    parse_pending_reload_payload,
+    read_json_dict_nofollow,
+)
 
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_VAULT_DIR = Path.home() / ".antigravity-vault"
@@ -483,12 +491,286 @@ class PresenceDetector:
 
 
 
+_EXHAUSTION_REGEX: re.Pattern[str] = re.compile(
+    r"resource[_\s-]?exhausted"
+    r"|\b(?:http(?:/\d+(?:\.\d+)?)?(?:_?(?:status|code))?|(?:grpc|response|api|http)_?(?:status|error)(?:_?code)?|error(?:_?code)?|code|status(?:_?code)?)\"?\s*(?:[:=]|\()?\s*\"?429\b"
+    r"|\b429\b\"?\s*\)?\s*(?:[:\-]?\s*(?:quota\s+(?:exceeded|exhausted|reached)|resource\s*exhausted|rate[- ]?limit|too\s+many\s+requests)\b|:\s*quota\b)"
+    r"|\b(?:too\s+many\s+requests|rate[- ]?limit(?:ed|\s+exceeded)?|quota\s+(?:exceeded|exhausted|reached))\s*[:\-]?\s*[\(\[]\s*429\s*[\)\]]"
+    r"|Individual quota reached|weekly quota reached", re.IGNORECASE,
+)
+
+
+def _is_scalar_code(val: object) -> bool:
+    return (isinstance(val, int) and not isinstance(val, bool)) or (isinstance(val, str) and val.strip().isdigit())
+
+
+def _extract_text_fragments(value: object, max_items: int = 10000) -> list[str]:
+    """Extracts unescaped text fragments and scalar status codes from nested JSON payloads.
+    Guards against cyclic structures and excessive depth via visited tracking.
+    """
+    fragments: list[str] = []
+    stack: list[object] = [value]
+    visited: set[int] = set()
+    items_processed = 0
+
+    while stack and items_processed < max_items:
+        current = stack.pop()
+        items_processed += 1
+        if isinstance(current, str):
+            clean = current.strip()
+            if clean:
+                fragments.append(clean)
+        elif _is_scalar_code(current):
+            fragments.append(str(current).strip())
+        elif isinstance(current, (list, tuple)):
+            c_id = id(current)
+            if c_id in visited:
+                continue
+            visited.add(c_id)
+            stack.extend(reversed(current))
+        elif isinstance(current, dict):
+            c_id = id(current)
+            if c_id in visited:
+                continue
+            visited.add(c_id)
+            for k, v in reversed(list(current.items())):
+                if isinstance(k, str) and _EXHAUSTION_REGEX.search(k):
+                    fragments.append(k.strip())
+                if isinstance(k, str) and _is_scalar_code(v):
+                    stack.append(f"{k}: {str(v).strip()}")
+                elif isinstance(v, (str, list, tuple, dict)) and v:
+                    stack.append(v)
+                elif _is_scalar_code(v):
+                    stack.append(str(v).strip())
+    return fragments
+
+
+def read_latest_jsonl_record(target_path: Path) -> dict[str, Any] | None:
+    """Reads and parses the trailing JSON object record from a JSONL transcript file."""
+    try:
+        size = target_path.stat().st_size
+        if size == 0:
+            return None
+        max_read = 4 * 1024 * 1024
+        chunk_size = min(size, 65536)
+        with open(target_path, "rb") as f:
+            while True:
+                f.seek(max(0, size - chunk_size))
+                data = f.read(min(chunk_size, size))
+                last_line_str: str | None = None
+                for line in reversed(data.splitlines()):
+                    s = line.strip().decode("utf-8", errors="replace")
+                    if s:
+                        last_line_str = s
+                        break
+                if not last_line_str:
+                    return None
+                if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
+                    chunk_size = min(size, chunk_size * 4, max_read)
+                    continue
+                if not last_line_str.startswith("{"):
+                    return None
+                try:
+                    parsed = json.loads(last_line_str)
+                    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
+                except json.JSONDecodeError:
+                    if chunk_size < size and chunk_size < max_read:
+                        chunk_size = min(size, chunk_size * 4, max_read)
+                        continue
+                    return None
+    except OSError:
+        return None
+
+
+def safe_stderr_write(message: str) -> None:
+    """Writes a diagnostic line to sys.stderr without raising on closed streams."""
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write(f"{message}\n")
+            sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def write_watch_log_line(
+    log_dir: Path | None,
+    log_line: str,
+    append_fn: Callable[[Path | str, str], None] = append_secure_log_entry,
+) -> None:
+    """Appends a formatted audit line to watch.log with mode 0600 and safe error handling."""
+    try:
+        if log_dir is None:
+            return
+        append_fn(log_dir / "watch.log", log_line)
+    except OSError as e:
+        msg = (
+            f"[watch] Disk full (ENOSPC): Error appending audit log: {e}"
+            if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC))
+            else f"[watch] Error appending audit log: {e}"
+        )
+        safe_stderr_write(msg)
+    except Exception as e:
+        safe_stderr_write(f"[watch] Error appending audit log: {e}")
+
+
+def format_audit_log_line(
+    target_account: str,
+    old_account: str | None = None,
+    reason: str = "",
+    reloaded: bool = False,
+    clean_reason: str = "",
+) -> str:
+    """Formats a structured watcher account-switch audit line."""
+    if not clean_reason and reason and isinstance(reason, str):
+        r = reason.strip()
+        while r.startswith("(") and r.endswith(")") and len(r) >= 2:
+            r = r[1:-1].strip()
+        clean_reason = r
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    log_reason = clean_reason or reason
+    suffix = " with force-restart language_server" if reloaded else ""
+    prefix = f"Switched from '{old_account}' to '{target_account}'" if old_account else f"Switched to '{target_account}'"
+    return (
+        f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n"
+        if (old_account or reloaded)
+        else f"{ts} [watch] {prefix} ({log_reason})\n"
+    )
+
+
+def format_deferred_reload_audit_line(
+    target_account: str,
+    reason: str = "in_turn_deferred_reload",
+) -> str:
+    """Formats a structured deferred safe-turn reload audit line."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    clean_target = " ".join(target_account.split())
+    clean_reason = " ".join(reason.split()) if isinstance(reason, str) and reason.strip() else "in_turn_deferred_reload"
+    return (
+        f"{ts} [watch] Deferred safe-turn reload for '{clean_target}' "
+        f"with force-restart language_server (reason: {clean_reason})\n"
+    )
+
+
+def is_watch_process_cmdline(proc_dir: Path, pid: int, watch_script: Path | None) -> bool:
+    """Validates /proc/<pid>/cmdline if accessible to prevent signaling arbitrary processes."""
+    if not proc_dir.is_dir():
+        return True
+    cmdline_file = proc_dir / str(pid) / "cmdline"
+    if not cmdline_file.is_file():
+        return False
+    try:
+        raw = cmdline_file.read_bytes()
+    except OSError:
+        return False
+    raw_args = [a for a in raw.split(b"\x00") if a] if raw else []
+    if not raw_args:
+        return False
+    args = [a.decode("utf-8", errors="replace").strip() for a in raw_args]
+    argv0 = os.path.basename(args[0]).lower()
+    is_python = argv0.startswith(("python", "pypy"))
+    is_agyswitch = "agy-switch" in argv0 or "agy_switch" in argv0
+    if not (is_python or is_agyswitch):
+        return False
+    script_name = watch_script.name.lower() if watch_script else ""
+    if is_python:
+        target_script = None
+        skip_next = False
+        for arg in args[1:]:
+            if skip_next:
+                skip_next = False
+            elif arg == "-m":
+                target_script = "-m"
+                break
+            elif arg == "-c":
+                return False
+            elif arg.startswith("-"):
+                if arg in ("-w", "-x"):
+                    skip_next = True
+                continue
+            else:
+                target_script = os.path.basename(arg).lower()
+                break
+        if not target_script:
+            return False
+        full_cmd = " ".join(args).lower()
+        if target_script == "-m":
+            return "watch" in full_cmd and "run" in full_cmd
+        matches_script = (
+            (bool(script_name) and target_script == script_name)
+            or target_script in ("watch.py", "watcher.py", "agy_switch.py")
+            or "agy-switch" in target_script
+            or "agy_switch" in target_script
+        )
+        return matches_script and (
+            "run" in full_cmd
+            or "watch" in full_cmd
+            or bool(script_name and script_name in full_cmd)
+        )
+    args_lower = [a.lower() for a in args]
+    return "watch" in args_lower or "run" in args_lower
+
+
+def extract_5h_rolling_reset(
+    target_dict: dict[str, Any],
+    now: float,
+    parse_ts_fn: Callable[[Any], float],
+) -> float | None:
+    """Extracts valid 5-hour rolling bucket reset timestamp, rejecting weekly timestamps > 5 hours."""
+    max_rolling_window = 18000.0
+    max_daily_window = 86400.0
+    raw_buckets = target_dict.get("buckets")
+
+    def _is_weekly(identifier: str) -> bool:
+        return any(x in identifier for x in ("weekly", "week", "7d", "wk"))
+
+    def _is_5h_rolling(identifier: str) -> bool:
+        return any(x in identifier for x in ("5h", "five_hour", "five_hours", "5_hour", "5-hour", "rolling_5h"))
+
+    bucket_items: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(raw_buckets, dict):
+        bucket_items = [(str(k).strip().lower(), b) for k, b in raw_buckets.items() if isinstance(b, dict)]
+    elif isinstance(raw_buckets, list):
+        bucket_items = [(str(b.get("bucketId", "")).strip().lower(), b) for b in raw_buckets if isinstance(b, dict)]
+    if bucket_items:
+        for ident, b in bucket_items:
+            if _is_5h_rolling(ident):
+                rt_val = parse_ts_fn(b.get("reset_time", b.get("resetTime")))
+                if math.isfinite(rt_val) and rt_val - now > 0:
+                    return min(rt_val, now + max_rolling_window)
+        if all(_is_weekly(ident) for ident, _ in bucket_items):
+            return None
+        for ident, b in bucket_items:
+            if not _is_weekly(ident):
+                rt_val = parse_ts_fn(b.get("reset_time", b.get("resetTime")))
+                if math.isfinite(rt_val) and 0 < rt_val - now <= max_daily_window:
+                    return min(rt_val, now + max_rolling_window)
+        if any(_is_weekly(ident) for ident, _ in bucket_items):
+            return None
+    if (top_rt := target_dict.get("reset_time", target_dict.get("resetTime"))) is not None:
+        rt_val = parse_ts_fn(top_rt)
+        if math.isfinite(rt_val) and 0 < rt_val - now <= max_daily_window:
+            return min(rt_val, now + max_rolling_window)
+    return None
+
+
 __all__ = [
     "_resolve_vault_log_path",
     "_resolve_log_file_target",
     "_open_secure_log_file",
     "append_secure_log_entry",
     "_write_atomic_file_secure",
+    "parse_pending_reload_payload",
+    "read_json_dict_nofollow",
+    "extract_5h_rolling_reset",
+    "_EXHAUSTION_REGEX",
+    "_is_scalar_code",
+    "_extract_text_fragments",
+    "read_latest_jsonl_record",
+    "safe_stderr_write",
+    "write_watch_log_line",
+    "format_audit_log_line",
+    "format_deferred_reload_audit_line",
+    "is_watch_process_cmdline",
     "PresenceDetector",
     "DEFAULT_GEMINI_DIR",
 ]

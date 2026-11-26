@@ -11,6 +11,7 @@ Does not import Layer 3 (hook) or Layer 4 (cli).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -27,24 +28,36 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
-from typing import Any, Callable, cast
+from typing import Any, Callable, Iterator, cast
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from agy_switcher.exceptions import (
+    AccountAuthError,
     AccountNotFoundError,
     ActiveTurnRunningError,
     AgySwitchError,
     InvalidThresholdError,
     InvalidTokenError,
 )
-from agy_switcher.models import DiagnosticItem, DiagnosticReport
+from agy_switcher.models import (
+    AuthErrorEntry,
+    DiagnosticItem,
+    DiagnosticReport,
+    FailoverStateDict,
+    LastFailoverEntry,
+    PendingReloadPayload,
+)
 from agy_switcher.security import (
     _atomic_write_file,
     _atomic_write_json,
     extract_email_from_jwt,
+    is_safe_account_alias,
+    parse_pending_reload_payload,
+    read_json_dict_safe,
     resolve_token_email,
     validate_token_dict,
     validate_token_file,
@@ -53,6 +66,7 @@ from agy_switcher.supervisor import ProcessSupervisor
 from agy_switcher.telemetry import (
     _parse_timestamp_defensive,
     normalize_model_name,
+    probe_account_auth,
 )
 from agy_switcher.doctor import DoctorEngine
 
@@ -61,6 +75,40 @@ DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_LEGACY_ROOT = Path.home() / ".agy-cli-manager"
 GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
 USERINFO_TIMEOUT_SECONDS = 5.0
+FAILOVER_STATUS_WINDOW_SECONDS = 86400.0
+_FAILOVER_STATE_LOCK = threading.RLock()
+
+
+def _coerce_positive_timestamp(timestamp: float | int | None) -> float:
+    """Returns a valid positive finite UNIX timestamp, defaulting to time.time()."""
+    if timestamp is None or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return time.time()
+    val = float(timestamp)
+    if not math.isfinite(val) or val <= 0:
+        return time.time()
+    return val
+
+
+def _normalize_failover_state(raw: dict[str, object] | None) -> FailoverStateDict:
+    """Normalizes raw failover state payload into canonical schema."""
+    last_failover: LastFailoverEntry | None = None
+    auth_errors: dict[str, AuthErrorEntry] = {}
+
+    if isinstance(raw, dict):
+        raw_lf = raw.get("last_failover")
+        if isinstance(raw_lf, dict) and raw_lf:
+            last_failover = cast(LastFailoverEntry, dict(raw_lf))
+
+        raw_ae = raw.get("auth_errors")
+        if isinstance(raw_ae, dict):
+            for key, val in raw_ae.items():
+                if isinstance(key, str) and key.strip() and isinstance(val, dict):
+                    auth_errors[key.strip()] = cast(AuthErrorEntry, dict(val))
+
+    return {
+        "last_failover": last_failover,
+        "auth_errors": auth_errors,
+    }
 
 
 def _clean_email_str(value: object) -> str | None:
@@ -157,9 +205,12 @@ class AgySwitchEngine:
         self.cache_dir = self._vault_dir / "cache"
         self.cache_file = self.cache_dir / "last_known_quota.json"
         self.cooldown_file = self.cache_dir / "cooldown.json"
+        self.failover_state_file = self.cache_dir / "failover_state.json"
+        self.pending_reload_file = self.cache_dir / "pending_reload.json"
         self.config_file = self._vault_dir / "config.json"
         self.desktop_token_file = self._gemini_dir / "jetski-standalone-oauth-token"
         self.cli_token_file = self.cli_dir / "antigravity-oauth-token"
+        self._failover_lock = _FAILOVER_STATE_LOCK
 
         self.supervisor = ProcessSupervisor(gemini_dir=self._gemini_dir, proc_dir=self._proc_dir)
         self.doctor = DoctorEngine(engine=self)
@@ -178,6 +229,8 @@ class AgySwitchEngine:
         self.cache_dir = self._vault_dir / "cache"
         self.cache_file = self.cache_dir / "last_known_quota.json"
         self.cooldown_file = self.cache_dir / "cooldown.json"
+        self.failover_state_file = self.cache_dir / "failover_state.json"
+        self.pending_reload_file = self.cache_dir / "pending_reload.json"
         self.config_file = self._vault_dir / "config.json"
 
     @property
@@ -221,13 +274,13 @@ class AgySwitchEngine:
         except OSError:
             pass
 
-    def validate_token_dict(self, data: Any) -> dict[str, Any]:
+    def validate_token_dict(self, data: Any, *, require_refresh_token: bool = True) -> dict[str, Any]:
         """Validates that data complies with Google OAuth token JSON schema."""
-        return cast(dict[str, Any], validate_token_dict(data))
+        return cast(dict[str, Any], validate_token_dict(data, require_refresh_token=require_refresh_token))
 
-    def validate_token_file(self, token_path: Path) -> dict[str, Any]:
+    def validate_token_file(self, token_path: Path, *, require_refresh_token: bool = True) -> dict[str, Any]:
         """Reads and validates a token file from disk."""
-        return cast(dict[str, Any], validate_token_file(token_path))
+        return cast(dict[str, Any], validate_token_file(token_path, require_refresh_token=require_refresh_token))
 
     def get_account_tokens(self, name: str) -> dict[str, str | None] | None:
         """Retrieves and returns access_token and refresh_token for a given account.
@@ -485,6 +538,176 @@ class AgySwitchEngine:
         except Exception:
             return {}
 
+    def _write_failover_state_unlocked(self, state: FailoverStateDict) -> bool:
+        """Atomically persists failover state with 0600 mode, warning on OSError."""
+        try:
+            _atomic_write_json(self.failover_state_file, state)
+            return True
+        except OSError as exc:
+            print(
+                f"[agy-switch] Warning: Failed to persist failover state to '{self.failover_state_file}': {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+    def load_failover_state(self) -> FailoverStateDict:
+        """Loads cache/failover_state.json safely, recovering as empty state on error."""
+        with self._failover_lock:
+            raw, _ = read_json_dict_safe(self.failover_state_file)
+            return _normalize_failover_state(raw)
+
+    def record_auth_error(
+        self,
+        account_name: str,
+        error: str = "Authentication failed",
+        error_type: str = "auth",
+        timestamp: float | None = None,
+    ) -> FailoverStateDict:
+        """Records an account auth error quarantine entry atomically at mode 0600."""
+        with self._failover_lock:
+            raw, _ = read_json_dict_safe(self.failover_state_file)
+            state = _normalize_failover_state(raw)
+            alias = account_name.strip() if isinstance(account_name, str) else ""
+            if not alias:
+                return state
+            err_msg = error.strip() if isinstance(error, str) and error.strip() else "Authentication failed"
+            err_type = error_type.strip() if isinstance(error_type, str) and error_type.strip() else "auth"
+            ts = _coerce_positive_timestamp(timestamp)
+            state["auth_errors"][alias] = {
+                "timestamp": ts,
+                "error": err_msg,
+                "error_type": err_type,
+            }
+            self._write_failover_state_unlocked(state)
+            return state
+
+    def clear_auth_error(self, account_name: str) -> bool:
+        """Clears an account's auth quarantine entry atomically if present."""
+        with self._failover_lock:
+            alias = account_name.strip() if isinstance(account_name, str) else ""
+            if not alias:
+                return False
+            raw, exists = read_json_dict_safe(self.failover_state_file)
+            if not exists:
+                return False
+            state = _normalize_failover_state(raw)
+            removed = state["auth_errors"].pop(alias, None) is not None
+            if removed:
+                return self._write_failover_state_unlocked(state)
+            return False
+
+    def record_last_failover(
+        self,
+        from_account: str,
+        to_account: str,
+        trigger: str,
+        reason: str = "",
+        timestamp: float | None = None,
+    ) -> FailoverStateDict:
+        """Records the most recent hook failover event atomically at mode 0600."""
+        with self._failover_lock:
+            raw, _ = read_json_dict_safe(self.failover_state_file)
+            state = _normalize_failover_state(raw)
+            state["last_failover"] = {
+                "timestamp": _coerce_positive_timestamp(timestamp),
+                "from_account": from_account.strip() if isinstance(from_account, str) else "",
+                "to_account": to_account.strip() if isinstance(to_account, str) else "",
+                "trigger": trigger.strip() if isinstance(trigger, str) else "",
+                "reason": reason.strip() if isinstance(reason, str) else "",
+            }
+            self._write_failover_state_unlocked(state)
+            return state
+
+    def clear_last_failover(self) -> bool:
+        """Clears last_failover metadata atomically while preserving auth_errors."""
+        with self._failover_lock:
+            raw, exists = read_json_dict_safe(self.failover_state_file)
+            if not exists:
+                return False
+            state = _normalize_failover_state(raw)
+            had_failover = state["last_failover"] is not None
+            if had_failover:
+                state["last_failover"] = None
+                return self._write_failover_state_unlocked(state)
+            return False
+
+    def write_pending_reload(
+        self,
+        target_account: str,
+        reason: str = "in_turn_deferred_reload",
+        ttl_seconds: float | int = 120,
+        requested_at: float | None = None,
+    ) -> PendingReloadPayload:
+        """Atomically writes cache/pending_reload.json at mode 0600."""
+        clean_target = target_account.strip() if isinstance(target_account, str) else ""
+        if not clean_target:
+            raise AgySwitchError("Target account for pending reload cannot be empty.")
+
+        clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "in_turn_deferred_reload"
+        ttl_val: float | int = 120
+        if not isinstance(ttl_seconds, bool) and isinstance(ttl_seconds, (int, float)) and math.isfinite(ttl_seconds) and ttl_seconds > 0:
+            ttl_val = ttl_seconds
+
+        payload: PendingReloadPayload = {
+            "target_account": clean_target,
+            "requested_at": _coerce_positive_timestamp(requested_at),
+            "ttl_seconds": ttl_val,
+            "reason": clean_reason,
+        }
+        with self._failover_lock:
+            try:
+                _atomic_write_json(self.pending_reload_file, payload)
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to persist pending reload marker '{self.pending_reload_file}': {exc}",
+                    file=sys.stderr,
+                )
+        return payload
+
+    def load_pending_reload(
+        self,
+        *,
+        include_expired: bool = False,
+        now: float | None = None,
+    ) -> PendingReloadPayload | None:
+        """Loads cache/pending_reload.json safely, returning None if missing, corrupt, or expired."""
+        with self._failover_lock:
+            raw, _ = read_json_dict_safe(self.pending_reload_file)
+            parsed = parse_pending_reload_payload(raw)
+            if parsed is None:
+                return None
+
+            if not include_expired:
+                curr_now = _coerce_positive_timestamp(now)
+                if curr_now - parsed["requested_at"] > float(parsed["ttl_seconds"]):
+                    return None
+
+            return parsed
+
+    def clear_pending_reload(self) -> bool:
+        """Unlinks cache/pending_reload.json safely without following symlinks."""
+        with self._failover_lock:
+            try:
+                os.lstat(self.pending_reload_file)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to inspect pending reload marker '{self.pending_reload_file}': {exc}",
+                    file=sys.stderr,
+                )
+                return False
+
+            try:
+                self.pending_reload_file.unlink(missing_ok=True)
+                return True
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to remove pending reload marker '{self.pending_reload_file}': {exc}",
+                    file=sys.stderr,
+                )
+                return False
+
     def install_hook(
         self,
         hooks_file: Path | None = None,
@@ -646,6 +869,9 @@ class AgySwitchEngine:
     def list_accounts(self) -> dict[str, Any]:
         """Lists all accounts registered in the vault and marks the active account."""
         active = self.get_active_name()
+        failover_state = self.load_failover_state()
+        raw_auth_errors = failover_state.get("auth_errors")
+        auth_errors: dict[str, Any] = raw_auth_errors if isinstance(raw_auth_errors, dict) else {}
         accounts: list[dict[str, Any]] = []
 
         if self.accounts_dir.is_dir():
@@ -665,47 +891,82 @@ class AgySwitchEngine:
                     except InvalidTokenError:
                         pass
 
-                accounts.append({
+                entry: dict[str, Any] = {
                     "name": name,
                     "email": email,
                     "valid": valid,
                     "is_active": (name == active),
-                })
+                }
+                auth_err = auth_errors.get(name)
+                if isinstance(auth_err, dict) and auth_err:
+                    entry["auth_error"] = dict(auth_err)
+
+                accounts.append(entry)
 
         return {
             "active": active,
             "accounts": accounts,
         }
 
+    def _available_account_names(self) -> list[str]:
+        if not self.accounts_dir.is_dir():
+            return []
+        return sorted(
+            p.name for p in self.accounts_dir.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+
     def switch_tokens(
         self,
         name: str,
         restart_server: bool = True,
         force: bool = False,
+        verify_auth: bool = False,
+        force_restart_now: bool = False,
+        clear_failover: bool = True,
     ) -> dict[str, Any]:
         """Atomically switches active tokens across both Antigravity 2.0 and CLI surfaces."""
-        acc_dir = self.accounts_dir / name
-        token_file = acc_dir / "token.json"
+        clean_name = name.strip() if isinstance(name, str) else ""
+        is_safe_name = is_safe_account_alias(clean_name)
+        acc_dir = self.accounts_dir / clean_name if is_safe_name else None
+        token_file = acc_dir / "token.json" if acc_dir is not None else None
 
-        if not acc_dir.is_dir() or not token_file.is_file():
-            available = sorted(
-                p.name for p in self.accounts_dir.iterdir()
-                if p.is_dir() and not p.name.startswith(".")
-            ) if self.accounts_dir.is_dir() else []
+        if acc_dir is None or token_file is None or not acc_dir.is_dir() or not token_file.is_file():
+            available = self._available_account_names()
             raise AccountNotFoundError(
-                f"Account '{name}' not found in vault ({self.accounts_dir}). "
+                f"Account '{clean_name or name}' not found in vault ({self.accounts_dir}). "
                 f"Available accounts: {', '.join(available) or 'None'}"
             )
 
-        # Validate token payload before touching live target files
-        token_data = self.validate_token_file(token_file)
+        # When verify_auth=True, defer empty/missing refresh_token rejection to probe_account_auth()
+        # so HTTP 401/403 fails closed with AccountAuthError and auth_errors quarantine.
+        token_data = self.validate_token_file(token_file, require_refresh_token=not verify_auth)
+
+        if restart_server:
+            self.verify_turn_safety(force=force)
+
+        if verify_auth:
+            probe_res = probe_account_auth(self, clean_name)
+            if not probe_res.get("ok"):
+                err_detail = str(probe_res.get("error") or "CloudCode authentication rejected")
+                err_type = str(probe_res.get("error_type") or "auth")
+                self.record_auth_error(clean_name, error=err_detail, error_type=err_type)
+                raise AccountAuthError(
+                    f"Account '{clean_name}' failed pre-flight authentication ({err_detail}). "
+                    f"Run `agy-switch login {clean_name}` to re-authenticate."
+                )
+            if probe_res.get("refreshed"):
+                token_data = self.validate_token_file(token_file, require_refresh_token=not verify_auth)
+            if not probe_res.get("fail_open"):
+                self.clear_auth_error(clean_name)
+
         token_payload = json.dumps(token_data, indent=2) + "\n"
 
         # 1 & 2. Update Antigravity 2.0 (WSL / Desktop) and CLI tokens atomically
         self._sync_tokens_to_targets(token_payload)
 
         # 3. Update vault active marker
-        self.set_active_name(name)
+        self.set_active_name(clean_name)
 
         # 4. Backward-compatibility bridge: Update ~/.agy-cli-manager/state.json if it exists
         legacy_state_file = self.legacy_root / "state.json"
@@ -713,7 +974,7 @@ class AgySwitchEngine:
             try:
                 state_data = json.loads(legacy_state_file.read_text(encoding="utf-8"))
                 if isinstance(state_data, dict):
-                    state_data["active"] = name
+                    state_data["active"] = clean_name
                     self._atomic_write_json(legacy_state_file, state_data)
             except Exception:
                 pass
@@ -721,13 +982,28 @@ class AgySwitchEngine:
         email = resolve_token_email(token_data)
 
         server_restarted = False
+        restart_deferred = False
         if restart_server:
-            server_restarted = self.restart_language_server(force=force)
+            if not force_restart_now and self.is_invoked_by_language_server():
+                self.write_pending_reload(
+                    clean_name,
+                    reason="in_turn_deferred_reload",
+                    ttl_seconds=120,
+                )
+                restart_deferred = True
+            else:
+                server_restarted = self.restart_language_server(force=force)
+                if force_restart_now or server_restarted:
+                    self.clear_pending_reload()
+
+        if clear_failover:
+            self.clear_last_failover()
 
         return {
-            "active": name,
+            "active": clean_name,
             "email": email,
             "server_restarted": server_restarted,
+            "restart_deferred": restart_deferred,
         }
 
     def switch_account(
@@ -735,9 +1011,15 @@ class AgySwitchEngine:
         name: str,
         force: bool = False,
         no_restart: bool = False,
+        force_restart_now: bool = False,
     ) -> dict[str, Any]:
         """Unified Facade alias for switch_tokens matching specification."""
-        return self.switch_tokens(name=name, restart_server=not no_restart, force=force)
+        return self.switch_tokens(
+            name=name,
+            restart_server=not no_restart,
+            force=force,
+            force_restart_now=force_restart_now,
+        )
 
     def _resolve_and_enrich_registration_email(self, token_data: dict[str, Any]) -> str | None:
         """Resolves Token Identity via id_token/id_token_email or best-effort Google UserInfo lookup."""
@@ -793,6 +1075,7 @@ class AgySwitchEngine:
 
         acc_dir = self.accounts_dir / clean_name
         email = self._persist_registered_account(acc_dir, token_data)
+        self.clear_auth_error(clean_name)
         return {"name": clean_name, "email": email}
 
     def remove_account(self, name: str, force: bool = False) -> None:
@@ -1152,6 +1435,7 @@ class AgySwitchEngine:
 
             token_data = self.validate_token_file(token_file)
             email = self._persist_registered_account(acc_dir, token_data)
+            self.clear_auth_error(clean_name)
 
             return {
                 "name": clean_name,
@@ -1177,6 +1461,14 @@ class AgySwitchEngine:
         """Checks if language_server has active child processes or presence locks."""
         return self.supervisor.is_server_busy(pid)
 
+    def is_invoked_by_language_server(
+        self,
+        pid: int | None = None,
+        current_pid: int | None = None,
+    ) -> bool:
+        """Detects whether the current process descends from language_server."""
+        return self.supervisor.is_invoked_by_language_server(pid=pid, current_pid=current_pid)
+
     def _send_signal(self, pid: int, sig: int = signal.SIGTERM) -> None:
         """Dispatches signal to target process."""
         self.supervisor._send_signal(pid, sig)
@@ -1185,6 +1477,32 @@ class AgySwitchEngine:
         """Polls until process with given pid has terminated."""
         return self.supervisor._poll_process_exit(pid, timeout=timeout)
 
+    @contextmanager
+    def _bridged_supervisor(self, attrs: tuple[str, ...]) -> Iterator[None]:
+        """Temporarily bridges instance-level monkey-patched attributes onto self.supervisor."""
+        saved: dict[str, Any] = {}
+        had_instance_attr: set[str] = set()
+        for attr in attrs:
+            if attr in self.__dict__:
+                if attr in self.supervisor.__dict__:
+                    had_instance_attr.add(attr)
+                    saved[attr] = self.supervisor.__dict__[attr]
+                setattr(self.supervisor, attr, getattr(self, attr))
+        try:
+            yield
+        finally:
+            for attr in attrs:
+                if attr in self.__dict__:
+                    if attr in had_instance_attr:
+                        setattr(self.supervisor, attr, saved[attr])
+                    else:
+                        self.supervisor.__dict__.pop(attr, None)
+
+    def verify_turn_safety(self, force: bool = False, pid: int | None = None) -> None:
+        """Validates that language_server is not actively executing a turn."""
+        with self._bridged_supervisor(("locate_language_server_pid", "is_server_busy")):
+            self.supervisor.verify_turn_safety(force=force, pid=pid)
+
     def restart_language_server(self, force: bool = False) -> bool:
         """Restarts language_server gracefully via SIGTERM so WSL Relay auto-respawns it.
 
@@ -1192,23 +1510,8 @@ class AgySwitchEngine:
         instance-level monkey-patched mocks on this engine instance.
         """
         bridge_attrs = ("_send_signal", "_poll_process_exit", "locate_language_server_pid", "is_server_busy")
-        saved = {}
-        had_instance_attr = set()
-        for attr in bridge_attrs:
-            if attr in self.__dict__:
-                if attr in self.supervisor.__dict__:
-                    had_instance_attr.add(attr)
-                    saved[attr] = self.supervisor.__dict__[attr]
-                setattr(self.supervisor, attr, getattr(self, attr))
-        try:
+        with self._bridged_supervisor(bridge_attrs):
             return self.supervisor.restart_language_server(force=force)
-        finally:
-            for attr in bridge_attrs:
-                if attr in self.__dict__:
-                    if attr in had_instance_attr:
-                        setattr(self.supervisor, attr, saved[attr])
-                    else:
-                        self.supervisor.__dict__.pop(attr, None)
 
     def get_status(self) -> dict[str, Any]:
         """Returns health and status of the vault and running language_server."""
@@ -1227,13 +1530,32 @@ class AgySwitchEngine:
                 except Exception:
                     pass
 
-        return {
+        status: dict[str, Any] = {
             "active": active,
             "email": email,
             "server_running": running,
             "server_pid": pid,
             "server_busy": busy,
         }
+
+        failover_state = self.load_failover_state()
+        raw_last_failover = failover_state.get("last_failover")
+        if isinstance(raw_last_failover, dict) and raw_last_failover:
+            raw_ts = raw_last_failover.get("timestamp")
+            if (
+                not isinstance(raw_ts, bool)
+                and isinstance(raw_ts, (int, float))
+                and math.isfinite(raw_ts)
+                and raw_ts > 0
+                and (time.time() - float(raw_ts)) <= FAILOVER_STATUS_WINDOW_SECONDS
+            ):
+                status["last_failover"] = dict(raw_last_failover)
+
+        pending_reload = self.load_pending_reload()
+        if isinstance(pending_reload, dict) and pending_reload:
+            status["pending_reload"] = pending_reload
+
+        return status
 
     def _is_valid_expiry(self, raw_expiry: Any) -> bool:
         """Validates that expiry is a recognizable positive timestamp or ISO string."""

@@ -77,7 +77,7 @@ class TestLogWatcher(unittest.TestCase):
             
             self.watcher.process_line(line)
             
-            self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True, clear_failover=False)
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_trigger_switch_aborts_when_all_exhausted(self, sleep_mock):
@@ -261,7 +261,7 @@ class TestLogWatcher(unittest.TestCase):
             self.watcher.process_line(line)
 
             # Because claude was exhausted, acc3 (80% claude) should be selected, not acc2 (0% claude)
-            self.engine_mock.switch_tokens.assert_called_once_with('acc3', restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with('acc3', restart_server=True, force=True, clear_failover=False)
 
 
     def test_process_line_returns_boolean(self):
@@ -332,7 +332,7 @@ class TestLogWatcher(unittest.TestCase):
 
                 success = self.watcher.handle_exhaustion(line="RESOURCE_EXHAUSTED (code 429)", file_path=f1)
                 self.assertTrue(success)
-                self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with('acc2', restart_server=True, force=True, clear_failover=False)
 
                 # Both cursors must be seeked to their file sizes (EOF)
                 self.assertEqual(self.watcher.file_cursors[f1], os.path.getsize(f1))
@@ -935,7 +935,7 @@ class TestLogWatcher(unittest.TestCase):
         res_depleted = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_depleted)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Adversarial Edge Cases ---
         # 1. Exact boundary at 0.25 (<= 0.25 is not healthy, authorizes rotation)
@@ -954,7 +954,7 @@ class TestLogWatcher(unittest.TestCase):
         res_boundary = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_boundary)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # 2. Healthy boundary just above threshold (0.26 > 0.25 suppresses rotation)
         self.watcher.cooldown_manager.clear_cooldown()
@@ -989,7 +989,7 @@ class TestLogWatcher(unittest.TestCase):
         res_missing = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_missing)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # 4. Active damping window suppresses rotation prior to quota probe
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1043,7 +1043,7 @@ class TestLogWatcher(unittest.TestCase):
         res_boundary = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_boundary)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # Also verify integer percentage quota = 25 (25% <= 25% boundary)
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1061,7 +1061,7 @@ class TestLogWatcher(unittest.TestCase):
         res_boundary_int = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_boundary_int)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- [PRE-PROBE-ERR-001]: Missing last_known_quota.json falls back safely to rotation ---
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1072,7 +1072,7 @@ class TestLogWatcher(unittest.TestCase):
         res_missing = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_missing)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- [PRE-PROBE-ERR-001]: Unparseable/corrupted last_known_quota.json falls back safely to rotation ---
         self.watcher.cooldown_manager.clear_cooldown()
@@ -1083,7 +1083,7 @@ class TestLogWatcher(unittest.TestCase):
         res_corrupt = self.watcher.handle_exhaustion(line=exhaustion_line)
         self.assertTrue(res_corrupt)
         self.assertIn("primary-acc", self.watcher.get_cooldowns())
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     @patch("scripts.watch.time.sleep", return_value=None)
     def test_truncation_resets_cursor_and_clock_skew(self, mock_sleep):
@@ -1195,7 +1195,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1000.0):
                 res = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res)
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 1000.0)
 
@@ -1326,7 +1326,7 @@ class TestLogWatcher(unittest.TestCase):
         with patch("time.time", return_value=1060.0):
             res_60_0 = self.watcher.handle_exhaustion(line=exhaustion_line)
             self.assertTrue(res_60_0, "Exhaustion at elapsed=60.0s must be allowed (elapsed >= damping_seconds)")
-            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
             self.assertIn("primary-acc", self.watcher.get_cooldowns())
             self.assertEqual(self.watcher.last_switch_time, 1060.0)
 
@@ -1337,7 +1337,7 @@ class TestLogWatcher(unittest.TestCase):
         with patch("time.time", return_value=1061.0):
             res_61_0 = self.watcher.handle_exhaustion(line=exhaustion_line)
             self.assertTrue(res_61_0, "[PRE-PROBE-004] Exhaustion at elapsed=61.0s re-arms failover")
-            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+            self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
             self.assertIn("primary-acc", self.watcher.get_cooldowns())
             self.assertEqual(self.watcher.last_switch_time, 1061.0)
 
@@ -1391,7 +1391,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1061.0):
                 res = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res, "handle_exhaustion must succeed when damping has expired (61.0s >= 60.0s)")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 1061.0)
 
@@ -1413,7 +1413,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1060.0):
                 switched = self.watcher.process_line(exhaustion_line)
                 self.assertTrue(switched, "process_line must allow failover at exact 60.0s boundary")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 1060.0)
 
@@ -1435,7 +1435,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=2060.0):
                 res = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res, "handle_exhaustion must allow failover at exact 60.0s boundary")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
                 self.assertEqual(self.watcher.last_switch_time, 2060.0)
 
@@ -1525,7 +1525,7 @@ class TestLogWatcher(unittest.TestCase):
                 res_url_err = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res_url_err, "Network URLError during probe must fall back safely to rotation")
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Sub-scenario B: [PRE-PROBE-ERR-002] Stale cache + socket.timeout during probe ---
         with self.subTest("[PRE-PROBE-ERR-002]: stale cache + socket timeout falls back safely to rotation"):
@@ -1548,7 +1548,7 @@ class TestLogWatcher(unittest.TestCase):
                     res_timeout = self.watcher.handle_exhaustion(line=exhaustion_line)
                     self.assertTrue(res_timeout, "Socket timeout during live probe must fall back safely to rotation")
                     self.assertIn("primary-acc", self.watcher.get_cooldowns())
-                    self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                    self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Sub-scenario C: [PRE-PROBE-ERR-002] Missing cache + TimeoutError / OSError during probe ---
         with self.subTest("[PRE-PROBE-ERR-002]: missing cache + TimeoutError / OSError falls back safely"):
@@ -1561,7 +1561,7 @@ class TestLogWatcher(unittest.TestCase):
                 res_to = self.watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res_to, "TimeoutError during live probe must fall back safely to rotation")
                 self.assertIn("primary-acc", self.watcher.get_cooldowns())
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # --- Sub-scenario D: [PRE-PROBE-EDGE-003] Custom damping_seconds = 90.0 suppresses rotation at 75s ---
         with self.subTest("[PRE-PROBE-EDGE-003]: damping_seconds = 90.0 suppresses rotation at elapsed = 75.0s"):
@@ -1614,7 +1614,7 @@ class TestLogWatcher(unittest.TestCase):
             with patch("time.time", return_value=1090.0):
                 res_elapsed = custom_watcher.handle_exhaustion(line=exhaustion_line)
                 self.assertTrue(res_elapsed, "Rotation must be authorized once custom damping window (90.0s) elapses")
-                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+                self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
                 self.assertIn("primary-acc", custom_watcher.get_cooldowns())
                 self.assertEqual(custom_watcher.last_switch_time, 1090.0)
 
@@ -2042,7 +2042,7 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         # Safe Turn Boundary is reached -> rotation proceeds!
         res_quiescent = watcher.poll_once()
         self.assertTrue(res_quiescent, "poll_once() must trigger rotation once Safe Turn Boundary is reached")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
 
 class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
@@ -2287,7 +2287,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
             res = watcher.poll_once()
 
         self.assertEqual(res, 0, "poll_once() must return 0 when switch_tokens fails")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         stderr_output = stderr_capture.getvalue()
         self.assertIn("ProcessSupervisor error: language_server failed to terminate cleanly", stderr_output)
@@ -2481,7 +2481,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
 
         self.assertTrue(res, "poll_once() must return truthy/True when proactive rotation succeeds")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
         # File cursors must be updated to EOF
@@ -2538,7 +2538,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res, "Active account quota at exact 20.0% threshold must trigger proactive rotation")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_proactive_rotation_edge_above_threshold_suppresses_rotation(self):
@@ -2605,7 +2605,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res, "Invalid engine threshold method must default to 20% and trigger rotation")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_proactive_rotation_cursor_advancement_when_evaluated_directly(self):
@@ -2715,7 +2715,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res)
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
 
@@ -2905,7 +2905,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
         res = watcher.poll_once()
         self.assertTrue(res)
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-2", restart_server=True, force=True
+            "standby-2", restart_server=True, force=True, clear_failover=False
         )
 
     def test_standby_qualification_live_telemetry_fallback_when_cache_missing(self):
@@ -2943,7 +2943,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
 
         self.assertTrue(res)
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-2", restart_server=True, force=True
+            "standby-2", restart_server=True, force=True, clear_failover=False
         )
 
 
@@ -3095,7 +3095,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
 
         self.assertTrue(res, "Hard floor <= 5% must override drain window and force rotation")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_drain_window_exact_5_percent_hard_floor_override(self):
@@ -3137,7 +3137,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
 
         self.assertTrue(res, "Exact 5% floor must override drain window and rotate")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
     def test_drain_window_outside_30m_rotates_normally(self):
@@ -3179,7 +3179,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
 
         self.assertTrue(res, "Reset outside 30m window does not qualify for drain window; rotates normally")
         self.engine_mock.switch_tokens.assert_called_once_with(
-            "standby-acc", restart_server=True, force=True
+            "standby-acc", restart_server=True, force=True, clear_failover=False
         )
 
 
@@ -3276,7 +3276,7 @@ class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
         self.watcher.last_switch_time = 0.0
         res_depleted = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
         self.assertTrue(res_depleted, "Active account quota of 18% <= configured 20% threshold must authorize rotation")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     def test_threshold_sync_cooldown_err_001_malformed_json_syntax_returns_empty_and_allows_rotation(self):
         """[COOLDOWN-ERR-001]: Corrupted cooldown.json with malformed JSON syntax handles JSONDecodeError
@@ -3307,7 +3307,7 @@ class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
             res = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
 
         self.assertTrue(res, "Corrupted cooldown file must not crash daemon and must allow rotation to healthy standby")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
     def test_threshold_sync_cooldown_err_001_truncated_bytes_returns_empty_and_allows_rotation(self):
         """[COOLDOWN-ERR-001]: Corrupted cooldown.json with truncated/invalid bytes handles decode errors
@@ -3338,7 +3338,7 @@ class TestThresholdSyncAndCooldownResilience(unittest.TestCase):
             res = self.watcher.handle_exhaustion(line=error_line, model_hint="gemini")
 
         self.assertTrue(res, "Truncated bytes in cooldown.json must not crash daemon and must allow rotation to healthy standby")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
 
 class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
@@ -3439,7 +3439,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
 
         self.assertEqual(proactive_switches, 1, "Initial proactive rotation at Safe Turn Boundary must succeed")
         self.assertEqual(watcher.last_switch_time, t0, "Proactive rotation must update unified last_switch_time")
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # Simulate active account is now standby-acc, with depleted quota so failover would fire if undamped
         self.engine_mock.get_active_name.return_value = "standby-acc"
@@ -3487,7 +3487,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
 
         self.assertTrue(res_allowed, "handle_exhaustion() must allow rotation once elapsed=60.0s >= 60.0s")
         self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
-        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True, clear_failover=False)
         self.assertEqual(watcher.last_switch_time, t_60)
 
     def test_unified_damping_watch_proactive_edge_003_suppresses_successive_proactive_switches(self):
@@ -3526,7 +3526,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
 
         self.assertEqual(first_switches, 1)
         self.assertEqual(watcher.last_switch_time, t0)
-        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
 
         # Newly active account 'standby-acc' reports cached quota below threshold (15% <= 20%)
         self.engine_mock.get_active_name.return_value = "standby-acc"
@@ -3570,7 +3570,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
             switches_60 = watcher.poll_once()
         self.assertEqual(switches_60, 1, "Proactive rotation must proceed once elapsed=60.0s >= 60.0s")
         self.assertEqual(self.engine_mock.switch_tokens.call_count, 2)
-        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True)
+        self.engine_mock.switch_tokens.assert_called_with("standby-2", restart_server=True, force=True, clear_failover=False)
         self.assertEqual(watcher.last_switch_time, t_60)
 
     @patch("scripts.watch.time.sleep", return_value=None)
@@ -5229,6 +5229,553 @@ setattr(
     "test_VAULT_EDGE_002_ticket08_gate",
     TestVaultLogIsolation._test_vault_ticket08_scenarios,
 )
+
+
+class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
+    """Tests for Safe-Turn Boundary consumption and deferral of cache/pending_reload.json.
+
+    Covers:
+    - [WATCH-RELOAD-001]: Valid pending_reload.json consumed at verified Safe Turn Boundary.
+    - [WATCH-RELOAD-002]: Valid pending_reload.json deferred while _is_turn_quiescent() is False.
+    - [WATCH-RELOAD-ERR-001]: Malformed or corrupt pending_reload.json unlinked safely without crashing.
+    - [WATCH-RELOAD-EDGE-001]: Expired pending_reload.json exceeding ttl_seconds unlinked without restarting.
+    """
+
+    def setUp(self) -> None:
+        self.orig_agy_vault_dir = os.environ.pop("AGY_VAULT_DIR", None)
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = None
+        self.engine_mock.restart_language_server.return_value = True
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self) -> None:
+        if self.orig_agy_vault_dir is not None:
+            os.environ["AGY_VAULT_DIR"] = self.orig_agy_vault_dir
+        else:
+            os.environ.pop("AGY_VAULT_DIR", None)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_session(self, session_id: str, latest_record: dict[str, object]) -> Path:
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / f"{session_id}.lock").touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        transcript_path.write_text(json.dumps(latest_record) + "\n", encoding="utf-8")
+        return transcript_path
+
+    def _write_pending_reload(
+        self,
+        target_account: str = "work-acc",
+        age_seconds: float = 5.0,
+        ttl_seconds: int = 120,
+        reason: str = "in_turn_deferred_reload",
+    ) -> Path:
+        pending_file = self.cache_dir / "pending_reload.json"
+        payload = {
+            "target_account": target_account,
+            "requested_at": time.time() - age_seconds,
+            "ttl_seconds": ttl_seconds,
+            "reason": reason,
+        }
+        pending_file.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(pending_file, 0o600)
+        return pending_file
+
+    def test_pending_reload_safe_turn_consumes_when_quiescent(self) -> None:
+        """[WATCH-RELOAD-001]: Valid pending_reload.json consumed at verified Safe Turn Boundary
+        calls engine.restart_language_server(force=True), appends audit entry to watch.log,
+        and unlinks pending_reload.json from disk.
+        """
+        self._setup_session(
+            "session-reload-001",
+            {"type": "MESSAGE", "status": "DONE", "content": "Turn completed."},
+        )
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.assertFalse(pending_file.exists(), "pending_reload.json must be unlinked after consumption")
+
+        watch_log = self.vault_dir / "watch.log"
+        self.assertTrue(watch_log.is_file(), "Structured audit entry must be appended to watch.log")
+        self.assertEqual(watch_log.stat().st_mode & 0o777, 0o600)
+        log_content = watch_log.read_text(encoding="utf-8")
+        self.assertRegex(log_content, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[watch\] ")
+        self.assertIn("work-acc", log_content)
+        self.assertIn("language_server", log_content)
+
+    def test_pending_reload_safe_turn_defers_when_busy(self) -> None:
+        """[WATCH-RELOAD-002]: Valid pending_reload.json is preserved and restart_language_server()
+        is NOT called while _is_turn_quiescent() is False.
+        """
+        transcript_path = self._setup_session(
+            "session-reload-002",
+            {"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Streaming response..."},
+        )
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+        original_content = pending_file.read_text(encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(watcher._is_turn_quiescent())
+
+        self.assertEqual(watcher.poll_once(), 0)
+
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_file(), "pending_reload.json must remain intact while turn is busy")
+        self.assertEqual(pending_file.read_text(encoding="utf-8"), original_content)
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Verify next quiescent cycle consumes the preserved marker cleanly
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Turn finished."}) + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(watcher.poll_once(), 0)
+
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.assertFalse(pending_file.exists())
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_pending_reload_safe_turn_defers_while_proc_child_busy_then_consumes(self) -> None:
+        """[WATCH-RELOAD-002] + [WATCH-RELOAD-001]: Even when transcript says USER_INPUT,
+        an active non-zombie child process under language_server in /proc defers
+        pending_reload.json until the child exits.
+        """
+        self._setup_session(
+            "session-reload-proc",
+            {"type": "USER_INPUT", "content": "Ready."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-proc.lock"
+        ls_proc = self.proc_dir / "5001"
+        ls_proc.mkdir(parents=True, exist_ok=True)
+        (ls_proc / "cmdline").write_bytes(b"/usr/local/bin/language_server\x00--standalone\x00")
+        (ls_proc / "stat").write_text("5001 (language_server) S 1 5001 5001 0 -1\n", encoding="utf-8")
+
+        child_proc = self.proc_dir / "5002"
+        child_proc.mkdir(parents=True, exist_ok=True)
+        (child_proc / "cmdline").write_bytes(b"bash\x00-c\x00pytest\x00")
+        (child_proc / "stat").write_text("5002 (bash) S 5001 5001 5001 0 -1\n", encoding="utf-8")
+
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertFalse(watcher._is_turn_quiescent())
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_file())
+
+        # Child task completes and exits; re-touch session presence lock as in active IDE session
+        shutil.rmtree(child_proc)
+        lock_path.touch()
+        self.assertTrue(watcher._is_turn_quiescent())
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.assertFalse(pending_file.exists())
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_pending_reload_safe_turn_preserves_marker_when_restart_returns_false_or_raises(self) -> None:
+        """Restart failure (returning False or raising) logs to stderr, preserves marker
+        for retry, avoids false audit entries, and does not crash poll_once().
+        """
+        from io import StringIO
+
+        self._setup_session(
+            "session-reload-err",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-err.lock"
+        pending_file = self._write_pending_reload(
+            target_account="work-acc",
+            age_seconds=5.0,
+            ttl_seconds=120,
+            reason="in_turn\nwith_newline",
+        )
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Case 1: restart_language_server returns False
+        self.engine_mock.restart_language_server.return_value = False
+        stderr_false = StringIO()
+        with patch("sys.stderr", stderr_false):
+            self.assertEqual(watcher.poll_once(), 0)
+        self.assertTrue(pending_file.is_file())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+        self.assertIn("did not restart language_server", stderr_false.getvalue())
+
+        # Case 2: restart_language_server raises an exception
+        lock_path.touch()
+        self.engine_mock.restart_language_server.side_effect = RuntimeError("supervisor timeout")
+        stderr_exc = StringIO()
+        with patch("sys.stderr", stderr_exc):
+            self.assertEqual(watcher.poll_once(), 0)
+        self.assertTrue(pending_file.is_file())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+        self.assertIn("supervisor timeout", stderr_exc.getvalue())
+
+        # Case 3: Next quiescent cycle succeeds and sanitizes multi-line reason in watch.log
+        lock_path.touch()
+        self.engine_mock.restart_language_server.side_effect = None
+        self.engine_mock.restart_language_server.return_value = True
+        self.assertEqual(watcher.poll_once(), 0)
+        self.assertFalse(pending_file.exists())
+        lines = (self.vault_dir / "watch.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("(reason: in_turn with_newline)", lines[0])
+
+    def test_pending_reload_safe_turn_exact_ttl_boundary_and_skips_same_cycle_proactive_switch(self) -> None:
+        """Exact boundary now - requested_at == ttl_seconds is valid and consumed, and
+        consuming pending_reload.json skips proactive switch_tokens in the same cycle.
+        """
+        self._setup_session(
+            "session-reload-ttl",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        fixed_now = 1_700_000_120.0
+        pending_file = self.cache_dir / "pending_reload.json"
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+                "ttl_seconds": 120,
+                "reason": "in_turn_deferred_reload",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+
+        # Configure proactive threshold + low cached quota to ensure proactive switch is skipped this cycle
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "work-acc"
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({"accounts": {"work-acc": {"gemini": {"fraction": 0.10}}, "standby": {"gemini": {"fraction": 0.90}}}}),
+            encoding="utf-8",
+        )
+        self.engine_mock.list_accounts.return_value = {
+            "accounts": [{"name": "work-acc", "valid": True}, {"name": "standby", "valid": True}]
+        }
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        with patch("agy_switcher.watcher.time.time", return_value=fixed_now):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertFalse(pending_file.exists())
+
+    def test_pending_reload_safe_turn_skipped_when_reactive_failover_occurs(self) -> None:
+        """When reactive 429 exhaustion triggers a switch in poll_once(), pending_reload
+        consumption does not perform a duplicate restart in the same cycle.
+        """
+        transcript_path = self._setup_session(
+            "session-reload-reactive",
+            {"type": "MESSAGE", "status": "DONE", "content": "Initial."},
+        )
+        self.engine_mock.get_active_name.return_value = "work-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "accounts": [{"name": "work-acc", "valid": True}, {"name": "standby-acc", "valid": True}]
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({
+                "accounts": {
+                    "work-acc": {"gemini": {"fraction": 0.0}, "cached_at": time.time()},
+                    "standby-acc": {"gemini": {"fraction": 0.95}, "cached_at": time.time()},
+                }
+            }),
+            encoding="utf-8",
+        )
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-acc",
+            "server_restarted": True,
+        }
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Prime transcript cursor at initial EOF before pending_reload + 429 line arrive
+        watcher.file_cursors[str(transcript_path)] = transcript_path.stat().st_size
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+
+        with open(transcript_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "ERROR", "code": 429, "message": "RESOURCE_EXHAUSTED"}) + "\n")
+
+        switches = watcher.poll_once()
+
+        self.assertEqual(switches, 1)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.exists())
+
+    def test_pending_reload_prune_corrupt_expired_unlinks_malformed_and_invalid_payloads(self) -> None:
+        """[WATCH-RELOAD-ERR-001]: Invalid JSON, non-UTF8 bytes, non-dict payloads, or invalid
+        target_account / requested_at / ttl_seconds fields are safely unlinked without raising,
+        restarting language_server, or writing an audit log entry.
+        """
+        self._setup_session(
+            "session-reload-corrupt",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-corrupt.lock"
+        pending_file = self.cache_dir / "pending_reload.json"
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        corrupt_cases: list[tuple[str, bytes]] = [
+            ("invalid_json", b"{not valid json"),
+            ("empty_file", b""),
+            ("invalid_utf8", b"\xff\xfe\xfd"),
+            ("json_list", b'["work-acc"]'),
+            ("json_string", b'"work-acc"'),
+            ("json_number", b"12345"),
+            ("json_bool", b"true"),
+            ("json_null", b"null"),
+            ("missing_target_account", json.dumps({"requested_at": 1_700_000_000.0}).encode("utf-8")),
+            ("empty_target_account", json.dumps({"target_account": "   ", "requested_at": 1_700_000_000.0}).encode("utf-8")),
+            ("non_string_target_account", json.dumps({"target_account": 123, "requested_at": 1_700_000_000.0}).encode("utf-8")),
+            ("missing_requested_at", json.dumps({"target_account": "work-acc"}).encode("utf-8")),
+            ("null_requested_at", json.dumps({"target_account": "work-acc", "requested_at": None}).encode("utf-8")),
+            ("string_requested_at", json.dumps({"target_account": "work-acc", "requested_at": "1700000000"}).encode("utf-8")),
+            ("bool_true_requested_at", json.dumps({"target_account": "work-acc", "requested_at": True}).encode("utf-8")),
+            ("bool_false_requested_at", json.dumps({"target_account": "work-acc", "requested_at": False}).encode("utf-8")),
+            ("zero_requested_at", json.dumps({"target_account": "work-acc", "requested_at": 0}).encode("utf-8")),
+            ("negative_requested_at", json.dumps({"target_account": "work-acc", "requested_at": -10.5}).encode("utf-8")),
+            ("nan_requested_at", b'{"target_account": "work-acc", "requested_at": NaN}'),
+            ("inf_requested_at", b'{"target_account": "work-acc", "requested_at": Infinity}'),
+            ("neg_inf_requested_at", b'{"target_account": "work-acc", "requested_at": -Infinity}'),
+            ("overflow_requested_at", f'{{"target_account": "work-acc", "requested_at": {"9" * 400}}}'.encode("utf-8")),
+            ("max_digits_requested_at", f'{{"target_account": "work-acc", "requested_at": {"9" * 4400}}}'.encode("utf-8")),
+            ("deeply_nested_json", (b"[" * 1500) + (b"]" * 1500)),
+            ("bool_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": True}).encode("utf-8")),
+            ("string_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": "120"}).encode("utf-8")),
+            ("zero_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": 0}).encode("utf-8")),
+            ("negative_ttl_seconds", json.dumps({"target_account": "work-acc", "requested_at": 1_700_000_000.0, "ttl_seconds": -30}).encode("utf-8")),
+            ("nan_ttl_seconds", b'{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": NaN}'),
+            ("inf_ttl_seconds", b'{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": Infinity}'),
+            ("neg_inf_ttl_seconds", b'{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": -Infinity}'),
+            ("overflow_ttl_seconds", f'{{"target_account": "work-acc", "requested_at": 1700000000.0, "ttl_seconds": {"9" * 400}}}'.encode("utf-8")),
+        ]
+
+        for label, raw_bytes in corrupt_cases:
+            with self.subTest(case=label):
+                self.engine_mock.restart_language_server.reset_mock()
+                lock_path.touch()
+                pending_file.write_bytes(raw_bytes)
+                os.chmod(pending_file, 0o600)
+
+                switches = watcher.poll_once()
+
+                self.assertEqual(switches, 0)
+                self.engine_mock.restart_language_server.assert_not_called()
+                self.assertFalse(pending_file.exists(), f"Corrupt marker '{label}' must be unlinked")
+                self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_pending_reload_prune_corrupt_expired_unlinks_expired_marker_without_restart(self) -> None:
+        """[WATCH-RELOAD-EDGE-001]: Expired pending_reload.json (now - requested_at > ttl_seconds)
+        when _is_turn_quiescent() is True is unlinked without restarting language_server or writing watch.log.
+        """
+        self._setup_session(
+            "session-reload-expired",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-expired.lock"
+        pending_file = self.cache_dir / "pending_reload.json"
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertTrue(watcher._is_turn_quiescent())
+
+        # Case 1: Explicit ttl_seconds exceeded (120.001s > 120s)
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+                "ttl_seconds": 120,
+                "reason": "in_turn_deferred_reload",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+        lock_path.touch()
+
+        with patch("agy_switcher.watcher.time.time", return_value=1_700_000_120.001):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertFalse(pending_file.exists(), "Expired marker must be unlinked")
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Case 2: Omitted ttl_seconds defaults to 120s and expires when now - requested_at > 120s
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+        lock_path.touch()
+
+        with patch("agy_switcher.watcher.time.time", return_value=1_700_000_121.0):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertFalse(pending_file.exists(), "Expired marker with default ttl_seconds must be unlinked")
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Case 3: Expired marker while _is_turn_quiescent() is False is still unlinked without restart or audit entry
+        transcript_path = (
+            self.gemini_dir
+            / "antigravity"
+            / "brain"
+            / "session-reload-expired"
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Busy..."}) + "\n",
+            encoding="utf-8",
+        )
+        lock_path.touch()
+        self.assertFalse(watcher._is_turn_quiescent())
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+                "ttl_seconds": 60,
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+
+        with patch("agy_switcher.watcher.time.time", return_value=1_700_000_061.0):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertFalse(pending_file.exists(), "Expired marker during busy turn must still be unlinked")
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_pending_reload_prune_corrupt_expired_survives_unlink_oserror_and_non_regular_paths(self) -> None:
+        """[WATCH-RELOAD-ERR-001]: OSError during marker unlink (e.g., read-only cache dir)
+        and non-regular paths (directory or symlink) do not crash poll_once() or restart language_server.
+        """
+        from io import StringIO
+
+        self._setup_session(
+            "session-reload-oserr",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-oserr.lock"
+        pending_file = self.cache_dir / "pending_reload.json"
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Case 1: Directory at pending_reload.json path
+        pending_file.mkdir()
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_dir())
+        pending_file.rmdir()
+
+        # Case 2: Symlink at pending_reload.json path
+        target_file = self.cache_dir / "real_target.json"
+        target_file.write_text('{"target_account": "work-acc", "requested_at": 1700000000.0}', encoding="utf-8")
+        pending_file.symlink_to(target_file)
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_symlink())
+        pending_file.unlink()
+
+        # Case 3: Real OSError on unlink via read-only cache directory (0o555)
+        pending_file.write_bytes(b"{corrupt")
+        os.chmod(pending_file, 0o600)
+        lock_path.touch()
+        stderr_capture = StringIO()
+        try:
+            os.chmod(self.cache_dir, 0o555)
+            with patch("sys.stderr", stderr_capture):
+                switches = watcher.poll_once()
+        finally:
+            os.chmod(self.cache_dir, 0o755)
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertIn("Failed to unlink", stderr_capture.getvalue())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
 
 
 if __name__ == '__main__':

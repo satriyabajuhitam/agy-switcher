@@ -9,10 +9,14 @@ import itertools
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -24,7 +28,12 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from agy_switcher.exceptions import InvalidTokenError
+from agy_switcher.exceptions import (
+    AccountAuthError,
+    AccountNotFoundError,
+    ActiveTurnRunningError,
+    InvalidTokenError,
+)
 from agy_switcher.vault import AgySwitchEngine, AgySwitchError
 
 
@@ -1247,6 +1256,1519 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertTrue(existing_dir.is_dir())
         self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
         self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+    def test_failover_state_persistence_corrupt_and_nondict_recovery(self) -> None:
+        """[AUDIT-HOOK-ERR-001] Corrupt or non-dict failover_state.json recovers as empty state and overwrites atomically at 0600."""
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+
+        # Missing file yields clean default schema without creating file
+        initial = self.engine.load_failover_state()
+        self.assertEqual(initial, {"last_failover": None, "auth_errors": {}})
+        self.assertFalse(failover_file.exists())
+
+        # Truncated JSON, JSON array, and scalar payloads recover safely
+        for corrupt_payload in ('{"last_failover": ', "[]", '"string-payload"', "123"):
+            with self.subTest(corrupt_payload=corrupt_payload):
+                failover_file.write_text(corrupt_payload, encoding="utf-8")
+                os.chmod(failover_file, 0o644)
+
+                loaded = self.engine.load_failover_state()
+                self.assertEqual(loaded, {"last_failover": None, "auth_errors": {}})
+
+                # Mutating helper recovers cleanly and overwrites atomically with 0600 JSON
+                self.engine.record_auth_error(
+                    "automator",
+                    error="HTTP 403 Forbidden",
+                    error_type="auth",
+                    timestamp=1791201000.0,
+                )
+                self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+                disk_state = json.loads(failover_file.read_text(encoding="utf-8"))
+                self.assertIsNone(disk_state["last_failover"])
+                self.assertEqual(
+                    disk_state["auth_errors"]["automator"],
+                    {
+                        "timestamp": 1791201000.0,
+                        "error": "HTTP 403 Forbidden",
+                        "error_type": "auth",
+                    },
+                )
+
+                # Clear and re-test clear_last_failover / clear_auth_error preservation
+                self.engine.record_last_failover(
+                    from_account="automator",
+                    to_account="honey",
+                    trigger="auth_corruption",
+                    reason="HTTP 403 Forbidden",
+                    timestamp=1791201005.0,
+                )
+                self.assertTrue(self.engine.clear_auth_error("automator"))
+                self.assertFalse(self.engine.clear_auth_error("automator"))
+                after_clear_auth = self.engine.load_failover_state()
+                self.assertEqual(after_clear_auth["auth_errors"], {})
+                self.assertEqual(after_clear_auth["last_failover"]["from_account"], "automator")
+                self.assertEqual(after_clear_auth["last_failover"]["to_account"], "honey")
+                self.assertEqual(after_clear_auth["last_failover"]["trigger"], "auth_corruption")
+                self.assertEqual(after_clear_auth["last_failover"]["reason"], "HTTP 403 Forbidden")
+                self.assertEqual(after_clear_auth["last_failover"]["timestamp"], 1791201005.0)
+
+                self.engine.record_auth_error("other-acc", error="HTTP 401", timestamp=1791201010.0)
+                self.assertTrue(self.engine.clear_last_failover())
+                self.assertFalse(self.engine.clear_last_failover())
+                after_clear_lf = self.engine.load_failover_state()
+                self.assertIsNone(after_clear_lf["last_failover"])
+                self.assertIn("other-acc", after_clear_lf["auth_errors"])
+
+        # Symlink safety: never read or write through pre-existing symlink
+        victim_file = self.base_path / "external_victim.json"
+        victim_content = json.dumps({"auth_errors": {"victim": {"error": "should-not-leak"}}})
+        victim_file.write_text(victim_content, encoding="utf-8")
+        failover_file.unlink(missing_ok=True)
+        failover_file.symlink_to(victim_file)
+
+        self.assertEqual(self.engine.load_failover_state(), {"last_failover": None, "auth_errors": {}})
+        self.engine.record_auth_error("revoked-acc", error="HTTP 403", timestamp=1791201020.0)
+        self.assertFalse(failover_file.is_symlink())
+        self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+        self.assertEqual(victim_file.read_text(encoding="utf-8"), victim_content)
+
+    def test_failover_state_persistence_concurrent_mutations_and_oserror_resilience(self) -> None:
+        """[AUDIT-HOOK-EDGE-003] Concurrent failover_state mutations serialize cleanly at 0600 without lost entries."""
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+        total_threads = 14
+        barrier = threading.Barrier(total_threads)
+        errors: list[BaseException] = []
+        errors_lock = threading.Lock()
+
+        def _keep_worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for step in range(15):
+                    self.engine.record_auth_error(
+                        f"keep-{idx}",
+                        error=f"HTTP 403 step-{step}",
+                        error_type="auth",
+                    )
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        def _churn_worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                alias = f"ephemeral-{idx}"
+                for step in range(10):
+                    self.engine.record_auth_error(alias, error=f"HTTP 401 step-{step}")
+                    self.engine.clear_auth_error(alias)
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        def _failover_worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for step in range(10):
+                    self.engine.record_last_failover(
+                        from_account=f"src-{idx}",
+                        to_account=f"dst-{step}",
+                        trigger="auth_corruption",
+                        reason="HTTP 403",
+                    )
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        def _reader_worker() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for _ in range(20):
+                    snapshot = self.engine.load_failover_state()
+                    self.assertIn("last_failover", snapshot)
+                    self.assertIn("auth_errors", snapshot)
+                    self.assertIsInstance(snapshot["auth_errors"], dict)
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        threads = (
+            [threading.Thread(target=_keep_worker, args=(i,)) for i in range(6)]
+            + [threading.Thread(target=_churn_worker, args=(i,)) for i in range(4)]
+            + [threading.Thread(target=_failover_worker, args=(i,)) for i in range(2)]
+            + [threading.Thread(target=_reader_worker) for _ in range(2)]
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertTrue(failover_file.is_file())
+        self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+
+        disk_state = json.loads(failover_file.read_text(encoding="utf-8"))
+        self.assertIsInstance(disk_state, dict)
+        auth_errors = disk_state["auth_errors"]
+        for i in range(6):
+            self.assertIn(f"keep-{i}", auth_errors)
+            self.assertEqual(auth_errors[f"keep-{i}"]["error"], "HTTP 403 step-14")
+        for i in range(4):
+            self.assertNotIn(f"ephemeral-{i}", auth_errors)
+        last_failover = disk_state["last_failover"]
+        self.assertIsInstance(last_failover, dict)
+        self.assertEqual(last_failover["trigger"], "auth_corruption")
+        self.assertIn(last_failover["from_account"], {"src-0", "src-1"})
+
+        # bool-as-int guard on timestamp falls back to positive float epoch instead of 1.0
+        bool_state = self.engine.record_auth_error(
+            "bool-ts-acc",
+            error="HTTP 403",
+            timestamp=True,  # type: ignore[arg-type]
+        )
+        self.assertGreater(bool_state["auth_errors"]["bool-ts-acc"]["timestamp"], 1_000_000.0)
+
+        # OSError during persistence warns to stderr without raising unhandled exception
+        # and clear helpers return False when disk persistence fails
+        stderr_buf = io.StringIO()
+        with patch("agy_switcher.security.os.replace", side_effect=OSError("ENOSPC simulated")), \
+             patch("sys.stderr", stderr_buf):
+            self.engine.record_auth_error("io-fail-acc", error="HTTP 403")
+            self.assertFalse(self.engine.clear_auth_error("keep-0"))
+            self.assertFalse(self.engine.clear_last_failover())
+        self.assertIn("Warning:", stderr_buf.getvalue())
+        reloaded_after_io_err = self.engine.load_failover_state()
+        self.assertIn("keep-0", reloaded_after_io_err["auth_errors"])
+        self.assertIsNotNone(reloaded_after_io_err["last_failover"])
+
+    def test_failover_state_persistence_pending_reload_lifecycle_and_recovery(self) -> None:
+        """Pending reload write/load/clear enforces 0600 permissions, expiry filtering, symlink safety, and corrupt recovery."""
+        reload_file = self.vault_dir / "cache" / "pending_reload.json"
+
+        # Missing marker returns None and clear returns False
+        self.assertIsNone(self.engine.load_pending_reload())
+        self.assertFalse(self.engine.clear_pending_reload())
+
+        # Empty target_account raises AgySwitchError; bool ttl/requested_at fall back safely
+        with self.assertRaises(AgySwitchError):
+            self.engine.write_pending_reload("   ")
+        bool_guarded = self.engine.write_pending_reload(
+            "work-acc",
+            ttl_seconds=True,  # type: ignore[arg-type]
+            requested_at=True,  # type: ignore[arg-type]
+        )
+        self.assertEqual(bool_guarded["ttl_seconds"], 120)
+        self.assertGreater(bool_guarded["requested_at"], 1_000_000.0)
+
+        # Write valid marker and inspect on-disk schema & 0600 mode
+        written = self.engine.write_pending_reload(
+            "work-acc",
+            reason="in_turn_deferred_reload",
+            ttl_seconds=120,
+            requested_at=1000.0,
+        )
+        self.assertEqual(written["target_account"], "work-acc")
+        self.assertEqual(written["ttl_seconds"], 120)
+        self.assertEqual(written["requested_at"], 1000.0)
+        self.assertEqual(written["reason"], "in_turn_deferred_reload")
+        self.assertTrue(reload_file.is_file())
+        self.assertEqual(stat.S_IMODE(reload_file.stat().st_mode), 0o600)
+
+        # Unexpired load succeeds (including exact TTL boundary); expired load returns None unless include_expired=True
+        loaded = self.engine.load_pending_reload(now=1050.0)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded["target_account"], "work-acc")
+        self.assertIsNotNone(self.engine.load_pending_reload(now=1120.0))
+        self.assertIsNone(self.engine.load_pending_reload(now=1121.0))
+        loaded_expired = self.engine.load_pending_reload(include_expired=True, now=1121.0)
+        self.assertIsNotNone(loaded_expired)
+
+        # Clear removes file cleanly
+        self.assertTrue(self.engine.clear_pending_reload())
+        self.assertFalse(reload_file.exists())
+        self.assertFalse(self.engine.clear_pending_reload())
+
+        # Corrupt, non-dict, or non-numeric requested_at/ttl_seconds payloads recover safely as None
+        corrupt_cases = (
+            "{bad-json",
+            "[]",
+            json.dumps({"target_account": "work-acc", "requested_at": "not-a-number", "ttl_seconds": 120}),
+            json.dumps({"target_account": "work-acc", "requested_at": True, "ttl_seconds": 120}),
+            json.dumps({"target_account": "work-acc", "requested_at": 1000.0, "ttl_seconds": True}),
+            json.dumps({"target_account": "  ", "requested_at": 1000.0, "ttl_seconds": 120}),
+            json.dumps({"target_account": "work-acc", "requested_at": 1000.0, "ttl_seconds": -5}),
+        )
+        for idx, raw_payload in enumerate(corrupt_cases):
+            with self.subTest(case=idx):
+                reload_file.write_text(raw_payload, encoding="utf-8")
+                self.assertIsNone(self.engine.load_pending_reload(now=1010.0))
+
+        # Symlink safety: load ignores symlink, write replaces symlink without touching target,
+        # and clear_pending_reload unlinks symlink without touching target
+        victim = self.base_path / "reload_victim.json"
+        victim_payload = json.dumps({"target_account": "victim", "requested_at": 1000.0, "ttl_seconds": 120})
+        victim.write_text(victim_payload, encoding="utf-8")
+        reload_file.unlink(missing_ok=True)
+        reload_file.symlink_to(victim)
+
+        self.assertIsNone(self.engine.load_pending_reload(now=1010.0))
+        self.assertTrue(self.engine.clear_pending_reload())
+        self.assertFalse(reload_file.exists())
+        self.assertTrue(victim.exists())
+        self.assertEqual(victim.read_text(encoding="utf-8"), victim_payload)
+
+        reload_file.symlink_to(victim)
+        self.engine.write_pending_reload("safe-acc", requested_at=1000.0)
+        self.assertFalse(reload_file.is_symlink())
+        self.assertEqual(stat.S_IMODE(reload_file.stat().st_mode), 0o600)
+        self.assertEqual(victim.read_text(encoding="utf-8"), victim_payload)
+
+        # OSError during write_pending_reload warns to stderr without crashing
+        stderr_buf = io.StringIO()
+        with patch("agy_switcher.security.os.replace", side_effect=OSError("ENOSPC simulated")), \
+             patch("sys.stderr", stderr_buf):
+            self.engine.write_pending_reload("io-fail-acc", requested_at=1000.0)
+        self.assertIn("Warning:", stderr_buf.getvalue())
+
+    def _register_test_account(
+        self,
+        engine: AgySwitchEngine,
+        alias: str,
+        email: str,
+        *,
+        refresh_token: str | None = None,
+    ) -> dict[str, object]:
+        payload = make_valid_token_payload(email=email)
+        if refresh_token is not None:
+            token_obj = cast(dict[str, object], payload["token"])
+            token_obj["refresh_token"] = refresh_token
+        acc_dir = engine.accounts_dir / alias
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return payload
+
+    def _setup_busy_proc_server(
+        self,
+        proc_dir: Path,
+        gemini_dir: Path,
+        server_pid: int = 45000,
+    ) -> Path:
+        presence_dir = gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / "active-turn.lock"
+        lock_file.write_text(f"pid: {server_pid}\n", encoding="utf-8")
+
+        pid_dir = proc_dir / str(server_pid)
+        fd_dir = pid_dir / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (pid_dir / "cmdline").write_bytes(b"/opt/antigravity/bin/language_server\x00--standalone\x00")
+        (pid_dir / "stat").write_text(f"{server_pid} (language_server) S 1 {server_pid} 1 0 -1\n", encoding="utf-8")
+        (fd_dir / "3").symlink_to(lock_file)
+        return lock_file
+
+    def test_atomic_check_before_write_and_auth_gate_active_turn_rejection(self) -> None:
+        """[AUTH-GATE-ERR-001] ActiveTurnRunningError aborts switch_tokens before mutating Desktop/CLI/active/state.json."""
+        proc_dir = self.base_path / "proc_gate_err_001"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "standby-acc", "standby@example.com")
+
+        # Activate primary-acc and seed legacy state.json
+        engine.switch_tokens("primary-acc", restart_server=False)
+        legacy_state_file = self.legacy_root / "state.json"
+        legacy_state_file.write_text(
+            json.dumps({"active": "primary-acc", "accounts": {"primary-acc": {}, "standby-acc": {}}}),
+            encoding="utf-8",
+        )
+
+        desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+        active_before = engine.active_file.read_text(encoding="utf-8")
+        legacy_before = legacy_state_file.read_text(encoding="utf-8")
+
+        # Simulate external invocation while language_server holds an active presence lock
+        self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=45123)
+        self.assertTrue(engine.supervisor.is_server_busy())
+        self.assertFalse(engine.supervisor.is_invoked_by_language_server())
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens(
+                    "standby-acc",
+                    restart_server=True,
+                    force=False,
+                    verify_auth=False,
+                )
+            mock_urlopen.assert_not_called()
+
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+        self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+        self.assertEqual(engine.active_file.read_text(encoding="utf-8"), active_before)
+        self.assertEqual(engine.get_active_name(), "primary-acc")
+        self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+        self.assertFalse(engine.failover_state_file.exists())
+
+    def test_atomic_check_before_write_and_auth_gate_confirmed_rejection(self) -> None:
+        """[AUTH-GATE-ERR-002][AUTH-GATE-ERR-003] Confirmed 401/403 rejects before disk write or server restart."""
+        proc_dir = self.base_path / "proc_gate_err_002"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "healthy-acc", "healthy@example.com")
+        self._register_test_account(engine, "revoked-acc", "revoked@example.com")
+
+        engine.switch_tokens("healthy-acc", restart_server=False)
+        legacy_state_file = self.legacy_root / "state.json"
+        legacy_state_file.write_text(json.dumps({"active": "healthy-acc"}), encoding="utf-8")
+
+        desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+        active_before = engine.active_file.read_text(encoding="utf-8")
+        legacy_before = legacy_state_file.read_text(encoding="utf-8")
+
+        # Case 1: HTTP 403 -> refresh fails with 400 invalid_grant; force=True still enforces verify_auth=True
+        for force_flag in (False, True):
+            with self.subTest(case="http_403_invalid_grant", force=force_flag):
+                engine.failover_state_file.unlink(missing_ok=True)
+                err_403 = urllib.error.HTTPError(
+                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    403,
+                    "Forbidden",
+                    email.message.Message(),
+                    io.BytesIO(b"Forbidden"),
+                )
+                err_400 = urllib.error.HTTPError(
+                    "https://oauth2.googleapis.com/token",
+                    400,
+                    "Bad Request",
+                    email.message.Message(),
+                    io.BytesIO(b'{"error": "invalid_grant", "error_description": "Token has been revoked."}'),
+                )
+                with patch("urllib.request.urlopen", side_effect=[err_403, err_400]), \
+                     patch.object(engine, "restart_language_server") as mock_restart:
+                    with self.assertRaises(AccountAuthError) as ctx:
+                        engine.switch_tokens(
+                            "revoked-acc",
+                            restart_server=True,
+                            force=force_flag,
+                            verify_auth=True,
+                        )
+                    mock_restart.assert_not_called()
+
+                self.assertIn("agy-switch login revoked-acc", str(ctx.exception))
+                self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                self.assertEqual(engine.active_file.read_text(encoding="utf-8"), active_before)
+                self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+
+                self.assertTrue(engine.failover_state_file.is_file())
+                self.assertEqual(stat.S_IMODE(engine.failover_state_file.stat().st_mode), 0o600)
+                failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+                self.assertIn("revoked-acc", failover_state["auth_errors"])
+                self.assertEqual(failover_state["auth_errors"]["revoked-acc"]["error_type"], "auth")
+
+        # Case 2: HTTP 401 -> 1x refresh succeeds -> re-probe still returns 403 -> fails closed
+        engine.failover_state_file.unlink(missing_ok=True)
+        err_401 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "Unauthorized",
+            email.message.Message(),
+            io.BytesIO(b"Unauthorized"),
+        )
+        refresh_ok = _MockHTTPResponse(json.dumps({"access_token": "ya29.still_rejected", "expires_in": 3600}).encode("utf-8"))
+        err_403_retry = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+        with patch("urllib.request.urlopen", side_effect=[err_401, refresh_ok, err_403_retry]) as mock_urlopen, \
+             patch.object(engine, "restart_language_server") as mock_restart:
+            with self.assertRaises(AccountAuthError) as ctx:
+                engine.switch_tokens("revoked-acc", restart_server=True, verify_auth=True)
+            self.assertEqual(mock_urlopen.call_count, 3)
+            mock_restart.assert_not_called()
+
+        self.assertIn("agy-switch login revoked-acc", str(ctx.exception))
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+        self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+        self.assertEqual(engine.active_file.read_text(encoding="utf-8"), active_before)
+        self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+        failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+        self.assertIn("revoked-acc", failover_state["auth_errors"])
+
+    def test_atomic_check_before_write_and_auth_gate_preflight_order_refresh_and_fail_open(self) -> None:
+        """[AUTH-GATE-001][AUTH-GATE-002][AUTH-GATE-003][AUTH-GATE-004][AUTH-GATE-EDGE-001] Ordering, healthy restart, refresh sync, and fail-open."""
+        proc_dir = self.base_path / "proc_gate_order"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "base-acc", "base@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        self._register_test_account(engine, "ws-refresh-acc", "ws@example.com", refresh_token="   ")
+        missing_access_dir = engine.accounts_dir / "missing-access-acc"
+        missing_access_dir.mkdir(parents=True, exist_ok=True)
+        missing_access_payload = make_valid_token_payload("missing-access@example.com")
+        del cast(dict[str, object], missing_access_payload["token"])["access_token"]
+        (missing_access_dir / "token.json").write_text(
+            json.dumps(missing_access_payload, indent=2) + "\n", encoding="utf-8"
+        )
+        corrupt_dir = engine.accounts_dir / "corrupt-acc"
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "token.json").write_text("{not-json", encoding="utf-8")
+
+        engine.switch_tokens("base-acc", restart_server=False)
+        desktop_base = engine.desktop_token_file.read_text(encoding="utf-8")
+
+        # 1. Missing, unsafe (path traversal / NUL byte), and invalid-token accounts fail before HTTP probe
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            for bad_alias in ("missing-acc", "../etc", "bad\x00alias"):
+                with self.assertRaises(AccountNotFoundError):
+                    engine.switch_tokens(bad_alias, restart_server=False, verify_auth=True)
+            with self.assertRaises(InvalidTokenError):
+                engine.switch_tokens("corrupt-acc", restart_server=False, verify_auth=True)
+            with self.assertRaises(InvalidTokenError):
+                engine.switch_tokens("missing-access-acc", restart_server=False, verify_auth=True)
+            # Without verify_auth=True, whitespace-only refresh_token still raises InvalidTokenError
+            with self.assertRaises(InvalidTokenError):
+                engine.switch_tokens("ws-refresh-acc", restart_server=False, verify_auth=False)
+            mock_urlopen.assert_not_called()
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_base)
+
+        # 2. ActiveTurnRunningError fails before HTTP probe when restart_server=True, force=False, verify_auth=True
+        lock_file = self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=46000)
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens("work-acc", restart_server=True, force=False, verify_auth=True)
+            mock_urlopen.assert_not_called()
+        self.assertFalse(engine.failover_state_file.exists())
+        lock_file.unlink()
+        (proc_dir / "46000" / "fd" / "3").unlink()
+
+        # 3. Default verify_auth=False performs zero HTTP requests and preserves existing quarantine entries
+        engine.record_auth_error("work-acc", error="prior error", error_type="auth")
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            res_default = engine.switch_tokens("work-acc", restart_server=False)
+            mock_urlopen.assert_not_called()
+        self.assertEqual(res_default["active"], "work-acc")
+        self.assertIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+        # [AUTH-GATE-EDGE-002]: With verify_auth=True, whitespace-only refresh_token proceeds to probe_account_auth(),
+        # skips QuotaClient.refresh_access_token() on HTTP 401, fails closed with AccountAuthError, and quarantines alias.
+        engine.switch_tokens("base-acc", restart_server=False)
+        desktop_base_edge = engine.desktop_token_file.read_text(encoding="utf-8")
+        err_401_ws = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "Unauthorized",
+            email.message.Message(),
+            io.BytesIO(b"Unauthorized"),
+        )
+        with patch("urllib.request.urlopen", side_effect=err_401_ws) as mock_urlopen, \
+             patch("agy_switcher.telemetry.QuotaClient.refresh_access_token") as mock_refresh:
+            with self.assertRaises(AccountAuthError):
+                engine.switch_tokens("ws-refresh-acc", restart_server=False, verify_auth=True)
+            self.assertEqual(mock_urlopen.call_count, 1)
+            mock_refresh.assert_not_called()
+        self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_base_edge)
+        self.assertEqual(engine.get_active_name(), "base-acc")
+        self.assertIn("ws-refresh-acc", engine.load_failover_state()["auth_errors"])
+
+        # Switch back to base-acc before testing verify_auth=True flows
+        engine.switch_tokens("base-acc", restart_server=False)
+
+        quota_payload = json.dumps({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "five_hour",
+                            "remainingFraction": 0.9,
+                            "resetTime": "2026-12-31T23:59:59Z",
+                        }
+                    ],
+                }
+            ]
+        }).encode("utf-8")
+
+        # 4. [AUTH-GATE-001] Healthy pre-flight auth probe (HTTP 200) permits atomic token switch and server reload
+        with patch("urllib.request.urlopen", return_value=_MockHTTPResponse(quota_payload)) as mock_urlopen, \
+             patch.object(engine, "restart_language_server", return_value=True) as mock_restart:
+            res_healthy = engine.switch_tokens("work-acc", restart_server=True, force=False, verify_auth=True)
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_restart.assert_called_once_with(force=False)
+        self.assertTrue(res_healthy["server_restarted"])
+        self.assertEqual(res_healthy["active"], "work-acc")
+        self.assertNotIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+        # Switch back to base-acc before testing refresh sync and fail-open flows
+        engine.switch_tokens("base-acc", restart_server=False)
+
+        # 5. Expired access_token -> 401 -> refresh 200 -> re-probe 200 persists AND syncs fresh access_token
+        #    and clears any prior quarantine entry for work-acc
+        engine.record_auth_error("work-acc", error="HTTP 401", error_type="auth")
+        err_401 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "Unauthorized",
+            email.message.Message(),
+            io.BytesIO(b"Unauthorized"),
+        )
+        refresh_ok = _MockHTTPResponse(json.dumps({"access_token": "ya29.fresh_synced_token", "expires_in": 3600}).encode("utf-8"))
+        quota_ok = _MockHTTPResponse(quota_payload)
+
+        stderr_refresh = io.StringIO()
+        with patch("urllib.request.urlopen", side_effect=[err_401, refresh_ok, quota_ok]) as mock_urlopen, \
+             patch("sys.stderr", stderr_refresh):
+            res_refreshed = engine.switch_tokens("work-acc", restart_server=False, verify_auth=True)
+        self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertNotIn("failing open", stderr_refresh.getvalue())
+        self.assertEqual(res_refreshed["active"], "work-acc")
+        desktop_after_refresh = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        cli_after_refresh = json.loads(engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_after_refresh["token"]["access_token"], "ya29.fresh_synced_token")
+        self.assertEqual(cli_after_refresh["token"]["access_token"], "ya29.fresh_synced_token")
+        self.assertNotIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+        # 6. Transient HTTP 503, URLError, and TimeoutError fail open with stderr warning and complete switch
+        transient_errors: list[tuple[str, Exception]] = [
+            (
+                "http_503",
+                urllib.error.HTTPError(
+                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    503,
+                    "Service Unavailable",
+                    email.message.Message(),
+                    io.BytesIO(b"Unavailable"),
+                ),
+            ),
+            ("url_error", urllib.error.URLError("Temporary failure in name resolution")),
+            ("timeout_error", TimeoutError("timed out")),
+        ]
+        for label, exc in transient_errors:
+            with self.subTest(transient=label):
+                engine.switch_tokens("base-acc", restart_server=False)
+                engine.record_auth_error("work-acc", error="prior error", error_type="auth")
+                stderr_buf = io.StringIO()
+                with patch("urllib.request.urlopen", side_effect=exc), \
+                     patch("sys.stderr", stderr_buf):
+                    res_fail_open = engine.switch_tokens("work-acc", restart_server=False, verify_auth=True)
+                self.assertEqual(res_fail_open["active"], "work-acc")
+                self.assertIn("Warning:", stderr_buf.getvalue())
+                self.assertEqual(engine.get_active_name(), "work-acc")
+                # Fail-open must NOT clear prior quarantine entry
+                self.assertIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+    def _setup_in_turn_proc_lineage(
+        self,
+        proc_dir: Path,
+        gemini_dir: Path,
+        *,
+        server_pid: int = 47000,
+        child_pid: int = 47010,
+        external_pid: int | None = None,
+    ) -> Path:
+        lock_file = self._setup_busy_proc_server(proc_dir, gemini_dir, server_pid=server_pid)
+        init_dir = proc_dir / "1"
+        init_dir.mkdir(parents=True, exist_ok=True)
+        (init_dir / "cmdline").write_bytes(b"/sbin/init\x00")
+        (init_dir / "stat").write_text("1 (systemd) S 0 1 1 0 -1\n", encoding="utf-8")
+
+        child_dir = proc_dir / str(child_pid)
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / "cmdline").write_bytes(b"/bin/bash\x00-c\x00agy-switch\x00")
+        (child_dir / "stat").write_text(f"{child_pid} (bash) S {server_pid} {child_pid} 1 0 -1\n", encoding="utf-8")
+
+        if external_pid is not None:
+            ext_dir = proc_dir / str(external_pid)
+            ext_dir.mkdir(parents=True, exist_ok=True)
+            (ext_dir / "cmdline").write_bytes(b"/bin/bash\x00")
+            (ext_dir / "stat").write_text(f"{external_pid} (bash) S 1 {external_pid} 1 0 -1\n", encoding="utf-8")
+        return lock_file
+
+    def test_deferred_safe_turn_reload_in_turn_downgrades_to_disk_swap_and_writes_marker(self) -> None:
+        """[DEFER-RELOAD-001] In-turn switch --force downgrades synchronous kill to Disk-Only Swap and pending_reload.json."""
+        proc_dir = self.base_path / "proc_defer_001"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        legacy_state_file = self.legacy_root / "state.json"
+        legacy_state_file.write_text(json.dumps({"active": "primary-acc"}), encoding="utf-8")
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=47000,
+            child_pid=47010,
+        )
+
+        with patch("os.getpid", return_value=47010):
+            self.assertTrue(engine.supervisor.is_invoked_by_language_server())
+            with patch("os.kill", side_effect=AssertionError("os.kill must not be called during in-turn deferred reload")):
+                res = engine.switch_tokens("work-acc", restart_server=True, force=True)
+
+        self.assertEqual(res["active"], "work-acc")
+        self.assertEqual(res["email"], "work@example.com")
+        self.assertIs(res["server_restarted"], False)
+        self.assertIs(res["restart_deferred"], True)
+
+        # Atomic Disk-Only Swap completed across active marker, Desktop/CLI tokens, and legacy state
+        self.assertEqual(engine.get_active_name(), "work-acc")
+        desktop_payload = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        cli_payload = json.loads(engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_payload["token"]["access_token"], "ya29.sample_token_for_work@example.com")
+        self.assertEqual(cli_payload["token"]["access_token"], "ya29.sample_token_for_work@example.com")
+        legacy_payload = json.loads(legacy_state_file.read_text(encoding="utf-8"))
+        self.assertEqual(legacy_payload["active"], "work-acc")
+
+        # cache/pending_reload.json atomically persisted at mode 0600 with expected schema
+        pending_file = engine.pending_reload_file
+        self.assertTrue(pending_file.is_file())
+        self.assertFalse(pending_file.is_symlink())
+        self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
+        pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(pending_data["target_account"], "work-acc")
+        self.assertEqual(pending_data["ttl_seconds"], 120)
+        self.assertIsInstance(pending_data["requested_at"], (int, float))
+        self.assertGreater(pending_data["requested_at"], 0)
+        self.assertIsInstance(pending_data["reason"], str)
+        self.assertTrue(bool(pending_data["reason"].strip()))
+
+    def test_deferred_safe_turn_reload_external_invocation_restarts_synchronously(self) -> None:
+        """[DEFER-RELOAD-003] External invocation preserves synchronous restart_language_server(force=True) without pending_reload.json."""
+        proc_dir = self.base_path / "proc_defer_003"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=48000,
+            child_pid=48010,
+            external_pid=48099,
+        )
+
+        sent_signals: list[tuple[int, int]] = []
+        terminated_pids: set[int] = set()
+
+        def fake_kill(pid: int, sig: int) -> None:
+            if sig == 0:
+                if pid in terminated_pids:
+                    raise ProcessLookupError(pid)
+                return
+            sent_signals.append((pid, sig))
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                terminated_pids.add(pid)
+
+        with patch("os.getpid", return_value=48099):
+            self.assertFalse(engine.supervisor.is_invoked_by_language_server())
+            with patch("os.kill", side_effect=fake_kill):
+                res = engine.switch_tokens("work-acc", restart_server=True, force=True)
+
+        self.assertEqual(sent_signals, [(48000, signal.SIGTERM)])
+        self.assertEqual(res["active"], "work-acc")
+        self.assertEqual(res["email"], "work@example.com")
+        self.assertIs(res["server_restarted"], True)
+        self.assertIs(res["restart_deferred"], False)
+        self.assertFalse(engine.pending_reload_file.exists())
+        self.assertEqual(engine.get_active_name(), "work-acc")
+
+    def test_deferred_safe_turn_reload_force_restart_now_and_safety_guards(self) -> None:
+        """[DEFER-RELOAD-005][DEFER-RELOAD-EDGE-002] force_restart_now overrides deferred reload and clears marker; force=False and restart_server=False preserve safety."""
+        proc_dir = self.base_path / "proc_defer_005"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=49000,
+            child_pid=49010,
+        )
+
+        with patch("os.getpid", return_value=49010):
+            # 1. Without --force and without --no-restart: ActiveTurnRunningError aborts before disk swap or marker
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens("work-acc", restart_server=True, force=False)
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+            self.assertFalse(engine.pending_reload_file.exists())
+
+            # 2. With restart_server=False (--no-restart): Disk-Only Swap without writing pending_reload.json
+            no_restart_res = engine.switch_tokens("work-acc", restart_server=False)
+            self.assertIs(no_restart_res["server_restarted"], False)
+            self.assertIs(no_restart_res["restart_deferred"], False)
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.get_active_name(), "work-acc")
+
+            # 3. In-turn deferred switch creates pending_reload.json, then force_restart_now=True restarts synchronously and clears it
+            engine.switch_tokens("primary-acc", restart_server=False)
+            deferred_res = engine.switch_tokens("work-acc", restart_server=True, force=True)
+            self.assertIs(deferred_res["restart_deferred"], True)
+            self.assertTrue(engine.pending_reload_file.is_file())
+
+            sent_signals: list[tuple[int, int]] = []
+            terminated_pids: set[int] = set()
+
+            def fake_kill(pid: int, sig: int) -> None:
+                if sig == 0:
+                    if pid in terminated_pids:
+                        raise ProcessLookupError(pid)
+                    return
+                sent_signals.append((pid, sig))
+                if sig in (signal.SIGTERM, signal.SIGKILL):
+                    terminated_pids.add(pid)
+
+            with patch("os.kill", side_effect=fake_kill):
+                now_res = engine.switch_tokens(
+                    "work-acc",
+                    restart_server=True,
+                    force=True,
+                    force_restart_now=True,
+                )
+
+            self.assertEqual(sent_signals, [(49000, signal.SIGTERM)])
+            self.assertIs(now_res["server_restarted"], True)
+            self.assertIs(now_res["restart_deferred"], False)
+            self.assertFalse(engine.pending_reload_file.exists())
+
+    def test_deferred_safe_turn_reload_error_paths_cache_creation_and_switch_account_parity(self) -> None:
+        """[DEFER-RELOAD-EDGE-004] Error paths write no marker; missing cache dir is created 0700; switch_account forwards force_restart_now."""
+        proc_dir = self.base_path / "proc_defer_edge"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        self._register_test_account(engine, "revoked-acc", "revoked@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=50000,
+            child_pid=50010,
+        )
+
+        desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+        with patch("os.getpid", return_value=50010):
+            # 1. force_restart_now=True without force=True still enforces ActiveTurnRunningError
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens(
+                    "work-acc",
+                    restart_server=True,
+                    force=False,
+                    force_restart_now=True,
+                )
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+
+            # 2. Failed verify_auth=True while in-turn raises AccountAuthError without writing marker
+            err_403 = urllib.error.HTTPError(
+                "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                403,
+                "Forbidden",
+                email.message.Message(),
+                io.BytesIO(b"Forbidden"),
+            )
+            err_400 = urllib.error.HTTPError(
+                "https://oauth2.googleapis.com/token",
+                400,
+                "Bad Request",
+                email.message.Message(),
+                io.BytesIO(b'{"error": "invalid_grant"}'),
+            )
+            with patch("urllib.request.urlopen", side_effect=[err_403, err_400]):
+                with self.assertRaises(AccountAuthError):
+                    engine.switch_tokens(
+                        "revoked-acc",
+                        restart_server=True,
+                        force=True,
+                        verify_auth=True,
+                    )
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+            self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+
+            # 3. Disk swap OSError aborts before writing pending_reload.json
+            with patch.object(engine, "_sync_tokens_to_targets", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    engine.switch_tokens("work-acc", restart_server=True, force=True)
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+
+            # 4. Missing cache_dir is recreated (0700) and switch_account forwards deferred/force_restart_now
+            shutil.rmtree(engine.cache_dir)
+            self.assertFalse(engine.cache_dir.exists())
+
+            with patch("os.kill", side_effect=AssertionError("os.kill must not be called during deferred switch_account")):
+                acc_deferred = engine.switch_account("work-acc", force=True)
+            self.assertIs(acc_deferred["server_restarted"], False)
+            self.assertIs(acc_deferred["restart_deferred"], True)
+            self.assertTrue(engine.cache_dir.is_dir())
+            self.assertEqual(stat.S_IMODE(engine.cache_dir.stat().st_mode), 0o700)
+            self.assertTrue(engine.pending_reload_file.is_file())
+            self.assertEqual(stat.S_IMODE(engine.pending_reload_file.stat().st_mode), 0o600)
+
+            sent_signals: list[tuple[int, int]] = []
+            terminated_pids: set[int] = set()
+
+            def fake_kill(pid: int, sig: int) -> None:
+                if sig == 0:
+                    if pid in terminated_pids:
+                        raise ProcessLookupError(pid)
+                    return
+                sent_signals.append((pid, sig))
+                if sig in (signal.SIGTERM, signal.SIGKILL):
+                    terminated_pids.add(pid)
+
+            with patch("os.kill", side_effect=fake_kill):
+                acc_now = engine.switch_account("primary-acc", force=True, force_restart_now=True)
+            self.assertEqual(sent_signals, [(50000, signal.SIGTERM)])
+            self.assertIs(acc_now["server_restarted"], True)
+            self.assertIs(acc_now["restart_deferred"], False)
+            self.assertFalse(engine.pending_reload_file.exists())
+
+    def test_emergency_restart_and_no_restart_force_restart_now_bypasses_defer_and_clears_marker(self) -> None:
+        """[DEFER-RELOAD-005] force_restart_now=True in-turn bypasses deferred reload, restarts synchronously, and clears/omits pending_reload.json."""
+        proc_dir = self.base_path / "proc_emergency_005"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=51000,
+            child_pid=51010,
+        )
+
+        sent_signals: list[tuple[int, int]] = []
+        terminated_pids: set[int] = set()
+
+        def fake_kill(pid: int, sig: int) -> None:
+            if sig == 0:
+                if pid in terminated_pids:
+                    raise ProcessLookupError(pid)
+                return
+            sent_signals.append((pid, sig))
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                terminated_pids.add(pid)
+
+        with patch("os.getpid", return_value=51010):
+            self.assertTrue(engine.supervisor.is_invoked_by_language_server())
+
+            # 1. Without pre-existing marker: bypasses deferred downgrade, restarts synchronously, omits pending_reload.json
+            with patch("os.kill", side_effect=fake_kill):
+                res = engine.switch_tokens(
+                    "work-acc",
+                    restart_server=True,
+                    force=True,
+                    force_restart_now=True,
+                )
+
+            self.assertEqual(sent_signals, [(51000, signal.SIGTERM)])
+            self.assertEqual(res["active"], "work-acc")
+            self.assertEqual(res["email"], "work@example.com")
+            self.assertIs(res["server_restarted"], True)
+            self.assertIs(res["restart_deferred"], False)
+            self.assertEqual(engine.get_active_name(), "work-acc")
+            self.assertFalse(engine.pending_reload_file.exists())
+
+            # 2. With pre-existing stale cache/pending_reload.json: clears stale marker after emergency restart
+            engine.write_pending_reload("work-acc", reason="stale_deferred_reload", ttl_seconds=120)
+            self.assertTrue(engine.pending_reload_file.is_file())
+
+            sent_signals.clear()
+            terminated_pids.clear()
+            with patch("os.kill", side_effect=fake_kill):
+                res_stale = engine.switch_tokens(
+                    "primary-acc",
+                    restart_server=True,
+                    force=True,
+                    force_restart_now=True,
+                )
+
+            self.assertEqual(sent_signals, [(51000, signal.SIGTERM)])
+            self.assertEqual(res_stale["active"], "primary-acc")
+            self.assertIs(res_stale["server_restarted"], True)
+            self.assertIs(res_stale["restart_deferred"], False)
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+            self.assertFalse(engine.pending_reload_file.exists())
+
+    def test_emergency_restart_and_no_restart_active_turn_guards_and_disk_only_swap(self) -> None:
+        """[DEFER-RELOAD-EDGE-002] In-turn force=False raises ActiveTurnRunningError without mutating disk; restart_server=False swaps without marker."""
+        proc_dir = self.base_path / "proc_emergency_edge_002"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        legacy_state_file = self.legacy_root / "state.json"
+        legacy_state_file.write_text(json.dumps({"active": "primary-acc"}), encoding="utf-8")
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=52000,
+            child_pid=52010,
+        )
+
+        desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+        legacy_before = legacy_state_file.read_text(encoding="utf-8")
+
+        with patch("os.getpid", return_value=52010):
+            self.assertTrue(engine.supervisor.is_invoked_by_language_server())
+            self.assertTrue(engine.supervisor.is_server_busy())
+
+            with patch("os.kill", side_effect=AssertionError("os.kill must not be called when turn safety guard rejects or restart_server=False")):
+                # 1. restart_server=True, force=False raises ActiveTurnRunningError with zero disk mutation
+                with self.assertRaises(ActiveTurnRunningError):
+                    engine.switch_tokens("work-acc", restart_server=True, force=False)
+                self.assertEqual(engine.get_active_name(), "primary-acc")
+                self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+                self.assertFalse(engine.pending_reload_file.exists())
+
+                # 2. force_restart_now=True with force=False still honors verify_turn_safety(force=False)
+                with self.assertRaises(ActiveTurnRunningError):
+                    engine.switch_tokens(
+                        "work-acc",
+                        restart_server=True,
+                        force=False,
+                        force_restart_now=True,
+                    )
+                self.assertEqual(engine.get_active_name(), "primary-acc")
+                self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                self.assertEqual(legacy_state_file.read_text(encoding="utf-8"), legacy_before)
+                self.assertFalse(engine.pending_reload_file.exists())
+
+                # 3. restart_server=False performs Disk-Only Swap without writing pending_reload.json
+                no_restart_res = engine.switch_tokens("work-acc", restart_server=False)
+                self.assertEqual(no_restart_res["active"], "work-acc")
+                self.assertEqual(no_restart_res["email"], "work@example.com")
+                self.assertIs(no_restart_res["server_restarted"], False)
+                self.assertIs(no_restart_res["restart_deferred"], False)
+                self.assertEqual(engine.get_active_name(), "work-acc")
+                self.assertEqual(
+                    json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                    "ya29.sample_token_for_work@example.com",
+                )
+                self.assertEqual(
+                    json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                    "ya29.sample_token_for_work@example.com",
+                )
+                self.assertEqual(json.loads(legacy_state_file.read_text(encoding="utf-8"))["active"], "work-acc")
+                self.assertFalse(engine.pending_reload_file.exists())
+
+    def test_quarantine_auto_clear_and_status_window_login_and_add_clear_auth_error(self) -> None:
+        """[AUDIT-HOOK-005] Successful login_account() and add_account() atomically clear auth_errors[alias] and list_accounts badge."""
+        self._register_test_account(self.engine, "honey", "honey@example.com")
+        self._register_test_account(self.engine, "automator", "automator@example.com")
+        self._register_test_account(self.engine, "other-acc", "other@example.com")
+        self.engine.set_active_name("honey")
+
+        now = time.time()
+        self.engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 300.0,
+        )
+        self.engine.record_auth_error(
+            "other-acc",
+            error="HTTP 401 Unauthorized",
+            error_type="auth",
+            timestamp=now - 200.0,
+        )
+        self.engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 300.0,
+        )
+
+        listed_before = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertNotIn("auth_error", listed_before["honey"])
+        self.assertIn("auth_error", listed_before["automator"])
+        self.assertEqual(listed_before["automator"]["auth_error"]["error"], "HTTP 403 Forbidden")
+        self.assertEqual(listed_before["automator"]["auth_error"]["error_type"], "auth")
+        self.assertIn("auth_error", listed_before["other-acc"])
+
+        # 1. Failed add_account (invalid token) must NOT clear quarantine
+        bad_token_path = self.base_path / "invalid_automator_token.json"
+        bad_token_path.write_text("{not-json", encoding="utf-8")
+        with self.assertRaises(InvalidTokenError):
+            self.engine.add_account("automator", bad_token_path)
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        # 2. Failed login_account (aborted overwrite or missing token output) must NOT clear quarantine
+        with self.assertRaises(AgySwitchError):
+            self.engine.login_account("automator", force=False, prompt_fn=lambda _: "n")
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", return_value=_StubLoginProcess(returncode=1)):
+            with self.assertRaises(AgySwitchError):
+                self.engine.login_account("automator", force=True)
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        # 3. Successful login_account clears auth_errors["automator"] atomically while preserving other-acc & last_failover
+        reauth_payload = make_valid_token_payload("automator@example.com")
+        self._run_registration_path("login_account", "automator", reauth_payload)
+
+        state_after_login = self.engine.load_failover_state()
+        self.assertNotIn("automator", state_after_login["auth_errors"])
+        self.assertIn("other-acc", state_after_login["auth_errors"])
+        self.assertIsNotNone(state_after_login["last_failover"])
+        self.assertEqual(stat.S_IMODE(self.engine.failover_state_file.stat().st_mode), 0o600)
+
+        listed_after_login = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertNotIn("auth_error", listed_after_login["automator"])
+        self.assertIn("auth_error", listed_after_login["other-acc"])
+
+        # 4. Re-quarantine "automator" and verify successful add_account clears auth_errors["automator"] atomically
+        self.engine.record_auth_error(
+            "automator",
+            error="HTTP 401 Unauthorized",
+            error_type="auth",
+            timestamp=time.time() - 60.0,
+        )
+        listed_requarantined = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertIn("auth_error", listed_requarantined["automator"])
+
+        self._run_registration_path("add_account", "automator", make_valid_token_payload("automator@example.com"))
+
+        state_after_add = self.engine.load_failover_state()
+        self.assertNotIn("automator", state_after_add["auth_errors"])
+        self.assertIn("other-acc", state_after_add["auth_errors"])
+        self.assertEqual(stat.S_IMODE(self.engine.failover_state_file.stat().st_mode), 0o600)
+
+        listed_after_add = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertNotIn("auth_error", listed_after_add["automator"])
+        self.assertIn("auth_error", listed_after_add["other-acc"])
+
+        # 5. Corrupt/non-dict failover_state.json or auth_errors payloads recover gracefully in list_accounts()
+        corrupt_payloads = [
+            "{truncated-json",
+            "[]",
+            json.dumps({"auth_errors": ["automator"]}),
+            json.dumps({"auth_errors": {"automator": "bad-entry"}}),
+            json.dumps({"auth_errors": {"automator": {}}}),
+        ]
+        for raw_payload in corrupt_payloads:
+            with self.subTest(corrupt_failover_state=raw_payload):
+                self.engine.failover_state_file.write_text(raw_payload, encoding="utf-8")
+                listed_corrupt = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+                self.assertIn("automator", listed_corrupt)
+                self.assertNotIn("auth_error", listed_corrupt["automator"])
+
+    def test_quarantine_auto_clear_and_status_window_24h_cutoff_and_manual_switch(self) -> None:
+        """[AUDIT-HOOK-003][AUDIT-HOOK-EDGE-001] get_status() enforces 24h window and manual switch superseding while preserving auth_errors."""
+        proc_dir = self.base_path / "proc_status_window"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "honey", "honey@example.com")
+        self._register_test_account(engine, "automator", "automator@example.com")
+        engine.switch_tokens("honey", restart_server=False)
+
+        now = 1_800_000_000.0
+        engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 7200.0,
+        )
+
+        # 1. Recent failover (2h ago <= 24h) + unexpired pending_reload surfaced in get_status()
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 7200.0,
+        )
+        engine.write_pending_reload("honey", reason="in_turn_deferred_reload", ttl_seconds=120, requested_at=now - 10.0)
+
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_recent = engine.get_status()
+        self.assertIsInstance(status_recent.get("last_failover"), dict)
+        self.assertEqual(status_recent["last_failover"]["from_account"], "automator")
+        self.assertEqual(status_recent["last_failover"]["to_account"], "honey")
+        self.assertEqual(status_recent["last_failover"]["trigger"], "auth_corruption")
+        self.assertIsInstance(status_recent.get("pending_reload"), dict)
+        self.assertEqual(status_recent["pending_reload"]["target_account"], "honey")
+
+        # 2. Boundary: exactly 86400s old is still surfaced; > 86400s (86401s) is omitted
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 86400.0,
+        )
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_at_boundary = engine.get_status()
+        self.assertIsInstance(status_at_boundary.get("last_failover"), dict)
+
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 86401.0,
+        )
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_stale = engine.get_status()
+        self.assertNotIn("last_failover", status_stale)
+        self.assertIsNone(status_stale.get("last_failover"))
+        # auth_errors quarantine persists in failover_state and list_accounts()
+        self.assertIn("automator", engine.load_failover_state()["auth_errors"])
+        listed_stale = {acc["name"]: acc for acc in engine.list_accounts()["accounts"]}
+        self.assertIn("auth_error", listed_stale["automator"])
+
+        # 3. Malformed, boolean, non-finite, non-positive, string, or missing last_failover.timestamp is omitted;
+        #    expired or malformed pending_reload.json is also omitted safely
+        invalid_last_failovers: list[tuple[str, str]] = [
+            ("bool_true", json.dumps({"last_failover": {"timestamp": True, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("bool_false", json.dumps({"last_failover": {"timestamp": False, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("zero_ts", json.dumps({"last_failover": {"timestamp": 0, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("negative_ts", json.dumps({"last_failover": {"timestamp": -10.0, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("string_ts", json.dumps({"last_failover": {"timestamp": str(now), "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("missing_ts", json.dumps({"last_failover": {"from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("nan_ts", '{"last_failover": {"timestamp": NaN, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}}'),
+            ("inf_ts", '{"last_failover": {"timestamp": Infinity, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}}'),
+            ("neg_inf_ts", '{"last_failover": {"timestamp": -Infinity, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}}'),
+        ]
+        for label, raw_state in invalid_last_failovers:
+            with self.subTest(invalid_last_failover=label):
+                engine.failover_state_file.write_text(raw_state, encoding="utf-8")
+                with patch("agy_switcher.vault.time.time", return_value=now):
+                    st = engine.get_status()
+                self.assertNotIn("last_failover", st)
+
+        engine.write_pending_reload("honey", reason="in_turn_deferred_reload", ttl_seconds=60, requested_at=now - 61.0)
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertNotIn("pending_reload", engine.get_status())
+        engine.pending_reload_file.write_text("{bad-json", encoding="utf-8")
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertNotIn("pending_reload", engine.get_status())
+        engine.clear_pending_reload()
+
+        # 4. Fresh last_failover is preserved on failed switch_tokens(), and cleared only on successful manual switch
+        engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 7200.0,
+        )
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 600.0,
+        )
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertIsInstance(engine.get_status().get("last_failover"), dict)
+
+        # 4a. Missing account does not clear last_failover
+        with self.assertRaises(AccountNotFoundError):
+            engine.switch_tokens("nonexistent-acc", restart_server=False)
+        self.assertIsNotNone(engine.load_failover_state()["last_failover"])
+
+        # 4b. ActiveTurnRunningError does not clear last_failover
+        self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=53000)
+        with self.assertRaises(ActiveTurnRunningError):
+            engine.switch_tokens("honey", restart_server=True, force=False)
+        self.assertIsNotNone(engine.load_failover_state()["last_failover"])
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertIsInstance(engine.get_status().get("last_failover"), dict)
+
+        # 4c. AccountAuthError (verify_auth failure) does not clear last_failover
+        err_403 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+        with patch("urllib.request.urlopen", side_effect=err_403):
+            with self.assertRaises(AccountAuthError):
+                engine.switch_tokens("automator", restart_server=False, verify_auth=True)
+        self.assertIsNotNone(engine.load_failover_state()["last_failover"])
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertIsInstance(engine.get_status().get("last_failover"), dict)
+
+        # 4d. Successful manual switch_tokens("honey", ...) supersedes last_failover
+        engine.switch_tokens("honey", restart_server=False)
+        with patch("agy_switcher.vault.time.time", return_value=now + 5.0):
+            status_superseded = engine.get_status()
+        self.assertNotIn("last_failover", status_superseded)
+        self.assertIsNone(status_superseded.get("last_failover"))
+        self.assertIsNone(engine.load_failover_state()["last_failover"])
+        # "automator" remains quarantined in auth_errors and flagged in list_accounts()
+        self.assertIn("automator", engine.load_failover_state()["auth_errors"])
+        listed_superseded = {acc["name"]: acc for acc in engine.list_accounts()["accounts"]}
+        self.assertIn("auth_error", listed_superseded["automator"])
+        self.assertNotIn("auth_error", listed_superseded["honey"])
+
+    def test_rejected_switch_preserves_last_failover_and_status_ignores_expired_or_malformed_pending_reload(
+        self,
+    ) -> None:
+        """[AUDIT-HOOK-EDGE-004] Rejected switches preserve last_failover and get_status() ignores expired/malformed pending_reload.json."""
+        proc_dir = self.base_path / "proc_edge_004"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "honey", "honey@example.com")
+        self._register_test_account(engine, "standby-acc", "standby@example.com")
+        corrupt_dir = engine.accounts_dir / "corrupt-acc"
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "token.json").write_text("{corrupt-token-json", encoding="utf-8")
+
+        engine.switch_tokens("honey", restart_server=False)
+        now = 1_800_000_000.0
+        one_hour_ago = now - 3600.0
+
+        engine.record_last_failover(
+            from_account="primary-acc",
+            to_account="honey",
+            trigger="quota_rotation",
+            reason="Remaining quota 8% <= 20%",
+            timestamp=one_hour_ago,
+        )
+
+        # Case 1: Expired pending_reload.json (now - requested_at > ttl_seconds) + ActiveTurnRunningError
+        self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=54000)
+        engine.write_pending_reload(
+            "honey",
+            reason="in_turn_deferred_reload",
+            ttl_seconds=120,
+            requested_at=now - 121.0,
+        )
+        with self.assertRaises(ActiveTurnRunningError):
+            engine.switch_tokens("standby-acc", restart_server=True, force=False)
+
+        self.assertEqual(engine.get_active_name(), "honey")
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_expired = engine.get_status()
+        self.assertIsInstance(status_expired.get("last_failover"), dict)
+        self.assertEqual(status_expired["last_failover"]["from_account"], "primary-acc")
+        self.assertEqual(status_expired["last_failover"]["to_account"], "honey")
+        self.assertEqual(status_expired["last_failover"]["trigger"], "quota_rotation")
+        self.assertEqual(status_expired["last_failover"]["timestamp"], one_hour_ago)
+        self.assertNotIn("pending_reload", status_expired)
+        self.assertIsNone(status_expired.get("pending_reload"))
+
+        # Case 2: Malformed / invalid pending_reload.json markers + AccountAuthError and InvalidTokenError
+        external_target = self.base_path / "external_secret.json"
+        external_target.write_text(
+            json.dumps(
+                {
+                    "target_account": "standby-acc",
+                    "requested_at": now - 5.0,
+                    "ttl_seconds": 120,
+                }
+            ),
+            encoding="utf-8",
+        )
+        malformed_markers: list[tuple[str, bytes | None]] = [
+            ("truncated_json", b"{bad-json"),
+            ("non_dict_list", b"[]"),
+            ("non_utf8_bytes", b"\xff\xfe\x00"),
+            (
+                "nan_requested_at",
+                b'{"target_account": "honey", "requested_at": NaN, "ttl_seconds": 120}',
+            ),
+            (
+                "bool_ttl",
+                json.dumps(
+                    {
+                        "target_account": "honey",
+                        "requested_at": now - 5.0,
+                        "ttl_seconds": True,
+                    }
+                ).encode("utf-8"),
+            ),
+            (
+                "missing_target",
+                json.dumps({"requested_at": now - 5.0, "ttl_seconds": 120}).encode("utf-8"),
+            ),
+            ("symlink_marker", None),
+        ]
+
+        err_403 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+        for label, marker_bytes in malformed_markers:
+            with self.subTest(pending_reload_variant=label):
+                engine.pending_reload_file.unlink(missing_ok=True)
+                if marker_bytes is None:
+                    engine.pending_reload_file.symlink_to(external_target)
+                else:
+                    engine.pending_reload_file.write_bytes(marker_bytes)
+
+                with patch("urllib.request.urlopen", side_effect=err_403):
+                    with self.assertRaises(AccountAuthError):
+                        engine.switch_tokens("standby-acc", restart_server=False, verify_auth=True)
+
+                with self.assertRaises(InvalidTokenError):
+                    engine.switch_tokens("corrupt-acc", restart_server=False)
+
+                self.assertEqual(engine.get_active_name(), "honey")
+                with patch("agy_switcher.vault.time.time", return_value=now):
+                    status_malformed = engine.get_status()
+                self.assertIsInstance(status_malformed.get("last_failover"), dict)
+                self.assertEqual(status_malformed["last_failover"]["from_account"], "primary-acc")
+                self.assertEqual(status_malformed["last_failover"]["to_account"], "honey")
+                self.assertEqual(status_malformed["last_failover"]["timestamp"], one_hour_ago)
+                self.assertNotIn("pending_reload", status_malformed)
+                self.assertIsNone(status_malformed.get("pending_reload"))
+                self.assertIn("standby-acc", engine.load_failover_state()["auth_errors"])
+
+    def test_automated_switch_preserves_last_failover_while_manual_switch_clears_AUDIT_HOOK_EDGE_001(
+        self,
+    ) -> None:
+        """[AUDIT-HOOK-EDGE-001] Automated switch_tokens(..., clear_failover=False) and auto_rotate_on_exhaustion preserve last_failover while manual switch clears it."""
+        from agy_switcher import api
+
+        proc_dir = self.base_path / "proc_auto_preserve"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "automator", "automator@example.com")
+        self._register_test_account(engine, "honey", "honey@example.com")
+        self._register_test_account(engine, "standby-acc", "standby@example.com")
+        engine.switch_tokens("honey", restart_server=False)
+
+        now = 1_800_000_000.0
+        engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 600.0,
+        )
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 300.0,
+        )
+
+        # 1. Automated switch_tokens(..., clear_failover=False) preserves last_failover
+        engine.switch_tokens("standby-acc", restart_server=False, force=True, clear_failover=False)
+        self.assertEqual(engine.get_active_name(), "standby-acc")
+        state_after_auto = engine.load_failover_state()
+        self.assertIsNotNone(state_after_auto["last_failover"])
+        self.assertEqual(state_after_auto["last_failover"]["from_account"], "automator")
+        self.assertIn("automator", state_after_auto["auth_errors"])
+
+        # 2. api.auto_rotate_on_exhaustion() preserves last_failover
+        api._LAST_ROTATION_REGISTRY.clear()
+        cache_payload = {
+            "timestamp": now,
+            "accounts": {
+                "standby-acc": {"gemini": {"quota": 0, "reset_time": now + 3600}},
+                "honey": {"gemini": {"quota": 90, "reset_time": now + 3600}},
+            },
+        }
+        engine.cache_dir.mkdir(parents=True, exist_ok=True)
+        (engine.cache_dir / "last_known_quota.json").write_text(json.dumps(cache_payload), encoding="utf-8")
+        rot_res = api.auto_rotate_on_exhaustion(model="gemini", reload_server=False, engine=engine)
+        self.assertTrue(rot_res.success)
+        self.assertEqual(rot_res.new_account, "honey")
+        state_after_api_rot = engine.load_failover_state()
+        self.assertIsNotNone(state_after_api_rot["last_failover"])
+        self.assertEqual(state_after_api_rot["last_failover"]["from_account"], "automator")
+
+        # 3. Successful manual switch (default clear_failover=True) clears last_failover while preserving auth_errors
+        engine.switch_tokens("standby-acc", restart_server=False)
+        state_after_manual = engine.load_failover_state()
+        self.assertIsNone(state_after_manual["last_failover"])
+        self.assertIn("automator", state_after_manual["auth_errors"])
 
 
 if __name__ == "__main__":
