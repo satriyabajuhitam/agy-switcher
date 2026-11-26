@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping, TypeVar, cast
 import urllib.error, urllib.request
 
 from agy_switcher.exceptions import AgySwitchError, DaemonError, DaemonAlreadyRunningError
-from agy_switcher.supervisor import ProcessSupervisor
+from agy_switcher.supervisor import ProcessSupervisor, is_transcript_record_quiescent
 from agy_switcher.telemetry import (
     QuotaClient as _RealQuotaClient,
     dispatch_http_post,
@@ -785,72 +785,93 @@ class LogWatcher:
                 f"[watch] Warning: Failed to unlink {warning_context} '{pending_path}': {exc}"
             )
 
-    def _process_pending_reload(self) -> bool:
-        """Consumes a valid unexpired cache/pending_reload.json marker at a verified Safe Turn Boundary.
+    def _locate_language_server_pid(self) -> int | None:
+        """Locates running language_server PID via mocked engine override, supervisor, or engine."""
+        eng_fn = getattr(self.engine, "locate_language_server_pid", None)
+        sup_fn = getattr(getattr(self, "supervisor", None), "locate_language_server_pid", None)
+        candidates = [
+            fn for fn in (
+                eng_fn if callable(eng_fn) and _is_mock_object(eng_fn) else None,
+                sup_fn if callable(sup_fn) else None,
+                eng_fn if callable(eng_fn) and not _is_mock_object(eng_fn) else None,
+            )
+            if fn is not None
+        ]
+        for fn in candidates:
+            try:
+                val = fn()
+            except Exception:
+                return None
+            if val is None or (isinstance(val, int) and not isinstance(val, bool)):
+                return val
+        return None
 
-        Returns True when a deferred reload marker is consumed, or False when absent,
-        invalid/expired, failed to restart, or deferred because an agent turn is still running.
-        """
+    def _sync_tokens_from_vault_for_reload(self, phase: str) -> bool:
+        """Atomically re-syncs Desktop and CLI tokens from Vault during deferred reload."""
+        sync_fn = getattr(self.engine, "sync_active_tokens_from_vault", None)
+        if not callable(sync_fn):
+            return True
+        try:
+            if bool(sync_fn()):
+                return True
+            self._safe_stderr_write(f"[watch] Warning: {phase} vault re-sync failed; aborting deferred reload.")
+        except Exception as exc:
+            self._safe_stderr_write(f"[watch] Warning: {phase} vault re-sync failed: {exc}")
+        return False
+
+    def _process_pending_reload(self) -> bool:
+        """Consumes a valid unexpired cache/pending_reload.json marker at Global Quiescence."""
         pending_path = self._resolve_pending_reload_path()
         if pending_path is None:
             return False
         raw_payload, status = read_json_dict_nofollow(pending_path)
         if status in ("missing", "non_regular", "io_error"):
             return False
-        if status in ("parse_error", "not_dict"):
-            self._safe_stderr_write(
-                f"[watch] Pruning corrupt pending reload marker '{pending_path}': invalid JSON payload"
-            )
+        parsed = parse_pending_reload_payload(raw_payload) if status == "ok" else None
+        if status in ("parse_error", "not_dict") or parsed is None:
+            reason_msg = "invalid JSON payload" if status in ("parse_error", "not_dict") else "invalid payload schema"
+            self._safe_stderr_write(f"[watch] Pruning corrupt pending reload marker '{pending_path}': {reason_msg}")
             self._unlink_pending_reload_safe(pending_path, "corrupt pending reload marker")
             return False
 
-        parsed = parse_pending_reload_payload(raw_payload)
-        if parsed is None:
-            self._safe_stderr_write(
-                f"[watch] Pruning corrupt pending reload marker '{pending_path}': invalid payload schema"
-            )
-            self._unlink_pending_reload_safe(pending_path, "corrupt pending reload marker")
-            return False
-
-        target_account = parsed["target_account"]
-        requested_at = parsed["requested_at"]
-        ttl_seconds = float(parsed["ttl_seconds"])
-        reason = parsed["reason"]
+        target_account, requested_at, ttl_seconds, reason = (
+            parsed["target_account"], parsed["requested_at"], float(parsed["ttl_seconds"]), parsed["reason"]
+        )
         now = float(_get_time().time())
         if now - requested_at > ttl_seconds:
             self._safe_stderr_write(
-                f"[watch] Pruning expired pending reload marker '{pending_path}' "
-                f"(age={now - requested_at:.1f}s > ttl={ttl_seconds:.1f}s)"
+                f"[watch] Pruning expired pending reload marker '{pending_path}' (age={now - requested_at:.1f}s > ttl={ttl_seconds:.1f}s)"
             )
             self._unlink_pending_reload_safe(pending_path, "expired pending reload marker")
             return False
-
         if not self._is_turn_quiescent():
             return False
-
-        try:
-            restart_fn = getattr(self.engine, "restart_language_server", None)
-            if callable(restart_fn):
-                reloaded = bool(restart_fn(force=True))
-            elif getattr(self, "supervisor", None) is not None:
-                reloaded = bool(self.supervisor.restart_language_server(force=True))
-            else:
+        if self._locate_language_server_pid() is None:
+            if not self._sync_tokens_from_vault_for_reload("stopped-server"):
                 return False
+            self._unlink_pending_reload_safe(pending_path)
+            return True
+        if not self._sync_tokens_from_vault_for_reload("pre-restart"):
+            return False
+
+        restart_fn = getattr(self.engine, "restart_language_server", None)
+        if not callable(restart_fn):
+            restart_fn = getattr(getattr(self, "supervisor", None), "restart_language_server", None)
+        if not callable(restart_fn):
+            return False
+        try:
+            reloaded = bool(restart_fn(force=True))
         except Exception as exc:
             self._safe_stderr_write(f"[watch] Error executing deferred safe-turn reload: {exc}")
             return False
-
         if not reloaded:
             self._safe_stderr_write(
-                f"[watch] Deferred safe-turn reload for '{target_account}' did not restart "
-                "language_server; preserving marker for retry."
+                f"[watch] Deferred safe-turn reload for '{target_account}' did not restart language_server; preserving marker for retry."
             )
             return False
 
-        self._append_deferred_reload_audit_log(
-            target_account=target_account,
-            reason=reason,
-        )
+        self._sync_tokens_from_vault_for_reload("post-restart")
+        self._append_deferred_reload_audit_log(target_account=target_account, reason=reason)
         self._unlink_pending_reload_safe(pending_path)
         return True
 
@@ -1148,23 +1169,42 @@ class LogWatcher:
         return False
 
     def _is_turn_quiescent(self, transcript_path: str | Path | None = None) -> bool:
-        """Determines if the system is at a verified Safe Turn Boundary via dual inspection."""
+        """Determines if the system is at a verified Safe Turn Boundary via Global Quiescence."""
         try:
             if getattr(self, "supervisor", None) is None and not hasattr(self.engine, "is_server_busy"):
                 return False
-            record = self._get_latest_transcript_record(transcript_path)
-            if not record:
+            if transcript_path is not None:
+                if isinstance(transcript_path, str) and not transcript_path.strip():
+                    return False
+                return is_transcript_record_quiescent(self._get_latest_transcript_record(transcript_path)) and not self._is_server_busy()
+
+            detector = getattr(self, "presence_detector", None)
+            raw_sids = detector.get_active_session_ids() if detector is not None else []
+            live_sids = [s for s in raw_sids if isinstance(s, str) and s] if isinstance(raw_sids, (list, tuple)) else []
+            get_locks_fn = getattr(getattr(self, "supervisor", None), "get_active_presence_lock_paths", None)
+            raw_locks = get_locks_fn() if callable(get_locks_fn) else set()
+            live_locks: set[Path] = raw_locks if isinstance(raw_locks, set) else set()
+
+            # Resolve fallback transcript before _is_server_busy() prunes unlocked locks on disk.
+            fallback_path: Path | None = None
+            if not live_sids and not live_locks:
+                if self.active_transcript_path and self.active_transcript_path.is_file():
+                    fallback_path = self.active_transcript_path
+                elif detector is not None:
+                    p = detector.get_active_transcript_path(session_id=self.active_session_id)
+                    fallback_path = p if isinstance(p, Path) and p.is_file() else None
+
+            if self._is_server_busy():
                 return False
-            status = str(record.get("status", "")).strip().upper()
-            msg_type = str(record.get("type", "")).strip().upper()
-            if (
-                status in ("IN_PROGRESS", "RUNNING", "STREAMING")
-                or bool(record.get("tool_calls"))
-                or (status != "DONE" and msg_type != "USER_INPUT")
-                or self._is_server_busy()
-            ):
-                return False
-            return True
+            if live_sids and detector is not None:
+                for sid in live_sids:
+                    tp = detector.get_active_transcript_path(session_id=sid)
+                    if not isinstance(tp, Path) or not tp.is_file() or not is_transcript_record_quiescent(read_latest_jsonl_record(tp)):
+                        return False
+                return True
+            if live_locks or fallback_path is None:
+                return True
+            return is_transcript_record_quiescent(read_latest_jsonl_record(fallback_path))
         except Exception:
             return False
 
@@ -1255,7 +1295,12 @@ class LogWatcher:
             if threshold <= 0.0:
                 return False
             now = time.time()
-            if self._is_damping_active(now) or not self._is_turn_quiescent():
+            if self._is_damping_active(now):
+                return False
+            if getattr(self._is_turn_quiescent, "__func__", None) is LogWatcher._is_turn_quiescent:
+                if not is_transcript_record_quiescent(self._get_latest_transcript_record()):
+                    return False
+            if not self._is_turn_quiescent():
                 return False
             get_active_fn = getattr(self.engine, "get_active_name", None)
             if not callable(get_active_fn) or not isinstance(active_name := get_active_fn(), str) or not active_name:

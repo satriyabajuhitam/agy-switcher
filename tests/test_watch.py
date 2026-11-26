@@ -1726,18 +1726,18 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         transcript_path = logs_dir / "transcript.jsonl"
         return transcript_path
 
-    def test_safe_turn_boundary_quiescent_user_input_and_server_idle(self):
+    def test_safe_turn_boundary_quiescent_planner_response_done_and_server_idle(self):
         """[WATCH-PROACTIVE-005]: GIVEN an active transcript tailing loop where the latest record
-        has type == 'USER_INPUT' AND no open presence locks or active child processes exist in /proc
-        for language_server,
+        has type == 'PLANNER_RESPONSE', status == 'DONE' without tool_calls AND no open presence locks
+        or active child processes exist in /proc for language_server,
         WHEN LogWatcher._is_turn_quiescent() or ProcessSupervisor.is_server_busy() is evaluated,
-        THEN it confirms that the agent turn has completed and the system is waiting for user input
+        THEN it confirms that the agent turn has completed
         AND certifies the state as a verified Safe Turn Boundary.
         """
         transcript_path = self._setup_session("session-005")
         records = [
-            {"type": "MESSAGE", "status": "DONE", "content": "Initial assistant response."},
             {"type": "USER_INPUT", "content": "Next user instruction for the agent."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Initial assistant response."},
         ]
         transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
@@ -1751,15 +1751,15 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         # Confirm ProcessSupervisor sees no open presence locks or active child tasks
         self.assertFalse(self.supervisor.is_server_busy(), "Server must be idle with no active locks or children")
         # Confirm LogWatcher certifies the state as a verified Safe Turn Boundary
-        self.assertTrue(watcher._is_turn_quiescent(), "Safe Turn Boundary must be certified when latest record is USER_INPUT and server is idle")
+        self.assertTrue(watcher._is_turn_quiescent(), "Safe Turn Boundary must be certified when latest record is PLANNER_RESPONSE DONE and server is idle")
 
     def test_safe_turn_boundary_quiescent_status_done_and_server_idle(self):
-        """[WATCH-PROACTIVE-005]: Verifies status == 'DONE' also certifies Safe Turn Boundary."""
+        """[WATCH-PROACTIVE-005]: Verifies PLANNER_RESPONSE status == 'DONE' certifies Safe Turn Boundary."""
         transcript_path = self._setup_session("session-done")
         records = [
             {"type": "USER_INPUT", "content": "Perform task."},
-            {"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Running..."},
-            {"type": "MESSAGE", "status": "DONE", "content": "Completed task."},
+            {"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS", "content": "Running..."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Completed task."},
         ]
         transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
@@ -1780,7 +1780,7 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         transcript_path = self._setup_session("session-streaming")
         records = [
             {"type": "USER_INPUT", "content": "Generate code."},
-            {"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Writing tokens..."},
+            {"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS", "content": "Writing tokens..."},
         ]
         transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
@@ -1795,7 +1795,7 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         self.assertFalse(watcher._is_turn_quiescent(), "In-flight streaming turn must not be quiescent")
 
     def test_safe_turn_boundary_not_quiescent_when_server_busy_with_presence_lock(self):
-        """[WATCH-PROACTIVE-005]: When a process holds an open fd to presence lock,
+        """[WATCH-PROACTIVE-005]: When a process holds an open fd to presence lock on an in-flight turn,
         is_server_busy() is True and _is_turn_quiescent() returns False.
         """
         transcript_path = self._setup_session("session-locked")
@@ -1813,15 +1813,15 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
             log_dirs=[],
         )
 
-        self.assertTrue(self.supervisor.is_server_busy(), "Open fd on presence lock marks server busy")
-        self.assertFalse(watcher._is_turn_quiescent(), "Turn must not be quiescent when presence lock is held")
+        self.assertTrue(self.supervisor.is_server_busy(), "Open fd on presence lock with USER_INPUT marks server busy")
+        self.assertFalse(watcher._is_turn_quiescent(), "Turn must not be quiescent when presence lock is held on non-quiescent turn")
 
     def test_safe_turn_boundary_not_quiescent_when_server_busy_with_child_process(self):
         """[WATCH-PROACTIVE-005]: When language_server has active child subtask in /proc,
         is_server_busy() is True and _is_turn_quiescent() returns False.
         """
         transcript_path = self._setup_session("session-child")
-        transcript_path.write_text(json.dumps({"type": "USER_INPUT", "content": "Hello"}) + "\n", encoding="utf-8")
+        transcript_path.write_text(json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Hello"}) + "\n", encoding="utf-8")
 
         # Set up language_server at PID 500
         ls_dir = self.proc_dir / "500"
@@ -1844,26 +1844,32 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         self.assertFalse(watcher._is_turn_quiescent(), "Turn must not be quiescent when language_server has active child process")
 
     def test_safe_turn_boundary_not_quiescent_empty_or_missing_transcript(self):
-        """[WATCH-PROACTIVE-005]: Missing or empty transcript returns False for _is_turn_quiescent()."""
+        """[GLOBAL-QUIESCENCE-004] + [GLOBAL-QUIESCENCE-EDGE-004]: Zero open tabs certify globally quiescent,
+        while explicit missing transcript_path or empty active transcript returns False for _is_turn_quiescent().
+        """
         watcher = LogWatcher(
             engine=self.engine_mock,
             presence_detector=self.detector,
             supervisor=self.supervisor,
             log_dirs=[],
         )
-        self.assertFalse(watcher._is_turn_quiescent(), "No active transcript must return False")
+        self.assertTrue(watcher._is_turn_quiescent(), "Zero open sessions and no active children must certify globally quiescent")
+        self.assertFalse(
+            watcher._is_turn_quiescent(transcript_path=Path(self.tmpdir) / "missing.jsonl"),
+            "Explicit missing transcript path must return False",
+        )
 
         # Empty transcript file
         transcript_path = self._setup_session("session-empty")
         transcript_path.write_text("", encoding="utf-8")
-        self.assertFalse(watcher._is_turn_quiescent(), "Empty transcript file must return False")
+        self.assertFalse(watcher._is_turn_quiescent(), "Empty active transcript file must return False")
 
     def test_safe_turn_boundary_not_quiescent_corrupt_or_partial_line(self):
         """[WATCH-PROACTIVE-005]: Trailing unclosed JSON (streaming in flight) returns False."""
         transcript_path = self._setup_session("session-partial")
         # Line 1 completed, Line 2 is actively being streamed/written
         transcript_path.write_text(
-            '{"type": "USER_INPUT", "content": "Prompt"}\n{"type": "MESSAGE", "status": "IN_PRO',
+            '{"type": "USER_INPUT", "content": "Prompt"}\n{"type": "PLANNER_RESPONSE", "status": "IN_PRO',
             encoding="utf-8",
         )
         watcher = LogWatcher(
@@ -1879,8 +1885,8 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         transcript_path = self._setup_session("session-large")
         large_content = "X" * 75000
         records = [
-            {"type": "MESSAGE", "status": "DONE", "content": "Short intro"},
-            {"type": "USER_INPUT", "content": large_content},
+            {"type": "USER_INPUT", "content": "Short prompt"},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": large_content},
         ]
         transcript_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
@@ -1949,7 +1955,7 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
     def test_safe_turn_boundary_proc_reading_graceful_on_permission_error(self):
         """[WATCH-PROACTIVE-005]: PermissionError during /proc traversal degrades gracefully to idle."""
         transcript_path = self._setup_session("session-perm-err")
-        transcript_path.write_text(json.dumps({"type": "USER_INPUT", "content": "Hello"}) + "\n", encoding="utf-8")
+        transcript_path.write_text(json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Hello"}) + "\n", encoding="utf-8")
 
         mock_proc_dir = MagicMock(spec=Path)
         mock_proc_dir.is_dir.return_value = True
@@ -1982,7 +1988,7 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         # Initially, the turn is in-flight (status == 'IN_PROGRESS')
         transcript_path.write_text(
             json.dumps({"type": "USER_INPUT", "content": "Do heavy computation."}) + "\n"
-            + json.dumps({"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Processing..."}) + "\n",
+            + json.dumps({"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS", "content": "Processing..."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2018,9 +2024,13 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         self.assertFalse(res_inflight, "poll_once() must return 0/False while turn is in-flight")
         self.engine_mock.switch_tokens.assert_not_called()
 
-        # Case B: Turn transcript reports DONE, but language_server is busy (e.g. presence lock held)
+        # Case B: Turn transcript reports DONE with pending tool_calls while presence lock is held
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Finished step 1."}) + "\n",
+            json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest"}}],
+            }) + "\n",
             encoding="utf-8",
         )
         lock_path = self.gemini_dir / "antigravity" / "presence" / "session-proactive-002.lock"
@@ -2033,13 +2043,14 @@ class TestSafeTurnBoundaryQuiescence(unittest.TestCase):
         self.assertFalse(res_busy, "poll_once() must return 0/False while server is busy")
         self.engine_mock.switch_tokens.assert_not_called()
 
-        # Clean up lock fd so server becomes quiescent
-        (pid_fd / "4").unlink()
+        # Turn finishes cleanly (PLANNER_RESPONSE DONE without tool_calls) while lock remains open
+        transcript_path.write_text(
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Finished step 1."}) + "\n",
+            encoding="utf-8",
+        )
         self.assertFalse(self.supervisor.is_server_busy())
-        lock_path.touch()
 
-        # Case C: Both conditions met (turn completed with USER_INPUT or DONE AND server quiescent)
-        # Safe Turn Boundary is reached -> rotation proceeds!
+        # Case C: Safe Turn Boundary is reached -> rotation proceeds!
         res_quiescent = watcher.poll_once()
         self.assertTrue(res_quiescent, "poll_once() must trigger rotation once Safe Turn Boundary is reached")
         self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True, clear_failover=False)
@@ -2107,7 +2118,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         old_logs_dir.mkdir(parents=True, exist_ok=True)
         old_transcript = old_logs_dir / "transcript.jsonl"
         old_transcript.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Old finished session."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Old finished session."}) + "\n",
             encoding="utf-8",
         )
         os.utime(old_transcript, (time.time() - 3600.0, time.time() - 3600.0))
@@ -2167,7 +2178,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         recent_logs_dir.mkdir(parents=True, exist_ok=True)
         recent_transcript = recent_logs_dir / "transcript.jsonl"
         recent_transcript.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Recently finished turn."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Recently finished turn."}) + "\n",
             encoding="utf-8",
         )
         # Note: Transcript is brand new (mtime is now), but NO presence lock exists
@@ -2223,7 +2234,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         logs_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = logs_dir / "transcript.jsonl"
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2263,7 +2274,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         logs_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = logs_dir / "transcript.jsonl"
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Assistant finished turn."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Assistant finished turn."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2313,7 +2324,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         logs_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = logs_dir / "transcript.jsonl"
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2354,7 +2365,7 @@ class TestSessionDiscoveryAndReloadResilience(unittest.TestCase):
         logs_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = logs_dir / "transcript.jsonl"
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2448,7 +2459,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-proactive-001")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Turn execution completed successfully.",
         }
@@ -2506,7 +2517,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-proactive-edge-001")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Execution step finished.",
         }
@@ -2545,7 +2556,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         """Active account quota strictly above threshold (e.g. 20.1% > 20.0%) suppresses proactive rotation."""
         lock_file, transcript_path = self._setup_session("session-proactive-above")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2577,7 +2588,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         """Proactive rotation defaults threshold to 20% when engine threshold raises an exception or is unparseable."""
         lock_file, transcript_path = self._setup_session("session-proactive-default-thresh")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2612,7 +2623,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         """Direct evaluation of _evaluate_proactive_rotation discovers active transcript and updates cursors."""
         lock_file, transcript_path = self._setup_session("session-proactive-direct-eval")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Direct step."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Direct step."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2649,7 +2660,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         """Unexpected switch_tokens exception logs to stderr and leaves damping timer unadvanced."""
         lock_file, transcript_path = self._setup_session("session-proactive-exc")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2686,7 +2697,7 @@ class TestProactiveThresholdFailoverTrigger(unittest.TestCase):
         """Proactive rotation handles accounts_data returned as a raw list of AccountInfo-like objects."""
         lock_file, transcript_path = self._setup_session("session-proactive-obj-list")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -2787,7 +2798,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-qual-004")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Assistant finished response.",
         }
@@ -2833,7 +2844,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-err-001")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Turn execution finished.",
         }
@@ -2864,7 +2875,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
         """Standby account with >= 70% quota qualifies and is selected over depleted accounts."""
         lock_file, transcript_path = self._setup_session("session-qual-success")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Turn execution completed.",
         }
@@ -2912,7 +2923,7 @@ class TestStandbyQualificationAndTelemetryGuard(unittest.TestCase):
         """Live CloudCode telemetry fallback resolves active and standby quotas when cache is missing."""
         lock_file, transcript_path = self._setup_session("session-live-fallback")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Turn execution completed.",
         }
@@ -3013,7 +3024,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-drain-003")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Step complete.",
         }
@@ -3060,7 +3071,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-drain-edge-002")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Step complete.",
         }
@@ -3102,7 +3113,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
         """Active account at exact 5.0% quota floor overrides drain window and rotates immediately."""
         lock_file, transcript_path = self._setup_session("session-drain-exact-floor")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Step complete.",
         }
@@ -3144,7 +3155,7 @@ class TestDrainWindowPreservationAndFloorOverride(unittest.TestCase):
         """Active account with 12% quota but reset scheduled in 35 minutes (> 30m) rotates normally."""
         lock_file, transcript_path = self._setup_session("session-drain-outside-window")
         record = {
-            "type": "MESSAGE",
+            "type": "PLANNER_RESPONSE",
             "status": "DONE",
             "content": "Step complete.",
         }
@@ -3408,7 +3419,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
 
         _, transcript_path = self._setup_session("session-unified-damping-002")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Turn complete."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Turn complete."}) + "\n",
             encoding="utf-8",
         )
 
@@ -3496,7 +3507,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-unified-damping-edge-003")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Step complete."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Step complete."}) + "\n",
             encoding="utf-8",
         )
 
@@ -3580,7 +3591,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-unified-damping-sym")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Turn complete."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Turn complete."}) + "\n",
             encoding="utf-8",
         )
 
@@ -3652,7 +3663,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
         """
         _, transcript_path = self._setup_session("session-unified-damping-fail")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
 
@@ -3726,7 +3737,7 @@ class TestUnifiedProactiveReactiveDamping(unittest.TestCase):
         """
         lock_file, transcript_path = self._setup_session("session-unified-damping-bounds")
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Done."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."}) + "\n",
             encoding="utf-8",
         )
         quota_cache_file = self.cache_dir / "last_known_quota.json"
@@ -5282,11 +5293,18 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         transcript_path.write_text(json.dumps(latest_record) + "\n", encoding="utf-8")
         return transcript_path
 
+    def _setup_running_language_server(self, pid: int = 4242) -> Path:
+        ls_proc = self.proc_dir / str(pid)
+        ls_proc.mkdir(parents=True, exist_ok=True)
+        (ls_proc / "cmdline").write_bytes(b"/usr/local/bin/language_server\x00--standalone\x00")
+        (ls_proc / "stat").write_text(f"{pid} (language_server) S 1 {pid} {pid} 0 -1\n", encoding="utf-8")
+        return ls_proc
+
     def _write_pending_reload(
         self,
         target_account: str = "work-acc",
         age_seconds: float = 5.0,
-        ttl_seconds: int = 120,
+        ttl_seconds: int = 1800,
         reason: str = "in_turn_deferred_reload",
     ) -> Path:
         pending_file = self.cache_dir / "pending_reload.json"
@@ -5307,8 +5325,9 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         """
         self._setup_session(
             "session-reload-001",
-            {"type": "MESSAGE", "status": "DONE", "content": "Turn completed."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Turn completed."},
         )
+        self._setup_running_language_server(4242)
         pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
 
         watcher = LogWatcher(
@@ -5338,8 +5357,12 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         """
         transcript_path = self._setup_session(
             "session-reload-002",
-            {"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Streaming response..."},
+            {"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS", "content": "Streaming response..."},
         )
+        ls_proc = self._setup_running_language_server(4242)
+        fd_dir = ls_proc / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (fd_dir / "3").symlink_to(self.gemini_dir / "antigravity" / "presence" / "session-reload-002.lock")
         pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
         original_content = pending_file.read_text(encoding="utf-8")
 
@@ -5360,7 +5383,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
 
         # Verify next quiescent cycle consumes the preserved marker cleanly
         transcript_path.write_text(
-            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Turn finished."}) + "\n",
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Turn finished."}) + "\n",
             encoding="utf-8",
         )
 
@@ -5371,13 +5394,13 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         self.assertTrue((self.vault_dir / "watch.log").is_file())
 
     def test_pending_reload_safe_turn_defers_while_proc_child_busy_then_consumes(self) -> None:
-        """[WATCH-RELOAD-002] + [WATCH-RELOAD-001]: Even when transcript says USER_INPUT,
+        """[WATCH-RELOAD-002] + [WATCH-RELOAD-001]: Even when transcript says PLANNER_RESPONSE DONE,
         an active non-zombie child process under language_server in /proc defers
         pending_reload.json until the child exits.
         """
         self._setup_session(
             "session-reload-proc",
-            {"type": "USER_INPUT", "content": "Ready."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Ready."},
         )
         lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-proc.lock"
         ls_proc = self.proc_dir / "5001"
@@ -5422,8 +5445,9 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
 
         self._setup_session(
             "session-reload-err",
-            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."},
         )
+        self._setup_running_language_server(4242)
         lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-err.lock"
         pending_file = self._write_pending_reload(
             target_account="work-acc",
@@ -5473,8 +5497,9 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         """
         self._setup_session(
             "session-reload-ttl",
-            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."},
         )
+        self._setup_running_language_server(4242)
         fixed_now = 1_700_000_120.0
         pending_file = self.cache_dir / "pending_reload.json"
         pending_file.write_text(
@@ -5520,7 +5545,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         """
         transcript_path = self._setup_session(
             "session-reload-reactive",
-            {"type": "MESSAGE", "status": "DONE", "content": "Initial."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Initial."},
         )
         self.engine_mock.get_active_name.return_value = "work-acc"
         self.engine_mock.list_accounts.return_value = {
@@ -5568,7 +5593,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         """
         self._setup_session(
             "session-reload-corrupt",
-            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."},
         )
         lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-corrupt.lock"
         pending_file = self.cache_dir / "pending_reload.json"
@@ -5635,7 +5660,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         """
         self._setup_session(
             "session-reload-expired",
-            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."},
         )
         lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-expired.lock"
         pending_file = self.cache_dir / "pending_reload.json"
@@ -5669,7 +5694,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         self.assertFalse(pending_file.exists(), "Expired marker must be unlinked")
         self.assertFalse((self.vault_dir / "watch.log").exists())
 
-        # Case 2: Omitted ttl_seconds defaults to 120s and expires when now - requested_at > 120s
+        # Case 2: Omitted ttl_seconds defaults to 1800s and expires when now - requested_at > 1800s
         pending_file.write_text(
             json.dumps({
                 "target_account": "work-acc",
@@ -5680,7 +5705,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         os.chmod(pending_file, 0o600)
         lock_path.touch()
 
-        with patch("agy_switcher.watcher.time.time", return_value=1_700_000_121.0):
+        with patch("agy_switcher.watcher.time.time", return_value=1_700_001_801.0):
             switches = watcher.poll_once()
 
         self.assertEqual(switches, 0)
@@ -5730,7 +5755,7 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
 
         self._setup_session(
             "session-reload-oserr",
-            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Done."},
         )
         lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-oserr.lock"
         pending_file = self.cache_dir / "pending_reload.json"
@@ -5776,6 +5801,413 @@ class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
         self.engine_mock.restart_language_server.assert_not_called()
         self.assertIn("Failed to unlink", stderr_capture.getvalue())
         self.assertFalse((self.vault_dir / "watch.log").exists())
+
+
+class TestGlobalQuiescenceAndResyncGuard(unittest.TestCase):
+    """Behavior tests for ADR 0022 Global Quiescence & Pre/Post-Restart Re-Sync Guard.
+
+    Covers:
+    - [GLOBAL-QUIESCENCE-002], [GLOBAL-QUIESCENCE-003], [GLOBAL-QUIESCENCE-004]
+    - [GLOBAL-QUIESCENCE-ERR-001], [GLOBAL-QUIESCENCE-EDGE-001], [GLOBAL-QUIESCENCE-EDGE-004]
+    - [WATCH-PROACTIVE-ERR-002], [WATCH-RELOAD-001]
+    - [RESYNC-GUARD-001], [RESYNC-GUARD-ERR-001], [RESYNC-GUARD-ERR-002]
+    - [RESYNC-GUARD-EDGE-001], [RESYNC-GUARD-EDGE-002]
+    """
+
+    def setUp(self) -> None:
+        self.orig_agy_vault_dir = os.environ.get("AGY_VAULT_DIR")
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+        os.environ["AGY_VAULT_DIR"] = str(self.vault_dir)
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = None
+        self.engine_mock.locate_language_server_pid.return_value = 4242
+        self.engine_mock.restart_language_server.return_value = True
+        self.engine_mock.sync_active_tokens_from_vault.return_value = True
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self) -> None:
+        if self.orig_agy_vault_dir is not None:
+            os.environ["AGY_VAULT_DIR"] = self.orig_agy_vault_dir
+        else:
+            os.environ.pop("AGY_VAULT_DIR", None)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_ls_with_sidecar(self, pid: int = 500, sidecar_pid: int = 501) -> Path:
+        ls_proc = self.proc_dir / str(pid)
+        ls_proc.mkdir(parents=True, exist_ok=True)
+        (ls_proc / "cmdline").write_bytes(b"/opt/antigravity/language_server\x00--standalone\x00--enable_sidecars\x00")
+        (ls_proc / "stat").write_text(f"{pid} (language_server) S 1 {pid} {pid} 0 -1\n", encoding="utf-8")
+        (ls_proc / "fd").mkdir(parents=True, exist_ok=True)
+
+        sc_proc = self.proc_dir / str(sidecar_pid)
+        sc_proc.mkdir(parents=True, exist_ok=True)
+        (sc_proc / "cmdline").write_bytes(b"/usr/bin/node\x00/opt/antigravity/sidecar_sdk/index.js\x00")
+        (sc_proc / "stat").write_text(f"{sidecar_pid} (node) S {pid} {pid} {pid} 0 -1\n", encoding="utf-8")
+        return ls_proc
+
+    def _setup_live_tab(self, ls_proc: Path, fd_num: str, session_id: str, record: dict[str, object] | None) -> Path:
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = presence_dir / f"{session_id}.lock"
+        lock_file.touch()
+        fd_dir = ls_proc / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (fd_dir / fd_num).symlink_to(lock_file)
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        if record is not None:
+            transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return transcript_path
+
+    def _write_vault_account(self, alias: str) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "token": {
+                "access_token": f"ya29.{alias}",
+                "refresh_token": f"1//refresh-{alias}",
+                "token_type": "Bearer",
+                "expiry": "2027-01-01T00:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": f"{alias}@example.com",
+        }
+        acc_dir = self.vault_dir / "accounts" / alias
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        token_path = acc_dir / "token.json"
+        token_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(token_path, 0o600)
+        return payload
+
+    def _write_pending_reload(
+        self,
+        target_account: str = "work-acc",
+        age_seconds: float = 10.0,
+        ttl_seconds: int = 1800,
+        reason: str = "in_turn_deferred_reload",
+    ) -> Path:
+        pending_file = self.cache_dir / "pending_reload.json"
+        pending_file.write_text(
+            json.dumps({
+                "target_account": target_account,
+                "requested_at": time.time() - age_seconds,
+                "ttl_seconds": ttl_seconds,
+                "reason": reason,
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+        return pending_file
+
+    def test_global_quiescence_002_and_003_multi_tab_mixed_states_and_non_quiescent_types(self) -> None:
+        """[GLOBAL-QUIESCENCE-002] + [GLOBAL-QUIESCENCE-003] + [GLOBAL-QUIESCENCE-ERR-001]:
+        All open tabs PLANNER_RESPONSE DONE (no tool_calls) + sidecar_sdk -> True;
+        any open tab mid-turn (USER_INPUT, GENERIC DONE, tool_calls, IN_PROGRESS, missing/empty) -> False.
+        """
+        ls_proc = self._setup_ls_with_sidecar(pid=500, sidecar_pid=501)
+        self._setup_live_tab(ls_proc, "10", "tab-a", {"type": "PLANNER_RESPONSE", "status": "DONE"})
+        tab_b = self._setup_live_tab(ls_proc, "11", "tab-b", {"type": "PLANNER_RESPONSE", "status": "DONE"})
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertTrue(watcher._is_turn_quiescent())
+
+        busy_records: list[tuple[str, dict[str, object] | None]] = [
+            ("user_input", {"type": "USER_INPUT", "content": "Deploy"}),
+            ("generic_done", {"type": "GENERIC", "status": "DONE", "content": "Tool stdout"}),
+            ("message_done", {"type": "MESSAGE", "status": "DONE", "content": "Legacy"}),
+            ("tool_calls", {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{"name": "run_command"}]}),
+            ("in_progress", {"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS"}),
+            ("empty_file", None),
+        ]
+        for label, rec in busy_records:
+            with self.subTest(tab_b_state=label):
+                tab_b.write_text("" if rec is None else json.dumps(rec) + "\n", encoding="utf-8")
+                self.assertFalse(watcher._is_turn_quiescent(), f"Mixed tab-b '{label}' must return False")
+
+        # Even if supervisor is mocked idle, PresenceDetector multi-tab check must still block reload
+        tab_b.write_text(json.dumps({"type": "USER_INPUT", "content": "Deploy"}) + "\n", encoding="utf-8")
+        mock_sup = MagicMock(spec=ProcessSupervisor)
+        mock_sup.locate_language_server_pid.return_value = 500
+        mock_sup.is_server_busy.return_value = False
+        mock_sup.get_active_presence_lock_paths.return_value = set()
+        watcher_mock_sup = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=mock_sup,
+            log_dirs=[],
+        )
+        self.assertFalse(
+            watcher_mock_sup._is_turn_quiescent(),
+            "Multi-tab PresenceDetector check must block quiescence when tab-b is mid-turn",
+        )
+
+    def test_global_quiescence_edge_001_explicit_transcript_path_rejects_legacy_idle_types(self) -> None:
+        """[GLOBAL-QUIESCENCE-EDGE-001]: Explicit transcript_path rejects USER_INPUT, GENERIC DONE,
+        MESSAGE DONE, and non-dict JSON, accepting only PLANNER_RESPONSE DONE without tool_calls.
+        """
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        t_path = Path(self.tmpdir) / "explicit_transcript.jsonl"
+        for label, line in (
+            ("user_input", json.dumps({"type": "USER_INPUT", "content": "Analyze bug"})),
+            ("generic_done", json.dumps({"type": "GENERIC", "status": "DONE", "content": "Tool stdout"})),
+            ("message_done", json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Legacy"})),
+            ("non_dict_list", "[]"),
+        ):
+            with self.subTest(record=label):
+                t_path.write_text(line + "\n", encoding="utf-8")
+                self.assertFalse(watcher._is_turn_quiescent(transcript_path=t_path))
+
+        t_path.write_text(json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n", encoding="utf-8")
+        self.assertTrue(watcher._is_turn_quiescent(transcript_path=t_path))
+
+    def test_global_quiescence_004_zero_open_locks_quiescent_for_reload_but_skips_proactive(self) -> None:
+        """[GLOBAL-QUIESCENCE-004] + [WATCH-PROACTIVE-ERR-002]: Zero open presence locks and
+        only sidecar_sdk child certify globally quiescent for _process_pending_reload(),
+        while _evaluate_proactive_rotation() skips safely when no active transcript exists.
+        """
+        self._setup_ls_with_sidecar(pid=500, sidecar_pid=501)
+        pending_file = self._write_pending_reload(target_account="work-acc")
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "primary-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "accounts": [{"name": "primary-acc", "valid": True}, {"name": "standby-acc", "valid": True}]
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({"accounts": {"primary-acc": {"gemini": {"fraction": 0.10}}, "standby-acc": {"gemini": {"fraction": 0.90}}}}),
+            encoding="utf-8",
+        )
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertTrue(watcher._is_turn_quiescent())
+        self.assertFalse(watcher._evaluate_proactive_rotation())
+        self.engine_mock.switch_tokens.assert_not_called()
+
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.assertFalse(pending_file.exists())
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_global_quiescence_edge_004_restricted_proc_fallback_and_missing_explicit_path(self) -> None:
+        """[GLOBAL-QUIESCENCE-EDGE-004]: Restricted /proc with unlocked non-quiescent transcript
+        and missing/empty explicit transcript_path both fail safe to False.
+        """
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / "unlocked-session.lock").touch()
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / "unlocked-session" / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "transcript.jsonl").write_text(
+            json.dumps({"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS"}) + "\n",
+            encoding="utf-8",
+        )
+
+        mock_proc_dir = MagicMock(spec=Path)
+        mock_proc_dir.is_dir.return_value = True
+        mock_proc_dir.iterdir.side_effect = PermissionError("Restricted /proc")
+
+        restricted_detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=mock_proc_dir)
+        restricted_supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=mock_proc_dir)
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=restricted_detector,
+            supervisor=restricted_supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(watcher._is_turn_quiescent(), "Fallback non-quiescent transcript must return False")
+
+        empty_file = Path(self.tmpdir) / "empty.jsonl"
+        empty_file.write_text("", encoding="utf-8")
+        self.assertFalse(watcher._is_turn_quiescent(transcript_path=empty_file))
+        self.assertFalse(watcher._is_turn_quiescent(transcript_path=Path(self.tmpdir) / "nonexistent.jsonl"))
+
+    def test_resync_guard_001_pre_and_post_restart_sync_order(self) -> None:
+        """[RESYNC-GUARD-001] + [WATCH-RELOAD-001]: sync_active_tokens_from_vault() is invoked
+        immediately BEFORE and AFTER restart_language_server(force=True) succeeds.
+        """
+        self._setup_ls_with_sidecar(pid=4242, sidecar_pid=4243)
+        pending_file = self._write_pending_reload(target_account="work-acc")
+        call_order: list[str] = []
+        self.engine_mock.sync_active_tokens_from_vault.side_effect = lambda: (call_order.append("sync"), True)[1]
+        self.engine_mock.restart_language_server.side_effect = lambda force=False: (call_order.append(f"restart:{force}"), True)[1]
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertTrue(watcher._process_pending_reload())
+        self.assertEqual(call_order, ["sync", "restart:True", "sync"])
+        self.assertFalse(pending_file.exists())
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_resync_guard_err_001_presync_failure_aborts_restart_safely(self) -> None:
+        """[RESYNC-GUARD-ERR-001]: Pre-restart sync failure (False or OSError) logs to stderr,
+        aborts restart_language_server(force=True), preserves pending_reload.json, and returns False.
+        """
+        from io import StringIO
+
+        self._setup_ls_with_sidecar(pid=4242, sidecar_pid=4243)
+        pending_file = self._write_pending_reload(target_account="work-acc")
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Case 1: returns False
+        self.engine_mock.sync_active_tokens_from_vault.return_value = False
+        stderr_false = StringIO()
+        with patch("sys.stderr", stderr_false):
+            self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_file())
+        self.assertIn("pre-restart", stderr_false.getvalue().lower())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Case 2: raises OSError
+        self.engine_mock.sync_active_tokens_from_vault.side_effect = OSError("Vault token missing")
+        stderr_exc = StringIO()
+        with patch("sys.stderr", stderr_exc):
+            self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_file())
+        self.assertIn("Vault token missing", stderr_exc.getvalue())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_resync_guard_err_002_running_server_restart_failure_preserves_marker(self) -> None:
+        """[RESYNC-GUARD-ERR-002]: Running language_server (PID 4242) failing restart preserves
+        pending_reload.json without writing a false watch.log audit entry.
+        """
+        from io import StringIO
+
+        self._setup_ls_with_sidecar(pid=4242, sidecar_pid=4243)
+        pending_file = self._write_pending_reload(target_account="work-acc")
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.engine_mock.restart_language_server.return_value = False
+        stderr_buf = StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(watcher._process_pending_reload())
+        self.engine_mock.sync_active_tokens_from_vault.assert_called_once()
+        self.assertTrue(pending_file.is_file())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+        self.assertIn("did not restart", stderr_buf.getvalue())
+
+    def test_resync_guard_edge_001_shutdown_zombie_writeback_healed_from_vault(self) -> None:
+        """[RESYNC-GUARD-EDGE-001]: Real AgySwitchEngine heals shutdown Zombie Write-Back
+        occurring inside restart_language_server(force=True) using latest Vault active account.
+        """
+        from agy_switcher.vault import AgySwitchEngine
+
+        self._setup_ls_with_sidecar(pid=4242, sidecar_pid=4243)
+        acc0 = self._write_vault_account("acc0")
+        self._write_vault_account("acc1")
+        acc2 = self._write_vault_account("acc2")
+        (self.vault_dir / "active").write_text("acc2\n", encoding="utf-8")
+
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
+        )
+        pending_file = self._write_pending_reload(target_account="acc1")
+
+        def zombie_restart(force: bool = False) -> bool:
+            # Exiting server overwrites Desktop token with stale acc0 during shutdown
+            engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+            engine.desktop_token_file.write_text(json.dumps(acc0), encoding="utf-8")
+            return True
+
+        engine.restart_language_server = zombie_restart  # type: ignore[method-assign]
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+        )
+        self.assertTrue(watcher._process_pending_reload())
+        self.assertFalse(pending_file.exists())
+        desktop_written = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        cli_written = json.loads(engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_written["token"]["refresh_token"], acc2["token"]["refresh_token"])  # type: ignore[index]
+        self.assertEqual(cli_written["token"]["refresh_token"], acc2["token"]["refresh_token"])  # type: ignore[index]
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_resync_guard_edge_002_stopped_server_resyncs_and_unlinks_cleanly(self) -> None:
+        """[RESYNC-GUARD-EDGE-002]: When language_server is stopped (locate_language_server_pid() == None),
+        valid pending_reload.json re-syncs Desktop & CLI tokens from Vault and unlinks cleanly.
+        """
+        from agy_switcher.vault import AgySwitchEngine
+
+        work_payload = self._write_vault_account("work-acc")
+        stale_payload = self._write_vault_account("stale-acc")
+        (self.vault_dir / "active").write_text("work-acc\n", encoding="utf-8")
+
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
+        )
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(stale_payload), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(stale_payload), encoding="utf-8")
+
+        pending_file = self._write_pending_reload(target_account="work-acc")
+        restart_mock = MagicMock(return_value=True)
+        engine.restart_language_server = restart_mock  # type: ignore[method-assign]
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+        )
+        self.assertIsNone(engine.locate_language_server_pid())
+        self.assertTrue(watcher._process_pending_reload())
+        restart_mock.assert_not_called()
+        self.assertFalse(pending_file.exists())
+
+        desktop_written = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        cli_written = json.loads(engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_written["token"]["refresh_token"], work_payload["token"]["refresh_token"])  # type: ignore[index]
+        self.assertEqual(cli_written["token"]["refresh_token"], work_payload["token"]["refresh_token"])  # type: ignore[index]
 
 
 if __name__ == '__main__':
