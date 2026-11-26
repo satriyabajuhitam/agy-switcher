@@ -23,6 +23,7 @@ from agy_switcher.exceptions import InvalidTokenError
 from agy_switcher.models import (
     DEFAULT_PENDING_RELOAD_TTL_SECONDS,
     PendingReloadPayload,
+    TokenIdentity,
 )
 
 
@@ -248,6 +249,62 @@ def resolve_token_email(data: object) -> str | None:
     return None
 
 
+def extract_token_identity(data: object) -> TokenIdentity | None:
+    """Extracts normalized credential identity from an in-memory token payload."""
+    if not isinstance(data, dict):
+        return None
+
+    token_obj = data.get("token")
+    if not isinstance(token_obj, dict):
+        return None
+
+    raw_refresh_token = token_obj.get("refresh_token")
+    if not isinstance(raw_refresh_token, str):
+        return None
+    refresh_token = raw_refresh_token.strip()
+    if not refresh_token:
+        return None
+
+    raw_auth_method = data.get("auth_method")
+    if not isinstance(raw_auth_method, str):
+        return None
+    auth_method = raw_auth_method.strip()
+    if not auth_method:
+        return None
+
+    resolved_email = resolve_token_email(data)
+    email: str | None = None
+    if resolved_email is not None:
+        normalized_email = resolved_email.strip().lower()
+        if normalized_email:
+            email = normalized_email
+
+    return {
+        "refresh_token": refresh_token,
+        "auth_method": auth_method,
+        "email": email,
+    }
+
+
+def token_credentials_match(vault_data: object, target_data: object) -> bool:
+    """Compares Vault and target token payloads purely by normalized credential identity."""
+    vault_identity = extract_token_identity(vault_data)
+    target_identity = extract_token_identity(target_data)
+    if vault_identity is None or target_identity is None:
+        return False
+
+    if vault_identity["refresh_token"] != target_identity["refresh_token"]:
+        return False
+    if vault_identity["auth_method"] != target_identity["auth_method"]:
+        return False
+
+    vault_email = vault_identity["email"]
+    target_email = target_identity["email"]
+    if vault_email is not None and target_email is not None:
+        return vault_email == target_email
+    return True
+
+
 def _is_non_empty_str(value: object) -> bool:
     """Returns True when value is a string containing non-whitespace characters."""
     return isinstance(value, str) and bool(value.strip())
@@ -408,6 +465,8 @@ __all__ = [
     "extract_email_from_jwt",
     "has_valid_id_token_or_fallback",
     "resolve_token_email",
+    "extract_token_identity",
+    "token_credentials_match",
     "validate_token_dict",
     "validate_token_file",
     "check_token_dict",

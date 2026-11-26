@@ -40,6 +40,8 @@ _EXPORTS: dict[str, str] = {
     "read_latest_jsonl_record": "agy_switcher.security",
     "extract_email_from_jwt": "agy_switcher.security",
     "resolve_token_email": "agy_switcher.security",
+    "extract_token_identity": "agy_switcher.security",
+    "token_credentials_match": "agy_switcher.security",
     "validate_token_dict": "agy_switcher.security",
     "validate_token_file": "agy_switcher.security",
     "check_token_dict": "agy_switcher.security",

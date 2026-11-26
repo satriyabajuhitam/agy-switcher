@@ -2870,5 +2870,150 @@ class TestLayer0PendingReloadAndJsonlReader(unittest.TestCase):
             self.assertIsNone(security_mod.read_latest_jsonl_record(tmp))
 
 
+class TestTokenIdentityExtractorAndMatcher(unittest.TestCase):
+    """[VAULT-SYNC-001 / VAULT-SYNC-EDGE-004] Pure token identity extraction and matching tests."""
+
+    def test_token_identity_and_credentials_match_with_go_metadata_VAULT_SYNC_001(self) -> None:
+        """[VAULT-SYNC-001] Matching refresh_token, auth_method, and email match despite Desktop Go metadata with zero I/O or HTTP."""
+        from agy_switcher.security import extract_token_identity, token_credentials_match
+
+        vault_data = make_valid_token_payload("primary@example.com")
+        vault_token = cast(dict[str, object], vault_data["token"])
+        vault_token["refresh_token"] = "rt-primary"
+        vault_data["auth_method"] = "oauth"
+
+        desktop_data: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.freshly_rotated_desktop_access_token",
+                "token_type": "Bearer",
+                "refresh_token": "rt-primary",
+                "expiry": "2026-12-31T23:59:59.123456789Z",
+            },
+            "auth_method": "oauth",
+            "id_token": vault_data["id_token"],
+            "writer_id": "ls-991",
+        }
+
+        with (
+            patch("urllib.request.urlopen", side_effect=AssertionError("HTTP call must not happen")),
+            patch("pathlib.Path.write_text", side_effect=AssertionError("Disk write must not happen")),
+            patch("os.replace", side_effect=AssertionError("Atomic write must not happen")),
+        ):
+            vault_identity = extract_token_identity(vault_data)
+            desktop_identity = extract_token_identity(desktop_data)
+            matched = token_credentials_match(vault_data, desktop_data)
+
+        self.assertEqual(
+            vault_identity,
+            {
+                "refresh_token": "rt-primary",
+                "auth_method": "oauth",
+                "email": "primary@example.com",
+            },
+        )
+        self.assertEqual(desktop_identity, vault_identity)
+        self.assertTrue(matched)
+
+    def test_token_credentials_match_email_normalization_and_missing_fields_VAULT_SYNC_EDGE_004(self) -> None:
+        """[VAULT-SYNC-EDGE-004] Normalizes email case/whitespace, tolerates one-sided missing email, and rejects mismatched or missing fields."""
+        from agy_switcher.security import extract_token_identity, token_credentials_match
+
+        vault_data = make_valid_token_payload("Honey@Example.COM")
+        vault_token = cast(dict[str, object], vault_data["token"])
+        vault_token["refresh_token"] = "rt-1"
+        vault_data["auth_method"] = "oauth"
+
+        # (a) Case/whitespace email difference with matching refresh_token & auth_method -> True
+        case_whitespace_target: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.target",
+                "token_type": "Bearer",
+                "refresh_token": "rt-1",
+                "expiry": "2026-12-31T23:59:59Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": " honey@example.com ",
+        }
+        self.assertTrue(token_credentials_match(vault_data, case_whitespace_target))
+
+        # (b) One-sided omitted email (both directions) with matching refresh_token & auth_method -> True
+        omitted_email_target: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.target",
+                "token_type": "Bearer",
+                "refresh_token": "rt-1",
+                "expiry": "2026-12-31T23:59:59Z",
+            },
+            "auth_method": "oauth",
+        }
+        self.assertTrue(token_credentials_match(vault_data, omitted_email_target))
+        self.assertTrue(token_credentials_match(omitted_email_target, vault_data))
+
+        # (c) Mismatched email even with matching refresh_token & auth_method -> False
+        mismatched_email_target = make_valid_token_payload("other@example.com")
+        mismatched_token = cast(dict[str, object], mismatched_email_target["token"])
+        mismatched_token["refresh_token"] = "rt-1"
+        mismatched_email_target["auth_method"] = "oauth"
+        self.assertFalse(token_credentials_match(vault_data, mismatched_email_target))
+
+        # (d) Missing, empty, whitespace-only, or non-string refresh_token / auth_method -> False
+        invalid_targets: list[object] = [
+            None,
+            [],
+            "not-a-dict",
+            {"auth_method": "oauth"},
+            {"token": "not-a-dict", "auth_method": "oauth"},
+            {"token": {"refresh_token": ""}, "auth_method": "oauth"},
+            {"token": {"refresh_token": "   "}, "auth_method": "oauth"},
+            {"token": {"refresh_token": 12345}, "auth_method": "oauth"},
+            {"token": {}, "auth_method": "oauth"},
+            {"token": {"refresh_token": "rt-1"}, "auth_method": ""},
+            {"token": {"refresh_token": "rt-1"}, "auth_method": "   "},
+            {"token": {"refresh_token": "rt-1"}, "auth_method": None},
+            {"token": {"refresh_token": "rt-1"}},
+        ]
+        for bad_target in invalid_targets:
+            with self.subTest(bad_target=bad_target):
+                self.assertIsNone(extract_token_identity(bad_target))
+                self.assertFalse(token_credentials_match(vault_data, bad_target))
+                self.assertFalse(token_credentials_match(bad_target, vault_data))
+
+    def test_extract_token_identity_trims_required_fields_and_rejects_mismatched_credentials(self) -> None:
+        """extract_token_identity trims refresh_token and auth_method; mismatches return False."""
+        from agy_switcher.security import extract_token_identity, token_credentials_match
+
+        padded_payload: dict[str, object] = {
+            "token": {"refresh_token": "  rt-trimmed  "},
+            "auth_method": "  oauth  ",
+            "id_token_email": "  USER@Example.COM ",
+        }
+        self.assertEqual(
+            extract_token_identity(padded_payload),
+            {
+                "refresh_token": "rt-trimmed",
+                "auth_method": "oauth",
+                "email": "user@example.com",
+            },
+        )
+        self.assertTrue(
+            token_credentials_match(
+                padded_payload,
+                {"token": {"refresh_token": "rt-trimmed"}, "auth_method": "oauth"},
+            )
+        )
+        self.assertFalse(
+            token_credentials_match(
+                padded_payload,
+                {"token": {"refresh_token": "rt-other"}, "auth_method": "oauth"},
+            )
+        )
+        self.assertFalse(
+            token_credentials_match(
+                padded_payload,
+                {"token": {"refresh_token": "rt-trimmed"}, "auth_method": "api_key"},
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

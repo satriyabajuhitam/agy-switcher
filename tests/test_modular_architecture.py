@@ -673,6 +673,17 @@ class TestReExportLaunchers(unittest.TestCase):
             self.assertIs(getattr(security_mod, sym), getattr(agy_switcher, sym))
             self.assertIs(getattr(agy_switcher, sym), getattr(agy_switch, sym))
 
+    def test_token_identity_matcher_reexport_surface_parity(self):
+        """extract_token_identity and token_credentials_match maintain 100% parity across security, agy_switcher, and agy_switch."""
+        import agy_switcher.security as security_mod
+
+        for sym in ("extract_token_identity", "token_credentials_match"):
+            self.assertIn(sym, security_mod.__all__)
+            self.assertIn(sym, agy_switcher.__all__)
+            self.assertIn(sym, agy_switch.__all__)
+            self.assertIs(getattr(security_mod, sym), getattr(agy_switcher, sym))
+            self.assertIs(getattr(agy_switcher, sym), getattr(agy_switch, sym))
+
     def test_watch_launcher_uses_realpath_and_exports(self):
         watch_path = SCRIPTS_DIR / "watch.py"
         source = watch_path.read_text(encoding="utf-8")
