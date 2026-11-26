@@ -92,4 +92,17 @@ _Avoid_: CWD check, path filter, repo detector
 The architectural separation between machine-wide plugin lifecycle hooks (such as global multi-account quota rotation) and workspace-specific quality gates (which must remain disabled by default in plugin bundles to avoid cross-project execution delays).
 _Avoid_: Hook filtering, selective execution
 
+**Pre-Flight Auth Gate**:
+A live credential verification step executed before manual account switching mutates live token files or restarts the language server; fails closed on confirmed authentication rejections (HTTP 401/403 after a single best-effort refresh attempt), fails open with a warning on transient network errors, and allows explicit bypass only via `--skip-auth-check`.
+_Avoid_: Schema-only check, silent 403 switch, blind credential swap
+
+**Deferred Safe-Turn Reload**:
+A process-lineage-aware reload strategy for switches invoked from inside an active Antigravity agent turn (descendant of `language_server`) that performs an atomic Disk-Only Swap and records a TTL-bounded `pending_reload.json` marker so `LogWatcher` reloads `language_server` at the next verified Safe Turn Boundary instead of terminating the parent server mid-turn.
+_Avoid_: Mid-turn parricide, forced in-turn kill, ad-hoc waiter subprocess
+
+**Failover Audit & Auth Quarantine**:
+A dual-persistence transparency mechanism where `PreInvocation` hook ejections append structured entries to `watch.log` and atomically record `last_failover` plus per-account `auth_errors` in `cache/failover_state.json`, surfacing recent ejections in `status` (for up to 24 hours or until the next successful manual switch) and persisting auth quarantine in `list`/`doctor` until cleared by re-login or a successful live probe.
+_Avoid_: Silent rollback, stderr-only failover, ephemeral-only audit
+
+
 
