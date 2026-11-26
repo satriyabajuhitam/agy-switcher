@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import email.message
+import errno
 import io
 import itertools
 import json
@@ -3013,6 +3014,342 @@ class TestTokenIdentityExtractorAndMatcher(unittest.TestCase):
                 {"token": {"refresh_token": "rt-trimmed"}, "auth_method": "api_key"},
             )
         )
+
+
+class TestVaultAuthoritativeSyncCheckAndRepair(unittest.TestCase):
+    """[VAULT-SYNC-001 / VAULT-SYNC-002 / VAULT-SYNC-ERR-001..004] Vault sync check and atomic repair tests."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.gemini_dir = self.base_path / ".gemini"
+        self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _register_account(
+        self,
+        alias: str,
+        email: str,
+        *,
+        refresh_token: str | None = None,
+        set_active: bool = False,
+    ) -> dict[str, object]:
+        payload = make_valid_token_payload(email)
+        if refresh_token is not None:
+            cast(dict[str, object], payload["token"])["refresh_token"] = refresh_token
+        acc_dir = self.vault_dir / "accounts" / alias
+        acc_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        if set_active:
+            self.engine.set_active_name(alias)
+        return payload
+
+    def test_sync_status_matches_benign_go_runtime_metadata_zero_io_or_http_VAULT_SYNC_001(self) -> None:
+        """[VAULT-SYNC-001] Benign Go runtime metadata (writer_id, ns expiry, refreshed access_token) stays synced with zero writes or HTTP."""
+        vault_data = self._register_account(
+            "primary-acc",
+            "primary@example.com",
+            refresh_token="rt-primary",
+            set_active=True,
+        )
+        desktop_payload: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.freshly_rotated_desktop_access_token",
+                "token_type": "Bearer",
+                "refresh_token": "rt-primary",
+                "expiry": "2026-12-31T23:59:59.987654321Z",
+            },
+            "auth_method": "oauth",
+            "id_token": vault_data["id_token"],
+            "writer_id": "ls-991",
+        }
+        self.engine.desktop_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.desktop_token_file.write_text(json.dumps(desktop_payload), encoding="utf-8")
+        self.engine.cli_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.cli_token_file.write_text(json.dumps(vault_data), encoding="utf-8")
+
+        with (
+            patch("urllib.request.urlopen", side_effect=AssertionError("HTTP call must not happen")),
+            patch("pathlib.Path.write_text", side_effect=AssertionError("Disk write must not happen")),
+            patch("os.replace", side_effect=AssertionError("Atomic write must not happen")),
+        ):
+            status = self.engine.check_target_sync_status()
+
+        self.assertTrue(status["in_sync"])
+        self.assertTrue(status["desktop_synced"])
+        self.assertTrue(status["cli_synced"])
+        self.assertEqual(status["drifted_targets"], [])
+        self.assertEqual(status["desktop_email"], "primary@example.com")
+        self.assertEqual(status["cli_email"], "primary@example.com")
+
+    def test_sync_status_and_sync_active_tokens_heal_zombie_write_back_and_corrupt_targets_VAULT_SYNC_002(self) -> None:
+        """[VAULT-SYNC-002 / VAULT-SYNC-ERR-001 / VAULT-SYNC-ERR-002] Detects Zombie Write-Back, corrupt JSON, and symlinks; repairs atomically."""
+        work_data = self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            set_active=True,
+        )
+        self.engine.cli_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.cli_token_file.write_text(json.dumps(work_data), encoding="utf-8")
+
+        # 1. Zombie Write-Back overwrite on Desktop
+        old_payload = make_valid_token_payload("old@example.com")
+        cast(dict[str, object], old_payload["token"])["refresh_token"] = "rt-old"
+        old_payload["writer_id"] = "go-ls"
+        self.engine.desktop_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.desktop_token_file.write_text(json.dumps(old_payload), encoding="utf-8")
+
+        drift_status = self.engine.check_target_sync_status()
+        self.assertFalse(drift_status["in_sync"])
+        self.assertFalse(drift_status["desktop_synced"])
+        self.assertTrue(drift_status["cli_synced"])
+        self.assertEqual(drift_status["drifted_targets"], ["desktop"])
+        self.assertEqual(drift_status["desktop_email"], "old@example.com")
+        self.assertEqual(drift_status["cli_email"], "work@example.com")
+
+        self.assertTrue(self.engine.sync_active_tokens_from_vault())
+        self.assertEqual(self.engine.active_file.read_text(encoding="utf-8").strip(), "work-acc")
+        self.assertEqual(stat.S_IMODE(self.engine.desktop_token_file.stat().st_mode), 0o600)
+        restored_desktop = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(restored_desktop, work_data)
+
+        healed_status = self.engine.check_target_sync_status()
+        self.assertTrue(healed_status["in_sync"])
+        self.assertEqual(healed_status["drifted_targets"], [])
+
+        # 2. [VAULT-SYNC-ERR-001] Truncated JSON & non-dict JSON on Desktop
+        for bad_raw in ('{"token":', "[]"):
+            with self.subTest(bad_raw=bad_raw):
+                self.engine.desktop_token_file.write_text(bad_raw, encoding="utf-8")
+                corrupt_status = self.engine.check_target_sync_status()
+                self.assertFalse(corrupt_status["in_sync"])
+                self.assertFalse(corrupt_status["desktop_synced"])
+                self.assertTrue(corrupt_status["cli_synced"])
+                self.assertEqual(corrupt_status["drifted_targets"], ["desktop"])
+                self.assertIsNone(corrupt_status["desktop_email"])
+                self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=("desktop",)))
+                self.assertEqual(
+                    json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8")),
+                    work_data,
+                )
+
+        # 3. [VAULT-SYNC-ERR-002] External symlink & missing & unreadable target
+        external_secret = self.base_path / "external-secret"
+        external_secret.write_text('{"secret": "do-not-read-or-mutate"}', encoding="utf-8")
+        self.engine.desktop_token_file.unlink()
+        self.engine.desktop_token_file.symlink_to(external_secret)
+
+        symlink_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_status["in_sync"])
+        self.assertFalse(symlink_status["desktop_synced"])
+        self.assertIn("desktop", symlink_status["drifted_targets"])
+        self.assertIsNone(symlink_status["desktop_email"])
+        self.assertEqual(external_secret.read_text(encoding="utf-8"), '{"secret": "do-not-read-or-mutate"}')
+
+        # Missing target
+        self.engine.desktop_token_file.unlink()
+        missing_status = self.engine.check_target_sync_status()
+        self.assertFalse(missing_status["in_sync"])
+        self.assertFalse(missing_status["desktop_synced"])
+        self.assertEqual(missing_status["drifted_targets"], ["desktop"])
+
+        # Unreadable target (PermissionError via chmod 0000 when non-root, plus deterministic os.open OSError)
+        self.engine.desktop_token_file.write_text(json.dumps(work_data), encoding="utf-8")
+        if os.geteuid() != 0:
+            os.chmod(self.engine.desktop_token_file, 0o000)
+            try:
+                unreadable_status = self.engine.check_target_sync_status()
+            finally:
+                os.chmod(self.engine.desktop_token_file, 0o600)
+            self.assertFalse(unreadable_status["in_sync"])
+            self.assertFalse(unreadable_status["desktop_synced"])
+            self.assertEqual(unreadable_status["drifted_targets"], ["desktop"])
+
+        with patch("os.open", side_effect=PermissionError("Permission denied")):
+            io_err_status = self.engine.check_target_sync_status()
+        self.assertFalse(io_err_status["in_sync"])
+        self.assertFalse(io_err_status["desktop_synced"])
+        self.assertFalse(io_err_status["cli_synced"])
+        self.assertEqual(io_err_status["drifted_targets"], ["desktop", "cli"])
+
+    def test_sync_active_tokens_error_paths_invalid_vault_symlink_replace_and_oserror_VAULT_SYNC_ERR_004(self) -> None:
+        """[VAULT-SYNC-ERR-003 / VAULT-SYNC-ERR-004] Invalid Vault token aborts; symlink replaced atomically; PermissionError/ENOSPC logged to stderr."""
+        self.engine.desktop_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.cli_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.desktop_token_file.write_text('{"live": "desktop-sentinel"}', encoding="utf-8")
+        self.engine.cli_token_file.write_text('{"live": "cli-sentinel"}', encoding="utf-8")
+
+        # Case 1a: [VAULT-SYNC-ERR-003] Active points to broken-acc with missing token.json
+        (self.vault_dir / "accounts" / "broken-acc").mkdir(parents=True, mode=0o700)
+        self.engine.set_active_name("broken-acc")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+        self.assertEqual(self.engine.desktop_token_file.read_text(encoding="utf-8"), '{"live": "desktop-sentinel"}')
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), '{"live": "cli-sentinel"}')
+
+        # Case 1b: [VAULT-SYNC-ERR-003] broken-acc token.json fails validate_token_file()
+        (self.vault_dir / "accounts" / "broken-acc" / "token.json").write_text(
+            json.dumps({"token": {"access_token": ""}, "auth_method": "oauth"}),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+        self.assertEqual(self.engine.desktop_token_file.read_text(encoding="utf-8"), '{"live": "desktop-sentinel"}')
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), '{"live": "cli-sentinel"}')
+
+        # Case 2: [VAULT-SYNC-ERR-004] Valid work-acc replaces symlinked Desktop target without mutating external target
+        work_data = self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            set_active=True,
+        )
+        external_secret = self.base_path / "external-secret"
+        external_secret.write_text("EXTERNAL_SECRET_DATA", encoding="utf-8")
+        self.engine.desktop_token_file.unlink()
+        self.engine.desktop_token_file.symlink_to(external_secret)
+
+        self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=("desktop",)))
+        self.assertFalse(self.engine.desktop_token_file.is_symlink())
+        self.assertTrue(self.engine.desktop_token_file.is_file())
+        self.assertEqual(stat.S_IMODE(self.engine.desktop_token_file.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8")), work_data)
+        self.assertEqual(external_secret.read_text(encoding="utf-8"), "EXTERNAL_SECRET_DATA")
+        # CLI was not in targets=("desktop",), so remains untouched
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), '{"live": "cli-sentinel"}')
+        self.assertEqual(self.engine.active_file.read_text(encoding="utf-8").strip(), "work-acc")
+
+        # Case 3: [VAULT-SYNC-ERR-004] PermissionError / ENOSPC on os.replace logs to stderr and returns False
+        for err in (
+            PermissionError("Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        ):
+            with self.subTest(err=err):
+                stderr_buf = io.StringIO()
+                with patch("os.replace", side_effect=err), patch("sys.stderr", stderr_buf):
+                    result = self.engine.sync_active_tokens_from_vault(targets=("desktop",))
+                self.assertFalse(result)
+                self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Invalid target name rejected safely
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault(targets=("unknown",)))
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+    def test_sync_status_and_sync_active_tokens_edge_cases_active_symlink_corrupt_and_targets_VAULT_SYNC_EDGE(
+        self,
+    ) -> None:
+        """Edge cases: symlinked/corrupt/empty active file, symlinked account dir, empty/non-iterable targets, missing parent dir."""
+        work_data = self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            set_active=True,
+        )
+        # Missing parent directory for both targets is created atomically (0700 dir, 0600 file)
+        self.assertFalse(self.engine.desktop_token_file.parent.exists())
+        self.assertFalse(self.engine.cli_token_file.parent.exists())
+        self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=["desktop", "cli"]))
+        self.assertTrue(self.engine.desktop_token_file.is_file())
+        self.assertTrue(self.engine.cli_token_file.is_file())
+        self.assertEqual(stat.S_IMODE(self.engine.desktop_token_file.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.engine.cli_token_file.stat().st_mode), 0o600)
+
+        # Empty targets is a safe no-op when vault is valid, and does not touch files
+        with patch.object(self.engine, "_atomic_write_file", side_effect=AssertionError("Must not write")):
+            self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=()))
+
+        # Non-iterable / string targets rejected cleanly with stderr warning
+        for bad_targets in (None, 123, "desktop"):
+            with self.subTest(bad_targets=bad_targets):
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    self.assertFalse(self.engine.sync_active_tokens_from_vault(targets=bad_targets))  # type: ignore[arg-type]
+                self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Empty / whitespace active file
+        self.engine.active_file.write_text("   \n", encoding="utf-8")
+        empty_status = self.engine.check_target_sync_status()
+        self.assertFalse(empty_status["in_sync"])
+        self.assertIsNone(empty_status["active_account"])
+        self.assertEqual(empty_status["drifted_targets"], ["desktop", "cli"])
+        self.assertEqual(empty_status["desktop"]["status"], "no_active_account")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Corrupt binary (non-UTF8) active file does not crash
+        self.engine.active_file.write_bytes(b"\xff\xfe\x00\x80")
+        corrupt_active_status = self.engine.check_target_sync_status()
+        self.assertFalse(corrupt_active_status["in_sync"])
+        self.assertIsNone(corrupt_active_status["active_account"])
+        self.assertEqual(corrupt_active_status["drifted_targets"], ["desktop", "cli"])
+        self.assertEqual(corrupt_active_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Symlinked active file is refused without following external target
+        ext_active = self.base_path / "external-active"
+        ext_active.write_text("work-acc\n", encoding="utf-8")
+        self.engine.active_file.unlink()
+        self.engine.active_file.symlink_to(ext_active)
+        symlink_active_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_active_status["in_sync"])
+        self.assertIsNone(symlink_active_status["active_account"])
+        self.assertEqual(symlink_active_status["drifted_targets"], ["desktop", "cli"])
+        self.assertEqual(symlink_active_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Symlinked vault token.json is refused
+        self.engine.active_file.unlink()
+        self.engine.set_active_name("work-acc")
+        ext_token = self.base_path / "external-vault-token.json"
+        ext_token.write_text(json.dumps(work_data), encoding="utf-8")
+        vault_token = self.vault_dir / "accounts" / "work-acc" / "token.json"
+        vault_token.unlink()
+        vault_token.symlink_to(ext_token)
+        symlink_vault_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_vault_status["in_sync"])
+        self.assertEqual(symlink_vault_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Symlinked vault account directory is refused
+        vault_token.unlink()
+        (self.vault_dir / "accounts" / "work-acc").rmdir()
+        ext_acc_dir = self.base_path / "external-acc-dir"
+        ext_acc_dir.mkdir(parents=True)
+        (ext_acc_dir / "token.json").write_text(json.dumps(work_data), encoding="utf-8")
+        (self.vault_dir / "accounts" / "work-acc").symlink_to(ext_acc_dir)
+        symlink_dir_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_dir_status["in_sync"])
+        self.assertEqual(symlink_dir_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
 
 
 if __name__ == "__main__":
