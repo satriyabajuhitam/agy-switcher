@@ -1457,7 +1457,7 @@ class TestAgySwitchEngine(unittest.TestCase):
             ttl_seconds=True,  # type: ignore[arg-type]
             requested_at=True,  # type: ignore[arg-type]
         )
-        self.assertEqual(bool_guarded["ttl_seconds"], 120)
+        self.assertEqual(bool_guarded["ttl_seconds"], 1800)
         self.assertGreater(bool_guarded["requested_at"], 1_000_000.0)
 
         # Write valid marker and inspect on-disk schema & 0600 mode
@@ -1954,7 +1954,7 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
         pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
         self.assertEqual(pending_data["target_account"], "work-acc")
-        self.assertEqual(pending_data["ttl_seconds"], 120)
+        self.assertEqual(pending_data["ttl_seconds"], 1800)
         self.assertIsInstance(pending_data["requested_at"], (int, float))
         self.assertGreater(pending_data["requested_at"], 0)
         self.assertIsInstance(pending_data["reason"], str)
@@ -3350,6 +3350,254 @@ class TestVaultAuthoritativeSyncCheckAndRepair(unittest.TestCase):
         with patch("sys.stderr", stderr_buf):
             self.assertFalse(self.engine.sync_active_tokens_from_vault())
         self.assertTrue(stderr_buf.getvalue().strip())
+
+
+class TestVaultTtlRefreshAndStatusMetadata(unittest.TestCase):
+    """[VAULT-SYNC-005 / VAULT-SYNC-EDGE-003 / SYNC-VIS-001 / SYNC-VIS-003 / SYNC-VIS-ERR-002 / CONVERGE-RELOAD-ERR-002]."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.gemini_dir = self.base_path / ".gemini"
+        self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.proc_dir = self.base_path / "proc"
+        self.proc_dir.mkdir(parents=True, mode=0o700)
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _register_account(
+        self,
+        alias: str,
+        email: str,
+        *,
+        refresh_token: str,
+        access_token: str = "ya29.initial",
+        set_active: bool = False,
+    ) -> dict[str, object]:
+        payload = make_valid_token_payload(email=email)
+        token_obj = cast(dict[str, object], payload["token"])
+        token_obj["refresh_token"] = refresh_token
+        token_obj["access_token"] = access_token
+        acc_dir = self.vault_dir / "accounts" / alias
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.chmod(acc_dir / "token.json", 0o600)
+        if set_active:
+            self.engine.set_active_name(alias)
+        return payload
+
+    def test_write_pending_reload_default_and_invalid_ttl_sanitization_CONVERGE_RELOAD_ERR_002(self) -> None:
+        """[CONVERGE-RELOAD-ERR-002] write_pending_reload defaults and sanitizes invalid TTLs to 1800, while switch_tokens(--no-restart) skips it."""
+        default_payload = self.engine.write_pending_reload("work-acc", requested_at=1_700_000_000.0)
+        self.assertEqual(default_payload["ttl_seconds"], 1800)
+
+        for bad_ttl in (0, -60, True, False, float("nan"), float("inf"), float("-inf"), "120", None):
+            with self.subTest(bad_ttl=bad_ttl):
+                sanitized = self.engine.write_pending_reload(
+                    "work-acc",
+                    ttl_seconds=bad_ttl,  # type: ignore[arg-type]
+                    requested_at=1_700_000_000.0,
+                )
+                self.assertEqual(sanitized["ttl_seconds"], 1800)
+                on_disk = json.loads(self.engine.pending_reload_file.read_text(encoding="utf-8"))
+                self.assertEqual(on_disk["ttl_seconds"], 1800)
+
+        # Explicit valid TTL override is preserved
+        explicit = self.engine.write_pending_reload("work-acc", ttl_seconds=300, requested_at=1_700_000_000.0)
+        self.assertEqual(explicit["ttl_seconds"], 300)
+        self.engine.clear_pending_reload()
+
+        # switch_tokens(..., restart_server=False) never creates pending_reload.json
+        self._register_account("work-acc", "work@example.com", refresh_token="rt-work", set_active=True)
+        with patch.object(self.engine, "is_invoked_by_language_server", return_value=True):
+            res = self.engine.switch_tokens("work-acc", restart_server=False)
+        self.assertFalse(res["restart_deferred"])
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+    def test_update_account_access_token_active_drift_enqueues_pending_reload_VAULT_SYNC_005(self) -> None:
+        """[VAULT-SYNC-005] Active token refresh detects pre-existing Desktop drift and writes 1800s pending_reload."""
+        self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            access_token="ya29.work-old",
+            set_active=True,
+        )
+        self.engine.sync_active_tokens_from_vault()
+
+        # Case 1: Desktop has Zombie Write-Back credentials for "old-acc" while language_server is running
+        zombie_payload = make_valid_token_payload(email="old@example.com")
+        zombie_token = cast(dict[str, object], zombie_payload["token"])
+        zombie_token["refresh_token"] = "rt-old"
+        zombie_token["access_token"] = "ya29.zombie-old"
+        zombie_payload["writer_id"] = "go-ls"
+        self.engine.desktop_token_file.write_text(json.dumps(zombie_payload, indent=2) + "\n", encoding="utf-8")
+
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242):
+            ok = self.engine.update_account_access_token(
+                "work-acc",
+                "ya29.fresh-token",
+                expiry="2027-01-01T00:00:00Z",
+            )
+        self.assertTrue(ok)
+
+        for target_path in (
+            self.vault_dir / "accounts" / "work-acc" / "token.json",
+            self.engine.desktop_token_file,
+            self.engine.cli_token_file,
+        ):
+            loaded = json.loads(target_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["token"]["access_token"], "ya29.fresh-token")
+            self.assertEqual(loaded["token"]["expiry"], "2027-01-01T00:00:00Z")
+            self.assertEqual(loaded["token"]["refresh_token"], "rt-work")
+            self.assertEqual(stat.S_IMODE(target_path.stat().st_mode), 0o600)
+
+        self.assertTrue(self.engine.pending_reload_file.is_file())
+        self.assertEqual(stat.S_IMODE(self.engine.pending_reload_file.stat().st_mode), 0o600)
+        pending = json.loads(self.engine.pending_reload_file.read_text(encoding="utf-8"))
+        self.assertEqual(pending["target_account"], "work-acc")
+        self.assertEqual(pending["ttl_seconds"], 1800)
+        self.assertEqual(pending["reason"], "desktop_drift_on_token_refresh")
+
+        # Case 2: Desktop already matches "work-acc" identity (even with Go writer_id) -> no pending_reload
+        self.engine.clear_pending_reload()
+        same_id_desktop = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        same_id_desktop["writer_id"] = "go-ls"
+        same_id_desktop["token"]["access_token"] = "ya29.ls-refreshed-same-acc"
+        self.engine.desktop_token_file.write_text(json.dumps(same_id_desktop, indent=2) + "\n", encoding="utf-8")
+
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242):
+            self.assertTrue(self.engine.update_account_access_token("work-acc", "ya29.fresh-2"))
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+        # Case 3: Desktop drifted to "old-acc" while language_server is stopped -> heals disk, no pending_reload
+        self.engine.desktop_token_file.write_text(json.dumps(zombie_payload, indent=2) + "\n", encoding="utf-8")
+        with patch.object(self.engine, "locate_language_server_pid", return_value=None):
+            self.assertTrue(self.engine.update_account_access_token("work-acc", "ya29.fresh-3"))
+        self.assertEqual(
+            json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+            "ya29.fresh-3",
+        )
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+    def test_update_account_access_token_standby_never_touches_live_targets_VAULT_SYNC_EDGE_003(self) -> None:
+        """[VAULT-SYNC-EDGE-003] Standby refresh updates only accounts/<alias>/token.json without touching Desktop, CLI, or pending_reload."""
+        self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            access_token="ya29.work-live",
+            set_active=True,
+        )
+        self._register_account(
+            "standby-acc",
+            "standby@example.com",
+            refresh_token="rt-standby",
+            access_token="ya29.standby-old",
+            set_active=False,
+        )
+        self.engine.sync_active_tokens_from_vault()
+
+        desktop_before = self.engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = self.engine.cli_token_file.read_text(encoding="utf-8")
+
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242):
+            ok = self.engine.update_account_access_token(
+                "standby-acc",
+                "ya29.standby-fresh",
+                expiry="2027-02-02T00:00:00Z",
+            )
+        self.assertTrue(ok)
+
+        standby_vault = json.loads((self.vault_dir / "accounts" / "standby-acc" / "token.json").read_text(encoding="utf-8"))
+        self.assertEqual(standby_vault["token"]["access_token"], "ya29.standby-fresh")
+        self.assertEqual(standby_vault["token"]["expiry"], "2027-02-02T00:00:00Z")
+        self.assertEqual(self.engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+    def test_get_status_and_list_accounts_sync_status_pending_reload_zero_http_SYNC_VIS(self) -> None:
+        """[SYNC-VIS-001 / SYNC-VIS-003 / SYNC-VIS-ERR-002] get_status() and list_accounts() expose local-only sync_status and unexpired pending_reload."""
+        self._register_account(
+            "honey",
+            "honey@example.com",
+            refresh_token="rt-honey",
+            access_token="ya29.honey",
+            set_active=True,
+        )
+        self.engine.sync_active_tokens_from_vault()
+
+        # 1. In-sync + no pending_reload, strictly zero HTTP/socket calls
+        with patch("urllib.request.urlopen", side_effect=AssertionError("HTTP must not be called")), \
+             patch("socket.create_connection", side_effect=AssertionError("Network socket must not be opened")):
+            status_synced = self.engine.get_status()
+            listed_synced = self.engine.list_accounts()
+
+        for payload in (status_synced, listed_synced):
+            sync_info = payload.get("sync_status")
+            self.assertIsInstance(sync_info, dict)
+            assert isinstance(sync_info, dict)
+            self.assertIs(sync_info["in_sync"], True)
+            self.assertIs(sync_info["desktop_synced"], True)
+            self.assertIs(sync_info["cli_synced"], True)
+            self.assertEqual(sync_info["drifted_targets"], [])
+            self.assertNotIn("pending_reload", payload)
+            # JSON serializable & backward-compatible top-level keys
+            dumped = json.dumps(payload)
+            self.assertIsInstance(json.loads(dumped), dict)
+
+        self.assertEqual(listed_synced["active"], "honey")
+        self.assertEqual(len(listed_synced["accounts"]), 1)
+        self.assertEqual(listed_synced["accounts"][0]["name"], "honey")
+        self.assertTrue(listed_synced["accounts"][0]["is_active"])
+
+        # 2. Desktop drift + unexpired 1800s pending_reload surfaced in both get_status() and list_accounts()
+        drifted_desktop = make_valid_token_payload(email="old@example.com")
+        cast(dict[str, object], drifted_desktop["token"])["refresh_token"] = "rt-old"
+        self.engine.desktop_token_file.write_text(json.dumps(drifted_desktop, indent=2) + "\n", encoding="utf-8")
+        now = 1_800_000_000.0
+        self.engine.write_pending_reload(
+            "honey",
+            reason="desktop_drift_on_token_refresh",
+            requested_at=now - 30.0,
+        )
+
+        with patch("agy_switcher.vault.time.time", return_value=now), \
+             patch("urllib.request.urlopen", side_effect=AssertionError("HTTP must not be called")), \
+             patch("socket.create_connection", side_effect=AssertionError("Network socket must not be opened")):
+            status_drifted = self.engine.get_status()
+            listed_drifted = self.engine.list_accounts()
+
+        for payload in (status_drifted, listed_drifted):
+            sync_info = payload["sync_status"]
+            self.assertIs(sync_info["in_sync"], False)
+            self.assertIs(sync_info["desktop_synced"], False)
+            self.assertIs(sync_info["cli_synced"], True)
+            self.assertEqual(sync_info["drifted_targets"], ["desktop"])
+            self.assertEqual(sync_info["desktop_email"], "old@example.com")
+            self.assertEqual(sync_info["cli_email"], "honey@example.com")
+            pending = payload.get("pending_reload")
+            self.assertIsInstance(pending, dict)
+            assert isinstance(pending, dict)
+            self.assertEqual(pending["target_account"], "honey")
+            self.assertEqual(pending["ttl_seconds"], 1800)
+            self.assertEqual(pending["reason"], "desktop_drift_on_token_refresh")
+
+        # 3. Expired pending_reload is omitted from both get_status() and list_accounts()
+        with patch("agy_switcher.vault.time.time", return_value=now + 5000.0), \
+             patch("urllib.request.urlopen", side_effect=AssertionError("HTTP must not be called")):
+            status_expired = self.engine.get_status()
+            listed_expired = self.engine.list_accounts()
+        self.assertNotIn("pending_reload", status_expired)
+        self.assertNotIn("pending_reload", listed_expired)
 
 
 if __name__ == "__main__":

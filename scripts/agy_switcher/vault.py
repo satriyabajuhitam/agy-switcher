@@ -45,6 +45,7 @@ from agy_switcher.exceptions import (
 )
 from agy_switcher.models import (
     AuthErrorEntry,
+    DEFAULT_PENDING_RELOAD_TTL_SECONDS,
     DiagnosticItem,
     DiagnosticReport,
     FailoverStateDict,
@@ -639,25 +640,46 @@ class AgySwitchEngine:
         if not name or not isinstance(name, str) or not name.strip():
             return False
         name = name.strip()
+        if not is_safe_account_alias(name):
+            return False
         if not access_token or not isinstance(access_token, str) or not access_token.strip():
             return False
-        token_path = self.accounts_dir / name / "token.json"
-        if not token_path.is_file():
+        account_dir = self.accounts_dir / name
+        if account_dir.is_symlink():
+            return False
+        token_path = account_dir / "token.json"
+        data, io_status = read_json_dict_nofollow(token_path)
+        if io_status != "ok" or data is None:
+            return False
+        token_obj = data.get("token")
+        if not isinstance(token_obj, dict):
             return False
         try:
-            raw = token_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if "token" not in data or not isinstance(data["token"], dict):
-                return False
-            data["token"]["access_token"] = access_token.strip()
+            token_obj["access_token"] = access_token.strip()
             if expiry is not None:
                 if isinstance(expiry, str) and expiry.strip():
-                    data["token"]["expiry"] = expiry.strip()
+                    token_obj["expiry"] = expiry.strip()
             self._atomic_write_json(token_path, data)
 
-            if name == self.get_active_name():
+            active_name, active_error = self._resolve_active_name_for_sync()
+            if active_error is None and name == active_name:
+                desktop_drifted = False
+                desktop_data, desktop_status = read_json_dict_nofollow(self.desktop_token_file)
+                if desktop_status == "ok" and desktop_data is not None:
+                    vault_identity = extract_token_identity(data)
+                    desktop_identity = extract_token_identity(desktop_data)
+                    if vault_identity is not None and desktop_identity is not None:
+                        desktop_drifted = not token_credentials_match(data, desktop_data)
+
                 token_payload = json.dumps(data, indent=2) + "\n"
                 self._sync_tokens_to_targets(token_payload)
+
+                if desktop_drifted and self.locate_language_server_pid() is not None:
+                    self.write_pending_reload(
+                        name,
+                        reason="desktop_drift_on_token_refresh",
+                        ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+                    )
             return True
         except Exception:
             return False
@@ -862,7 +884,7 @@ class AgySwitchEngine:
         self,
         target_account: str,
         reason: str = "in_turn_deferred_reload",
-        ttl_seconds: float | int = 120,
+        ttl_seconds: float | int = DEFAULT_PENDING_RELOAD_TTL_SECONDS,
         requested_at: float | None = None,
     ) -> PendingReloadPayload:
         """Atomically writes cache/pending_reload.json at mode 0600."""
@@ -871,7 +893,7 @@ class AgySwitchEngine:
             raise AgySwitchError("Target account for pending reload cannot be empty.")
 
         clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "in_turn_deferred_reload"
-        ttl_val: float | int = 120
+        ttl_val: float | int = DEFAULT_PENDING_RELOAD_TTL_SECONDS
         if not isinstance(ttl_seconds, bool) and isinstance(ttl_seconds, (int, float)) and math.isfinite(ttl_seconds) and ttl_seconds > 0:
             ttl_val = ttl_seconds
 
@@ -1093,6 +1115,13 @@ class AgySwitchEngine:
         """Alias for set_active_name."""
         self.set_active_name(name)
 
+    def _attach_local_sync_metadata(self, payload: dict[str, Any]) -> None:
+        """Attaches local-only sync_status and unexpired pending_reload metadata to a status/list payload."""
+        payload["sync_status"] = self.check_target_sync_status()
+        pending_reload = self.load_pending_reload()
+        if isinstance(pending_reload, dict) and pending_reload:
+            payload["pending_reload"] = pending_reload
+
     def list_accounts(self) -> dict[str, Any]:
         """Lists all accounts registered in the vault and marks the active account."""
         active = self.get_active_name()
@@ -1130,10 +1159,12 @@ class AgySwitchEngine:
 
                 accounts.append(entry)
 
-        return {
+        result: dict[str, Any] = {
             "active": active,
             "accounts": accounts,
         }
+        self._attach_local_sync_metadata(result)
+        return result
 
     def _available_account_names(self) -> list[str]:
         if not self.accounts_dir.is_dir():
@@ -1215,7 +1246,7 @@ class AgySwitchEngine:
                 self.write_pending_reload(
                     clean_name,
                     reason="in_turn_deferred_reload",
-                    ttl_seconds=120,
+                    ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
                 )
                 restart_deferred = True
             else:
@@ -1778,10 +1809,7 @@ class AgySwitchEngine:
             ):
                 status["last_failover"] = dict(raw_last_failover)
 
-        pending_reload = self.load_pending_reload()
-        if isinstance(pending_reload, dict) and pending_reload:
-            status["pending_reload"] = pending_reload
-
+        self._attach_local_sync_metadata(status)
         return status
 
     def _is_valid_expiry(self, raw_expiry: Any) -> bool:
