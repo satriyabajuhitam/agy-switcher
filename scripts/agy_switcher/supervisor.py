@@ -16,10 +16,71 @@ import time
 from agy_switcher.exceptions import ActiveTurnRunningError
 
 
+def is_transcript_record_quiescent(record: object) -> bool:
+    """Returns True only for a completed PLANNER_RESPONSE record without tool_calls."""
+    if not isinstance(record, dict):
+        return False
+
+    record_type = record.get("type")
+    if not isinstance(record_type, str) or record_type.strip().upper() != "PLANNER_RESPONSE":
+        return False
+
+    status = record.get("status")
+    if not isinstance(status, str) or status.strip().upper() != "DONE":
+        return False
+
+    tool_calls = record.get("tool_calls")
+    if tool_calls is None:
+        return True
+    if isinstance(tool_calls, (list, tuple, set, dict)):
+        return len(tool_calls) == 0
+    return False
+
+
 class ProcessSupervisor:
     """Supervises the Antigravity language_server process, enforcing turn safety."""
 
     _MAX_ANCESTRY_HOPS = 64
+    _NODE_BIN_NAMES = frozenset({"node", "nodejs"})
+    _SIDECAR_ENTRYPOINT_FILES = frozenset(
+        {"sidecar_sdk", "sidecar_sdk.js", "sidecar_sdk.mjs", "sidecar_sdk.cjs"}
+    )
+    _NODE_NON_ENTRYPOINT_FLAGS = frozenset(
+        {"-e", "--eval", "-p", "--print", "-i", "--interactive", "-c", "--check"}
+    )
+    _NODE_VALUE_FLAGS = frozenset(
+        {
+            "-r",
+            "--require",
+            "--import",
+            "--loader",
+            "--experimental-loader",
+            "--env-file",
+            "-C",
+            "--conditions",
+            "--input-type",
+            "--title",
+            "--max-http-header-size",
+            "--diagnostic-dir",
+            "--heapsnapshot-signal",
+            "--redirect-warnings",
+            "--icu-data-dir",
+            "--openssl-config",
+            "--tls-cipher-list",
+            "--watch-path",
+            "--report-directory",
+            "--report-dir",
+            "--report-filename",
+            "--report-signal",
+            "--cpu-prof-dir",
+            "--cpu-prof-name",
+            "--heap-prof-dir",
+            "--heap-prof-name",
+            "--test-reporter",
+            "--test-reporter-destination",
+            "--test-shard",
+        }
+    )
 
     def __init__(
         self,
@@ -221,21 +282,95 @@ class ProcessSupervisor:
         if active_locks:
             return True
 
+        return self.has_active_child_processes(pid)
+
+    @staticmethod
+    def _read_cmdline_tokens(cmdline_file: Path) -> list[str] | None:
+        """Reads NUL-delimited /proc/<pid>/cmdline tokens, failing safe to None on error."""
+        try:
+            raw = cmdline_file.read_bytes()
+        except OSError:
+            return None
+        tokens = [
+            t.decode("utf-8", errors="replace").strip()
+            for t in raw.split(b"\x00")
+            if t
+        ]
+        if len(tokens) == 1 and " " in tokens[0]:
+            tokens = tokens[0].split()
+        return [t for t in tokens if t]
+
+    @classmethod
+    def _is_sidecar_sdk_child(cls, cmdline_file: Path) -> bool:
+        """Returns True only for Node.js runtimes invoking a sidecar_sdk entrypoint."""
+        tokens = cls._read_cmdline_tokens(cmdline_file)
+        if not tokens:
+            return False
+
+        if Path(tokens[0]).name not in cls._NODE_BIN_NAMES:
+            return False
+
+        entrypoint: str | None = None
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--":
+                entrypoint = tokens[i + 1] if i + 1 < len(tokens) else None
+                break
+            if (
+                tok in cls._NODE_NON_ENTRYPOINT_FLAGS
+                or tok.startswith(("--eval=", "--print="))
+                or (
+                    tok.startswith("-")
+                    and not tok.startswith("--")
+                    and len(tok) > 2
+                    and tok[1:].islower()
+                    and any(ch in tok[1:] for ch in ("e", "p", "i", "c"))
+                )
+            ):
+                return False
+            if tok in cls._NODE_VALUE_FLAGS:
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            entrypoint = tok
+            break
+
+        if not entrypoint:
+            return False
+
+        entrypoint_path = Path(entrypoint)
+        return (
+            "sidecar_sdk" in entrypoint_path.parts
+            or entrypoint_path.name in cls._SIDECAR_ENTRYPOINT_FILES
+        )
+
+    def has_active_child_processes(self, pid: int | None = None) -> bool:
+        """Checks for non-zombie child processes of language_server excluding Node sidecar_sdk."""
         target_pid = pid if pid is not None else self.locate_language_server_pid()
-        if target_pid is not None:
-            proc_path = self.proc_dir
-            if proc_path.is_dir():
-                try:
-                    for p_dir in proc_path.iterdir():
-                        if not p_dir.name.isdigit():
-                            continue
-                        parsed = self._parse_stat_state_and_ppid(p_dir / "stat")
-                        if parsed is not None:
-                            state, ppid = parsed
-                            if ppid == target_pid and state != "Z":
-                                return True
-                except OSError:
-                    pass
+        if target_pid is None or target_pid <= 0:
+            return False
+
+        proc_path = self.proc_dir
+        if not proc_path.is_dir():
+            return False
+
+        try:
+            for p_dir in proc_path.iterdir():
+                if not p_dir.name.isdigit():
+                    continue
+                parsed = self._parse_stat_state_and_ppid(p_dir / "stat")
+                if parsed is None:
+                    continue
+                state, ppid = parsed
+                if ppid != target_pid or state == "Z":
+                    continue
+                if not self._is_sidecar_sdk_child(p_dir / "cmdline"):
+                    return True
+        except OSError:
+            pass
 
         return False
 
@@ -350,4 +485,4 @@ class ProcessSupervisor:
 
 
 
-__all__ = ["ProcessSupervisor"]
+__all__ = ["ProcessSupervisor", "is_transcript_record_quiescent"]

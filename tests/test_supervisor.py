@@ -31,7 +31,7 @@ from agy_switcher.models import (
     QuotaStatus,
     EvaluationCandidate,
 )
-from agy_switcher.supervisor import ProcessSupervisor
+from agy_switcher.supervisor import ProcessSupervisor, is_transcript_record_quiescent
 from agy_switcher.formatters import (
     format_countdown,
     format_accounts_listicle,
@@ -988,6 +988,230 @@ class TestProcessSupervisor(unittest.TestCase):
             cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
         )
         self.assertTrue(self.supervisor.is_invoked_by_language_server(current_pid=1))
+
+    def test_is_transcript_record_quiescent_global_quiescence_edge_001(self):
+        """[GLOBAL-QUIESCENCE-EDGE-001]: Only PLANNER_RESPONSE DONE without tool_calls is quiescent."""
+        quiescent_cases = [
+            ("planner_done_no_tool_calls", {"type": "PLANNER_RESPONSE", "status": "DONE"}),
+            (
+                "trimmed_case_insensitive_empty_tool_calls",
+                {"type": " planner_response ", "status": " done ", "tool_calls": []},
+            ),
+            (
+                "planner_done_null_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": None},
+            ),
+            (
+                "planner_done_empty_dict_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": {}},
+            ),
+        ]
+        for label, record in quiescent_cases:
+            with self.subTest(case=label):
+                self.assertTrue(is_transcript_record_quiescent(record))
+
+        non_quiescent_cases: list[tuple[str, object]] = [
+            (
+                "planner_done_with_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{"name": "run"}]},
+            ),
+            (
+                "planner_done_with_empty_dict_in_tool_calls_list",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{}]},
+            ),
+            (
+                "planner_done_with_non_empty_dict_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": {"name": "run"}},
+            ),
+            (
+                "planner_done_with_str_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": "x"},
+            ),
+            (
+                "planner_done_with_empty_str_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": ""},
+            ),
+            (
+                "planner_done_with_zero_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": 0},
+            ),
+            (
+                "planner_done_with_false_tool_calls",
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": False},
+            ),
+            ("user_input", {"type": "USER_INPUT"}),
+            ("user_input_done", {"type": "USER_INPUT", "status": "DONE"}),
+            ("generic_done", {"type": "GENERIC", "status": "DONE"}),
+            ("message_done", {"type": "MESSAGE", "status": "DONE"}),
+            ("planner_in_progress", {"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS"}),
+            ("planner_running", {"type": "PLANNER_RESPONSE", "status": "RUNNING"}),
+            ("planner_streaming", {"type": "PLANNER_RESPONSE", "status": "STREAMING"}),
+            ("non_string_type_int", {"type": 123, "status": "DONE"}),
+            ("non_string_status_none", {"type": "PLANNER_RESPONSE", "status": None}),
+            ("non_string_status_bool", {"type": "PLANNER_RESPONSE", "status": True}),
+            ("missing_status", {"type": "PLANNER_RESPONSE"}),
+            ("missing_type", {"status": "DONE"}),
+            ("none_record", None),
+            ("list_record", []),
+            ("str_record", "PLANNER_RESPONSE"),
+            ("int_record", 123),
+        ]
+        for label, record in non_quiescent_cases:
+            with self.subTest(case=label):
+                self.assertFalse(is_transcript_record_quiescent(record))
+
+    def test_has_active_child_processes_sidecar_exclusion_and_tool_shells(self):
+        """[GLOBAL-QUIESCENCE-001][GLOBAL-QUIESCENCE-EDGE-003]: Excludes Node sidecar_sdk but flags tool shells."""
+        self._write_proc_node(
+            500,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00--enable_sidecars\x00",
+        )
+        # Persistent Node.js sidecar_sdk child (PID 501) -> excluded
+        self._write_proc_node(
+            501,
+            ppid=500,
+            comm="node",
+            cmdline=b"node\x00/opt/antigravity/sidecar_sdk/index.js\x00",
+        )
+        # Zombie child (PID 509) -> excluded
+        self._write_proc_node(509, ppid=500, comm="defunct", state="Z")
+
+        self.assertFalse(self.supervisor.has_active_child_processes(500))
+        self.assertFalse(self.supervisor.has_active_child_processes())
+        self.assertFalse(self.supervisor.is_server_busy(500))
+
+        # Second sidecar via nodejs + VM flags -> still excluded
+        self._write_proc_node(
+            504,
+            ppid=500,
+            comm="nodejs",
+            cmdline=b"/usr/bin/nodejs\x00--max-old-space-size=4096\x00/opt/antigravity/sidecar_sdk/dist/main.mjs\x00--stdio\x00",
+        )
+        # Full path node with --inspect and --enable_sidecars -> still excluded
+        self._write_proc_node(
+            505,
+            ppid=500,
+            comm="node",
+            cmdline=b"/usr/local/bin/node\x00--inspect\x00/opt/antigravity/sidecar_sdk/dist/main.js\x00--enable_sidecars\x00",
+        )
+        self.assertFalse(self.supervisor.has_active_child_processes(500))
+
+        # Non-zombie states (R, D, T) on non-sidecar children are all active
+        for state in ("R", "D", "T"):
+            with self.subTest(non_zombie_state=state):
+                self._write_proc_node(
+                    506,
+                    ppid=500,
+                    comm="worker",
+                    state=state,
+                    cmdline=b"/usr/bin/python3\x00worker.py\x00",
+                )
+                self.assertTrue(self.supervisor.has_active_child_processes(500))
+        (self.proc_dir / "506" / "stat").unlink()
+        (self.proc_dir / "506" / "cmdline").unlink()
+        (self.proc_dir / "506").rmdir()
+
+        # Bash tool child (PID 502) -> active
+        self._write_proc_node(
+            502,
+            ppid=500,
+            comm="bash",
+            cmdline=b"/bin/bash\x00-c\x00pytest\x00",
+        )
+        self.assertTrue(self.supervisor.has_active_child_processes(500))
+        self.assertTrue(self.supervisor.is_server_busy(500))
+
+        # Remove PID 502, add bash child mentioning "sidecar_sdk" (PID 503) -> [GLOBAL-QUIESCENCE-EDGE-003] active
+        (self.proc_dir / "502" / "stat").unlink()
+        (self.proc_dir / "502" / "cmdline").unlink()
+        (self.proc_dir / "502").rmdir()
+        self._write_proc_node(
+            503,
+            ppid=500,
+            comm="bash",
+            cmdline=b"/bin/bash\x00-c\x00grep -r sidecar_sdk scripts/\x00",
+        )
+        self.assertTrue(self.supervisor.has_active_child_processes(500))
+        self.assertTrue(self.supervisor.is_server_busy(500))
+
+    def test_has_active_child_processes_unreadable_cmdline_and_node_edge_cases(self):
+        """[GLOBAL-QUIESCENCE-ERR-002]: Missing/unreadable cmdline and non-sidecar Node scripts fail safe to True."""
+        self._write_proc_node(
+            500,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+        )
+        # Invalid/zero/negative PID never matches init/kthreadd ppid=0
+        self._write_proc_node(1, ppid=0, comm="systemd", cmdline=b"/sbin/init\x00")
+        self.assertFalse(self.supervisor.has_active_child_processes(0))
+        self.assertFalse(self.supervisor.has_active_child_processes(-1))
+
+        # Unreadable /proc/<other_pid>/stat on unrelated process is skipped safely
+        self._write_proc_node(
+            501,
+            ppid=500,
+            comm="node",
+            cmdline=b"node\x00/opt/antigravity/sidecar_sdk/index.js\x00",
+        )
+        self._write_proc_node(549, ppid=1, comm="other", cmdline=b"/bin/sleep\x0010\x00")
+        unreadable_stat = self.proc_dir / "549" / "stat"
+        orig_read_bytes = Path.read_bytes
+
+        def mock_read_unreadable_stat(path_obj: Path) -> bytes:
+            if path_obj == unreadable_stat:
+                raise PermissionError(13, "Permission denied")
+            return orig_read_bytes(path_obj)
+
+        with patch.object(Path, "read_bytes", side_effect=mock_read_unreadable_stat, autospec=True):
+            self.assertFalse(self.supervisor.has_active_child_processes(500))
+
+        # Missing /proc/550/cmdline -> fails safe to True
+        self._write_proc_node(550, ppid=500, comm="unknown")
+        self.assertTrue(self.supervisor.has_active_child_processes(500))
+        self.assertTrue(self.supervisor.is_server_busy(500))
+
+        # Clean up PID 550, test PermissionError reading /proc/551/cmdline
+        (self.proc_dir / "550" / "stat").unlink()
+        (self.proc_dir / "550").rmdir()
+        self._write_proc_node(
+            551,
+            ppid=500,
+            comm="node",
+            cmdline=b"node\x00/opt/antigravity/sidecar_sdk/index.js\x00",
+        )
+        unreadable_cmdline = self.proc_dir / "551" / "cmdline"
+
+        def mock_read_bytes(path_obj: Path) -> bytes:
+            if path_obj == unreadable_cmdline:
+                raise PermissionError(13, "Permission denied")
+            return orig_read_bytes(path_obj)
+
+        with patch.object(Path, "read_bytes", side_effect=mock_read_bytes, autospec=True):
+            self.assertTrue(self.supervisor.has_active_child_processes(500))
+            self.assertTrue(self.supervisor.is_server_busy(500))
+
+        # Non-sidecar Node edge cases must all classify as busy (True)
+        non_sidecar_cmdlines = [
+            ("node_eval_sidecar", b"node\x00-e\x00console.log('sidecar_sdk')\x00"),
+            ("node_combined_pe_flag", b"node\x00-pe\x00/opt/antigravity/sidecar_sdk/index.js\x00"),
+            ("node_arg_sidecar", b"node\x00/tmp/worker.js\x00sidecar_sdk\x00"),
+            ("node_flag_sidecar", b"node\x00/tmp/evil.js\x00--flag=sidecar_sdk\x00"),
+            ("node_watch_path_sidecar", b"node\x00--watch-path\x00/opt/antigravity/sidecar_sdk\x00/tmp/evil.js\x00"),
+            ("node_test_script", b"node\x00/tmp/test_sidecar_sdk.js\x00"),
+            ("node_hyphen_script", b"node\x00/tmp/sidecar_sdk-test.js\x00"),
+            ("node_dot_spec_script", b"node\x00/tmp/sidecar_sdk.spec.js\x00"),
+            ("node_hyphen_dir_script", b"node\x00/tmp/sidecar_sdk-helper/run.js\x00"),
+            ("node_no_script", b"node\x00--version\x00"),
+            ("empty_cmdline", b"\x00"),
+            ("blank_cmdline", b""),
+        ]
+        for label, cmdline in non_sidecar_cmdlines:
+            with self.subTest(case=label):
+                self._write_proc_node(551, ppid=500, comm="node", cmdline=cmdline)
+                self.assertTrue(self.supervisor.has_active_child_processes(500))
 
 
 
