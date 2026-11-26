@@ -535,9 +535,15 @@ class DoctorEngine:
         if self.active_file.is_file():
             files_to_check.append(self.active_file)
         if self.cache_dir.is_dir():
-            for cf in self.cache_dir.iterdir():
-                if cf.is_file():
-                    files_to_check.append(cf)
+            try:
+                for cf in self.cache_dir.iterdir():
+                    try:
+                        if not cf.is_symlink() and cf.is_file():
+                            files_to_check.append(cf)
+                    except (PermissionError, OSError):
+                        pass
+            except (PermissionError, OSError):
+                pass
         if self.config_file.is_file():
             files_to_check.append(self.config_file)
         watch_pid = self.vault_dir / "watch.pid"
@@ -1354,6 +1360,8 @@ class DoctorEngine:
                     def _safe_chmod(target: Path, mode: int) -> None:
                         try:
                             os.chmod(target, mode)
+                        except FileNotFoundError:
+                            return
                         except OSError as e:
                             chmod_errors.append(f"{target.name}: {e}")
 
@@ -1371,9 +1379,15 @@ class DoctorEngine:
                         _safe_chmod(self.active_file, 0o600)
                     if self.cache_dir.is_dir():
                         _safe_chmod(self.cache_dir, 0o700)
-                        for cf in self.cache_dir.iterdir():
-                            if cf.is_file():
-                                _safe_chmod(cf, 0o600)
+                        try:
+                            for cf in self.cache_dir.iterdir():
+                                try:
+                                    if not cf.is_symlink() and cf.is_file():
+                                        _safe_chmod(cf, 0o600)
+                                except (PermissionError, OSError):
+                                    continue
+                        except (PermissionError, OSError) as e:
+                            chmod_errors.append(f"{self.cache_dir.name}: {e}")
                     if self.config_file.is_file():
                         _safe_chmod(self.config_file, 0o600)
                     watch_pid = self.vault_dir / "watch.pid"
