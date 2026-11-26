@@ -1879,6 +1879,309 @@ class TestPreflightAuthProbe(unittest.TestCase):
         self.assertFalse(verdict_corrupt.get("ok"))
         self.assertEqual(verdict_corrupt.get("error_type"), "auth")
 
+    @patch("urllib.request.urlopen")
+    def test_preflight_network_fail_open_urlerror_timeout_and_5xx(self, mock_urlopen):
+        """[AUTH-GATE-EDGE-001] URLError, TimeoutError, and HTTP 5xx emit stderr warning and fail open."""
+        import io
+        from agy_switcher.telemetry import probe_account_auth
+
+        self._write_account_token(
+            "work-acc",
+            access_token="ya29.valid_local",
+            refresh_token="1//valid_refresh",
+        )
+
+        transient_cases = [
+            ("urlerror", urllib.error.URLError("Network unreachable")),
+            ("timeout", TimeoutError("Request timed out")),
+            (
+                "http_503",
+                urllib.error.HTTPError(
+                    "https://daily-cloudcode-pa.googleapis.com",
+                    503,
+                    "Service Unavailable",
+                    {},
+                    None,
+                ),
+            ),
+            (
+                "http_501",
+                urllib.error.HTTPError(
+                    "https://daily-cloudcode-pa.googleapis.com",
+                    501,
+                    "Not Implemented",
+                    {},
+                    None,
+                ),
+            ),
+        ]
+
+        for label, side_exc in transient_cases:
+            with self.subTest(case=label):
+                mock_urlopen.reset_mock()
+                mock_urlopen.side_effect = side_exc
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    verdict = probe_account_auth(self.engine, "work-acc")
+
+                self.assertTrue(verdict.get("ok"))
+                self.assertTrue(verdict.get("fail_open"))
+                self.assertFalse(verdict.get("refreshed"))
+                self.assertEqual(verdict.get("error_type"), "network")
+                self.assertTrue(verdict.get("error"))
+                stderr_out = stderr_buf.getvalue()
+                self.assertIn("Warning:", stderr_out)
+                self.assertIn("work-acc", stderr_out)
+                self.assertIn("failing open", stderr_out)
+                self.assertFalse(self.engine.cache_file.exists())
+
+    @patch("urllib.request.urlopen")
+    def test_preflight_network_fail_open_direct_exceptions_and_refresh_5xx(self, mock_urlopen):
+        """Transient network/5xx errors raised directly or during 1x refresh emit warning and fail open."""
+        import io
+        from agy_switcher.telemetry import probe_account_auth
+
+        self._write_account_token(
+            "work-acc",
+            access_token="ya29.valid_local",
+            refresh_token="1//valid_refresh",
+        )
+
+        # Case 1: Direct exceptions raised by client.fetch_quota
+        for label, exc in (
+            ("direct_urlerror", urllib.error.URLError("DNS lookup failed")),
+            ("direct_timeout", TimeoutError("Socket read timed out")),
+            (
+                "direct_http_503",
+                urllib.error.HTTPError(
+                    "https://daily-cloudcode-pa.googleapis.com",
+                    503,
+                    "Service Unavailable",
+                    {},
+                    None,
+                ),
+            ),
+        ):
+            with self.subTest(case=label):
+                client = MagicMock(spec=QuotaClient)
+                client.fetch_quota.side_effect = exc
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    verdict = probe_account_auth(self.engine, "work-acc", client=client)
+
+                self.assertTrue(verdict.get("ok"))
+                self.assertTrue(verdict.get("fail_open"))
+                self.assertFalse(verdict.get("refreshed"))
+                self.assertEqual(verdict.get("error_type"), "network")
+                stderr_out = stderr_buf.getvalue()
+                self.assertIn("Warning:", stderr_out)
+                self.assertIn("failing open", stderr_out)
+
+        # Case 2: 401 initial probe -> transient URLError / TimeoutError / HTTP 503 during refresh
+        refresh_client = QuotaClient(timeout=0.5, engine=self.engine, fallback_quota_endpoint=None)
+        for label, refresh_exc in (
+            ("refresh_urlerror", urllib.error.URLError("Token endpoint unreachable")),
+            ("refresh_timeout", TimeoutError("Token endpoint timed out")),
+            (
+                "refresh_503_proxy_text",
+                urllib.error.HTTPError(
+                    refresh_client.token_endpoint,
+                    503,
+                    "Service Unavailable (upstream unauthorized)",
+                    {},
+                    None,
+                ),
+            ),
+        ):
+            with self.subTest(case=label):
+                mock_401 = urllib.error.HTTPError(
+                    refresh_client.quota_endpoint, 401, "Unauthorized", {}, None
+                )
+                mock_urlopen.reset_mock()
+                mock_urlopen.side_effect = [mock_401, refresh_exc]
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    verdict = probe_account_auth(self.engine, "work-acc", client=refresh_client)
+
+                self.assertTrue(verdict.get("ok"))
+                self.assertTrue(verdict.get("fail_open"))
+                self.assertFalse(verdict.get("refreshed"))
+                self.assertEqual(verdict.get("error_type"), "network")
+                stderr_out = stderr_buf.getvalue()
+                self.assertIn("Warning:", stderr_out)
+                self.assertIn("work-acc", stderr_out)
+                self.assertIn("failing open", stderr_out)
+
+    @patch("urllib.request.urlopen")
+    def test_preflight_auth_401_403_with_5xx_tokens_in_message_must_fail_closed(self, mock_urlopen):
+        """HTTP 401/403 errors containing 5xx numbers (e.g. req=503, 500 ms) must NEVER fail open."""
+        from agy_switcher.telemetry import probe_account_auth
+
+        self._write_account_token(
+            "revoked-acc",
+            access_token="ya29.revoked",
+            refresh_token="1//valid_refresh",
+        )
+
+        # Case 1: Mock client returning {} with last_error_type="http" and 401/403 + 5xx numbers
+        for err_msg in (
+            "HTTP Error 403: Forbidden (req=503)",
+            "HTTP Error 401: Unauthorized (latency 500 ms, port 502)",
+            "HTTP Error 400: Bad Request (invalid_grant, req=503)",
+            "Access Forbidden (req=503)",
+        ):
+            with self.subTest(client_http_msg=err_msg):
+                client = MagicMock(spec=QuotaClient)
+                client.fetch_quota.return_value = {}
+                client.last_error = err_msg
+                client.last_error_type = "http"
+                client.refresh_access_token.return_value = None
+
+                verdict = probe_account_auth(self.engine, "revoked-acc", client=client)
+                self.assertFalse(verdict.get("ok"))
+                self.assertFalse(verdict.get("fail_open"))
+                self.assertEqual(verdict.get("error_type"), "auth")
+
+        # Case 2: Direct exception containing 403 + req=503
+        client_exc = MagicMock(spec=QuotaClient)
+        client_exc.fetch_quota.side_effect = RuntimeError("HTTP Error 403: Forbidden (req=503)")
+        client_exc.refresh_access_token.return_value = None
+        client_exc.last_error = None
+        client_exc.last_error_type = None
+        verdict_exc = probe_account_auth(self.engine, "revoked-acc", client=client_exc)
+        self.assertFalse(verdict_exc.get("ok"))
+        self.assertFalse(verdict_exc.get("fail_open"))
+        self.assertEqual(verdict_exc.get("error_type"), "auth")
+
+        # Case 3: Real QuotaClient receiving HTTPError 403 with req=503 in reason -> 403 on refresh
+        real_client = QuotaClient(timeout=0.5, engine=self.engine, fallback_quota_endpoint=None)
+        mock_403_probe = urllib.error.HTTPError(
+            real_client.quota_endpoint, 403, "Forbidden (req=503)", {}, None
+        )
+        mock_403_refresh = urllib.error.HTTPError(
+            real_client.token_endpoint, 403, "Forbidden (req=500)", {}, None
+        )
+        mock_urlopen.side_effect = [mock_403_probe, mock_403_refresh]
+        verdict_real = probe_account_auth(self.engine, "revoked-acc", client=real_client)
+        self.assertFalse(verdict_real.get("ok"))
+        self.assertFalse(verdict_real.get("fail_open"))
+        self.assertEqual(verdict_real.get("error_type"), "auth")
+
+    @patch("urllib.request.urlopen")
+    def test_preflight_network_fail_open_5xx_all_codes_socket_and_retry_paths(self, mock_urlopen):
+        """All 5xx codes, socket.timeout, OSError/HTTPException, and post-refresh retry failures fail open with stderr warning."""
+        import http.client
+        import io
+        import socket
+        import ssl
+        from agy_switcher.telemetry import probe_account_auth
+
+        self._write_account_token(
+            "work-acc",
+            access_token="ya29.valid_local",
+            refresh_token="1//valid_refresh",
+        )
+
+        # 1. Direct socket.timeout, OSError, ssl.SSLError, RemoteDisconnected, IncompleteRead
+        for label, exc in (
+            ("socket_timeout", socket.timeout("timed out")),
+            ("oserror_net", OSError(101, "Network is unreachable")),
+            ("ssl_eof", ssl.SSLError("EOF occurred in violation of protocol")),
+            ("remote_disconnected", http.client.RemoteDisconnected("Remote end closed connection")),
+            ("incomplete_read", http.client.IncompleteRead(b'{"groups":')),
+        ):
+            with self.subTest(direct_exc=label):
+                mock_urlopen.reset_mock()
+                mock_urlopen.side_effect = exc
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    verdict = probe_account_auth(self.engine, "work-acc")
+                self.assertTrue(verdict.get("ok"))
+                self.assertTrue(verdict.get("fail_open"))
+                self.assertEqual(verdict.get("error_type"), "network")
+                self.assertIn("Warning:", stderr_buf.getvalue())
+
+        # 2. HTTP 500/501/502/503/504 during 1x refresh (both plain and with auth-like proxy wording)
+        refresh_client = QuotaClient(timeout=0.5, engine=self.engine, fallback_quota_endpoint=None)
+        for code in (500, 501, 502, 503, 504):
+            for body_bytes in (b"upstream timeout", b'{"error": "unauthorized proxy"}'):
+                with self.subTest(refresh_code=code, body=body_bytes):
+                    mock_401 = urllib.error.HTTPError(
+                        refresh_client.quota_endpoint, 401, "Unauthorized", {}, None
+                    )
+                    mock_5xx = urllib.error.HTTPError(
+                        refresh_client.token_endpoint,
+                        code,
+                        "Server Error",
+                        {},
+                        io.BytesIO(body_bytes),
+                    )
+                    mock_urlopen.reset_mock()
+                    mock_urlopen.side_effect = [mock_401, mock_5xx]
+                    stderr_buf = io.StringIO()
+                    with patch("sys.stderr", stderr_buf):
+                        verdict = probe_account_auth(self.engine, "work-acc", client=refresh_client)
+                    self.assertTrue(verdict.get("ok"))
+                    self.assertTrue(verdict.get("fail_open"))
+                    self.assertFalse(verdict.get("refreshed"))
+                    self.assertEqual(verdict.get("error_type"), "network")
+                    self.assertIn("Warning:", stderr_buf.getvalue())
+
+        # 3. Mock client refresh returns None with last_error_type="http" + 503 proxy text, or None + timeout text
+        for err_msg, err_type in (
+            ("HTTP Error 503: Service Unavailable (upstream unauthorized)", "http"),
+            ("Token endpoint timed out", None),
+        ):
+            with self.subTest(mock_refresh_err=err_msg, mock_refresh_type=err_type):
+                m_client = MagicMock(spec=QuotaClient)
+                m_client.fetch_quota.side_effect = urllib.error.HTTPError(
+                    "https://daily-cloudcode-pa.googleapis.com", 401, "Unauthorized", {}, None
+                )
+
+                def _fail_refresh(_rt: str, _msg: str = err_msg, _typ: str | None = err_type) -> None:
+                    m_client.last_error = _msg
+                    m_client.last_error_type = _typ
+                    return None
+
+                m_client.refresh_access_token.side_effect = _fail_refresh
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    verdict = probe_account_auth(self.engine, "work-acc", client=m_client)
+                self.assertTrue(verdict.get("ok"))
+                self.assertTrue(verdict.get("fail_open"))
+                self.assertEqual(verdict.get("error_type"), "network")
+                self.assertIn("Warning:", stderr_buf.getvalue())
+
+        # 4. 401 -> refresh succeeds -> retry probe hits URLError / TimeoutError / HTTP 503
+        for retry_exc in (
+            urllib.error.URLError("Retry DNS failed"),
+            TimeoutError("Retry timed out"),
+            urllib.error.HTTPError(
+                refresh_client.quota_endpoint, 503, "Service Unavailable", {}, None
+            ),
+        ):
+            with self.subTest(retry_exc=type(retry_exc).__name__):
+                mock_401 = urllib.error.HTTPError(
+                    refresh_client.quota_endpoint, 401, "Unauthorized", {}, None
+                )
+                mock_refresh_ok = MagicMock()
+                mock_refresh_ok.read.return_value = json.dumps({
+                    "access_token": "ya29.refreshed_for_retry",
+                    "expires_in": 3600,
+                }).encode("utf-8")
+                mock_refresh_ok.__enter__.return_value = mock_refresh_ok
+
+                mock_urlopen.reset_mock()
+                mock_urlopen.side_effect = [mock_401, mock_refresh_ok, retry_exc]
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    verdict = probe_account_auth(self.engine, "work-acc", client=refresh_client)
+                self.assertTrue(verdict.get("ok"))
+                self.assertTrue(verdict.get("fail_open"))
+                self.assertTrue(verdict.get("refreshed"))
+                self.assertEqual(verdict.get("error_type"), "network")
+                self.assertIn("Warning:", stderr_buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import ssl
 import sys
 import tempfile
 import threading
@@ -66,6 +67,8 @@ DEFAULT_FALLBACK_QUOTA_ENDPOINT = f"{DEFAULT_FALLBACK_CLOUDCODE_ENDPOINT}{QUOTA_
 # Error classification patterns and phrases
 AUTH_ERROR_CODE_PATTERN = re.compile(r"\b(401|403)\b")
 HTTP_SERVER_ERROR_PATTERN = re.compile(r"\b(500|502|503|504)\b")
+HTTP_STATUS_CODE_PATTERN = re.compile(r"\bHTTP(?:/[\d.]+|\s+Error)?\s+(\d{3})\b", re.IGNORECASE)
+HTTP_5XX_ERROR_PATTERN = re.compile(r"\bHTTP(?:/[\d.]+|\s+Error)?\s+5\d{2}\b", re.IGNORECASE)
 QUOTA_REGEX = re.compile(
     r"^(Gemini Models|Claude and GPT models)\s+"
     r"(Weekly Limit Remaining|Five Hour Limit Remaining)\s+"
@@ -109,6 +112,26 @@ def _has_auth_indicator(text: Any) -> bool:
     if AUTH_ERROR_CODE_PATTERN.search(lower):
         return True
     return False
+
+
+def _classify_http_error_message(err_msg: str) -> str:
+    """Classifies an HTTP error message into 'auth', 'network', or 'http' with 401/403 precedence."""
+    status_match = HTTP_STATUS_CODE_PATTERN.search(err_msg)
+    if status_match:
+        status_code = int(status_match.group(1))
+        if status_code in (401, 403):
+            return "auth"
+        if 500 <= status_code <= 599 or status_code in (408, 429):
+            return "network"
+        if _has_auth_indicator(err_msg):
+            return "auth"
+        return "http"
+
+    if _has_auth_indicator(err_msg):
+        return "auth"
+    if HTTP_SERVER_ERROR_PATTERN.search(err_msg):
+        return "network"
+    return "http"
 
 
 def _parse_timestamp_defensive(val: Any) -> float:
@@ -184,10 +207,10 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
         if isinstance(code, int):
             if code in (401, 403):
                 return True
-            if code in (500, 502, 503, 504):
+            if 500 <= code <= 599:
                 return False
         err_str = str(error_val.get("error", "")).lower()
-        if raw_type == "http" and _has_auth_indicator(err_str):
+        if raw_type == "http" and _classify_http_error_message(err_str) == "auth":
             return True
         if isinstance(raw_type, str) and raw_type.strip() and raw_type.strip() != "auth":
             return False
@@ -195,9 +218,9 @@ def _is_auth_error(error_val: Any, client: Any = None) -> bool:
         if isinstance(error_val, urllib.error.HTTPError):
             if error_val.code in (401, 403):
                 return True
-            if error_val.code in (500, 502, 503, 504):
+            if 500 <= error_val.code <= 599:
                 return False
-        if isinstance(error_val, (TimeoutError, ConnectionError)):
+        if isinstance(error_val, (TimeoutError, ConnectionError, ssl.SSLError)) or type(error_val).__module__ == "http.client":
             return False
         if isinstance(error_val, urllib.error.URLError) and not isinstance(error_val, urllib.error.HTTPError):
             return False
@@ -227,8 +250,10 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
         return False
     if isinstance(error_val, urllib.error.HTTPError):
         # Only classify 5xx server errors as transient network/transport errors
-        return error_val.code in (500, 502, 503, 504)
-    if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError)):
+        return 500 <= error_val.code <= 599
+    if isinstance(error_val, (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError)) or (
+        isinstance(error_val, Exception) and type(error_val).__module__ == "http.client"
+    ):
         return True
     if isinstance(error_val, dict):
         if error_val.get("error_type") == "network":
@@ -237,10 +262,12 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
             return False
         if error_val.get("error_type") == "http":
             code = error_val.get("code") or error_val.get("status_code")
+            if isinstance(code, str) and code.isdigit():
+                code = int(code)
             if isinstance(code, int):
-                return code in (500, 502, 503, 504)
+                return 500 <= code <= 599
             err_str = str(error_val.get("error", "")).lower()
-            return bool(HTTP_SERVER_ERROR_PATTERN.search(err_str))
+            return _classify_http_error_message(err_str) == "network"
         err_str = str(error_val.get("error", "")).lower()
     elif isinstance(error_val, Exception):
         err_str = str(error_val).lower()
@@ -265,7 +292,7 @@ def _is_network_error(error_val: Any, client: Any = None) -> bool:
             return True
         if isinstance(c_type, str) and c_type == "http":
             c_err = getattr(client, "last_error", None)
-            if isinstance(c_err, str) and bool(HTTP_SERVER_ERROR_PATTERN.search(c_err)):
+            if isinstance(c_err, str) and _classify_http_error_message(c_err) == "network":
                 return True
         c_err = getattr(client, "last_error", None)
         if isinstance(c_err, str):
@@ -799,25 +826,30 @@ class QuotaClient:
                 except Exception:
                     if "invalid_grant" in body_text.lower():
                         err_detail = f"{err_detail} (invalid_grant)"
-            if e.code in (400, 401, 403) or _has_auth_indicator(err_detail):
+            if e.code in (400, 401, 403):
                 self.last_error = f"Token refresh rejected: {err_detail}"
                 self.last_error_type = "auth"
             elif e.code >= 500 or e.code in (408, 429):
                 self.last_error = f"Token refresh network error: {err_detail}"
                 self.last_error_type = "network"
+            elif _has_auth_indicator(err_detail):
+                self.last_error = f"Token refresh rejected: {err_detail}"
+                self.last_error_type = "auth"
             else:
                 self.last_error = f"Token refresh failed: {err_detail}"
                 self.last_error_type = "http"
             print(f"[QuotaClient] Failed to refresh token: {err_detail}", file=sys.stderr)
             return None
-        except (urllib.error.URLError, TimeoutError) as e:
-            self.last_error = f"Token refresh network error: {e}"
-            self.last_error_type = "network"
-            print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
-            return None
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self.last_error = f"Token refresh parse error: {e}"
             self.last_error_type = "parse"
+            print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
+            return None
+        except Exception as e:
+            if not isinstance(e, (urllib.error.URLError, TimeoutError, OSError)) and type(e).__module__ != "http.client":
+                raise
+            self.last_error = f"Token refresh network error: {e}"
+            self.last_error_type = "network"
             print(f"[QuotaClient] Failed to refresh token: {e}", file=sys.stderr)
             return None
 
@@ -1020,12 +1052,20 @@ class QuotaClient:
                     self.last_error_type = "http"
                     print(f"[QuotaClient] HTTP Error {e.code}: {e.reason}", file=sys.stderr)
                     return {}
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            except Exception as e:
+                if (
+                    not isinstance(
+                        e,
+                        (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError),
+                    )
+                    and type(e).__module__ != "http.client"
+                ):
+                    raise
                 if has_fallback:
                     print(f"[QuotaClient] Primary endpoint error ({e}). Falling back to {self.fallback_quota_endpoint}", file=sys.stderr)
                     continue
                 self.last_error = f"Network or Parse Error: {e}"
-                self.last_error_type = "network" if isinstance(e, (urllib.error.URLError, TimeoutError)) else "parse"
+                self.last_error_type = "parse" if isinstance(e, (json.JSONDecodeError, UnicodeDecodeError)) else "network"
                 print(f"[QuotaClient] Network or Parse Error: {e}", file=sys.stderr)
                 return {}
 
@@ -1286,7 +1326,7 @@ def _classify_probe_failure(client: Any, exc: Exception | None = None) -> tuple[
                 pass
             if exc.code in (401, 403):
                 return str(exc), "auth"
-            if exc.code >= 500 or exc.code in (408, 429):
+            if 500 <= exc.code <= 599 or exc.code in (408, 429):
                 return str(exc), "network"
         err_str = str(exc)
         err_type = "network" if _is_network_error(exc) else ("auth" if _is_auth_error(exc) else "general")
@@ -1295,14 +1335,16 @@ def _classify_probe_failure(client: Any, exc: Exception | None = None) -> tuple[
     raw_err = getattr(client, "last_error", None)
     err_msg = raw_err if isinstance(raw_err, str) and raw_err else "Fetch failed"
     raw_type = getattr(client, "last_error_type", None)
-    if raw_type == "http" and bool(HTTP_SERVER_ERROR_PATTERN.search(err_msg)):
-        err_type = "network"
-    elif raw_type == "http" and _has_auth_indicator(err_msg):
-        err_type = "auth"
+    if raw_type == "http":
+        err_type = _classify_http_error_message(err_msg)
     elif isinstance(raw_type, str) and raw_type:
         err_type = raw_type
     else:
-        err_type = "auth" if _has_auth_indicator(err_msg) else "network"
+        http_class = _classify_http_error_message(err_msg)
+        if http_class in ("auth", "network"):
+            err_type = http_class
+        else:
+            err_type = "auth" if _has_auth_indicator(err_msg) else "network"
     return err_msg, err_type
 
 
@@ -1363,9 +1405,9 @@ def _probe_quota_once(
 
 def _refresh_failure_verdict(acc_name: str, err_msg: str, err_type: str | None) -> dict[str, Any]:
     """Builds the probe verdict after a failed refresh_access_token attempt."""
-    is_transient = (
-        err_type in ("network", "parse", "general")
-        or (err_type == "http" and not _has_auth_indicator(err_msg))
+    resolved_type = _classify_http_error_message(err_msg) if err_type == "http" else err_type
+    is_transient = resolved_type in ("network", "parse", "general") or (
+        resolved_type == "http" and not _has_auth_indicator(err_msg)
     )
     if is_transient:
         print(
@@ -1376,7 +1418,7 @@ def _refresh_failure_verdict(acc_name: str, err_msg: str, err_type: str | None) 
             "ok": True,
             "account": acc_name,
             "error": err_msg,
-            "error_type": err_type or "network",
+            "error_type": resolved_type or "network",
             "refreshed": False,
             "fail_open": True,
         }
@@ -1478,6 +1520,8 @@ def probe_account_auth(
         ref_type_raw = getattr(client, "last_error_type", None)
         refresh_err_msg = ref_err_raw if isinstance(ref_err_raw, str) and ref_err_raw else err_msg
         refresh_err_type: str | None = ref_type_raw if isinstance(ref_type_raw, str) and ref_type_raw else None
+        if refresh_err_type is None and isinstance(ref_err_raw, str) and ref_err_raw.strip():
+            _, refresh_err_type = _classify_probe_failure(client, exc=None)
         return _refresh_failure_verdict(acc_name, refresh_err_msg, refresh_err_type)
 
     refreshed_access_token = _persist_refreshed_token(engine, acc_name, new_token_data)
