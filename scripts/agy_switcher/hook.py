@@ -174,6 +174,23 @@ def _extract_failover_context(
     return "quota_rotation", f"{display_model} quota below threshold", ""
 
 
+def _save_cache_fail_safe(
+    client: Any,
+    data: dict[str, Any],
+    *,
+    merge: bool = True,
+    evict_keys: set[str] | None = None,
+) -> None:
+    """Persists quota cache fail-safely so EACCES/ENOSPC errors never abort hook execution."""
+    try:
+        if evict_keys is not None:
+            client.save_cache(data, merge=merge, evict_keys=evict_keys)
+        else:
+            client.save_cache(data, merge=merge)
+    except OSError as cache_exc:
+        print(f"[agy-switch hook] Warning: Failed to persist quota cache: {cache_exc}", file=sys.stderr)
+
+
 def _persist_failover_audit(
     engine: AgySwitchEngine,
     from_account: str | None,
@@ -191,6 +208,8 @@ def _persist_failover_audit(
     try:
         log_target = _resolve_vault_log_path(engine=engine)
         if log_target is not None:
+            if log_target.is_symlink():
+                log_target.unlink()
             try:
                 ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
             except (ValueError, TypeError, OverflowError, OSError):
@@ -216,7 +235,11 @@ def _persist_failover_audit(
                 reason=clean_reason,
                 timestamp=timestamp,
             )
-        if trigger == "auth_corruption" and clean_from:
+    except Exception as state_exc:
+        print(f"[agy-switch hook] Warning: Failed to persist failover state: {state_exc}", file=sys.stderr)
+
+    if trigger == "auth_corruption" and clean_from:
+        try:
             record_auth_error = getattr(engine, "record_auth_error", None)
             if callable(record_auth_error):
                 record_auth_error(
@@ -225,8 +248,8 @@ def _persist_failover_audit(
                     error_type=error_type or "auth",
                     timestamp=timestamp,
                 )
-    except Exception as state_exc:
-        print(f"[agy-switch hook] Warning: Failed to persist failover state: {state_exc}", file=sys.stderr)
+        except Exception as auth_exc:
+            print(f"[agy-switch hook] Warning: Failed to persist auth quarantine state: {auth_exc}", file=sys.stderr)
 
 
 def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
@@ -352,7 +375,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                         ):
                             active_entry = dict(active_quota)
                             active_entry["cached_at"] = time.time()
-                            client.save_cache({"accounts": {active_name: active_entry}}, merge=True)
+                            _save_cache_fail_safe(client, {"accounts": {active_name: active_entry}}, merge=True)
                             print(f"[agy-switch hook] Tier 2 probe for '{active_name}' healthy ({active_status.remaining_percentage()}%). Retaining active account.", file=sys.stderr)
                             sys.stdout.write(json.dumps({}) + "\n")
                             sys.stdout.flush()
@@ -410,7 +433,7 @@ def handle_pre_invocation_hook(engine: AgySwitchEngine) -> int:
                     combined_quotas.pop(active_name, None)
 
             # Persist fresh telemetry to cache
-            client.save_cache({"accounts": combined_quotas}, merge=True, evict_keys=evict_keys)
+            _save_cache_fail_safe(client, {"accounts": combined_quotas}, merge=True, evict_keys=evict_keys)
 
             target_account = rot_engine.evaluate(combined_quotas, current_active=active_name, target_model=model_name)
             print(f"[agy-switch hook] Evaluated rotation for {model_name}: {active_name} -> {target_account or active_name}", file=sys.stderr)
