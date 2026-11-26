@@ -572,6 +572,52 @@ class DoctorEngine:
             can_fix=False,
         )
 
+    def _load_quarantined_accounts(self) -> set[str]:
+        """Reads quarantined account aliases from cache/failover_state.json['auth_errors'] safely."""
+        failover_path = self.cache_dir / "failover_state.json"
+        try:
+            st = os.lstat(failover_path)
+        except OSError:
+            return set()
+
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            return set()
+
+        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(failover_path, open_flags)
+        except OSError:
+            return set()
+
+        try:
+            fd_stat = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            return set()
+
+        if not stat.S_ISREG(fd_stat.st_mode):
+            os.close(fd)
+            return set()
+
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                loaded: object = json.load(handle)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError):
+            return set()
+
+        if not isinstance(loaded, dict):
+            return set()
+
+        raw_auth_errors: object = loaded.get("auth_errors")
+        if not isinstance(raw_auth_errors, dict):
+            return set()
+
+        quarantined: set[str] = set()
+        for alias, detail in raw_auth_errors.items():
+            if isinstance(alias, str) and alias.strip() and isinstance(detail, dict):
+                quarantined.add(alias.strip())
+        return quarantined
+
     def _check_token_integrity(self) -> DiagnosticItem:
         """Layer 2: Validates OAuth token JSON schema, extracts JWT identity, and detects expired tokens."""
         if not self.accounts_dir.is_dir():
@@ -636,6 +682,8 @@ class DoctorEngine:
                 can_fix=False,
             )
 
+        quarantined_accounts = self._load_quarantined_accounts()
+
         permission_denied_accounts: list[tuple[str, str, str]] = []
         corrupt_accounts: list[tuple[str, str]] = []
         corrupt_secondary: list[tuple[str, str]] = []
@@ -643,11 +691,18 @@ class DoctorEngine:
         expired_secondary: list[str] = []
         standby_ready: list[str] = []
         missing_identity_accounts: list[str] = []
+        active_quarantined: str | None = None
+        standby_quarantined: list[str] = []
 
         for acc in accounts:
             acc_name = acc.name
             token_path = acc / "token.json"
             is_active = bool(active_account and acc_name == active_account.strip())
+            if acc_name in quarantined_accounts:
+                if is_active:
+                    active_quarantined = acc_name
+                else:
+                    standby_quarantined.append(acc_name)
 
             try:
                 os.scandir(acc).close()
@@ -752,7 +807,8 @@ class DoctorEngine:
 
                 if self._is_token_expired(raw_expiry):
                     if has_valid_refresh:
-                        standby_ready.append(acc_name)
+                        if acc_name not in quarantined_accounts:
+                            standby_ready.append(acc_name)
                     else:
                         expired_secondary.append(acc_name)
 
@@ -776,6 +832,18 @@ class DoctorEngine:
                 can_fix=False,
             )
 
+        if active_quarantined:
+            return DiagnosticItem(
+                category="token_integrity",
+                name="OAuth Token & JWT Identity Integrity",
+                status="FAIL",
+                message=(
+                    f"Active account '{active_quarantined}' is quarantined due to authentication failure. "
+                    f"Re-authenticate with 'agy-switch login {active_quarantined}'."
+                ),
+                can_fix=False,
+            )
+
         if expired_active:
             return DiagnosticItem(
                 category="token_integrity",
@@ -785,8 +853,17 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        if corrupt_secondary or expired_secondary or missing_identity_accounts:
+        if corrupt_secondary or expired_secondary or missing_identity_accounts or standby_quarantined:
             warn_parts: list[str] = []
+            if standby_quarantined:
+                aliases_str = ", ".join(f"'{alias}'" for alias in standby_quarantined)
+                remediations = ", ".join(f"'agy-switch login {alias}'" for alias in standby_quarantined)
+                noun = "account" if len(standby_quarantined) == 1 else "accounts"
+                verb = "is" if len(standby_quarantined) == 1 else "are"
+                warn_parts.append(
+                    f"Standby {noun} {aliases_str} {verb} quarantined due to authentication failure. "
+                    f"Re-authenticate with {remediations}"
+                )
             if expired_secondary:
                 warn_parts.append(
                     f"Secondary account token(s) expired without a valid refresh token "

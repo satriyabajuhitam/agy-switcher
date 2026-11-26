@@ -1742,6 +1742,370 @@ class TestDoctorCLIIntegration(unittest.TestCase):
         # Now busy must be True
         self.assertTrue(self.engine.is_server_busy(101))
 
+    # ---------------------------------------------------------
+    # Layer 2 Auth Quarantine Diagnostics Tests (Ticket 14)
+    # ---------------------------------------------------------
+    def test_quarantine_token_integrity_active_fail(self) -> None:
+        """[DOCTOR-QUARANTINE-001] Active account in failover_state.json['auth_errors'] returns [FAIL] with login remediation."""
+        self._setup_pristine_environment()
+        # Register "automator" as active account with valid local token.json
+        acc_dir = self.vault_dir / "accounts" / "automator"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(acc_dir, 0o700)
+        tok = create_sample_token(email="automator@example.com")
+        tok_path = acc_dir / "token.json"
+        tok_path.write_text(json.dumps(tok), encoding="utf-8")
+        os.chmod(tok_path, 0o600)
+        self.engine.set_active_name("automator")
+
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+        failover_file.write_text(
+            json.dumps(
+                {
+                    "last_failover": None,
+                    "auth_errors": {
+                        "automator": {
+                            "timestamp": 1791201000.0,
+                            "error": "HTTP 403 Forbidden",
+                            "error_type": "auth",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(failover_file, 0o600)
+
+        direct_item = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_item.category, "token_integrity")
+        self.assertEqual(direct_item.status, "FAIL")
+        self.assertFalse(direct_item.can_fix)
+        self.assertIn("automator", direct_item.message)
+        self.assertIn("agy-switch login automator", direct_item.message)
+
+    def test_quarantine_token_integrity_standby_warn(self) -> None:
+        """[DOCTOR-QUARANTINE-002] Standby account in failover_state.json['auth_errors'] returns [WARN] with login remediation."""
+        self._setup_pristine_environment()
+        # Set up healthy active account "honey" and standby account "automator"
+        honey_dir = self.vault_dir / "accounts" / "honey"
+        honey_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(honey_dir, 0o700)
+        honey_tok = create_sample_token(email="honey@example.com")
+        (honey_dir / "token.json").write_text(json.dumps(honey_tok), encoding="utf-8")
+        os.chmod(honey_dir / "token.json", 0o600)
+        self.engine.set_active_name("honey")
+
+        automator_dir = self.vault_dir / "accounts" / "automator"
+        automator_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(automator_dir, 0o700)
+        automator_tok = create_sample_token(email="automator@example.com")
+        (automator_dir / "token.json").write_text(json.dumps(automator_tok), encoding="utf-8")
+        os.chmod(automator_dir / "token.json", 0o600)
+
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+        failover_file.write_text(
+            json.dumps(
+                {
+                    "last_failover": None,
+                    "auth_errors": {
+                        "automator": {
+                            "timestamp": 1791201000.0,
+                            "error": "invalid_grant",
+                            "error_type": "auth",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(failover_file, 0o600)
+
+        direct_item = self.engine.doctor._check_token_integrity()
+        self.assertEqual(direct_item.category, "token_integrity")
+        self.assertEqual(direct_item.status, "WARN")
+        self.assertFalse(direct_item.can_fix)
+        self.assertIn("automator", direct_item.message)
+        self.assertIn("agy-switch login automator", direct_item.message)
+
+    def test_quarantine_token_integrity_corrupt_and_edge_cases(self) -> None:
+        """[DOCTOR-QUARANTINE-ERR-001] Corrupt/unreadable failover_state.json, malformed auth_errors, and precedence edge cases."""
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+
+        # 1. Corrupt JSON, non-dict payloads, and malformed auth_errors must be ignored safely
+        malformed_payloads = [
+            "{bad json",
+            "[]",
+            '"string-payload"',
+            "123",
+            json.dumps({"auth_errors": ["acc_primary"]}),
+            json.dumps({"auth_errors": "acc_primary"}),
+            json.dumps({"auth_errors": {"": {"error": "bad"}}}),
+            json.dumps({"auth_errors": {"acc_primary": "not-a-dict"}}),
+            json.dumps({"auth_errors": {"acc_primary": None}}),
+        ]
+        for idx, payload in enumerate(malformed_payloads):
+            with self.subTest(case=f"malformed_payload_{idx}"):
+                shutil.rmtree(self.vault_dir, ignore_errors=True)
+                self._setup_pristine_environment()
+                failover_file.write_text(payload, encoding="utf-8")
+                os.chmod(failover_file, 0o600)
+
+                direct_item = self.engine.doctor._check_token_integrity()
+                self.assertEqual(direct_item.status, "PASS", f"Expected PASS for payload {payload!r}, got {direct_item}")
+                self.assertFalse(direct_item.can_fix)
+
+        # 2. Symlink failover_state.json must not be followed
+        with self.subTest(case="symlink_ignored"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            victim = self.base_path / "external_failover.json"
+            victim.write_text(json.dumps({"auth_errors": {"acc_primary": {"error": "leak"}}}), encoding="utf-8")
+            failover_file.unlink(missing_ok=True)
+            failover_file.symlink_to(victim)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "PASS")
+
+        # 3. Unreadable failover_state.json (chmod 0000) ignored safely when non-root
+        if os.geteuid() != 0:
+            with self.subTest(case="unreadable_failover_state_ignored"):
+                shutil.rmtree(self.vault_dir, ignore_errors=True)
+                self._setup_pristine_environment()
+                failover_file.write_text(
+                    json.dumps({"auth_errors": {"acc_primary": {"error": "HTTP 403"}}}),
+                    encoding="utf-8",
+                )
+                os.chmod(failover_file, 0o000)
+                try:
+                    direct_item = self.engine.doctor._check_token_integrity()
+                    self.assertEqual(direct_item.status, "PASS")
+                finally:
+                    os.chmod(failover_file, 0o600)
+
+        # 4. Active quarantine takes [FAIL] precedence over standby quarantine / warnings
+        with self.subTest(case="active_fail_precedence_over_standby"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            standby_dir = self.vault_dir / "accounts" / "standby_q"
+            standby_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(standby_dir, 0o700)
+            standby_tok = create_sample_token(email="standby@example.com")
+            (standby_dir / "token.json").write_text(json.dumps(standby_tok), encoding="utf-8")
+            os.chmod(standby_dir / "token.json", 0o600)
+
+            failover_file.write_text(
+                json.dumps(
+                    {
+                        "auth_errors": {
+                            "acc_primary": {"error": "HTTP 403"},
+                            "standby_q": {"error": "HTTP 401"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(failover_file, 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("acc_primary", direct_item.message)
+            self.assertIn("agy-switch login acc_primary", direct_item.message)
+
+        # 5. Standby with expired access token + valid refresh_token that is ALSO quarantined returns [WARN]
+        with self.subTest(case="expired_refreshable_standby_quarantined_warns"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            standby_dir = self.vault_dir / "accounts" / "automator"
+            standby_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(standby_dir, 0o700)
+            standby_tok = create_sample_token(email="automator@example.com", expiry_offset_hours=-3)
+            (standby_dir / "token.json").write_text(json.dumps(standby_tok), encoding="utf-8")
+            os.chmod(standby_dir / "token.json", 0o600)
+
+            failover_file.write_text(
+                json.dumps({"auth_errors": {"automator": {"error": "invalid_grant"}}}),
+                encoding="utf-8",
+            )
+            os.chmod(failover_file, 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "WARN")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("automator", direct_item.message)
+            self.assertIn("agy-switch login automator", direct_item.message)
+
+    def test_quarantine_token_integrity_multi_standby_and_interactions(self) -> None:
+        """Verifies multi-standby quarantine formatting, Layer 2 interactions, stale/whitespace aliases, and custom cache_dir."""
+        from agy_switcher.doctor import DoctorEngine
+
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+
+        # 1. Multi-standby simultaneous quarantine (len > 1): sorted deterministic aliases & remediations
+        with self.subTest(case="multi_standby_sorted"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            for alias in ("zeta", "alpha", "mid"):
+                acc_dir = self.vault_dir / "accounts" / alias
+                acc_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(acc_dir, 0o700)
+                tok = create_sample_token(email=f"{alias}@example.com")
+                (acc_dir / "token.json").write_text(json.dumps(tok), encoding="utf-8")
+                os.chmod(acc_dir / "token.json", 0o600)
+
+            failover_file.write_text(
+                json.dumps(
+                    {
+                        "auth_errors": {
+                            "zeta": {"error": "HTTP 403"},
+                            "alpha": {"error": "HTTP 401"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(failover_file, 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "WARN")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("Standby accounts 'alpha', 'zeta' are quarantined", direct_item.message)
+            self.assertIn("'agy-switch login alpha', 'agy-switch login zeta'", direct_item.message)
+            self.assertNotIn("mid", direct_item.message)
+
+            report = self.engine.run_diagnostics()
+            self.assertEqual(report.exit_code, 1)
+            token_item = next(it for it in report.items if it.category == "token_integrity")
+            self.assertEqual(token_item.status, "WARN")
+
+        # 2. Quarantined active account that ALSO has missing email identity and expired token -> [FAIL]
+        with self.subTest(case="quarantined_active_missing_email_and_expired_fails"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            tok = create_sample_token(email="primary@example.com", expiry_offset_hours=-2)
+            tok.pop("id_token", None)
+            (self.vault_dir / "accounts" / "acc_primary" / "token.json").write_text(
+                json.dumps(tok), encoding="utf-8"
+            )
+            failover_file.write_text(
+                json.dumps({"auth_errors": {"acc_primary": {"error": "invalid_grant"}}}),
+                encoding="utf-8",
+            )
+            os.chmod(failover_file, 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("acc_primary", direct_item.message)
+            self.assertIn("agy-switch login acc_primary", direct_item.message)
+
+        # 3. Active missing email (WARN) + standby quarantined (WARN) surfaces both in [WARN]
+        with self.subTest(case="active_missing_email_plus_standby_quarantined"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            active_tok = create_sample_token(email="primary@example.com")
+            active_tok.pop("id_token", None)
+            (self.vault_dir / "accounts" / "acc_primary" / "token.json").write_text(
+                json.dumps(active_tok), encoding="utf-8"
+            )
+
+            standby_dir = self.vault_dir / "accounts" / "automator"
+            standby_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(standby_dir, 0o700)
+            standby_tok = create_sample_token(email="automator@example.com")
+            (standby_dir / "token.json").write_text(json.dumps(standby_tok), encoding="utf-8")
+            os.chmod(standby_dir / "token.json", 0o600)
+
+            failover_file.write_text(
+                json.dumps({"auth_errors": {"automator": {"error": "HTTP 403"}}}),
+                encoding="utf-8",
+            )
+            os.chmod(failover_file, 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "WARN")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("automator", direct_item.message)
+            self.assertIn("agy-switch login automator", direct_item.message)
+            self.assertIn("acc_primary", direct_item.message)
+
+        # 4. Stale alias in auth_errors (deleted from accounts/) is ignored safely
+        with self.subTest(case="stale_alias_in_auth_errors_ignored"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            failover_file.write_text(
+                json.dumps({"auth_errors": {"deleted-account": {"error": "HTTP 403"}}}),
+                encoding="utf-8",
+            )
+            os.chmod(failover_file, 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "PASS")
+            self.assertFalse(direct_item.can_fix)
+
+        # 5. Whitespace-padded alias matches; whitespace-only alias, binary garbage, and dir are ignored
+        with self.subTest(case="whitespace_alias_and_non_regular_failover_state"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            standby_dir = self.vault_dir / "accounts" / "automator"
+            standby_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(standby_dir, 0o700)
+            (standby_dir / "token.json").write_text(
+                json.dumps(create_sample_token(email="automator@example.com")), encoding="utf-8"
+            )
+            os.chmod(standby_dir / "token.json", 0o600)
+
+            failover_file.write_text(
+                json.dumps(
+                    {
+                        "auth_errors": {
+                            "  automator  ": {"error": "HTTP 401"},
+                            "   ": {"error": "ignored"},
+                            "acc_primary": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(failover_file, 0o600)
+
+            direct_item = self.engine.doctor._check_token_integrity()
+            self.assertEqual(direct_item.status, "WARN")
+            self.assertIn("agy-switch login automator", direct_item.message)
+
+            # Non-UTF-8 binary payload
+            failover_file.write_bytes(b"\xff\xfe\x00\x80invalid")
+            self.assertEqual(self.engine.doctor._check_token_integrity().status, "PASS")
+
+            # Directory instead of regular file
+            failover_file.unlink()
+            failover_file.mkdir()
+            self.assertEqual(self.engine.doctor._check_token_integrity().status, "PASS")
+
+        # 6. Standalone DoctorEngine respects custom cache_dir for failover_state.json
+        with self.subTest(case="standalone_doctor_custom_cache_dir"):
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            self._setup_pristine_environment()
+            custom_cache = self.base_path / "custom_cache"
+            custom_cache.mkdir(parents=True, exist_ok=True)
+            custom_failover = custom_cache / "failover_state.json"
+            custom_failover.write_text(
+                json.dumps({"auth_errors": {"acc_primary": {"error": "HTTP 403"}}}),
+                encoding="utf-8",
+            )
+            os.chmod(custom_failover, 0o600)
+
+            standalone = DoctorEngine(
+                vault_dir=self.vault_dir,
+                cache_dir=custom_cache,
+                gemini_dir=self.gemini_dir,
+                proc_dir=self.proc_dir,
+            )
+            direct_item = standalone._check_token_integrity()
+            self.assertEqual(direct_item.status, "FAIL")
+            self.assertFalse(direct_item.can_fix)
+            self.assertIn("agy-switch login acc_primary", direct_item.message)
+
 
 if __name__ == "__main__":
     unittest.main()
