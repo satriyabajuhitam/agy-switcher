@@ -5,7 +5,7 @@ Strictly acyclic DAG: Does NOT import vault.py, rotation.py, doctor.py, hook.py,
 
 from __future__ import annotations
 
-import argparse, errno, fcntl, glob, json, logging, math, os, re, shutil, signal, ssl, subprocess, sys, threading, time
+import argparse, errno, fcntl, glob, json, logging, math, os, re, shutil, signal, ssl, stat, subprocess, sys, threading, time
 _real_popen = subprocess.Popen
 from datetime import datetime, timezone
 from pathlib import Path
@@ -781,6 +781,32 @@ class LogWatcher:
         target = self._resolve_vault_log_path()
         return target.parent if target is not None else None
 
+    def _write_watch_log_line(self, log_line: str) -> None:
+        """Appends a formatted audit line to watch.log with mode 0600 and safe error handling."""
+        try:
+            if (log_dir := self._resolve_audit_log_dir()) is None:
+                return
+            append_secure_log_entry(log_dir / "watch.log", log_line)
+        except OSError as e:
+            msg = (
+                f"[watch] Disk full (ENOSPC): Error appending audit log: {e}\n"
+                if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC))
+                else f"[watch] Error appending audit log: {e}\n"
+            )
+            try:
+                if sys.stderr is not None:
+                    sys.stderr.write(msg)
+                    sys.stderr.flush()
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                if sys.stderr is not None:
+                    sys.stderr.write(f"[watch] Error appending audit log: {e}\n")
+                    sys.stderr.flush()
+            except Exception:
+                pass
+
     def _append_audit_log(
         self,
         target_account: str,
@@ -796,22 +822,12 @@ class LogWatcher:
                 while r.startswith("(") and r.endswith(")") and len(r) >= 2:
                     r = r[1:-1].strip()
                 clean_reason = r
-            if (log_dir := self._resolve_audit_log_dir()) is None:
-                return
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             log_reason = clean_reason or reason
             suffix = " with force-restart language_server" if reloaded else ""
             prefix = f"Switched from '{old_account}' to '{target_account}'" if old_account else f"Switched to '{target_account}'"
             log_line = f"{ts} [watch] {prefix}{suffix} (reason: {log_reason})\n" if (old_account or reloaded) else f"{ts} [watch] {prefix} ({log_reason})\n"
-            append_secure_log_entry(log_dir / "watch.log", log_line)
-        except OSError as e:
-            msg = f"[watch] Disk full (ENOSPC): Error appending audit log: {e}\n" if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)) else f"[watch] Error appending audit log: {e}\n"
-            try:
-                if sys.stderr is not None:
-                    sys.stderr.write(msg)
-                    sys.stderr.flush()
-            except Exception:
-                pass
+            self._write_watch_log_line(log_line)
         except Exception as e:
             try:
                 if sys.stderr is not None:
@@ -819,6 +835,140 @@ class LogWatcher:
                     sys.stderr.flush()
             except Exception:
                 pass
+
+    def _append_deferred_reload_audit_log(
+        self,
+        target_account: str,
+        reason: str = "in_turn_deferred_reload",
+    ) -> None:
+        """Appends structured deferred-reload audit entry to watch.log with mode 0600."""
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        clean_target = " ".join(target_account.split())
+        clean_reason = " ".join(reason.split()) if isinstance(reason, str) and reason.strip() else "in_turn_deferred_reload"
+        log_line = (
+            f"{ts} [watch] Deferred safe-turn reload for '{clean_target}' "
+            f"with force-restart language_server (reason: {clean_reason})\n"
+        )
+        self._write_watch_log_line(log_line)
+
+    @staticmethod
+    def _safe_stderr_write(message: str) -> None:
+        """Writes a diagnostic line to sys.stderr without raising on closed streams."""
+        try:
+            if sys.stderr is not None:
+                sys.stderr.write(f"{message}\n")
+                sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _resolve_pending_reload_path(self) -> Path | None:
+        """Resolves cache/pending_reload.json path, guarding production paths under test runners."""
+        raw_prf = getattr(self.engine, "pending_reload_file", None)
+        if isinstance(raw_prf, (str, Path)) and not _is_mock_object(raw_prf):
+            cleaned = str(raw_prf).strip()
+            if not cleaned or cleaned == ".":
+                return None
+            candidate = Path(cleaned).expanduser()
+        else:
+            candidate = self._resolve_cache_dir() / "pending_reload.json"
+        if _is_test_runner() and _is_prod_vault_path(candidate):
+            return None
+        return candidate
+
+    def _process_pending_reload(self) -> bool:
+        """Consumes a valid unexpired cache/pending_reload.json marker at a verified Safe Turn Boundary.
+
+        Returns True when a deferred reload marker is consumed, or False when absent,
+        invalid/expired, failed to restart, or deferred because an agent turn is still running.
+        """
+        pending_path = self._resolve_pending_reload_path()
+        if pending_path is None:
+            return False
+        try:
+            st = os.lstat(pending_path)
+        except (FileNotFoundError, OSError):
+            return False
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            return False
+        try:
+            raw_payload: object = json.loads(pending_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(raw_payload, dict):
+            return False
+
+        raw_target = raw_payload.get("target_account")
+        if not isinstance(raw_target, str) or not raw_target.strip():
+            return False
+        target_account = raw_target.strip()
+
+        raw_req = raw_payload.get("requested_at")
+        if (
+            isinstance(raw_req, bool)
+            or not isinstance(raw_req, (int, float))
+            or not math.isfinite(raw_req)
+            or raw_req <= 0
+        ):
+            return False
+        requested_at = float(raw_req)
+
+        raw_ttl = raw_payload.get("ttl_seconds")
+        if raw_ttl is None:
+            ttl_seconds = 120.0
+        elif (
+            isinstance(raw_ttl, bool)
+            or not isinstance(raw_ttl, (int, float))
+            or not math.isfinite(raw_ttl)
+            or raw_ttl <= 0
+        ):
+            return False
+        else:
+            ttl_seconds = float(raw_ttl)
+
+        now = float(_get_time().time())
+        if now - requested_at > ttl_seconds:
+            return False
+
+        if not self._is_turn_quiescent():
+            return False
+
+        raw_reason = raw_payload.get("reason")
+        reason = (
+            raw_reason.strip()
+            if isinstance(raw_reason, str) and raw_reason.strip()
+            else "in_turn_deferred_reload"
+        )
+
+        try:
+            restart_fn = getattr(self.engine, "restart_language_server", None)
+            if callable(restart_fn):
+                reloaded = bool(restart_fn(force=True))
+            elif getattr(self, "supervisor", None) is not None:
+                reloaded = bool(self.supervisor.restart_language_server(force=True))
+            else:
+                return False
+        except Exception as exc:
+            self._safe_stderr_write(f"[watch] Error executing deferred safe-turn reload: {exc}")
+            return False
+
+        if not reloaded:
+            self._safe_stderr_write(
+                f"[watch] Deferred safe-turn reload for '{target_account}' did not restart "
+                "language_server; preserving marker for retry."
+            )
+            return False
+
+        self._append_deferred_reload_audit_log(
+            target_account=target_account,
+            reason=reason,
+        )
+        try:
+            pending_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._safe_stderr_write(
+                f"[watch] Warning: Failed to unlink pending reload marker '{pending_path}': {exc}"
+            )
+        return True
 
     def _dispatch_http_post(self, url: str, data: bytes, label: str) -> threading.Thread | None:
         def _send() -> None:
@@ -1416,10 +1566,16 @@ class LogWatcher:
                     continue
         if switches_triggered == 0:
             try:
-                if self._evaluate_proactive_rotation():
-                    switches_triggered += 1
+                reloaded_pending = self._process_pending_reload()
             except Exception as e:
-                print(f"[watch] Error evaluating proactive rotation: {e}", file=sys.stderr)
+                reloaded_pending = False
+                print(f"[watch] Error processing pending reload marker: {e}", file=sys.stderr)
+            if not reloaded_pending:
+                try:
+                    if self._evaluate_proactive_rotation():
+                        switches_triggered += 1
+                except Exception as e:
+                    print(f"[watch] Error evaluating proactive rotation: {e}", file=sys.stderr)
         return switches_triggered
 
     def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None) -> None:

@@ -5231,6 +5231,335 @@ setattr(
 )
 
 
+class TestPendingReloadSafeTurnConsumption(unittest.TestCase):
+    """Tests for Safe-Turn Boundary consumption and deferral of cache/pending_reload.json.
+
+    Covers:
+    - [WATCH-RELOAD-001]: Valid pending_reload.json consumed at verified Safe Turn Boundary.
+    - [WATCH-RELOAD-002]: Valid pending_reload.json deferred while _is_turn_quiescent() is False.
+    """
+
+    def setUp(self) -> None:
+        self.orig_agy_vault_dir = os.environ.pop("AGY_VAULT_DIR", None)
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.engine_mock = MagicMock()
+        self.engine_mock.vault_dir = self.vault_dir
+        self.engine_mock.cache_dir = self.cache_dir
+        self.engine_mock.gemini_dir = self.gemini_dir
+        self.engine_mock.get_quota_threshold.return_value = None
+        self.engine_mock.restart_language_server.return_value = True
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self) -> None:
+        if self.orig_agy_vault_dir is not None:
+            os.environ["AGY_VAULT_DIR"] = self.orig_agy_vault_dir
+        else:
+            os.environ.pop("AGY_VAULT_DIR", None)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_session(self, session_id: str, latest_record: dict[str, object]) -> Path:
+        presence_dir = self.gemini_dir / "antigravity" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        (presence_dir / f"{session_id}.lock").touch()
+
+        logs_dir = self.gemini_dir / "antigravity" / "brain" / session_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = logs_dir / "transcript.jsonl"
+        transcript_path.write_text(json.dumps(latest_record) + "\n", encoding="utf-8")
+        return transcript_path
+
+    def _write_pending_reload(
+        self,
+        target_account: str = "work-acc",
+        age_seconds: float = 5.0,
+        ttl_seconds: int = 120,
+        reason: str = "in_turn_deferred_reload",
+    ) -> Path:
+        pending_file = self.cache_dir / "pending_reload.json"
+        payload = {
+            "target_account": target_account,
+            "requested_at": time.time() - age_seconds,
+            "ttl_seconds": ttl_seconds,
+            "reason": reason,
+        }
+        pending_file.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(pending_file, 0o600)
+        return pending_file
+
+    def test_pending_reload_safe_turn_consumes_when_quiescent(self) -> None:
+        """[WATCH-RELOAD-001]: Valid pending_reload.json consumed at verified Safe Turn Boundary
+        calls engine.restart_language_server(force=True), appends audit entry to watch.log,
+        and unlinks pending_reload.json from disk.
+        """
+        self._setup_session(
+            "session-reload-001",
+            {"type": "MESSAGE", "status": "DONE", "content": "Turn completed."},
+        )
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.assertFalse(pending_file.exists(), "pending_reload.json must be unlinked after consumption")
+
+        watch_log = self.vault_dir / "watch.log"
+        self.assertTrue(watch_log.is_file(), "Structured audit entry must be appended to watch.log")
+        self.assertEqual(watch_log.stat().st_mode & 0o777, 0o600)
+        log_content = watch_log.read_text(encoding="utf-8")
+        self.assertRegex(log_content, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[watch\] ")
+        self.assertIn("work-acc", log_content)
+        self.assertIn("language_server", log_content)
+
+    def test_pending_reload_safe_turn_defers_when_busy(self) -> None:
+        """[WATCH-RELOAD-002]: Valid pending_reload.json is preserved and restart_language_server()
+        is NOT called while _is_turn_quiescent() is False.
+        """
+        transcript_path = self._setup_session(
+            "session-reload-002",
+            {"type": "MESSAGE", "status": "IN_PROGRESS", "content": "Streaming response..."},
+        )
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+        original_content = pending_file.read_text(encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        self.assertFalse(watcher._is_turn_quiescent())
+
+        self.assertEqual(watcher.poll_once(), 0)
+
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_file(), "pending_reload.json must remain intact while turn is busy")
+        self.assertEqual(pending_file.read_text(encoding="utf-8"), original_content)
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Verify next quiescent cycle consumes the preserved marker cleanly
+        transcript_path.write_text(
+            json.dumps({"type": "MESSAGE", "status": "DONE", "content": "Turn finished."}) + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(watcher.poll_once(), 0)
+
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.assertFalse(pending_file.exists())
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_pending_reload_safe_turn_defers_while_proc_child_busy_then_consumes(self) -> None:
+        """[WATCH-RELOAD-002] + [WATCH-RELOAD-001]: Even when transcript says USER_INPUT,
+        an active non-zombie child process under language_server in /proc defers
+        pending_reload.json until the child exits.
+        """
+        self._setup_session(
+            "session-reload-proc",
+            {"type": "USER_INPUT", "content": "Ready."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-proc.lock"
+        ls_proc = self.proc_dir / "5001"
+        ls_proc.mkdir(parents=True, exist_ok=True)
+        (ls_proc / "cmdline").write_bytes(b"/usr/local/bin/language_server\x00--standalone\x00")
+        (ls_proc / "stat").write_text("5001 (language_server) S 1 5001 5001 0 -1\n", encoding="utf-8")
+
+        child_proc = self.proc_dir / "5002"
+        child_proc.mkdir(parents=True, exist_ok=True)
+        (child_proc / "cmdline").write_bytes(b"bash\x00-c\x00pytest\x00")
+        (child_proc / "stat").write_text("5002 (bash) S 5001 5001 5001 0 -1\n", encoding="utf-8")
+
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        self.assertFalse(watcher._is_turn_quiescent())
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.is_file())
+
+        # Child task completes and exits; re-touch session presence lock as in active IDE session
+        shutil.rmtree(child_proc)
+        lock_path.touch()
+        self.assertTrue(watcher._is_turn_quiescent())
+        lock_path.touch()
+        self.assertEqual(watcher.poll_once(), 0)
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.assertFalse(pending_file.exists())
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_pending_reload_safe_turn_preserves_marker_when_restart_returns_false_or_raises(self) -> None:
+        """Restart failure (returning False or raising) logs to stderr, preserves marker
+        for retry, avoids false audit entries, and does not crash poll_once().
+        """
+        from io import StringIO
+
+        self._setup_session(
+            "session-reload-err",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        lock_path = self.gemini_dir / "antigravity" / "presence" / "session-reload-err.lock"
+        pending_file = self._write_pending_reload(
+            target_account="work-acc",
+            age_seconds=5.0,
+            ttl_seconds=120,
+            reason="in_turn\nwith_newline",
+        )
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Case 1: restart_language_server returns False
+        self.engine_mock.restart_language_server.return_value = False
+        stderr_false = StringIO()
+        with patch("sys.stderr", stderr_false):
+            self.assertEqual(watcher.poll_once(), 0)
+        self.assertTrue(pending_file.is_file())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+        self.assertIn("did not restart language_server", stderr_false.getvalue())
+
+        # Case 2: restart_language_server raises an exception
+        lock_path.touch()
+        self.engine_mock.restart_language_server.side_effect = RuntimeError("supervisor timeout")
+        stderr_exc = StringIO()
+        with patch("sys.stderr", stderr_exc):
+            self.assertEqual(watcher.poll_once(), 0)
+        self.assertTrue(pending_file.is_file())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+        self.assertIn("supervisor timeout", stderr_exc.getvalue())
+
+        # Case 3: Next quiescent cycle succeeds and sanitizes multi-line reason in watch.log
+        lock_path.touch()
+        self.engine_mock.restart_language_server.side_effect = None
+        self.engine_mock.restart_language_server.return_value = True
+        self.assertEqual(watcher.poll_once(), 0)
+        self.assertFalse(pending_file.exists())
+        lines = (self.vault_dir / "watch.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("(reason: in_turn with_newline)", lines[0])
+
+    def test_pending_reload_safe_turn_exact_ttl_boundary_and_skips_same_cycle_proactive_switch(self) -> None:
+        """Exact boundary now - requested_at == ttl_seconds is valid and consumed, and
+        consuming pending_reload.json skips proactive switch_tokens in the same cycle.
+        """
+        self._setup_session(
+            "session-reload-ttl",
+            {"type": "MESSAGE", "status": "DONE", "content": "Done."},
+        )
+        fixed_now = 1_700_000_120.0
+        pending_file = self.cache_dir / "pending_reload.json"
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "work-acc",
+                "requested_at": 1_700_000_000.0,
+                "ttl_seconds": 120,
+                "reason": "in_turn_deferred_reload",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+
+        # Configure proactive threshold + low cached quota to ensure proactive switch is skipped this cycle
+        self.engine_mock.get_quota_threshold.return_value = 0.20
+        self.engine_mock.get_active_name.return_value = "work-acc"
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({"accounts": {"work-acc": {"gemini": {"fraction": 0.10}}, "standby": {"gemini": {"fraction": 0.90}}}}),
+            encoding="utf-8",
+        )
+        self.engine_mock.list_accounts.return_value = {
+            "accounts": [{"name": "work-acc", "valid": True}, {"name": "standby", "valid": True}]
+        }
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        with patch("agy_switcher.watcher.time.time", return_value=fixed_now):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        self.engine_mock.restart_language_server.assert_called_once_with(force=True)
+        self.engine_mock.switch_tokens.assert_not_called()
+        self.assertFalse(pending_file.exists())
+
+    def test_pending_reload_safe_turn_skipped_when_reactive_failover_occurs(self) -> None:
+        """When reactive 429 exhaustion triggers a switch in poll_once(), pending_reload
+        consumption does not perform a duplicate restart in the same cycle.
+        """
+        transcript_path = self._setup_session(
+            "session-reload-reactive",
+            {"type": "MESSAGE", "status": "DONE", "content": "Initial."},
+        )
+        self.engine_mock.get_active_name.return_value = "work-acc"
+        self.engine_mock.list_accounts.return_value = {
+            "accounts": [{"name": "work-acc", "valid": True}, {"name": "standby-acc", "valid": True}]
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({
+                "accounts": {
+                    "work-acc": {"gemini": {"fraction": 0.0}, "cached_at": time.time()},
+                    "standby-acc": {"gemini": {"fraction": 0.95}, "cached_at": time.time()},
+                }
+            }),
+            encoding="utf-8",
+        )
+        self.engine_mock.switch_tokens.return_value = {
+            "active": "standby-acc",
+            "server_restarted": True,
+        }
+
+        watcher = LogWatcher(
+            engine=self.engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+
+        # Prime transcript cursor at initial EOF before pending_reload + 429 line arrive
+        watcher.file_cursors[str(transcript_path)] = transcript_path.stat().st_size
+        pending_file = self._write_pending_reload(target_account="work-acc", age_seconds=5.0, ttl_seconds=120)
+
+        with open(transcript_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "ERROR", "code": 429, "message": "RESOURCE_EXHAUSTED"}) + "\n")
+
+        switches = watcher.poll_once()
+
+        self.assertEqual(switches, 1)
+        self.engine_mock.switch_tokens.assert_called_once_with("standby-acc", restart_server=True, force=True)
+        self.engine_mock.restart_language_server.assert_not_called()
+        self.assertTrue(pending_file.exists())
+
+
 if __name__ == '__main__':
     unittest.main()
 
