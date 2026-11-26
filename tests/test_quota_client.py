@@ -1,5 +1,6 @@
 """Tests for Fast Quota Telemetry Client."""
 
+import io
 import json
 import os
 import stat
@@ -9,6 +10,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2181,6 +2183,93 @@ class TestPreflightAuthProbe(unittest.TestCase):
                 self.assertTrue(verdict.get("refreshed"))
                 self.assertEqual(verdict.get("error_type"), "network")
                 self.assertIn("Warning:", stderr_buf.getvalue())
+
+    def test_quarantine_auto_clear_and_status_window_fetch_account_quota_recovery(self) -> None:
+        """[AUDIT-HOOK-005] Healthy fetch_account_quota() clears auth_errors[alias] atomically while error responses preserve quarantine."""
+        self._write_account_token(
+            "automator",
+            access_token="ya29.automator_tok",
+            refresh_token="1//automator_refresh",
+            expiry="2099-01-01T00:00:00Z",
+        )
+        self._write_account_token(
+            "other-acc",
+            access_token="ya29.other_tok",
+            refresh_token="1//other_refresh",
+            expiry="2099-01-01T00:00:00Z",
+        )
+        self.engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=1791201000.0,
+        )
+        self.engine.record_auth_error(
+            "other-acc",
+            error="HTTP 401 Unauthorized",
+            error_type="auth",
+            timestamp=1791201005.0,
+        )
+
+        # 1. Errored quota fetch (dict with "error" key) preserves auth_errors["automator"]
+        class _ErrorReturningClient(QuotaClient):
+            def fetch_quota(
+                self,
+                access_token: str | dict[str, Any],
+                refresh_token: str | None = None,
+                on_refresh: Any | None = None,
+            ) -> dict[str, Any]:
+                return {"error": "HTTP 403 Forbidden", "error_type": "auth"}
+
+        err_client = _ErrorReturningClient(timeout=0.5, engine=self.engine, fallback_quota_endpoint=None)
+        acc_name, err_quota = fetch_account_quota(self.engine, "automator", client=err_client)
+        self.assertEqual(acc_name, "automator")
+        self.assertIn("error", err_quota)
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+        listed_errored = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertIn("auth_error", listed_errored["automator"])
+
+        # 2. Empty {} response from QuotaClient (e.g., empty models payload) also preserves auth_errors["automator"]
+        empty_models_resp = MagicMock()
+        empty_models_resp.read.return_value = json.dumps({"models": {}}).encode("utf-8")
+        empty_models_resp.__enter__.return_value = empty_models_resp
+        empty_client = QuotaClient(timeout=0.5, engine=self.engine, fallback_quota_endpoint=None)
+        with patch("urllib.request.urlopen", return_value=empty_models_resp):
+            _, empty_quota = fetch_account_quota(self.engine, "automator", client=empty_client)
+        self.assertIn("error", empty_quota)
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        # 3. HTTP 403 exception probe also preserves auth_errors["automator"]
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError(
+                empty_client.quota_endpoint, 403, "Forbidden", {}, io.BytesIO(b"Forbidden")
+            ),
+        ):
+            _, exc_quota = fetch_account_quota(self.engine, "automator", client=empty_client)
+        self.assertIn("error", exc_quota)
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        # 3. Healthy live quota probe (no "error" key) clears auth_errors["automator"] atomically at 0600
+        ok_response = MagicMock()
+        ok_response.read.return_value = json.dumps(self.quota_ok_payload).encode("utf-8")
+        ok_response.__enter__.return_value = ok_response
+
+        ok_client = QuotaClient(timeout=0.5, engine=self.engine, fallback_quota_endpoint=None)
+        with patch("urllib.request.urlopen", return_value=ok_response):
+            ok_name, ok_quota = fetch_account_quota(self.engine, "automator", client=ok_client)
+
+        self.assertEqual(ok_name, "automator")
+        self.assertNotIn("error", ok_quota)
+        self.assertIn("gemini", ok_quota)
+        state_after = self.engine.load_failover_state()
+        self.assertNotIn("automator", state_after["auth_errors"])
+        self.assertIn("other-acc", state_after["auth_errors"])
+        self.assertEqual(stat.S_IMODE(self.engine.failover_state_file.stat().st_mode), 0o600)
+
+        listed_recovered = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertNotIn("auth_error", listed_recovered["automator"])
+        self.assertIn("auth_error", listed_recovered["other-acc"])
 
 
 if __name__ == "__main__":

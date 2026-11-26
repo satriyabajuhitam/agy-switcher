@@ -65,6 +65,7 @@ DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_LEGACY_ROOT = Path.home() / ".agy-cli-manager"
 GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
 USERINFO_TIMEOUT_SECONDS = 5.0
+FAILOVER_STATUS_WINDOW_SECONDS = 86400.0
 _FAILOVER_STATE_LOCK = threading.RLock()
 
 
@@ -919,6 +920,9 @@ class AgySwitchEngine:
     def list_accounts(self) -> dict[str, Any]:
         """Lists all accounts registered in the vault and marks the active account."""
         active = self.get_active_name()
+        failover_state = self.load_failover_state()
+        raw_auth_errors = failover_state.get("auth_errors")
+        auth_errors: dict[str, Any] = raw_auth_errors if isinstance(raw_auth_errors, dict) else {}
         accounts: list[dict[str, Any]] = []
 
         if self.accounts_dir.is_dir():
@@ -938,12 +942,17 @@ class AgySwitchEngine:
                     except InvalidTokenError:
                         pass
 
-                accounts.append({
+                entry: dict[str, Any] = {
                     "name": name,
                     "email": email,
                     "valid": valid,
                     "is_active": (name == active),
-                })
+                }
+                auth_err = auth_errors.get(name)
+                if isinstance(auth_err, dict) and auth_err:
+                    entry["auth_error"] = dict(auth_err)
+
+                accounts.append(entry)
 
         return {
             "active": active,
@@ -1046,6 +1055,8 @@ class AgySwitchEngine:
                 if force_restart_now or server_restarted:
                     self.clear_pending_reload()
 
+        self.clear_last_failover()
+
         return {
             "active": clean_name,
             "email": email,
@@ -1122,6 +1133,7 @@ class AgySwitchEngine:
 
         acc_dir = self.accounts_dir / clean_name
         email = self._persist_registered_account(acc_dir, token_data)
+        self.clear_auth_error(clean_name)
         return {"name": clean_name, "email": email}
 
     def remove_account(self, name: str, force: bool = False) -> None:
@@ -1481,6 +1493,7 @@ class AgySwitchEngine:
 
             token_data = self.validate_token_file(token_file)
             email = self._persist_registered_account(acc_dir, token_data)
+            self.clear_auth_error(clean_name)
 
             return {
                 "name": clean_name,
@@ -1575,13 +1588,32 @@ class AgySwitchEngine:
                 except Exception:
                     pass
 
-        return {
+        status: dict[str, Any] = {
             "active": active,
             "email": email,
             "server_running": running,
             "server_pid": pid,
             "server_busy": busy,
         }
+
+        failover_state = self.load_failover_state()
+        raw_last_failover = failover_state.get("last_failover")
+        if isinstance(raw_last_failover, dict) and raw_last_failover:
+            raw_ts = raw_last_failover.get("timestamp")
+            if (
+                not isinstance(raw_ts, bool)
+                and isinstance(raw_ts, (int, float))
+                and math.isfinite(raw_ts)
+                and raw_ts > 0
+                and (time.time() - float(raw_ts)) <= FAILOVER_STATUS_WINDOW_SECONDS
+            ):
+                status["last_failover"] = dict(raw_last_failover)
+
+        pending_reload = self.load_pending_reload()
+        if isinstance(pending_reload, dict) and pending_reload:
+            status["pending_reload"] = pending_reload
+
+        return status
 
     def _is_valid_expiry(self, raw_expiry: Any) -> bool:
         """Validates that expiry is a recognizable positive timestamp or ISO string."""

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -2290,6 +2291,264 @@ class TestAgySwitchEngine(unittest.TestCase):
                 )
                 self.assertEqual(json.loads(legacy_state_file.read_text(encoding="utf-8"))["active"], "work-acc")
                 self.assertFalse(engine.pending_reload_file.exists())
+
+    def test_quarantine_auto_clear_and_status_window_login_and_add_clear_auth_error(self) -> None:
+        """[AUDIT-HOOK-005] Successful login_account() and add_account() atomically clear auth_errors[alias] and list_accounts badge."""
+        self._register_test_account(self.engine, "honey", "honey@example.com")
+        self._register_test_account(self.engine, "automator", "automator@example.com")
+        self._register_test_account(self.engine, "other-acc", "other@example.com")
+        self.engine.set_active_name("honey")
+
+        now = time.time()
+        self.engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 300.0,
+        )
+        self.engine.record_auth_error(
+            "other-acc",
+            error="HTTP 401 Unauthorized",
+            error_type="auth",
+            timestamp=now - 200.0,
+        )
+        self.engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 300.0,
+        )
+
+        listed_before = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertNotIn("auth_error", listed_before["honey"])
+        self.assertIn("auth_error", listed_before["automator"])
+        self.assertEqual(listed_before["automator"]["auth_error"]["error"], "HTTP 403 Forbidden")
+        self.assertEqual(listed_before["automator"]["auth_error"]["error_type"], "auth")
+        self.assertIn("auth_error", listed_before["other-acc"])
+
+        # 1. Failed add_account (invalid token) must NOT clear quarantine
+        bad_token_path = self.base_path / "invalid_automator_token.json"
+        bad_token_path.write_text("{not-json", encoding="utf-8")
+        with self.assertRaises(InvalidTokenError):
+            self.engine.add_account("automator", bad_token_path)
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        # 2. Failed login_account (aborted overwrite or missing token output) must NOT clear quarantine
+        with self.assertRaises(AgySwitchError):
+            self.engine.login_account("automator", force=False, prompt_fn=lambda _: "n")
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        with patch.object(self.engine, "resolve_agy_binary", return_value="/bin/mock_agy"), \
+             patch("subprocess.Popen", return_value=_StubLoginProcess(returncode=1)):
+            with self.assertRaises(AgySwitchError):
+                self.engine.login_account("automator", force=True)
+        self.assertIn("automator", self.engine.load_failover_state()["auth_errors"])
+
+        # 3. Successful login_account clears auth_errors["automator"] atomically while preserving other-acc & last_failover
+        reauth_payload = make_valid_token_payload("automator@example.com")
+        self._run_registration_path("login_account", "automator", reauth_payload)
+
+        state_after_login = self.engine.load_failover_state()
+        self.assertNotIn("automator", state_after_login["auth_errors"])
+        self.assertIn("other-acc", state_after_login["auth_errors"])
+        self.assertIsNotNone(state_after_login["last_failover"])
+        self.assertEqual(stat.S_IMODE(self.engine.failover_state_file.stat().st_mode), 0o600)
+
+        listed_after_login = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertNotIn("auth_error", listed_after_login["automator"])
+        self.assertIn("auth_error", listed_after_login["other-acc"])
+
+        # 4. Re-quarantine "automator" and verify successful add_account clears auth_errors["automator"] atomically
+        self.engine.record_auth_error(
+            "automator",
+            error="HTTP 401 Unauthorized",
+            error_type="auth",
+            timestamp=time.time() - 60.0,
+        )
+        listed_requarantined = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertIn("auth_error", listed_requarantined["automator"])
+
+        self._run_registration_path("add_account", "automator", make_valid_token_payload("automator@example.com"))
+
+        state_after_add = self.engine.load_failover_state()
+        self.assertNotIn("automator", state_after_add["auth_errors"])
+        self.assertIn("other-acc", state_after_add["auth_errors"])
+        self.assertEqual(stat.S_IMODE(self.engine.failover_state_file.stat().st_mode), 0o600)
+
+        listed_after_add = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+        self.assertNotIn("auth_error", listed_after_add["automator"])
+        self.assertIn("auth_error", listed_after_add["other-acc"])
+
+        # 5. Corrupt/non-dict failover_state.json or auth_errors payloads recover gracefully in list_accounts()
+        corrupt_payloads = [
+            "{truncated-json",
+            "[]",
+            json.dumps({"auth_errors": ["automator"]}),
+            json.dumps({"auth_errors": {"automator": "bad-entry"}}),
+            json.dumps({"auth_errors": {"automator": {}}}),
+        ]
+        for raw_payload in corrupt_payloads:
+            with self.subTest(corrupt_failover_state=raw_payload):
+                self.engine.failover_state_file.write_text(raw_payload, encoding="utf-8")
+                listed_corrupt = {acc["name"]: acc for acc in self.engine.list_accounts()["accounts"]}
+                self.assertIn("automator", listed_corrupt)
+                self.assertNotIn("auth_error", listed_corrupt["automator"])
+
+    def test_quarantine_auto_clear_and_status_window_24h_cutoff_and_manual_switch(self) -> None:
+        """[AUDIT-HOOK-003][AUDIT-HOOK-EDGE-001] get_status() enforces 24h window and manual switch superseding while preserving auth_errors."""
+        proc_dir = self.base_path / "proc_status_window"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "honey", "honey@example.com")
+        self._register_test_account(engine, "automator", "automator@example.com")
+        engine.switch_tokens("honey", restart_server=False)
+
+        now = 1_800_000_000.0
+        engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 7200.0,
+        )
+
+        # 1. Recent failover (2h ago <= 24h) + unexpired pending_reload surfaced in get_status()
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 7200.0,
+        )
+        engine.write_pending_reload("honey", reason="in_turn_deferred_reload", ttl_seconds=120, requested_at=now - 10.0)
+
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_recent = engine.get_status()
+        self.assertIsInstance(status_recent.get("last_failover"), dict)
+        self.assertEqual(status_recent["last_failover"]["from_account"], "automator")
+        self.assertEqual(status_recent["last_failover"]["to_account"], "honey")
+        self.assertEqual(status_recent["last_failover"]["trigger"], "auth_corruption")
+        self.assertIsInstance(status_recent.get("pending_reload"), dict)
+        self.assertEqual(status_recent["pending_reload"]["target_account"], "honey")
+
+        # 2. Boundary: exactly 86400s old is still surfaced; > 86400s (86401s) is omitted
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 86400.0,
+        )
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_at_boundary = engine.get_status()
+        self.assertIsInstance(status_at_boundary.get("last_failover"), dict)
+
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 86401.0,
+        )
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_stale = engine.get_status()
+        self.assertNotIn("last_failover", status_stale)
+        self.assertIsNone(status_stale.get("last_failover"))
+        # auth_errors quarantine persists in failover_state and list_accounts()
+        self.assertIn("automator", engine.load_failover_state()["auth_errors"])
+        listed_stale = {acc["name"]: acc for acc in engine.list_accounts()["accounts"]}
+        self.assertIn("auth_error", listed_stale["automator"])
+
+        # 3. Malformed, boolean, non-finite, non-positive, string, or missing last_failover.timestamp is omitted;
+        #    expired or malformed pending_reload.json is also omitted safely
+        invalid_last_failovers: list[tuple[str, str]] = [
+            ("bool_true", json.dumps({"last_failover": {"timestamp": True, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("bool_false", json.dumps({"last_failover": {"timestamp": False, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("zero_ts", json.dumps({"last_failover": {"timestamp": 0, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("negative_ts", json.dumps({"last_failover": {"timestamp": -10.0, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("string_ts", json.dumps({"last_failover": {"timestamp": str(now), "from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("missing_ts", json.dumps({"last_failover": {"from_account": "automator", "to_account": "honey"}, "auth_errors": {}})),
+            ("nan_ts", '{"last_failover": {"timestamp": NaN, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}}'),
+            ("inf_ts", '{"last_failover": {"timestamp": Infinity, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}}'),
+            ("neg_inf_ts", '{"last_failover": {"timestamp": -Infinity, "from_account": "automator", "to_account": "honey"}, "auth_errors": {}}'),
+        ]
+        for label, raw_state in invalid_last_failovers:
+            with self.subTest(invalid_last_failover=label):
+                engine.failover_state_file.write_text(raw_state, encoding="utf-8")
+                with patch("agy_switcher.vault.time.time", return_value=now):
+                    st = engine.get_status()
+                self.assertNotIn("last_failover", st)
+
+        engine.write_pending_reload("honey", reason="in_turn_deferred_reload", ttl_seconds=60, requested_at=now - 61.0)
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertNotIn("pending_reload", engine.get_status())
+        engine.pending_reload_file.write_text("{bad-json", encoding="utf-8")
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertNotIn("pending_reload", engine.get_status())
+        engine.clear_pending_reload()
+
+        # 4. Fresh last_failover is preserved on failed switch_tokens(), and cleared only on successful manual switch
+        engine.record_auth_error(
+            "automator",
+            error="HTTP 403 Forbidden",
+            error_type="auth",
+            timestamp=now - 7200.0,
+        )
+        engine.record_last_failover(
+            from_account="automator",
+            to_account="honey",
+            trigger="auth_corruption",
+            reason="HTTP 403 Forbidden",
+            timestamp=now - 600.0,
+        )
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertIsInstance(engine.get_status().get("last_failover"), dict)
+
+        # 4a. Missing account does not clear last_failover
+        with self.assertRaises(AccountNotFoundError):
+            engine.switch_tokens("nonexistent-acc", restart_server=False)
+        self.assertIsNotNone(engine.load_failover_state()["last_failover"])
+
+        # 4b. ActiveTurnRunningError does not clear last_failover
+        self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=53000)
+        with self.assertRaises(ActiveTurnRunningError):
+            engine.switch_tokens("honey", restart_server=True, force=False)
+        self.assertIsNotNone(engine.load_failover_state()["last_failover"])
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertIsInstance(engine.get_status().get("last_failover"), dict)
+
+        # 4c. AccountAuthError (verify_auth failure) does not clear last_failover
+        err_403 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+        with patch("urllib.request.urlopen", side_effect=err_403):
+            with self.assertRaises(AccountAuthError):
+                engine.switch_tokens("automator", restart_server=False, verify_auth=True)
+        self.assertIsNotNone(engine.load_failover_state()["last_failover"])
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            self.assertIsInstance(engine.get_status().get("last_failover"), dict)
+
+        # 4d. Successful manual switch_tokens("honey", ...) supersedes last_failover
+        engine.switch_tokens("honey", restart_server=False)
+        with patch("agy_switcher.vault.time.time", return_value=now + 5.0):
+            status_superseded = engine.get_status()
+        self.assertNotIn("last_failover", status_superseded)
+        self.assertIsNone(status_superseded.get("last_failover"))
+        self.assertIsNone(engine.load_failover_state()["last_failover"])
+        # "automator" remains quarantined in auth_errors and flagged in list_accounts()
+        self.assertIn("automator", engine.load_failover_state()["auth_errors"])
+        listed_superseded = {acc["name"]: acc for acc in engine.list_accounts()["accounts"]}
+        self.assertIn("auth_error", listed_superseded["automator"])
+        self.assertNotIn("auth_error", listed_superseded["honey"])
 
 
 if __name__ == "__main__":

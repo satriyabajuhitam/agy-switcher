@@ -1612,6 +1612,10 @@ def fetch_account_quota(
             else:
                 raise
         if quota_res:
+            if isinstance(quota_res, dict) and "error" not in quota_res:
+                clear_auth_error = getattr(engine, "clear_auth_error", None)
+                if callable(clear_auth_error):
+                    clear_auth_error(acc_name)
             return acc_name, quota_res
         err_msg, err_type = _classify_probe_failure(client, exc=None)
         return acc_name, {"error": err_msg, "error_type": err_type}
