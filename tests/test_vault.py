@@ -9,6 +9,8 @@ import itertools
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1841,6 +1843,305 @@ class TestAgySwitchEngine(unittest.TestCase):
                 self.assertEqual(engine.get_active_name(), "work-acc")
                 # Fail-open must NOT clear prior quarantine entry
                 self.assertIn("work-acc", engine.load_failover_state()["auth_errors"])
+
+    def _setup_in_turn_proc_lineage(
+        self,
+        proc_dir: Path,
+        gemini_dir: Path,
+        *,
+        server_pid: int = 47000,
+        child_pid: int = 47010,
+        external_pid: int | None = None,
+    ) -> Path:
+        lock_file = self._setup_busy_proc_server(proc_dir, gemini_dir, server_pid=server_pid)
+        init_dir = proc_dir / "1"
+        init_dir.mkdir(parents=True, exist_ok=True)
+        (init_dir / "cmdline").write_bytes(b"/sbin/init\x00")
+        (init_dir / "stat").write_text("1 (systemd) S 0 1 1 0 -1\n", encoding="utf-8")
+
+        child_dir = proc_dir / str(child_pid)
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / "cmdline").write_bytes(b"/bin/bash\x00-c\x00agy-switch\x00")
+        (child_dir / "stat").write_text(f"{child_pid} (bash) S {server_pid} {child_pid} 1 0 -1\n", encoding="utf-8")
+
+        if external_pid is not None:
+            ext_dir = proc_dir / str(external_pid)
+            ext_dir.mkdir(parents=True, exist_ok=True)
+            (ext_dir / "cmdline").write_bytes(b"/bin/bash\x00")
+            (ext_dir / "stat").write_text(f"{external_pid} (bash) S 1 {external_pid} 1 0 -1\n", encoding="utf-8")
+        return lock_file
+
+    def test_deferred_safe_turn_reload_in_turn_downgrades_to_disk_swap_and_writes_marker(self) -> None:
+        """[DEFER-RELOAD-001] In-turn switch --force downgrades synchronous kill to Disk-Only Swap and pending_reload.json."""
+        proc_dir = self.base_path / "proc_defer_001"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        legacy_state_file = self.legacy_root / "state.json"
+        legacy_state_file.write_text(json.dumps({"active": "primary-acc"}), encoding="utf-8")
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=47000,
+            child_pid=47010,
+        )
+
+        with patch("os.getpid", return_value=47010):
+            self.assertTrue(engine.supervisor.is_invoked_by_language_server())
+            with patch("os.kill", side_effect=AssertionError("os.kill must not be called during in-turn deferred reload")):
+                res = engine.switch_tokens("work-acc", restart_server=True, force=True)
+
+        self.assertEqual(res["active"], "work-acc")
+        self.assertEqual(res["email"], "work@example.com")
+        self.assertIs(res["server_restarted"], False)
+        self.assertIs(res["restart_deferred"], True)
+
+        # Atomic Disk-Only Swap completed across active marker, Desktop/CLI tokens, and legacy state
+        self.assertEqual(engine.get_active_name(), "work-acc")
+        desktop_payload = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        cli_payload = json.loads(engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_payload["token"]["access_token"], "ya29.sample_token_for_work@example.com")
+        self.assertEqual(cli_payload["token"]["access_token"], "ya29.sample_token_for_work@example.com")
+        legacy_payload = json.loads(legacy_state_file.read_text(encoding="utf-8"))
+        self.assertEqual(legacy_payload["active"], "work-acc")
+
+        # cache/pending_reload.json atomically persisted at mode 0600 with expected schema
+        pending_file = engine.pending_reload_file
+        self.assertTrue(pending_file.is_file())
+        self.assertFalse(pending_file.is_symlink())
+        self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
+        pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(pending_data["target_account"], "work-acc")
+        self.assertEqual(pending_data["ttl_seconds"], 120)
+        self.assertIsInstance(pending_data["requested_at"], (int, float))
+        self.assertGreater(pending_data["requested_at"], 0)
+        self.assertIsInstance(pending_data["reason"], str)
+        self.assertTrue(bool(pending_data["reason"].strip()))
+
+    def test_deferred_safe_turn_reload_external_invocation_restarts_synchronously(self) -> None:
+        """[DEFER-RELOAD-003] External invocation preserves synchronous restart_language_server(force=True) without pending_reload.json."""
+        proc_dir = self.base_path / "proc_defer_003"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=48000,
+            child_pid=48010,
+            external_pid=48099,
+        )
+
+        sent_signals: list[tuple[int, int]] = []
+        terminated_pids: set[int] = set()
+
+        def fake_kill(pid: int, sig: int) -> None:
+            if sig == 0:
+                if pid in terminated_pids:
+                    raise ProcessLookupError(pid)
+                return
+            sent_signals.append((pid, sig))
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                terminated_pids.add(pid)
+
+        with patch("os.getpid", return_value=48099):
+            self.assertFalse(engine.supervisor.is_invoked_by_language_server())
+            with patch("os.kill", side_effect=fake_kill):
+                res = engine.switch_tokens("work-acc", restart_server=True, force=True)
+
+        self.assertEqual(sent_signals, [(48000, signal.SIGTERM)])
+        self.assertEqual(res["active"], "work-acc")
+        self.assertEqual(res["email"], "work@example.com")
+        self.assertIs(res["server_restarted"], True)
+        self.assertIs(res["restart_deferred"], False)
+        self.assertFalse(engine.pending_reload_file.exists())
+        self.assertEqual(engine.get_active_name(), "work-acc")
+
+    def test_deferred_safe_turn_reload_force_restart_now_and_safety_guards(self) -> None:
+        """[DEFER-RELOAD-005][DEFER-RELOAD-EDGE-002] force_restart_now overrides deferred reload and clears marker; force=False and restart_server=False preserve safety."""
+        proc_dir = self.base_path / "proc_defer_005"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=49000,
+            child_pid=49010,
+        )
+
+        with patch("os.getpid", return_value=49010):
+            # 1. Without --force and without --no-restart: ActiveTurnRunningError aborts before disk swap or marker
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens("work-acc", restart_server=True, force=False)
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+            self.assertFalse(engine.pending_reload_file.exists())
+
+            # 2. With restart_server=False (--no-restart): Disk-Only Swap without writing pending_reload.json
+            no_restart_res = engine.switch_tokens("work-acc", restart_server=False)
+            self.assertIs(no_restart_res["server_restarted"], False)
+            self.assertIs(no_restart_res["restart_deferred"], False)
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.get_active_name(), "work-acc")
+
+            # 3. In-turn deferred switch creates pending_reload.json, then force_restart_now=True restarts synchronously and clears it
+            engine.switch_tokens("primary-acc", restart_server=False)
+            deferred_res = engine.switch_tokens("work-acc", restart_server=True, force=True)
+            self.assertIs(deferred_res["restart_deferred"], True)
+            self.assertTrue(engine.pending_reload_file.is_file())
+
+            sent_signals: list[tuple[int, int]] = []
+            terminated_pids: set[int] = set()
+
+            def fake_kill(pid: int, sig: int) -> None:
+                if sig == 0:
+                    if pid in terminated_pids:
+                        raise ProcessLookupError(pid)
+                    return
+                sent_signals.append((pid, sig))
+                if sig in (signal.SIGTERM, signal.SIGKILL):
+                    terminated_pids.add(pid)
+
+            with patch("os.kill", side_effect=fake_kill):
+                now_res = engine.switch_tokens(
+                    "work-acc",
+                    restart_server=True,
+                    force=True,
+                    force_restart_now=True,
+                )
+
+            self.assertEqual(sent_signals, [(49000, signal.SIGTERM)])
+            self.assertIs(now_res["server_restarted"], True)
+            self.assertIs(now_res["restart_deferred"], False)
+            self.assertFalse(engine.pending_reload_file.exists())
+
+    def test_deferred_safe_turn_reload_error_paths_cache_creation_and_switch_account_parity(self) -> None:
+        """[DEFER-RELOAD-EDGE-004] Error paths write no marker; missing cache dir is created 0700; switch_account forwards force_restart_now."""
+        proc_dir = self.base_path / "proc_defer_edge"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "work-acc", "work@example.com")
+        self._register_test_account(engine, "revoked-acc", "revoked@example.com")
+        engine.switch_tokens("primary-acc", restart_server=False)
+
+        self._setup_in_turn_proc_lineage(
+            proc_dir,
+            self.gemini_dir,
+            server_pid=50000,
+            child_pid=50010,
+        )
+
+        desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+
+        with patch("os.getpid", return_value=50010):
+            # 1. force_restart_now=True without force=True still enforces ActiveTurnRunningError
+            with self.assertRaises(ActiveTurnRunningError):
+                engine.switch_tokens(
+                    "work-acc",
+                    restart_server=True,
+                    force=False,
+                    force_restart_now=True,
+                )
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+
+            # 2. Failed verify_auth=True while in-turn raises AccountAuthError without writing marker
+            err_403 = urllib.error.HTTPError(
+                "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                403,
+                "Forbidden",
+                email.message.Message(),
+                io.BytesIO(b"Forbidden"),
+            )
+            err_400 = urllib.error.HTTPError(
+                "https://oauth2.googleapis.com/token",
+                400,
+                "Bad Request",
+                email.message.Message(),
+                io.BytesIO(b'{"error": "invalid_grant"}'),
+            )
+            with patch("urllib.request.urlopen", side_effect=[err_403, err_400]):
+                with self.assertRaises(AccountAuthError):
+                    engine.switch_tokens(
+                        "revoked-acc",
+                        restart_server=True,
+                        force=True,
+                        verify_auth=True,
+                    )
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+            self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+
+            # 3. Disk swap OSError aborts before writing pending_reload.json
+            with patch.object(engine, "_sync_tokens_to_targets", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    engine.switch_tokens("work-acc", restart_server=True, force=True)
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertEqual(engine.get_active_name(), "primary-acc")
+
+            # 4. Missing cache_dir is recreated (0700) and switch_account forwards deferred/force_restart_now
+            shutil.rmtree(engine.cache_dir)
+            self.assertFalse(engine.cache_dir.exists())
+
+            with patch("os.kill", side_effect=AssertionError("os.kill must not be called during deferred switch_account")):
+                acc_deferred = engine.switch_account("work-acc", force=True)
+            self.assertIs(acc_deferred["server_restarted"], False)
+            self.assertIs(acc_deferred["restart_deferred"], True)
+            self.assertTrue(engine.cache_dir.is_dir())
+            self.assertEqual(stat.S_IMODE(engine.cache_dir.stat().st_mode), 0o700)
+            self.assertTrue(engine.pending_reload_file.is_file())
+            self.assertEqual(stat.S_IMODE(engine.pending_reload_file.stat().st_mode), 0o600)
+
+            sent_signals: list[tuple[int, int]] = []
+            terminated_pids: set[int] = set()
+
+            def fake_kill(pid: int, sig: int) -> None:
+                if sig == 0:
+                    if pid in terminated_pids:
+                        raise ProcessLookupError(pid)
+                    return
+                sent_signals.append((pid, sig))
+                if sig in (signal.SIGTERM, signal.SIGKILL):
+                    terminated_pids.add(pid)
+
+            with patch("os.kill", side_effect=fake_kill):
+                acc_now = engine.switch_account("primary-acc", force=True, force_restart_now=True)
+            self.assertEqual(sent_signals, [(50000, signal.SIGTERM)])
+            self.assertIs(acc_now["server_restarted"], True)
+            self.assertIs(acc_now["restart_deferred"], False)
+            self.assertFalse(engine.pending_reload_file.exists())
 
 
 if __name__ == "__main__":

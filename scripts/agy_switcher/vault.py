@@ -1032,13 +1032,25 @@ class AgySwitchEngine:
         email = resolve_token_email(token_data)
 
         server_restarted = False
+        restart_deferred = False
         if restart_server:
-            server_restarted = self.restart_language_server(force=force)
+            if not force_restart_now and self.is_invoked_by_language_server():
+                self.write_pending_reload(
+                    clean_name,
+                    reason="in_turn_deferred_reload",
+                    ttl_seconds=120,
+                )
+                restart_deferred = True
+            else:
+                server_restarted = self.restart_language_server(force=force)
+                if force_restart_now or server_restarted:
+                    self.clear_pending_reload()
 
         return {
             "active": clean_name,
             "email": email,
             "server_restarted": server_restarted,
+            "restart_deferred": restart_deferred,
         }
 
     def switch_account(
@@ -1046,9 +1058,15 @@ class AgySwitchEngine:
         name: str,
         force: bool = False,
         no_restart: bool = False,
+        force_restart_now: bool = False,
     ) -> dict[str, Any]:
         """Unified Facade alias for switch_tokens matching specification."""
-        return self.switch_tokens(name=name, restart_server=not no_restart, force=force)
+        return self.switch_tokens(
+            name=name,
+            restart_server=not no_restart,
+            force=force,
+            force_restart_now=force_restart_now,
+        )
 
     def _resolve_and_enrich_registration_email(self, token_data: dict[str, Any]) -> str | None:
         """Resolves Token Identity via id_token/id_token_email or best-effort Google UserInfo lookup."""
@@ -1487,6 +1505,14 @@ class AgySwitchEngine:
     def is_server_busy(self, pid: int | None = None) -> bool:
         """Checks if language_server has active child processes or presence locks."""
         return self.supervisor.is_server_busy(pid)
+
+    def is_invoked_by_language_server(
+        self,
+        pid: int | None = None,
+        current_pid: int | None = None,
+    ) -> bool:
+        """Detects whether the current process descends from language_server."""
+        return self.supervisor.is_invoked_by_language_server(pid=pid, current_pid=current_pid)
 
     def _send_signal(self, pid: int, sig: int = signal.SIGTERM) -> None:
         """Dispatches signal to target process."""
