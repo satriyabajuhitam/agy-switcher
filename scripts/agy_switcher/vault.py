@@ -30,7 +30,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator, cast
+from typing import Any, Callable, Iterable, Iterator, Sequence, cast
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,20 +45,26 @@ from agy_switcher.exceptions import (
 )
 from agy_switcher.models import (
     AuthErrorEntry,
+    DEFAULT_PENDING_RELOAD_TTL_SECONDS,
     DiagnosticItem,
     DiagnosticReport,
     FailoverStateDict,
     LastFailoverEntry,
     PendingReloadPayload,
+    TargetSyncSnapshot,
+    TokenSyncStatus,
 )
 from agy_switcher.security import (
     _atomic_write_file,
     _atomic_write_json,
     extract_email_from_jwt,
+    extract_token_identity,
     is_safe_account_alias,
     parse_pending_reload_payload,
+    read_json_dict_nofollow,
     read_json_dict_safe,
     resolve_token_email,
+    token_credentials_match,
     validate_token_dict,
     validate_token_file,
 )
@@ -407,30 +413,273 @@ class AgySwitchEngine:
         self._atomic_write_file(self.desktop_token_file, token_payload, mode=0o600)
         self._atomic_write_file(self.cli_token_file, token_payload, mode=0o600)
 
+    def _resolve_active_name_for_sync(self) -> tuple[str | None, str | None]:
+        """Resolves active account name safely without following active_file symlinks."""
+        try:
+            st = os.lstat(self.active_file)
+        except FileNotFoundError:
+            st = None
+        except OSError as exc:
+            return None, f"failed to stat active file: {exc}"
+
+        if st is not None and (stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode)):
+            return None, f"active file '{self.active_file}' is a symlink or non-regular file"
+
+        try:
+            active = self.get_active_name()
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            return None, f"failed to read active file: {exc}"
+
+        if active is None:
+            return None, None
+        cleaned = active.strip()
+        return (cleaned, None) if cleaned else (None, None)
+
+    def _inspect_target_sync_snapshot(
+        self,
+        target_path: Path,
+        active_name: str | None,
+        vault_data: dict[str, object] | None,
+        *,
+        active_invalid: bool = False,
+    ) -> TargetSyncSnapshot:
+        """Inspects a single live token file against Vault credentials without following symlinks."""
+        target_data, io_status = read_json_dict_nofollow(target_path)
+        if io_status != "ok":
+            return {
+                "synced": False,
+                "status": io_status,
+                "email": None,
+                "path": str(target_path),
+                "drifted": True,
+            }
+
+        target_email = resolve_token_email(target_data)
+        if active_invalid:
+            return {
+                "synced": False,
+                "status": "vault_invalid",
+                "email": target_email,
+                "path": str(target_path),
+                "drifted": True,
+            }
+        if active_name is None:
+            return {
+                "synced": False,
+                "status": "no_active_account",
+                "email": target_email,
+                "path": str(target_path),
+                "drifted": True,
+            }
+        if vault_data is None:
+            return {
+                "synced": False,
+                "status": "vault_invalid",
+                "email": target_email,
+                "path": str(target_path),
+                "drifted": True,
+            }
+
+        synced = token_credentials_match(vault_data, target_data)
+        return {
+            "synced": synced,
+            "status": "synced" if synced else "drift",
+            "email": target_email,
+            "path": str(target_path),
+            "drifted": not synced,
+        }
+
+    def check_target_sync_status(self) -> TokenSyncStatus:
+        """Locally inspects Desktop and CLI token files against the active Vault account."""
+        active, active_error = self._resolve_active_name_for_sync()
+        vault_data: dict[str, object] | None = None
+        if active is not None and is_safe_account_alias(active):
+            account_dir = self.accounts_dir / active
+            if not account_dir.is_symlink():
+                loaded_vault, vault_status = read_json_dict_nofollow(account_dir / "token.json")
+                if (
+                    vault_status == "ok"
+                    and loaded_vault is not None
+                    and extract_token_identity(loaded_vault) is not None
+                ):
+                    vault_data = loaded_vault
+
+        active_invalid = active_error is not None
+        desktop_snap = self._inspect_target_sync_snapshot(
+            self.desktop_token_file,
+            active,
+            vault_data,
+            active_invalid=active_invalid,
+        )
+        cli_snap = self._inspect_target_sync_snapshot(
+            self.cli_token_file,
+            active,
+            vault_data,
+            active_invalid=active_invalid,
+        )
+
+        drifted_targets: list[str] = []
+        if not desktop_snap["synced"]:
+            drifted_targets.append("desktop")
+        if not cli_snap["synced"]:
+            drifted_targets.append("cli")
+
+        return {
+            "in_sync": desktop_snap["synced"] and cli_snap["synced"],
+            "desktop_synced": desktop_snap["synced"],
+            "cli_synced": cli_snap["synced"],
+            "drifted_targets": drifted_targets,
+            "desktop_email": desktop_snap["email"],
+            "cli_email": cli_snap["email"],
+            "active_account": active,
+            "desktop": desktop_snap,
+            "cli": cli_snap,
+            "targets": {
+                "desktop": desktop_snap,
+                "cli": cli_snap,
+            },
+        }
+
+    def sync_active_tokens_from_vault(
+        self,
+        targets: Sequence[str] = ("desktop", "cli"),
+    ) -> bool:
+        """Validates the active Vault token and atomically repairs requested live target files."""
+        if isinstance(targets, (str, bytes)) or not isinstance(targets, Iterable):
+            print(
+                f"[agy-switch] Warning: Invalid targets collection {targets!r}; expected sequence of 'desktop'/'cli'.",
+                file=sys.stderr,
+            )
+            return False
+
+        target_map: dict[str, Path] = {
+            "desktop": self.desktop_token_file,
+            "cli": self.cli_token_file,
+        }
+        normalized_targets: list[tuple[str, Path]] = []
+        seen_targets: set[str] = set()
+        for raw_target in targets:
+            if not isinstance(raw_target, str):
+                print(
+                    f"[agy-switch] Warning: Invalid sync target {raw_target!r}; expected 'desktop' or 'cli'.",
+                    file=sys.stderr,
+                )
+                return False
+            name = raw_target.strip().lower()
+            target_path = target_map.get(name)
+            if target_path is None:
+                print(
+                    f"[agy-switch] Warning: Unknown sync target '{raw_target}'; expected 'desktop' or 'cli'.",
+                    file=sys.stderr,
+                )
+                return False
+            if name not in seen_targets:
+                seen_targets.add(name)
+                normalized_targets.append((name, target_path))
+
+        active, active_error = self._resolve_active_name_for_sync()
+        if active_error is not None:
+            print(
+                f"[agy-switch] Warning: Cannot sync tokens from vault: {active_error}.",
+                file=sys.stderr,
+            )
+            return False
+        if not active or not is_safe_account_alias(active):
+            print(
+                "[agy-switch] Warning: Cannot sync tokens from vault: no valid active account configured.",
+                file=sys.stderr,
+            )
+            return False
+
+        account_dir = self.accounts_dir / active
+        if account_dir.is_symlink():
+            print(
+                f"[agy-switch] Warning: Active account '{active}' directory is a symlink; refusing vault sync.",
+                file=sys.stderr,
+            )
+            return False
+
+        vault_token_path = account_dir / "token.json"
+        if vault_token_path.is_symlink():
+            print(
+                f"[agy-switch] Warning: Active account '{active}' token.json is a symlink; refusing vault sync.",
+                file=sys.stderr,
+            )
+            return False
+
+        try:
+            token_data = self.validate_token_file(vault_token_path)
+            if not isinstance(token_data, dict):
+                raise InvalidTokenError("Validated token payload must be a JSON object.")
+        except (InvalidTokenError, OSError, ValueError, RecursionError) as exc:
+            print(
+                f"[agy-switch] Warning: Active account '{active}' token.json is missing or invalid ({exc}); "
+                "aborting vault sync.",
+                file=sys.stderr,
+            )
+            return False
+
+        if not normalized_targets:
+            return True
+
+        token_payload = json.dumps(token_data, indent=2) + "\n"
+        all_ok = True
+        for name, target_path in normalized_targets:
+            try:
+                self._atomic_write_file(target_path, token_payload, mode=0o600)
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to atomically sync '{name}' token at '{target_path}': {exc}",
+                    file=sys.stderr,
+                )
+                all_ok = False
+        return all_ok
+
     def update_account_access_token(self, name: str, access_token: str, expiry: str | None = None) -> bool:
         """Updates the access token in vault and syncs to active targets if current."""
         if not name or not isinstance(name, str) or not name.strip():
             return False
         name = name.strip()
+        if not is_safe_account_alias(name):
+            return False
         if not access_token or not isinstance(access_token, str) or not access_token.strip():
             return False
-        token_path = self.accounts_dir / name / "token.json"
-        if not token_path.is_file():
+        account_dir = self.accounts_dir / name
+        if account_dir.is_symlink():
+            return False
+        token_path = account_dir / "token.json"
+        data, io_status = read_json_dict_nofollow(token_path)
+        if io_status != "ok" or data is None:
+            return False
+        token_obj = data.get("token")
+        if not isinstance(token_obj, dict):
             return False
         try:
-            raw = token_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if "token" not in data or not isinstance(data["token"], dict):
-                return False
-            data["token"]["access_token"] = access_token.strip()
+            token_obj["access_token"] = access_token.strip()
             if expiry is not None:
                 if isinstance(expiry, str) and expiry.strip():
-                    data["token"]["expiry"] = expiry.strip()
+                    token_obj["expiry"] = expiry.strip()
             self._atomic_write_json(token_path, data)
 
-            if name == self.get_active_name():
+            active_name, active_error = self._resolve_active_name_for_sync()
+            if active_error is None and name == active_name:
+                desktop_drifted = False
+                desktop_data, desktop_status = read_json_dict_nofollow(self.desktop_token_file)
+                if desktop_status == "ok" and desktop_data is not None:
+                    vault_identity = extract_token_identity(data)
+                    desktop_identity = extract_token_identity(desktop_data)
+                    if vault_identity is not None and desktop_identity is not None:
+                        desktop_drifted = not token_credentials_match(data, desktop_data)
+
                 token_payload = json.dumps(data, indent=2) + "\n"
                 self._sync_tokens_to_targets(token_payload)
+
+                if desktop_drifted and self.locate_language_server_pid() is not None:
+                    self.write_pending_reload(
+                        name,
+                        reason="desktop_drift_on_token_refresh",
+                        ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+                    )
             return True
         except Exception:
             return False
@@ -635,7 +884,7 @@ class AgySwitchEngine:
         self,
         target_account: str,
         reason: str = "in_turn_deferred_reload",
-        ttl_seconds: float | int = 120,
+        ttl_seconds: float | int = DEFAULT_PENDING_RELOAD_TTL_SECONDS,
         requested_at: float | None = None,
     ) -> PendingReloadPayload:
         """Atomically writes cache/pending_reload.json at mode 0600."""
@@ -644,7 +893,7 @@ class AgySwitchEngine:
             raise AgySwitchError("Target account for pending reload cannot be empty.")
 
         clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "in_turn_deferred_reload"
-        ttl_val: float | int = 120
+        ttl_val: float | int = DEFAULT_PENDING_RELOAD_TTL_SECONDS
         if not isinstance(ttl_seconds, bool) and isinstance(ttl_seconds, (int, float)) and math.isfinite(ttl_seconds) and ttl_seconds > 0:
             ttl_val = ttl_seconds
 
@@ -866,6 +1115,13 @@ class AgySwitchEngine:
         """Alias for set_active_name."""
         self.set_active_name(name)
 
+    def _attach_local_sync_metadata(self, payload: dict[str, Any]) -> None:
+        """Attaches local-only sync_status and unexpired pending_reload metadata to a status/list payload."""
+        payload["sync_status"] = self.check_target_sync_status()
+        pending_reload = self.load_pending_reload()
+        if isinstance(pending_reload, dict) and pending_reload:
+            payload["pending_reload"] = pending_reload
+
     def list_accounts(self) -> dict[str, Any]:
         """Lists all accounts registered in the vault and marks the active account."""
         active = self.get_active_name()
@@ -903,10 +1159,12 @@ class AgySwitchEngine:
 
                 accounts.append(entry)
 
-        return {
+        result: dict[str, Any] = {
             "active": active,
             "accounts": accounts,
         }
+        self._attach_local_sync_metadata(result)
+        return result
 
     def _available_account_names(self) -> list[str]:
         if not self.accounts_dir.is_dir():
@@ -988,7 +1246,7 @@ class AgySwitchEngine:
                 self.write_pending_reload(
                     clean_name,
                     reason="in_turn_deferred_reload",
-                    ttl_seconds=120,
+                    ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
                 )
                 restart_deferred = True
             else:
@@ -1551,10 +1809,7 @@ class AgySwitchEngine:
             ):
                 status["last_failover"] = dict(raw_last_failover)
 
-        pending_reload = self.load_pending_reload()
-        if isinstance(pending_reload, dict) and pending_reload:
-            status["pending_reload"] = pending_reload
-
+        self._attach_local_sync_metadata(status)
         return status
 
     def _is_valid_expiry(self, raw_expiry: Any) -> bool:

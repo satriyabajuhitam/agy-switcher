@@ -742,7 +742,7 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
             print("  - Updated: ~/.gemini/antigravity-cli/antigravity-oauth-token (Antigravity CLI)")
             if res.get("restart_deferred") is True:
                 print(
-                    "  - Server : Deferred safe-turn reload queued (cache/pending_reload.json, TTL 120s); active agent turn uninterrupted"
+                    "  - Server : Deferred safe-turn reload queued (cache/pending_reload.json, TTL 1800s (30m)); active agent turn uninterrupted"
                 )
                 if not _is_log_watcher_active(engine):
                     print(

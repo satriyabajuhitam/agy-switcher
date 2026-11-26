@@ -9,19 +9,22 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import errno
-import json
+import inspect
 import math
 import os
 from pathlib import Path
 import re
 import sys
 import time
-from typing import Any, Callable, cast
+from typing import Any, Callable, Mapping
 
+from agy_switcher.models import DEFAULT_PENDING_RELOAD_TTL_SECONDS, PendingReloadPayload
 from agy_switcher.security import (
     _atomic_write_file,
+    _atomic_write_json,
     parse_pending_reload_payload,
     read_json_dict_nofollow,
+    read_latest_jsonl_record,
 )
 
 DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
@@ -251,14 +254,13 @@ class PresenceDetector:
         self.cli_log_dir = self.gemini_dir / "antigravity-cli" / "log"
         self.proc_dir = Path(proc_dir) if proc_dir else Path("/proc")
 
-    def _discover_from_proc(self) -> str | None:
-        """
-        Tier 1: Scans proc_dir/<pid>/fd/* of running language_server or antigravity processes
+    def _collect_proc_session_ids(self) -> list[str]:
+        """Scans proc_dir/<pid>/fd/* of running language_server or antigravity processes
         to find file descriptors referencing presence/*.lock across Desktop and CLI presence directories.
-        Returns the active session ID (or newest if multiple), or None if not found or inaccessible.
+        Returns deduplicated session IDs ordered deterministically (newest mtime first, then session_id).
         """
         if not self.proc_dir.is_dir():
-            return None
+            return []
 
         candidates: list[tuple[float, str, str]] = []
         presence_dirs = [self.presence_dir, self.cli_presence_dir]
@@ -342,13 +344,35 @@ class PresenceDetector:
                 except OSError:
                     continue
         except OSError:
-            return None
+            return []
 
         if not candidates:
-            return None
+            return []
 
         candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
-        return candidates[0][1]
+        session_ids: list[str] = []
+        seen: set[str] = set()
+        for _, sid, _ in candidates:
+            if sid not in seen:
+                seen.add(sid)
+                session_ids.append(sid)
+        return session_ids
+
+    def _discover_from_proc(self) -> str | None:
+        """
+        Tier 1: Scans proc_dir/<pid>/fd/* of running language_server or antigravity processes
+        to find file descriptors referencing presence/*.lock across Desktop and CLI presence directories.
+        Returns the active session ID (or newest if multiple), or None if not found or inaccessible.
+        """
+        session_ids = self._collect_proc_session_ids()
+        return session_ids[0] if session_ids else None
+
+    def get_active_session_ids(self) -> list[str]:
+        """Enumerates all live session IDs tracked via open presence/*.lock fds."""
+        try:
+            return self._collect_proc_session_ids()
+        except OSError:
+            return []
 
     def _discover_from_presence_locks(self) -> str | None:
         """
@@ -470,6 +494,17 @@ class PresenceDetector:
 
         return None
 
+    def get_all_active_transcript_paths(self) -> list[Path]:
+        """Returns deduplicated transcript.jsonl paths for all live open-lock sessions."""
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for session_id in self.get_active_session_ids():
+            transcript_path = self.get_active_transcript_path(session_id=session_id)
+            if transcript_path is not None and transcript_path not in seen:
+                seen.add(transcript_path)
+                paths.append(transcript_path)
+        return paths
+
     def get_watch_targets(self, as_str: bool = False, session_id: str | None = None) -> list[Path] | list[str]:
         """
         Returns list of active log targets to watch:
@@ -545,43 +580,6 @@ def _extract_text_fragments(value: object, max_items: int = 10000) -> list[str]:
     return fragments
 
 
-def read_latest_jsonl_record(target_path: Path) -> dict[str, Any] | None:
-    """Reads and parses the trailing JSON object record from a JSONL transcript file."""
-    try:
-        size = target_path.stat().st_size
-        if size == 0:
-            return None
-        max_read = 4 * 1024 * 1024
-        chunk_size = min(size, 65536)
-        with open(target_path, "rb") as f:
-            while True:
-                f.seek(max(0, size - chunk_size))
-                data = f.read(min(chunk_size, size))
-                last_line_str: str | None = None
-                for line in reversed(data.splitlines()):
-                    s = line.strip().decode("utf-8", errors="replace")
-                    if s:
-                        last_line_str = s
-                        break
-                if not last_line_str:
-                    return None
-                if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
-                    chunk_size = min(size, chunk_size * 4, max_read)
-                    continue
-                if not last_line_str.startswith("{"):
-                    return None
-                try:
-                    parsed = json.loads(last_line_str)
-                    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
-                except json.JSONDecodeError:
-                    if chunk_size < size and chunk_size < max_read:
-                        chunk_size = min(size, chunk_size * 4, max_read)
-                        continue
-                    return None
-    except OSError:
-        return None
-
-
 def safe_stderr_write(message: str) -> None:
     """Writes a diagnostic line to sys.stderr without raising on closed streams."""
     try:
@@ -649,6 +647,236 @@ def format_deferred_reload_audit_line(
         f"{ts} [watch] Deferred safe-turn reload for '{clean_target}' "
         f"with force-restart language_server (reason: {clean_reason})\n"
     )
+
+
+def format_drift_guard_audit_line(
+    target_account: str,
+    drifted_targets: tuple[str, ...] | list[str],
+    *,
+    queued_reload: bool = False,
+) -> str:
+    """Formats a structured Continuous Drift Guard audit entry for watch.log."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    clean_target = " ".join(str(target_account).split()) or "unknown"
+    clean_drifted = [
+        " ".join(str(target).split())
+        for target in drifted_targets
+        if str(target).strip()
+    ]
+    targets_label = ", ".join(clean_drifted) if clean_drifted else "none"
+    reload_label = "queued_reload=true" if queued_reload else "queued_reload=false"
+    return (
+        f"{ts} [watch] Drift guard healed targets [{targets_label}] to '{clean_target}' "
+        f"({reload_label})\n"
+    )
+
+
+def sanitize_drift_check_interval(interval: object, default: float = 5.0) -> float:
+    """Normalizes drift check interval, rejecting booleans, negatives, and non-finite numbers."""
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+        return default
+    val = float(interval)
+    return val if math.isfinite(val) and val >= 0.0 else default
+
+
+def parse_drift_sync_status(status: object) -> tuple[list[str], str | None] | None:
+    """Validates engine sync status mapping, returning (drifted_targets, active_account) or None on mock/malformed status."""
+    if _is_mock_object(status) or not isinstance(status, Mapping):
+        return None
+    in_sync = status.get("in_sync")
+    drifted_raw = status.get("drifted_targets")
+    if not isinstance(in_sync, bool) or _is_mock_object(drifted_raw) or not isinstance(drifted_raw, (list, tuple)):
+        return None
+
+    has_active_key = "active_account" in status
+    raw_active = status.get("active_account") if has_active_key else None
+    if has_active_key and (_is_mock_object(raw_active) or not isinstance(raw_active, str) or not raw_active.strip()):
+        return [], None
+
+    snapshots: list[object] = [status.get("desktop"), status.get("cli")]
+    targets_map = status.get("targets")
+    if isinstance(targets_map, Mapping):
+        snapshots.extend([targets_map.get("desktop"), targets_map.get("cli")])
+    for snap in snapshots:
+        if isinstance(snap, Mapping) and snap.get("status") in ("no_active_account", "vault_invalid"):
+            return [], None
+
+    active_name = raw_active.strip() if isinstance(raw_active, str) and raw_active.strip() else None
+    if in_sync:
+        return [], active_name
+
+    drifted: list[str] = []
+    for item in drifted_raw:
+        if isinstance(item, str) and not _is_mock_object(item):
+            norm = item.strip().lower()
+            if norm in ("desktop", "cli") and norm not in drifted:
+                drifted.append(norm)
+    return drifted, active_name
+
+
+def resolve_pending_reload_path(engine: object, cache_dir: Path) -> Path | None:
+    """Resolves cache/pending_reload.json path, guarding production paths under test runners."""
+    raw_prf = getattr(engine, "pending_reload_file", None)
+    if isinstance(raw_prf, (str, Path)) and not _is_mock_object(raw_prf):
+        cleaned = str(raw_prf).strip()
+        if not cleaned or cleaned == ".":
+            return None
+        candidate = Path(cleaned).expanduser()
+    else:
+        candidate = cache_dir / "pending_reload.json"
+    if _is_test_runner() and _is_prod_vault_path(candidate):
+        return None
+    return candidate
+
+
+def unlink_pending_reload_safe(
+    pending_path: Path,
+    warning_context: str = "pending reload marker",
+    stderr_fn: Callable[[str], None] = safe_stderr_write,
+) -> None:
+    """Best-effort unlink of cache/pending_reload.json without raising on OSError."""
+    try:
+        pending_path.unlink(missing_ok=True)
+    except OSError as exc:
+        stderr_fn(f"[watch] Warning: Failed to unlink {warning_context} '{pending_path}': {exc}")
+
+
+def enqueue_drift_pending_reload(
+    pending_path: Path | None,
+    target_account: str,
+    now: float,
+    *,
+    reason: str = "desktop_drift_guard",
+    ttl_seconds: int = DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    write_fn: Callable[..., object] | None = None,
+    stderr_fn: Callable[[str], None] = safe_stderr_write,
+) -> bool:
+    """Atomically writes pending_reload.json unless an unexpired marker for target_account already exists."""
+    if pending_path is None:
+        return False
+    raw_existing, io_status = read_json_dict_nofollow(pending_path)
+    parsed_existing = parse_pending_reload_payload(raw_existing) if io_status == "ok" else None
+    if parsed_existing is not None:
+        age = now - float(parsed_existing["requested_at"])
+        if age <= float(parsed_existing["ttl_seconds"]) and parsed_existing["target_account"] == target_account:
+            return True
+
+    payload: PendingReloadPayload = {
+        "target_account": target_account,
+        "requested_at": float(now),
+        "ttl_seconds": ttl_seconds,
+        "reason": reason,
+    }
+    try:
+        if callable(write_fn) and not _is_mock_object(write_fn):
+            try:
+                write_fn(target_account, reason=reason, ttl_seconds=ttl_seconds, requested_at=float(now))
+            except TypeError:
+                write_fn(target_account, reason=reason, ttl_seconds=ttl_seconds)
+            raw_after, io_after = read_json_dict_nofollow(pending_path)
+            parsed_after = parse_pending_reload_payload(raw_after) if io_after == "ok" else None
+            if parsed_after is None or parsed_after["target_account"] != target_account:
+                return False
+            return (now - float(parsed_after["requested_at"])) <= float(parsed_after["ttl_seconds"])
+        else:
+            _atomic_write_json(pending_path, dict(payload), mode=0o600)
+        return True
+    except Exception as exc:
+        stderr_fn(f"[watch] Warning: Failed to persist pending reload marker '{pending_path}': {exc}")
+        return False
+
+
+def _accepts_targets_kwarg(fn: Callable[..., object]) -> bool:
+    """Returns True if fn accepts a 'targets' keyword argument or **kwargs."""
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    for name, param in sig.parameters.items():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if name == "targets" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+def execute_drift_guard(
+    engine: object,
+    now: float,
+    *,
+    pending_path: Path | None,
+    locate_pid_fn: Callable[[], int | None],
+    log_dir: Path | None,
+    stderr_fn: Callable[[str], None] = safe_stderr_write,
+) -> bool:
+    """Executes local-only drift inspection, atomic repair, deferred reload queueing, and audit logging."""
+    check_fn = getattr(engine, "check_target_sync_status", None)
+    if not callable(check_fn):
+        return False
+    try:
+        raw_status = check_fn()
+    except Exception as exc:
+        stderr_fn(f"[watch] Warning: Drift guard sync check failed: {exc}")
+        return False
+
+    parsed = parse_drift_sync_status(raw_status)
+    if parsed is None:
+        return False
+    drifted_targets, status_active = parsed
+    if not drifted_targets:
+        return False
+
+    sync_fn = getattr(engine, "sync_active_tokens_from_vault", None)
+    if not callable(sync_fn):
+        return False
+    try:
+        if _accepts_targets_kwarg(sync_fn):
+            repaired = bool(sync_fn(targets=tuple(drifted_targets)))
+        else:
+            repaired = bool(sync_fn())
+    except Exception as exc:
+        stderr_fn(f"[watch] Warning: Drift guard failed to repair {drifted_targets}: {exc}")
+        return False
+    if not repaired:
+        stderr_fn(f"[watch] Warning: Drift guard failed to repair {drifted_targets} from Vault.")
+        return False
+
+    target_account = status_active
+    get_active_fn = getattr(engine, "get_active_name", None)
+    if callable(get_active_fn):
+        try:
+            fresh_active = get_active_fn()
+            if isinstance(fresh_active, str) and fresh_active.strip() and not _is_mock_object(fresh_active):
+                target_account = fresh_active.strip()
+        except Exception as exc:
+            stderr_fn(f"[watch] Warning: Drift guard failed to refresh active account name: {exc}")
+    clean_target = target_account or "active"
+
+    queued_reload = False
+    if "desktop" in drifted_targets:
+        try:
+            ls_pid = locate_pid_fn()
+        except Exception as exc:
+            stderr_fn(f"[watch] Warning: Drift guard failed to locate language_server PID: {exc}")
+            ls_pid = None
+        if ls_pid is not None:
+            queued_reload = enqueue_drift_pending_reload(
+                pending_path,
+                clean_target,
+                now,
+                write_fn=getattr(engine, "write_pending_reload", None),
+                stderr_fn=stderr_fn,
+            )
+
+    write_watch_log_line(
+        log_dir,
+        format_drift_guard_audit_line(clean_target, drifted_targets, queued_reload=queued_reload),
+        append_fn=append_secure_log_entry,
+    )
+    return True
 
 
 def is_watch_process_cmdline(proc_dir: Path, pid: int, watch_script: Path | None) -> bool:
@@ -770,6 +998,13 @@ __all__ = [
     "write_watch_log_line",
     "format_audit_log_line",
     "format_deferred_reload_audit_line",
+    "format_drift_guard_audit_line",
+    "sanitize_drift_check_interval",
+    "parse_drift_sync_status",
+    "resolve_pending_reload_path",
+    "unlink_pending_reload_safe",
+    "enqueue_drift_pending_reload",
+    "execute_drift_guard",
     "is_watch_process_cmdline",
     "PresenceDetector",
     "DEFAULT_GEMINI_DIR",

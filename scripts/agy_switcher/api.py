@@ -26,9 +26,14 @@ from agy_switcher.formatters import (
     format_fleet_exhaustion_message,
     format_fleet_exhaustion_notice,
 )
-from agy_switcher.models import AccountInfo, RotationResult, FleetQuotaSummary
+from agy_switcher.models import (
+    AccountInfo,
+    DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    FleetQuotaSummary,
+    RotationResult,
+)
 from agy_switcher.rotation import RotationEngine
-from agy_switcher.security import resolve_token_email
+from agy_switcher.security import enqueue_pending_reload_fail_safe, resolve_token_email
 from agy_switcher.telemetry import normalize_model_name
 from agy_switcher.vault import AgySwitchEngine
 
@@ -207,6 +212,17 @@ def handle_soft_import_rotation(
         return (False, None, FALLBACK_MISSING_SWITCHER_MESSAGE)
     except Exception as exc:
         return (False, None, f"Rotation error: {exc}")
+
+
+def _enqueue_sdk_pending_reload(engine: AgySwitchEngine, target_account: str) -> None:
+    """Enqueues a deferred safe-turn reload marker after a Disk-Only Swap without failing rotation."""
+    enqueue_pending_reload_fail_safe(
+        engine,
+        target_account,
+        reason="sdk_disk_only_swap",
+        ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+        log_prefix="[agy-switch]",
+    )
 
 
 def auto_rotate_on_exhaustion(
@@ -457,6 +473,9 @@ def auto_rotate_on_exhaustion(
                 active_account=previous_account,
             )
 
+        if not reload_server:
+            _enqueue_sdk_pending_reload(engine, target_account)
+
         target_quota_cache = rot_engine._load_quota_cache()
         if isinstance(target_quota_cache, dict):
             target_accounts_map = (
@@ -560,6 +579,8 @@ def switch_account(
             )
 
     engine.switch_tokens(name=clean_name, restart_server=reload_server, force=False)
+    if not reload_server:
+        _enqueue_sdk_pending_reload(engine, clean_name)
     return True
 
 

@@ -226,6 +226,7 @@ class TestModularArchitectureDAG(unittest.TestCase):
             "gzip",
             "hashlib",
             "importlib",
+            "inspect",
             "io",
             "itertools",
             "json",
@@ -581,12 +582,15 @@ class TestReExportLaunchers(unittest.TestCase):
         watcher.py must remain strictly under 1300 lines (< 1500 lines limit).
         """
         import agy_switcher.presence as pres_mod
+        import agy_switcher.security as sec_mod
         import agy_switcher.watcher as watch_mod
 
         self.assertIs(pres_mod.PresenceDetector, watch_mod.PresenceDetector)
         self.assertIs(pres_mod._open_secure_log_file, watch_mod._open_secure_log_file)
         self.assertIs(pres_mod.append_secure_log_entry, watch_mod.append_secure_log_entry)
         self.assertIs(pres_mod.DEFAULT_GEMINI_DIR, watch_mod.DEFAULT_GEMINI_DIR)
+        self.assertIs(pres_mod.read_latest_jsonl_record, sec_mod.read_latest_jsonl_record)
+        self.assertIs(pres_mod.read_latest_jsonl_record, watch_mod.read_latest_jsonl_record)
 
         watcher_path = PACKAGE_DIR / "watcher.py"
         lines = watcher_path.read_text(encoding="utf-8").splitlines()
@@ -641,6 +645,48 @@ class TestReExportLaunchers(unittest.TestCase):
         self.assertIn("resolve_token_email", agy_switch.__all__)
         self.assertIs(security_mod.resolve_token_email, agy_switcher.resolve_token_email)
         self.assertIs(agy_switcher.resolve_token_email, agy_switch.resolve_token_email)
+
+    def test_layer0_ttl_types_jsonl_reexport_surface_parity(self):
+        """Layer 0 TTL constant, sync TypedDicts, pending_reload parser, and JSONL reader keep 100% parity."""
+        import agy_switcher.models as models_mod
+        import agy_switcher.security as security_mod
+
+        model_symbols = (
+            "DEFAULT_PENDING_RELOAD_TTL_SECONDS",
+            "PendingReloadPayload",
+            "TokenIdentity",
+            "TargetSyncSnapshot",
+            "TokenSyncStatus",
+        )
+        security_symbols = (
+            "parse_pending_reload_payload",
+            "read_latest_jsonl_record",
+        )
+
+        for sym in model_symbols:
+            self.assertIn(sym, models_mod.__all__)
+            self.assertIn(sym, agy_switcher.__all__)
+            self.assertIn(sym, agy_switch.__all__)
+            self.assertIs(getattr(models_mod, sym), getattr(agy_switcher, sym))
+            self.assertIs(getattr(agy_switcher, sym), getattr(agy_switch, sym))
+
+        for sym in security_symbols:
+            self.assertIn(sym, security_mod.__all__)
+            self.assertIn(sym, agy_switcher.__all__)
+            self.assertIn(sym, agy_switch.__all__)
+            self.assertIs(getattr(security_mod, sym), getattr(agy_switcher, sym))
+            self.assertIs(getattr(agy_switcher, sym), getattr(agy_switch, sym))
+
+    def test_token_identity_matcher_reexport_surface_parity(self):
+        """extract_token_identity and token_credentials_match maintain 100% parity across security, agy_switcher, and agy_switch."""
+        import agy_switcher.security as security_mod
+
+        for sym in ("extract_token_identity", "token_credentials_match"):
+            self.assertIn(sym, security_mod.__all__)
+            self.assertIn(sym, agy_switcher.__all__)
+            self.assertIn(sym, agy_switch.__all__)
+            self.assertIs(getattr(security_mod, sym), getattr(agy_switcher, sym))
+            self.assertIs(getattr(agy_switcher, sym), getattr(agy_switch, sym))
 
     def test_watch_launcher_uses_realpath_and_exports(self):
         watch_path = SCRIPTS_DIR / "watch.py"

@@ -8,9 +8,13 @@ Contracts & Specifications:
 from __future__ import annotations
 
 import base64
+import errno
+import io
 import json
+import os
 from pathlib import Path
 import signal
+import stat
 import sys
 import tempfile
 from typing import Any
@@ -1348,6 +1352,248 @@ class TestSDKFacade(unittest.TestCase):
         self.assertIs(agy_switch.get_fleet_quota_summary, api.get_fleet_quota_summary)
         for sym in expected_symbols:
             self.assertIn(sym, agy_switch.__all__, f"agy_switch.__all__ missing symbol: {sym}")
+
+    def test_converge_reload_002_and_003_sdk_disk_only_swap_enqueues_pending_reload(self) -> None:
+        """[CONVERGE-RELOAD-002] [CONVERGE-RELOAD-003] SDK Disk-Only Swaps enqueue 1800s pending_reload.json with zero /proc calls."""
+        for alias, email_addr in (
+            ("primary-acc", "primary@example.com"),
+            ("standby-acc", "standby@example.com"),
+            ("personal", "personal@example.com"),
+        ):
+            acc_dir = self.engine.accounts_dir / alias
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(
+                json.dumps(create_sample_token(email_addr)), encoding="utf-8"
+            )
+
+        self.engine.switch_tokens("primary-acc", restart_server=False)
+
+        presence_lock = self.gemini_dir / "antigravity" / "presence" / "active-turn.lock"
+        presence_lock.parent.mkdir(parents=True, exist_ok=True)
+        presence_lock.write_text("active-turn-lock-1\n", encoding="utf-8")
+        initial_lock_stat = presence_lock.stat()
+
+        cache_data = {
+            "timestamp": 1700000000,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600}},
+                "standby-acc": {"gemini": {"quota": 85, "reset_time": 1700003600}},
+                "personal": {"gemini": {"quota": 40, "reset_time": 1700003600}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+
+        pending_file = self.engine.pending_reload_file
+        self.assertFalse(pending_file.exists())
+
+        with patch.object(self.engine, "locate_language_server_pid") as mock_locate, \
+             patch.object(self.engine, "is_server_busy") as mock_busy, \
+             patch.object(self.engine, "restart_language_server") as mock_restart, \
+             patch.object(self.engine, "verify_turn_safety") as mock_turn_safety, \
+             patch.object(self.engine, "is_invoked_by_language_server") as mock_in_turn:
+            rot_res = api.auto_rotate_on_exhaustion(
+                model="gemini", reload_server=False, engine=self.engine
+            )
+            mock_locate.assert_not_called()
+            mock_busy.assert_not_called()
+            mock_restart.assert_not_called()
+            mock_turn_safety.assert_not_called()
+            mock_in_turn.assert_not_called()
+
+        self.assertTrue(rot_res.success)
+        self.assertEqual(rot_res.new_account, "standby-acc")
+        self.assertFalse(rot_res.reloaded_server)
+        self.assertTrue(pending_file.is_file())
+        self.assertEqual(stat.S_IMODE(os.stat(pending_file).st_mode), 0o600)
+        rot_pending = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(rot_pending["target_account"], "standby-acc")
+        self.assertEqual(rot_pending["ttl_seconds"], 1800)
+        self.assertEqual(rot_pending["reason"], "sdk_disk_only_swap")
+        self.assertEqual(presence_lock.read_text(encoding="utf-8"), "active-turn-lock-1\n")
+        self.assertEqual(presence_lock.stat().st_mtime_ns, initial_lock_stat.st_mtime_ns)
+
+        pending_file.unlink()
+
+        with patch.object(self.engine, "locate_language_server_pid") as mock_locate, \
+             patch.object(self.engine, "is_server_busy") as mock_busy, \
+             patch.object(self.engine, "restart_language_server") as mock_restart, \
+             patch.object(self.engine, "verify_turn_safety") as mock_turn_safety, \
+             patch.object(self.engine, "is_invoked_by_language_server") as mock_in_turn:
+            switched = api.switch_account(
+                "  personal  ", reload_server=False, engine=self.engine
+            )
+            mock_locate.assert_not_called()
+            mock_busy.assert_not_called()
+            mock_restart.assert_not_called()
+            mock_turn_safety.assert_not_called()
+            mock_in_turn.assert_not_called()
+
+        self.assertTrue(switched)
+        self.assertEqual(self.engine.get_active_name(), "personal")
+        self.assertTrue(pending_file.is_file())
+        self.assertEqual(stat.S_IMODE(os.stat(pending_file).st_mode), 0o600)
+        switch_pending = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(switch_pending["target_account"], "personal")
+        self.assertEqual(switch_pending["ttl_seconds"], 1800)
+        self.assertEqual(switch_pending["reason"], "sdk_disk_only_swap")
+        self.assertEqual(presence_lock.read_text(encoding="utf-8"), "active-turn-lock-1\n")
+        self.assertEqual(presence_lock.stat().st_mtime_ns, initial_lock_stat.st_mtime_ns)
+
+    def test_converge_reload_edge_003_and_err_001_no_spurious_marker_and_graceful_write_failure(self) -> None:
+        """[CONVERGE-RELOAD-EDGE-003] [CONVERGE-RELOAD-ERR-001] Exhaustion creates no marker; write OSError warns to stderr without failing swap."""
+        for alias, email_addr in (
+            ("primary-acc", "primary@example.com"),
+            ("standby-acc", "standby@example.com"),
+            ("personal", "personal@example.com"),
+        ):
+            acc_dir = self.engine.accounts_dir / alias
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            (acc_dir / "token.json").write_text(
+                json.dumps(create_sample_token(email_addr)), encoding="utf-8"
+            )
+
+        self.engine.switch_tokens("primary-acc", restart_server=False)
+        pending_file = self.engine.pending_reload_file
+
+        # 1. [CONVERGE-RELOAD-EDGE-003]: Fleet Exhaustion creates no pending_reload.json
+        exhausted_cache = {
+            "timestamp": 1700000000,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600}},
+                "standby-acc": {"gemini": {"quota": 0, "reset_time": 1700003600}},
+                "personal": {"gemini": {"quota": 0, "reset_time": 1700003600}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(exhausted_cache), encoding="utf-8")
+
+        exhausted_res = api.auto_rotate_on_exhaustion(
+            model="gemini", reload_server=False, engine=self.engine
+        )
+        self.assertFalse(exhausted_res.success)
+        self.assertFalse(pending_file.exists())
+
+        with self.assertRaises(AccountNotFoundError):
+            api.switch_account("missing-acc", reload_server=False, engine=self.engine)
+        self.assertFalse(pending_file.exists())
+
+        # reload_server=True (idle, external caller) must not create sdk_disk_only_swap marker
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242), \
+             patch.object(self.engine, "is_server_busy", return_value=False), \
+             patch.object(self.engine, "is_invoked_by_language_server", return_value=False), \
+             patch.object(self.engine, "restart_language_server", return_value=True):
+            self.assertTrue(api.switch_account("personal", reload_server=True, engine=self.engine))
+        self.assertFalse(pending_file.exists())
+
+        # reload_server=True busy turn raises ActiveTurnRunningError without creating marker
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242), \
+             patch.object(self.engine, "is_server_busy", return_value=True):
+            with self.assertRaises(ActiveTurnRunningError):
+                api.switch_account("standby-acc", reload_server=True, engine=self.engine)
+        self.assertFalse(pending_file.exists())
+
+        # Reset active account and populate standby quota for write-failure & failure-path tests
+        self.engine.switch_tokens("primary-acc", restart_server=False)
+        healthy_cache = {
+            "timestamp": 1700000000,
+            "accounts": {
+                "primary-acc": {"gemini": {"quota": 0, "reset_time": 1700003600}},
+                "standby-acc": {"gemini": {"quota": 90, "reset_time": 1700003600}},
+                "personal": {"gemini": {"quota": 50, "reset_time": 1700003600}},
+            },
+        }
+        self.engine.cache_file.write_text(json.dumps(healthy_cache), encoding="utf-8")
+
+        # auto_rotate_on_exhaustion switch failure creates no pending_reload.json
+        with patch.object(
+            self.engine,
+            "switch_tokens",
+            side_effect=InvalidTokenError("corrupt standby token"),
+        ):
+            failed_rot = api.auto_rotate_on_exhaustion(
+                model="gemini", reload_server=False, engine=self.engine
+            )
+        self.assertFalse(failed_rot.success)
+        self.assertFalse(pending_file.exists())
+
+        # auto_rotate_on_exhaustion(reload_server=True) busy or idle external creates no marker
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242), \
+             patch.object(self.engine, "is_server_busy", return_value=True):
+            busy_rot = api.auto_rotate_on_exhaustion(
+                model="gemini", reload_server=True, engine=self.engine
+            )
+        self.assertFalse(busy_rot.success)
+        self.assertFalse(pending_file.exists())
+
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242), \
+             patch.object(self.engine, "is_server_busy", return_value=False), \
+             patch.object(self.engine, "is_invoked_by_language_server", return_value=False), \
+             patch.object(self.engine, "restart_language_server", return_value=True):
+            idle_rot = api.auto_rotate_on_exhaustion(
+                model="gemini", reload_server=True, engine=self.engine
+            )
+        self.assertTrue(idle_rot.success)
+        self.assertTrue(idle_rot.reloaded_server)
+        self.assertFalse(pending_file.exists())
+
+        self.engine.switch_tokens("primary-acc", restart_server=False)
+
+        # 2. [CONVERGE-RELOAD-ERR-001]: write_pending_reload raising PermissionError / ENOSPC degrades gracefully
+        stderr_buf = io.StringIO()
+        with patch.object(
+            self.engine,
+            "write_pending_reload",
+            side_effect=PermissionError(errno.EACCES, "Permission denied"),
+        ), patch("sys.stderr", stderr_buf):
+            rot_res = api.auto_rotate_on_exhaustion(
+                model="gemini", reload_server=False, engine=self.engine
+            )
+        self.assertTrue(rot_res.success)
+        self.assertEqual(rot_res.new_account, "standby-acc")
+        self.assertFalse(rot_res.reloaded_server)
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+        self.assertIn("Warning", stderr_buf.getvalue())
+
+        stderr_buf_switch = io.StringIO()
+        with patch.object(
+            self.engine,
+            "write_pending_reload",
+            side_effect=OSError(errno.ENOSPC, "No space left on device"),
+        ), patch("sys.stderr", stderr_buf_switch):
+            switched = api.switch_account(
+                "personal", reload_server=False, engine=self.engine
+            )
+        self.assertTrue(switched)
+        self.assertEqual(self.engine.get_active_name(), "personal")
+        self.assertIn("Warning", stderr_buf_switch.getvalue())
+
+        # 3. Real engine.write_pending_reload() encountering disk write PermissionError / ENOSPC degrades gracefully
+        self.engine.switch_tokens("primary-acc", restart_server=False)
+        stderr_buf_real_rot = io.StringIO()
+        with patch(
+            "agy_switcher.vault._atomic_write_json",
+            side_effect=PermissionError(errno.EACCES, "Permission denied"),
+        ), patch("sys.stderr", stderr_buf_real_rot):
+            rot_real = api.auto_rotate_on_exhaustion(
+                model="gemini", reload_server=False, engine=self.engine
+            )
+        self.assertTrue(rot_real.success)
+        self.assertEqual(rot_real.new_account, "standby-acc")
+        self.assertFalse(rot_real.reloaded_server)
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+        self.assertIn("Warning", stderr_buf_real_rot.getvalue())
+
+        self.engine.switch_tokens("primary-acc", restart_server=False)
+        stderr_buf_real = io.StringIO()
+        with patch(
+            "agy_switcher.vault._atomic_write_json",
+            side_effect=OSError(errno.ENOSPC, "No space left on device"),
+        ), patch("sys.stderr", stderr_buf_real):
+            switched_real = api.switch_account(
+                "personal", reload_server=False, engine=self.engine
+            )
+        self.assertTrue(switched_real)
+        self.assertEqual(self.engine.get_active_name(), "personal")
+        self.assertIn("Warning", stderr_buf_real.getvalue())
 
 
 class TestSDKModels(unittest.TestCase):

@@ -1,6 +1,6 @@
 """Process supervisor for language_server and active turn safety enforcement.
 
-Layer 1 Core Services module: Depends only on Layer 0 (exceptions) and standard library.
+Layer 1 Core Services module: Depends only on Layer 0 (exceptions, security) and standard library.
 Pure Python 3.10+ standard library. Zero external dependencies.
 """
 
@@ -14,12 +14,75 @@ import sys
 import time
 
 from agy_switcher.exceptions import ActiveTurnRunningError
+from agy_switcher.security import read_latest_jsonl_record
+
+
+def is_transcript_record_quiescent(record: object) -> bool:
+    """Returns True only for a completed PLANNER_RESPONSE record without tool_calls."""
+    if not isinstance(record, dict):
+        return False
+
+    record_type = record.get("type")
+    if not isinstance(record_type, str) or record_type.strip().upper() != "PLANNER_RESPONSE":
+        return False
+
+    status = record.get("status")
+    if not isinstance(status, str) or status.strip().upper() != "DONE":
+        return False
+
+    tool_calls = record.get("tool_calls")
+    if tool_calls is None:
+        return True
+    if isinstance(tool_calls, (list, tuple, set, dict)):
+        return len(tool_calls) == 0
+    return False
 
 
 class ProcessSupervisor:
     """Supervises the Antigravity language_server process, enforcing turn safety."""
 
     _MAX_ANCESTRY_HOPS = 64
+    _PRESENCE_ROOTS = ("antigravity", "antigravity-cli")
+    _NODE_BIN_NAMES = frozenset({"node", "nodejs"})
+    _SIDECAR_ENTRYPOINT_FILES = frozenset(
+        {"sidecar_sdk", "sidecar_sdk.js", "sidecar_sdk.mjs", "sidecar_sdk.cjs"}
+    )
+    _NODE_NON_ENTRYPOINT_FLAGS = frozenset(
+        {"-e", "--eval", "-p", "--print", "-i", "--interactive", "-c", "--check"}
+    )
+    _NODE_VALUE_FLAGS = frozenset(
+        {
+            "-r",
+            "--require",
+            "--import",
+            "--loader",
+            "--experimental-loader",
+            "--env-file",
+            "-C",
+            "--conditions",
+            "--input-type",
+            "--title",
+            "--max-http-header-size",
+            "--diagnostic-dir",
+            "--heapsnapshot-signal",
+            "--redirect-warnings",
+            "--icu-data-dir",
+            "--openssl-config",
+            "--tls-cipher-list",
+            "--watch-path",
+            "--report-directory",
+            "--report-dir",
+            "--report-filename",
+            "--report-signal",
+            "--cpu-prof-dir",
+            "--cpu-prof-name",
+            "--heap-prof-dir",
+            "--heap-prof-name",
+            "--test-reporter",
+            "--test-reporter-destination",
+            "--test-shard",
+        }
+    )
 
     def __init__(
         self,
@@ -141,17 +204,26 @@ class ProcessSupervisor:
 
         return None
 
-    def _get_active_presence_lock_paths(self) -> set[Path]:
+    def _presence_to_brain_dirs(self) -> dict[Path, Path]:
+        """Maps resolved presence directories to their corresponding brain directories."""
+        mapping: dict[Path, Path] = {}
+        for rel_root in self._PRESENCE_ROOTS:
+            presence_dir = self.gemini_dir / rel_root / "presence"
+            brain_dir = self.gemini_dir / rel_root / "brain"
+            try:
+                mapping[presence_dir.resolve()] = brain_dir
+            except OSError:
+                mapping[presence_dir] = brain_dir
+        return mapping
+
+    def get_active_presence_lock_paths(self) -> set[Path]:
         """Scans proc_dir/*/fd/* for open file descriptors pointing to presence locks."""
         active_locks: set[Path] = set()
         proc_path = self.proc_dir
         if not proc_path.is_dir():
             return active_locks
 
-        presence_dirs = {
-            (self.gemini_dir / "antigravity" / "presence").resolve(),
-            (self.gemini_dir / "antigravity-cli" / "presence").resolve(),
-        }
+        presence_dirs = set(self._presence_to_brain_dirs().keys())
 
         try:
             for pid_dir in proc_path.iterdir():
@@ -186,15 +258,72 @@ class ProcessSupervisor:
 
         return active_locks
 
-    def is_server_busy(self, pid: int | None = None) -> bool:
-        """Checks if language_server has active child processes or presence locks."""
-        active_locks = self._get_active_presence_lock_paths()
+    def _get_active_presence_lock_paths(self) -> set[Path]:
+        """Backward-compatible alias for get_active_presence_lock_paths()."""
+        return self.get_active_presence_lock_paths()
 
-        presence_dirs = [
-            self.gemini_dir / "antigravity" / "presence",
-            self.gemini_dir / "antigravity-cli" / "presence",
-        ]
-        for p_dir in presence_dirs:
+    def _deduplicate_active_locks(
+        self,
+        active_locks: set[Path],
+        known_presence_dirs: set[Path],
+    ) -> list[Path]:
+        """Deduplicates resolved/unresolved presence lock pairs while preferring canonical dirs."""
+        if not active_locks:
+            return []
+
+        preferred: list[Path] = []
+        fallback: list[Path] = []
+        for lock_path in sorted(active_locks):
+            try:
+                parent_resolved = lock_path.parent.resolve()
+            except OSError:
+                parent_resolved = lock_path.parent
+            if parent_resolved in known_presence_dirs:
+                preferred.append(lock_path)
+            else:
+                fallback.append(lock_path)
+
+        seen_resolved: set[Path] = set()
+        deduped: list[Path] = []
+        for lock_path in preferred + fallback:
+            try:
+                resolved_lock = lock_path.resolve()
+            except OSError:
+                resolved_lock = lock_path
+            if resolved_lock in seen_resolved:
+                continue
+            seen_resolved.add(resolved_lock)
+            deduped.append(lock_path)
+        return deduped
+
+    @staticmethod
+    def _is_presence_lock_quiescent(
+        lock_path: Path,
+        presence_to_brain: dict[Path, Path],
+    ) -> bool:
+        """Returns True only when the lock's session transcript ends with a quiescent record."""
+        session_id = lock_path.stem
+        if not session_id or session_id in (".", "..") or "/" in session_id or "\\" in session_id:
+            return False
+
+        try:
+            resolved_parent = lock_path.parent.resolve()
+        except OSError:
+            return False
+
+        brain_dir = presence_to_brain.get(resolved_parent, lock_path.parent.parent / "brain")
+        transcript_path = (
+            brain_dir / session_id / ".system_generated" / "logs" / "transcript.jsonl"
+        )
+        record = read_latest_jsonl_record(transcript_path)
+        return is_transcript_record_quiescent(record)
+
+    def is_server_busy(self, pid: int | None = None) -> bool:
+        """Checks if language_server has active non-sidecar children or non-quiescent presence locks."""
+        active_locks = self.get_active_presence_lock_paths()
+
+        for rel_root in self._PRESENCE_ROOTS:
+            p_dir = self.gemini_dir / rel_root / "presence"
             if not p_dir.is_dir():
                 continue
             try:
@@ -218,24 +347,106 @@ class ProcessSupervisor:
             except OSError:
                 pass
 
-        if active_locks:
+        if self.has_active_child_processes(pid):
             return True
 
+        if not active_locks:
+            return False
+
+        presence_to_brain = self._presence_to_brain_dirs()
+        for lock_path in self._deduplicate_active_locks(active_locks, set(presence_to_brain.keys())):
+            if not self._is_presence_lock_quiescent(lock_path, presence_to_brain):
+                return True
+
+        return False
+
+    @staticmethod
+    def _read_cmdline_tokens(cmdline_file: Path) -> list[str] | None:
+        """Reads NUL-delimited /proc/<pid>/cmdline tokens, failing safe to None on error."""
+        try:
+            raw = cmdline_file.read_bytes()
+        except OSError:
+            return None
+        tokens = [
+            t.decode("utf-8", errors="replace").strip()
+            for t in raw.split(b"\x00")
+            if t
+        ]
+        if len(tokens) == 1 and " " in tokens[0]:
+            tokens = tokens[0].split()
+        return [t for t in tokens if t]
+
+    @classmethod
+    def _is_sidecar_sdk_child(cls, cmdline_file: Path) -> bool:
+        """Returns True only for Node.js runtimes invoking a sidecar_sdk entrypoint."""
+        tokens = cls._read_cmdline_tokens(cmdline_file)
+        if not tokens:
+            return False
+
+        if Path(tokens[0]).name not in cls._NODE_BIN_NAMES:
+            return False
+
+        entrypoint: str | None = None
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--":
+                entrypoint = tokens[i + 1] if i + 1 < len(tokens) else None
+                break
+            if (
+                tok in cls._NODE_NON_ENTRYPOINT_FLAGS
+                or tok.startswith(("--eval=", "--print="))
+                or (
+                    tok.startswith("-")
+                    and not tok.startswith("--")
+                    and len(tok) > 2
+                    and tok[1:].islower()
+                    and any(ch in tok[1:] for ch in ("e", "p", "i", "c"))
+                )
+            ):
+                return False
+            if tok in cls._NODE_VALUE_FLAGS:
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            entrypoint = tok
+            break
+
+        if not entrypoint:
+            return False
+
+        entrypoint_path = Path(entrypoint)
+        return (
+            "sidecar_sdk" in entrypoint_path.parts
+            or entrypoint_path.name in cls._SIDECAR_ENTRYPOINT_FILES
+        )
+
+    def has_active_child_processes(self, pid: int | None = None) -> bool:
+        """Checks for non-zombie child processes of language_server excluding Node sidecar_sdk."""
         target_pid = pid if pid is not None else self.locate_language_server_pid()
-        if target_pid is not None:
-            proc_path = self.proc_dir
-            if proc_path.is_dir():
-                try:
-                    for p_dir in proc_path.iterdir():
-                        if not p_dir.name.isdigit():
-                            continue
-                        parsed = self._parse_stat_state_and_ppid(p_dir / "stat")
-                        if parsed is not None:
-                            state, ppid = parsed
-                            if ppid == target_pid and state != "Z":
-                                return True
-                except OSError:
-                    pass
+        if target_pid is None or target_pid <= 0:
+            return False
+
+        proc_path = self.proc_dir
+        if not proc_path.is_dir():
+            return False
+
+        try:
+            for p_dir in proc_path.iterdir():
+                if not p_dir.name.isdigit():
+                    continue
+                parsed = self._parse_stat_state_and_ppid(p_dir / "stat")
+                if parsed is None:
+                    continue
+                state, ppid = parsed
+                if ppid != target_pid or state == "Z":
+                    continue
+                if not self._is_sidecar_sdk_child(p_dir / "cmdline"):
+                    return True
+        except OSError:
+            pass
 
         return False
 
@@ -350,4 +561,4 @@ class ProcessSupervisor:
 
 
 
-__all__ = ["ProcessSupervisor"]
+__all__ = ["ProcessSupervisor", "is_transcript_record_quiescent"]

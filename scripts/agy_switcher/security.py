@@ -16,11 +16,17 @@ import math
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
+import time
 from typing import Any, Mapping, cast
 
 from agy_switcher.exceptions import InvalidTokenError
-from agy_switcher.models import PendingReloadPayload
+from agy_switcher.models import (
+    DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    PendingReloadPayload,
+    TokenIdentity,
+)
 
 
 def _atomic_write_file(target_path: Path | str, content: str | bytes, mode: int = 0o600) -> None:
@@ -160,7 +166,7 @@ def parse_pending_reload_payload(raw_payload: object) -> PendingReloadPayload | 
     raw_ttl = raw_payload.get("ttl_seconds")
     ttl_val: float | int
     if raw_ttl is None:
-        ttl_val = 120
+        ttl_val = DEFAULT_PENDING_RELOAD_TTL_SECONDS
     else:
         parsed_ttl = parse_positive_finite_float(raw_ttl)
         if parsed_ttl is None:
@@ -243,6 +249,62 @@ def resolve_token_email(data: object) -> str | None:
         if trimmed:
             return trimmed
     return None
+
+
+def extract_token_identity(data: object) -> TokenIdentity | None:
+    """Extracts normalized credential identity from an in-memory token payload."""
+    if not isinstance(data, dict):
+        return None
+
+    token_obj = data.get("token")
+    if not isinstance(token_obj, dict):
+        return None
+
+    raw_refresh_token = token_obj.get("refresh_token")
+    if not isinstance(raw_refresh_token, str):
+        return None
+    refresh_token = raw_refresh_token.strip()
+    if not refresh_token:
+        return None
+
+    raw_auth_method = data.get("auth_method")
+    if not isinstance(raw_auth_method, str):
+        return None
+    auth_method = raw_auth_method.strip()
+    if not auth_method:
+        return None
+
+    resolved_email = resolve_token_email(data)
+    email: str | None = None
+    if resolved_email is not None:
+        normalized_email = resolved_email.strip().lower()
+        if normalized_email:
+            email = normalized_email
+
+    return {
+        "refresh_token": refresh_token,
+        "auth_method": auth_method,
+        "email": email,
+    }
+
+
+def token_credentials_match(vault_data: object, target_data: object) -> bool:
+    """Compares Vault and target token payloads purely by normalized credential identity."""
+    vault_identity = extract_token_identity(vault_data)
+    target_identity = extract_token_identity(target_data)
+    if vault_identity is None or target_identity is None:
+        return False
+
+    if vault_identity["refresh_token"] != target_identity["refresh_token"]:
+        return False
+    if vault_identity["auth_method"] != target_identity["auth_method"]:
+        return False
+
+    vault_email = vault_identity["email"]
+    target_email = target_identity["email"]
+    if vault_email is not None and target_email is not None:
+        return vault_email == target_email
+    return True
 
 
 def _is_non_empty_str(value: object) -> bool:
@@ -353,6 +415,96 @@ def check_token_file(token_path: Path | str) -> tuple[bool, str | None, dict[str
     return cast(tuple[bool, str | None, dict[str, Any] | None], validate_token_file(token_path, return_tuple=True))
 
 
+def read_latest_jsonl_record(target_path: Path | str) -> dict[str, object] | None:
+    """Reads and parses the trailing JSON object record from a JSONL transcript file."""
+    path = Path(target_path)
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return None
+        max_read = 4 * 1024 * 1024
+        chunk_size = min(size, 65536)
+        with open(path, "rb") as f:
+            while True:
+                f.seek(max(0, size - chunk_size))
+                data = f.read(min(chunk_size, size))
+                last_line_str: str | None = None
+                for line in reversed(data.splitlines()):
+                    s = line.strip().decode("utf-8", errors="replace")
+                    if s:
+                        last_line_str = s
+                        break
+                if not last_line_str:
+                    if chunk_size < size and chunk_size < max_read:
+                        chunk_size = min(size, chunk_size * 4, max_read)
+                        continue
+                    return None
+                if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
+                    chunk_size = min(size, chunk_size * 4, max_read)
+                    continue
+                if not last_line_str.startswith("{"):
+                    return None
+                try:
+                    parsed = json.loads(last_line_str)
+                    return cast(dict[str, object], parsed) if isinstance(parsed, dict) else None
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    if chunk_size < size and chunk_size < max_read:
+                        chunk_size = min(size, chunk_size * 4, max_read)
+                        continue
+                    return None
+    except OSError:
+        return None
+
+
+def enqueue_pending_reload_fail_safe(
+    engine: object | None,
+    target_account: str,
+    *,
+    reason: str,
+    ttl_seconds: int = DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    pending_file: Path | None = None,
+    log_prefix: str = "[agy-switch]",
+    catch_all_engine_errors: bool = False,
+) -> bool:
+    """Enqueues a deferred safe-turn reload marker fail-safely without aborting the caller."""
+    write_fn = getattr(engine, "write_pending_reload", None) if engine is not None else None
+    if callable(write_fn):
+        try:
+            write_fn(
+                target_account,
+                reason=reason,
+                ttl_seconds=ttl_seconds,
+            )
+            return True
+        except Exception as exc:
+            if not catch_all_engine_errors and not isinstance(exc, OSError):
+                raise
+            print(
+                f"{log_prefix} Warning: Failed to persist pending reload marker for '{target_account}': {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+    if pending_file is None:
+        return False
+
+    payload: PendingReloadPayload = {
+        "target_account": target_account.strip(),
+        "requested_at": time.time(),
+        "ttl_seconds": ttl_seconds,
+        "reason": reason,
+    }
+    try:
+        _atomic_write_json(pending_file, payload, mode=0o600)
+        return True
+    except OSError as exc:
+        print(
+            f"{log_prefix} Warning: Failed to persist pending reload marker '{pending_file}': {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+
 __all__ = [
     "_atomic_write_file",
     "_atomic_write_json",
@@ -361,11 +513,15 @@ __all__ = [
     "is_safe_account_alias",
     "parse_positive_finite_float",
     "parse_pending_reload_payload",
+    "enqueue_pending_reload_fail_safe",
     "extract_email_from_jwt",
     "has_valid_id_token_or_fallback",
     "resolve_token_email",
+    "extract_token_identity",
+    "token_credentials_match",
     "validate_token_dict",
     "validate_token_file",
     "check_token_dict",
     "check_token_file",
+    "read_latest_jsonl_record",
 ]

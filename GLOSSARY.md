@@ -61,7 +61,7 @@ An automated account rotation and language server reload cycle triggered between
 _Avoid_: Early switch, preemptive rotation, threshold hop
 
 **Safe Turn Boundary**:
-A quiescent operational interval between agent turns—verified by completion markers in transcript.jsonl (e.g. status "DONE" or type "USER_INPUT") and an idle language_server process state—where credential rotation and language server reloads can execute without aborting running tool calls.
+A quiescent operational interval verified by Global Quiescence—every open Antigravity session transcript has concluded its latest turn (`PLANNER_RESPONSE` with `status: "DONE"` and no `tool_calls`) and `language_server` has no active non-sidecar child processes—where credential rotation and server reloads can execute without aborting running tool calls.
 _Avoid_: Turn pause, idle window, prompt gap
 
 **Canonical Launcher**:
@@ -97,12 +97,30 @@ A live credential verification step executed before manual account switching mut
 _Avoid_: Schema-only check, silent 403 switch, blind credential swap
 
 **Deferred Safe-Turn Reload**:
-A process-lineage-aware reload strategy for switches invoked from inside an active Antigravity agent turn (descendant of `language_server`) that performs an atomic Disk-Only Swap and records a TTL-bounded `pending_reload.json` marker so `LogWatcher` reloads `language_server` at the next verified Safe Turn Boundary instead of terminating the parent server mid-turn.
+A non-disruptive reload strategy that performs an atomic token swap and records a 30-minute TTL `pending_reload.json` marker (used by in-turn switches, `PreInvocation` hook rotations, In-Process SDK swaps, and Drift Guard repairs) so `LogWatcher` re-syncs tokens from Vault and reloads `language_server` at the next verified Global Quiescence boundary without aborting active turns.
 _Avoid_: Mid-turn parricide, forced in-turn kill, ad-hoc waiter subprocess
 
 **Failover Audit & Auth Quarantine**:
 A dual-persistence transparency mechanism where `PreInvocation` hook ejections append structured entries to `watch.log` and atomically record `last_failover` plus per-account `auth_errors` in `cache/failover_state.json`, surfacing recent ejections in `status` (for up to 24 hours or until the next successful manual switch) and persisting auth quarantine in `list`/`doctor` until cleared by re-login or a successful live probe.
 _Avoid_: Silent rollback, stderr-only failover, ephemeral-only audit
+
+**Vault-Authoritative Sync**:
+The single-source-of-truth invariant establishing the Vault active pointer as the sole canonical authority for the active account, treating any divergence in Desktop or CLI token files as drift to be healed back toward the Vault rather than implicitly adopted.
+_Avoid_: Bidirectional sync, desktop-follow, implicit adopt
+
+**Zombie Write-Back**:
+A credential desynchronization hazard where a `language_server` process that was not restarted after an account switch retains the previous account in memory and overwrites the Desktop token file back to the stale account upon OAuth access-token refresh.
+_Avoid_: Ghost overwrite, stale token clobber, silent revert
+
+**Continuous Drift Guard**:
+A lightweight periodic integrity loop within `LogWatcher` that compares Desktop and CLI credential identities against the Vault active account, automatically repairing diverged files via Atomic Swap and scheduling a Deferred Safe-Turn Reload whenever Desktop credentials drifted.
+_Avoid_: Aggressive overwrite loop, passive doctor-only, blind file watcher
+
+**Global Quiescence**:
+The multi-session idle invariant requiring all open Antigravity Desktop sessions (tracked via live `presence/*.lock` descriptors) to be at a completed turn (`PLANNER_RESPONSE` with `status: "DONE"` and no pending `tool_calls`) and `language_server` to have zero active non-sidecar child processes (excluding persistent `sidecar_sdk` runtimes) before executing a server reload.
+_Avoid_: Single-tab idle, raw child-count check, naive lock-absence check
+
+
 
 
 

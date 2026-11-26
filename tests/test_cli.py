@@ -2337,11 +2337,13 @@ class TestCLIInTurnDeferredReload(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
             pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
             self.assertEqual(pending_data["target_account"], "best-standby")
-            self.assertEqual(pending_data["ttl_seconds"], 120)
+            self.assertEqual(pending_data["ttl_seconds"], 1800)
 
             out = stdout_buf.getvalue()
             self.assertIn("Deferred", out)
             self.assertIn("pending_reload.json", out)
+            self.assertIn("TTL 1800s (30m)", out)
+            self.assertNotIn("TTL 120s", out)
             self.assertNotIn("not running or no restart needed", out)
 
     def test_in_turn_deferred_reload_inactive_watcher_guidance_DEFER_RELOAD_004(self) -> None:
@@ -2400,10 +2402,12 @@ class TestCLIInTurnDeferredReload(unittest.TestCase):
             self.assertTrue(pending_file.is_file())
             pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
             self.assertEqual(pending_data["target_account"], "work-acc")
-            self.assertEqual(pending_data["ttl_seconds"], 120)
+            self.assertEqual(pending_data["ttl_seconds"], 1800)
 
             out = stdout_buf.getvalue()
             self.assertIn("Deferred", out)
+            self.assertIn("TTL 1800s (30m)", out)
+            self.assertNotIn("TTL 120s", out)
             self.assertIn("LogWatcher is inactive", out)
             self.assertIn("after the turn completes", out)
 
@@ -2613,6 +2617,597 @@ class TestCLIInTurnDeferredReload(unittest.TestCase):
             )
             self.assertFalse(engine.pending_reload_file.exists())
             self.assertIn("Restarted language_server", auto_stdout.getvalue())
+
+    def test_in_turn_deferred_reload_1800s_no_restart_and_no_adopt_desktop_DEFER_RELOAD_001(self) -> None:
+        """[DEFER-RELOAD-001] [CONVERGE-RELOAD-EDGE-001] [VAULT-SYNC-004] In-turn deferred 1800s (30m), --no-restart opt-out, zero adopt-desktop, and SKILL.md."""
+        import argparse
+        from agy_switcher.cli import build_parser
+
+        # 1. [VAULT-SYNC-004] build_parser() exposes zero adopt-desktop or sync --from-desktop surfaces
+        parser = build_parser()
+        subparsers_actions = [
+            action for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ]
+        self.assertEqual(len(subparsers_actions), 1)
+        registered_commands = set(subparsers_actions[0].choices.keys())
+        self.assertNotIn("adopt-desktop", registered_commands)
+        self.assertNotIn("sync", registered_commands)
+        for cmd_parser in subparsers_actions[0].choices.values():
+            for opt in cmd_parser._option_string_actions:
+                self.assertNotIn("from-desktop", opt)
+                self.assertNotIn("adopt-desktop", opt)
+
+        for bad_argv in (["adopt-desktop"], ["sync", "--from-desktop"]):
+            with self.subTest(bad_argv=bad_argv):
+                err_buf = io.StringIO()
+                with patch("sys.stderr", err_buf):
+                    with self.assertRaises(SystemExit) as ctx:
+                        main(bad_argv)
+                self.assertEqual(ctx.exception.code, 2)
+
+        # 2. [DEFER-RELOAD-001] & [CONVERGE-RELOAD-EDGE-001]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            self._register_account(engine, "standby-acc", "standby@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            child_pid = 49610
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=49600, child_pid=child_pid, busy=True
+            )
+
+            # Case A: In-turn switch --force prints 1800s (30m) TTL and writes pending_reload.json
+            stdout_force = io.StringIO()
+            stderr_force = io.StringIO()
+            with patch("os.getpid", return_value=child_pid), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not run in-turn")), \
+                 patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not run")), \
+                 patch("sys.stdout", stdout_force), \
+                 patch("sys.stderr", stderr_force):
+                rc_force = main(["switch", "work-acc", "--force"], engine=engine)
+
+            self.assertEqual(rc_force, 0)
+            out_force = stdout_force.getvalue()
+            self.assertIn("TTL 1800s (30m)", out_force)
+            self.assertIn("1800s", out_force)
+            self.assertIn("30m", out_force)
+            self.assertNotIn("120s", out_force)
+            self.assertTrue(engine.pending_reload_file.is_file())
+            pending_data = json.loads(engine.pending_reload_file.read_text(encoding="utf-8"))
+            self.assertEqual(pending_data["target_account"], "work-acc")
+            self.assertEqual(pending_data["ttl_seconds"], 1800)
+            self.assertEqual(pending_data["reason"], "in_turn_deferred_reload")
+
+            # Clear pending_reload.json to verify --no-restart never creates it
+            engine.pending_reload_file.unlink()
+
+            # Case B: [CONVERGE-RELOAD-EDGE-001] Explicit --no-restart suppresses pending_reload.json
+            stdout_no_restart = io.StringIO()
+            stderr_no_restart = io.StringIO()
+            with patch("os.getpid", return_value=child_pid), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not run with --no-restart")), \
+                 patch("sys.stdout", stdout_no_restart), \
+                 patch("sys.stderr", stderr_no_restart):
+                rc_no_restart = main(["switch", "standby-acc", "--no-restart"], engine=engine)
+
+            self.assertEqual(rc_no_restart, 0)
+            self.assertEqual(engine.get_active_name(), "standby-acc")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_standby@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_standby@example.com",
+            )
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertNotIn("Deferred", stdout_no_restart.getvalue())
+
+        # 3. SKILL.md reflects 1800s (30m) and Vault-Authoritative Sync guidance
+        skill_path = Path(__file__).resolve().parent.parent / "skills" / "agy-switch" / "SKILL.md"
+        skill_text = skill_path.read_text(encoding="utf-8")
+        self.assertIn("1800s (30m)", skill_text)
+        self.assertNotIn("TTL 120s", skill_text)
+        self.assertIn("Vault-Authoritative Sync", skill_text)
+
+
+class TestFormatterDesyncVisibility(unittest.TestCase):
+    """Tests for [SYNC-VIS-001..003], [SYNC-VIS-ERR-001/003], and [SYNC-VIS-EDGE-001..003]."""
+
+    def _base_accounts_payload(self, active: str | None = "honey") -> dict:
+        return {
+            "active": active,
+            "accounts": [
+                {
+                    "name": "honey",
+                    "email": "honey@example.com",
+                    "is_active": active == "honey",
+                    "valid": True,
+                },
+                {
+                    "name": "automator",
+                    "email": "automator@example.com",
+                    "is_active": active == "automator",
+                    "valid": True,
+                },
+            ],
+        }
+
+    def test_desync_visibility_synced_status_and_clean_list_outputs(self) -> None:
+        """[SYNC-VIS-001] Synced sync_status renders synced credential status in status and preserves clean list output."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        sync_ok = {
+            "in_sync": True,
+            "desktop_synced": True,
+            "cli_synced": True,
+            "drifted_targets": [],
+            "desktop_email": "honey@example.com",
+            "cli_email": "honey@example.com",
+        }
+        status_payload = {
+            "active": "honey",
+            "email": "honey@example.com",
+            "server_running": True,
+            "server_pid": 4242,
+            "server_busy": False,
+            "sync_status": sync_ok,
+        }
+        status_out = format_status_report(status_payload)
+        self.assertIn("Synced", status_out)
+        self.assertIn("Desktop", status_out)
+        self.assertIn("CLI", status_out)
+        self.assertNotIn("out of sync", status_out.lower())
+        self.assertNotIn("warning", status_out.lower())
+        self.assertNotIn("doctor --fix", status_out)
+        self.assertNotIn("Pending Reload", status_out)
+
+        list_payload = self._base_accounts_payload("honey")
+        list_payload_synced = {**list_payload, "sync_status": sync_ok}
+        self.assertEqual(
+            format_accounts_table(list_payload_synced, show_quota=False),
+            format_accounts_table(list_payload, show_quota=False),
+        )
+        self.assertEqual(
+            format_accounts_listicle(list_payload_synced, show_quota=False),
+            format_accounts_listicle(list_payload, show_quota=False),
+        )
+
+    def test_desync_visibility_desktop_drift_and_pending_reload_across_all_formatters(self) -> None:
+        """[SYNC-VIS-002] [SYNC-VIS-003] Desktop drift + pending_reload renders surface, email, remediation, and Pending Reload."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        sync_desktop_drift = {
+            "in_sync": False,
+            "desktop_synced": False,
+            "cli_synced": True,
+            "drifted_targets": ["desktop"],
+            "desktop_email": "automator@example.com",
+            "cli_email": "honey@example.com",
+        }
+        pending = {
+            "target_account": "honey",
+            "requested_at": 1791200000.0,
+            "ttl_seconds": 1800,
+            "reason": "desktop_drift_on_token_refresh",
+        }
+
+        status_out = format_status_report(
+            {
+                "active": "honey",
+                "email": "honey@example.com",
+                "server_running": True,
+                "server_pid": 4242,
+                "server_busy": True,
+                "sync_status": sync_desktop_drift,
+                "pending_reload": pending,
+            }
+        )
+        list_payload = {
+            **self._base_accounts_payload("honey"),
+            "sync_status": sync_desktop_drift,
+            "pending_reload": pending,
+        }
+        table_out = format_accounts_table(list_payload, show_quota=False)
+        listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+
+        for label, rendered in (
+            ("status", status_out),
+            ("table", table_out),
+            ("listicle", listicle_out),
+            ("table_quota", format_accounts_table(list_payload, show_quota=True)),
+            ("listicle_quota", format_accounts_listicle(list_payload, show_quota=True)),
+        ):
+            with self.subTest(view=label):
+                self.assertIn("Desktop", rendered)
+                self.assertIn("automator@example.com", rendered)
+                self.assertIn("honey", rendered)
+                self.assertIn("agy-switch doctor --fix", rendered)
+                self.assertIn("agy-switch switch honey", rendered)
+                self.assertIn("Pending Reload", rendered)
+                self.assertIn("1800s", rendered)
+                # Verify CLI is not falsely listed as drifted in the warning line
+                warning_lines = [
+                    line for line in rendered.splitlines()
+                    if "out of sync" in line.lower()
+                ]
+                self.assertEqual(len(warning_lines), 1)
+                self.assertNotIn("CLI", warning_lines[0])
+
+    def test_desync_visibility_cli_only_drift_and_cli_subcommands(self) -> None:
+        """CLI-only drift names CLI (not Desktop) and main() status/list render desync and pending_reload cleanly."""
+        sync_cli_drift = {
+            "in_sync": False,
+            "desktop_synced": True,
+            "cli_synced": False,
+            "drifted_targets": ["cli"],
+            "desktop_email": "honey@example.com",
+            "cli_email": "stale-cli@example.com",
+        }
+        pending = {
+            "target_account": "honey",
+            "requested_at": 1791200000.0,
+            "ttl_seconds": 1800,
+            "reason": "in_turn_deferred_reload",
+        }
+        mock_engine = MagicMock(spec=AgySwitchEngine)
+        mock_engine.get_status.return_value = {
+            "active": "honey",
+            "email": "honey@example.com",
+            "server_running": False,
+            "server_pid": None,
+            "server_busy": False,
+            "sync_status": sync_cli_drift,
+            "pending_reload": pending,
+        }
+        mock_engine.list_accounts.return_value = {
+            **self._base_accounts_payload("honey"),
+            "sync_status": sync_cli_drift,
+            "pending_reload": pending,
+        }
+
+        with patch("agy_switch.QuotaClient") as mock_qc_cls:
+            mock_qc = mock_qc_cls.return_value
+            mock_qc.load_cache.return_value = {"timestamp": 10**12, "accounts": {}}
+            for argv in (["status"], ["list"], ["list", "--format", "list"]):
+                buf = io.StringIO()
+                with patch("sys.stdout", buf):
+                    rc = main(argv, engine=mock_engine)
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                warning_lines = [line for line in out.splitlines() if "out of sync" in line.lower()]
+                self.assertEqual(len(warning_lines), 1)
+                self.assertIn("CLI (stale-cli@example.com)", warning_lines[0])
+                self.assertNotIn("Desktop", warning_lines[0])
+                self.assertIn("Pending Reload", out)
+                self.assertIn("1800s", out)
+
+        json_buf = io.StringIO()
+        with patch("sys.stdout", json_buf):
+            rc_json = main(["list", "--json"], engine=mock_engine)
+        self.assertEqual(rc_json, 0)
+        parsed = json.loads(json_buf.getvalue())
+        self.assertEqual(parsed["sync_status"]["drifted_targets"], ["cli"])
+        self.assertEqual(parsed["pending_reload"]["target_account"], "honey")
+
+    def test_desync_visibility_dual_surface_drift_with_and_without_emails(self) -> None:
+        """[SYNC-VIS-EDGE-002] [SYNC-VIS-ERR-001] Dual-surface drift names both Desktop and CLI cleanly."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        for case_name, d_email, c_email in (
+            ("with_emails", "stale@example.com", "stale@example.com"),
+            ("corrupt_or_missing_no_emails", None, None),
+        ):
+            with self.subTest(case=case_name):
+                sync_dual = {
+                    "in_sync": False,
+                    "desktop_synced": False,
+                    "cli_synced": False,
+                    "drifted_targets": ["desktop", "cli"],
+                    "desktop_email": d_email,
+                    "cli_email": c_email,
+                }
+                status_out = format_status_report(
+                    {
+                        "active": "honey",
+                        "email": "honey@example.com",
+                        "server_running": False,
+                        "sync_status": sync_dual,
+                    }
+                )
+                list_payload = {
+                    **self._base_accounts_payload("honey"),
+                    "sync_status": sync_dual,
+                }
+                table_out = format_accounts_table(list_payload, show_quota=False)
+                listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+
+                for view_name, rendered in (
+                    ("status", status_out),
+                    ("table", table_out),
+                    ("listicle", listicle_out),
+                ):
+                    with self.subTest(view=view_name):
+                        warning_lines = [
+                            line for line in rendered.splitlines()
+                            if "out of sync" in line.lower()
+                        ]
+                        self.assertEqual(len(warning_lines), 1)
+                        self.assertIn("Desktop", warning_lines[0])
+                        self.assertIn("CLI", warning_lines[0])
+                        self.assertIn("honey", warning_lines[0])
+                        self.assertIn("agy-switch doctor --fix", rendered)
+                        if d_email:
+                            self.assertIn(d_email, warning_lines[0])
+                        else:
+                            self.assertNotIn("(None)", warning_lines[0])
+
+    def test_pending_reload_rendered_when_disk_in_sync_across_list_and_status(self) -> None:
+        """[SYNC-VIS-EDGE-003] Queued pending_reload renders across table, listicle, and status even when in_sync=True."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        sync_ok = {
+            "in_sync": True,
+            "desktop_synced": True,
+            "cli_synced": True,
+            "drifted_targets": [],
+            "desktop_email": "honey@example.com",
+            "cli_email": "honey@example.com",
+        }
+        pending = {
+            "target_account": "honey",
+            "requested_at": 1791200000.0,
+            "ttl_seconds": 1800,
+            "reason": "in_turn_deferred_reload",
+        }
+        status_out = format_status_report(
+            {
+                "active": "honey",
+                "email": "honey@example.com",
+                "server_running": True,
+                "server_pid": 5150,
+                "server_busy": True,
+                "sync_status": sync_ok,
+                "pending_reload": pending,
+            }
+        )
+        list_payload = {
+            **self._base_accounts_payload("honey"),
+            "sync_status": sync_ok,
+            "pending_reload": pending,
+        }
+        table_out = format_accounts_table(list_payload, show_quota=False)
+        listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+
+        for view_name, rendered in (
+            ("status", status_out),
+            ("table", table_out),
+            ("listicle", listicle_out),
+        ):
+            with self.subTest(view=view_name):
+                self.assertIn("Pending Reload", rendered)
+                self.assertIn("honey", rendered)
+                self.assertIn("1800s", rendered)
+                self.assertNotIn("out of sync", rendered.lower())
+                self.assertNotIn("doctor --fix", rendered)
+
+    def test_desync_visibility_malformed_and_no_active_account_graceful_degradation(self) -> None:
+        """[SYNC-VIS-ERR-003] [SYNC-VIS-EDGE-001] Omitted, None, malformed metadata and missing active account degrade cleanly."""
+        from agy_switcher.formatters import (
+            format_accounts_listicle,
+            format_accounts_table,
+            format_status_report,
+        )
+
+        malformed_variants: list[tuple[str, dict]] = [
+            ("omitted", {}),
+            ("none_values", {"sync_status": None, "pending_reload": None}),
+            ("string_values", {"sync_status": "invalid", "pending_reload": "invalid"}),
+            (
+                "bad_types",
+                {
+                    "sync_status": {"in_sync": "bad", "drifted_targets": 123},
+                    "pending_reload": {"target_account": 123, "ttl_seconds": "bad"},
+                },
+            ),
+            (
+                "contradictory_in_sync_true",
+                {
+                    "sync_status": {"in_sync": True, "drifted_targets": ["desktop"]},
+                    "pending_reload": {"target_account": True},
+                },
+            ),
+            (
+                "empty_drifted_targets_false",
+                {
+                    "sync_status": {"in_sync": False, "drifted_targets": []},
+                    "pending_reload": [],
+                },
+            ),
+        ]
+
+        for label, extra in malformed_variants:
+            with self.subTest(malformed=label):
+                status_out = format_status_report(
+                    {"active": "honey", "email": "honey@example.com", "server_running": False, **extra}
+                )
+                list_payload = {**self._base_accounts_payload("honey"), **extra}
+                table_out = format_accounts_table(list_payload, show_quota=False)
+                listicle_out = format_accounts_listicle(list_payload, show_quota=False)
+                for rendered in (status_out, table_out, listicle_out):
+                    self.assertNotIn("out of sync", rendered.lower())
+                    self.assertNotIn("Pending Reload", rendered)
+                    self.assertNotIn("doctor --fix", rendered)
+
+        for active_val in (None, "", "   "):
+            with self.subTest(active=repr(active_val)):
+                stale_sync = {
+                    "in_sync": False,
+                    "desktop_synced": False,
+                    "cli_synced": False,
+                    "drifted_targets": ["desktop", "cli"],
+                }
+                status_out = format_status_report(
+                    {"active": active_val, "server_running": False, "sync_status": stale_sync}
+                )
+                self.assertIn("None (No account active)", status_out)
+                self.assertNotIn("out of sync", status_out.lower())
+                self.assertNotIn("doctor --fix", status_out)
+
+                list_payload = {**self._base_accounts_payload(None), "active": active_val, "sync_status": stale_sync}
+                for rendered in (
+                    format_accounts_table(list_payload, show_quota=False),
+                    format_accounts_listicle(list_payload, show_quota=False),
+                ):
+                    self.assertIn("No account currently active", rendered)
+                    self.assertNotIn("out of sync", rendered.lower())
+                    self.assertNotIn("doctor --fix", rendered)
+
+    def test_cli_main_status_and_list_end_to_end_desync_corrupt_missing_symlink_and_pending_reload_SYNC_VIS_003(
+        self,
+    ) -> None:
+        """[SYNC-VIS-003] [SYNC-VIS-ERR-001] [SYNC-VIS-EDGE-003] Real-engine CLI status/list handles drift, corrupt/missing/symlinked tokens, and pending_reload with exit 0."""
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            TestCLISwitchPreflightAuth._register_account(engine, "honey", "honey@example.com")
+            TestCLISwitchPreflightAuth._register_account(engine, "old", "old@example.com")
+            engine.switch_tokens("honey", restart_server=False)
+
+            # Seed fresh quota cache so status never spawns background internal-probe
+            cache_file = engine.cache_dir / "last_known_quota.json"
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps({"timestamp": time.time(), "accounts": {}}),
+                encoding="utf-8",
+            )
+
+            def run_cli(argv: list[str]) -> tuple[int, str]:
+                buf = io.StringIO()
+                with patch("urllib.request.urlopen", side_effect=AssertionError("Network calls barred")), \
+                     patch("subprocess.Popen", side_effect=AssertionError("Subprocess probe barred")), \
+                     patch("sys.stdout", buf):
+                    rc = main(argv, engine=engine)
+                return rc, buf.getvalue()
+
+            # Case 1 ([SYNC-VIS-003]): Drifted Desktop token ("old@example.com")
+            engine.desktop_token_file.write_text(
+                (engine.accounts_dir / "old" / "token.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            for argv in (["status"], ["list", "--format", "table"], ["list", "--format", "list"]):
+                rc, out = run_cli(argv)
+                self.assertEqual(rc, 0)
+                self.assertIn("Desktop", out)
+                self.assertIn("old@example.com", out)
+                self.assertIn("agy-switch doctor --fix", out)
+                warning_lines = [line for line in out.splitlines() if "out of sync" in line.lower()]
+                self.assertEqual(len(warning_lines), 1)
+                self.assertNotIn("CLI", warning_lines[0])
+
+            rc_json, out_json = run_cli(["list", "--json"])
+            self.assertEqual(rc_json, 0)
+            parsed = json.loads(out_json)
+            self.assertFalse(parsed["sync_status"]["in_sync"])
+            self.assertEqual(parsed["sync_status"]["drifted_targets"], ["desktop"])
+            self.assertEqual(parsed["sync_status"]["desktop_email"], "old@example.com")
+
+            # Case 2 ([SYNC-VIS-ERR-001]): Corrupt Desktop JSON + missing CLI token
+            engine.desktop_token_file.write_text('{"token":', encoding="utf-8")
+            engine.cli_token_file.unlink()
+            for argv in (["status"], ["list", "--format", "table"], ["list", "--format", "list"]):
+                rc, out = run_cli(argv)
+                self.assertEqual(rc, 0)
+                warning_lines = [line for line in out.splitlines() if "out of sync" in line.lower()]
+                self.assertEqual(len(warning_lines), 1)
+                self.assertIn("Desktop", warning_lines[0])
+                self.assertIn("CLI", warning_lines[0])
+
+            rc_json_err, out_json_err = run_cli(["list", "--json"])
+            self.assertEqual(rc_json_err, 0)
+            parsed_err = json.loads(out_json_err)
+            self.assertFalse(parsed_err["sync_status"]["in_sync"])
+            self.assertEqual(parsed_err["sync_status"]["drifted_targets"], ["desktop", "cli"])
+
+            # Case 3 ([SYNC-VIS-ERR-001]): Corrupt Desktop JSON + symlinked CLI token
+            external_secret = base / "external-secret.json"
+            external_secret.write_text('{"token": {"refresh_token": "ext-rt"}, "email": "ext@example.com"}', encoding="utf-8")
+            engine.cli_token_file.symlink_to(external_secret)
+            for argv in (["status"], ["list", "--format", "table"], ["list", "--format", "list"]):
+                rc, out = run_cli(argv)
+                self.assertEqual(rc, 0)
+                self.assertNotIn("ext@example.com", out)
+                warning_lines = [line for line in out.splitlines() if "out of sync" in line.lower()]
+                self.assertEqual(len(warning_lines), 1)
+                self.assertIn("Desktop", warning_lines[0])
+                self.assertIn("CLI", warning_lines[0])
+
+            rc_json_sym, out_json_sym = run_cli(["list", "--json"])
+            self.assertEqual(rc_json_sym, 0)
+            parsed_sym = json.loads(out_json_sym)
+            self.assertFalse(parsed_sym["sync_status"]["in_sync"])
+            self.assertEqual(parsed_sym["sync_status"]["drifted_targets"], ["desktop", "cli"])
+            self.assertIsNone(parsed_sym["sync_status"]["cli_email"])
+
+            # Case 4 ([SYNC-VIS-EDGE-003]): Synced disk + queued pending_reload.json (1800s TTL)
+            engine.cli_token_file.unlink()
+            engine.switch_tokens("honey", restart_server=False)
+            engine.write_pending_reload("honey", reason="in_turn_deferred_reload")
+
+            for argv in (["status"], ["list", "--format", "table"], ["list", "--format", "list"]):
+                rc, out = run_cli(argv)
+                self.assertEqual(rc, 0)
+                self.assertIn("Pending Reload", out)
+                self.assertIn("honey", out)
+                self.assertIn("1800s", out)
+                self.assertNotIn("out of sync", out.lower())
+                self.assertNotIn("doctor --fix", out)
+
+            rc_json_pr, out_json_pr = run_cli(["list", "--json"])
+            self.assertEqual(rc_json_pr, 0)
+            parsed_pr = json.loads(out_json_pr)
+            self.assertTrue(parsed_pr["sync_status"]["in_sync"])
+            self.assertEqual(parsed_pr["sync_status"]["drifted_targets"], [])
+            self.assertEqual(parsed_pr["pending_reload"]["target_account"], "honey")
+            self.assertEqual(parsed_pr["pending_reload"]["ttl_seconds"], 1800)
 
 
 if __name__ == '__main__':

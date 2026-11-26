@@ -6,6 +6,7 @@ Pure Python 3.10+ standard library. Zero external dependencies.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import math
 import re
@@ -13,6 +14,110 @@ import time
 from typing import Any
 
 from agy_switcher.models import DiagnosticReport
+
+
+@dataclass(frozen=True)
+class _ParsedSyncStatus:
+    """Normalized representation of local Vault-Authoritative sync metadata."""
+
+    in_sync: bool
+    surface_summary: str
+
+
+def _parse_sync_status(raw_sync: object) -> _ParsedSyncStatus | None:
+    """Validates sync_status metadata, returning None when absent or malformed."""
+    if not isinstance(raw_sync, dict):
+        return None
+
+    raw_in_sync = raw_sync.get("in_sync")
+    if not isinstance(raw_in_sync, bool):
+        return None
+
+    drifted_tokens: list[str] = []
+    if "drifted_targets" in raw_sync and raw_sync.get("drifted_targets") is not None:
+        raw_drifted = raw_sync.get("drifted_targets")
+        if not isinstance(raw_drifted, (list, tuple)):
+            return None
+        for item in raw_drifted:
+            if isinstance(item, str) and item.strip():
+                norm = item.strip().lower()
+                if norm not in drifted_tokens:
+                    drifted_tokens.append(norm)
+
+    desktop_synced = raw_sync.get("desktop_synced")
+    cli_synced = raw_sync.get("cli_synced")
+    if desktop_synced is not None and not isinstance(desktop_synced, bool):
+        return None
+    if cli_synced is not None and not isinstance(cli_synced, bool):
+        return None
+
+    drifted_surfaces: list[str] = []
+    if "desktop" in drifted_tokens or desktop_synced is False:
+        drifted_surfaces.append("desktop")
+    if "cli" in drifted_tokens or cli_synced is False:
+        drifted_surfaces.append("cli")
+    for extra in drifted_tokens:
+        if extra not in ("desktop", "cli"):
+            drifted_surfaces.append(extra)
+
+    if raw_in_sync:
+        if drifted_surfaces:
+            return None
+        return _ParsedSyncStatus(in_sync=True, surface_summary="Desktop & CLI")
+
+    if not drifted_surfaces:
+        return None
+
+    raw_desktop_email = raw_sync.get("desktop_email")
+    desktop_email = (
+        raw_desktop_email.strip()
+        if isinstance(raw_desktop_email, str) and raw_desktop_email.strip()
+        else None
+    )
+    raw_cli_email = raw_sync.get("cli_email")
+    cli_email = (
+        raw_cli_email.strip()
+        if isinstance(raw_cli_email, str) and raw_cli_email.strip()
+        else None
+    )
+
+    parts: list[str] = []
+    for surface in drifted_surfaces:
+        if surface == "desktop":
+            parts.append(f"Desktop ({desktop_email})" if desktop_email else "Desktop")
+        elif surface == "cli":
+            parts.append(f"CLI ({cli_email})" if cli_email else "CLI")
+        else:
+            parts.append(surface)
+
+    if len(parts) == 1:
+        summary = parts[0]
+    elif len(parts) == 2:
+        summary = f"{parts[0]} and {parts[1]}"
+    else:
+        summary = f"{', '.join(parts[:-1])}, and {parts[-1]}"
+
+    return _ParsedSyncStatus(in_sync=False, surface_summary=summary)
+
+
+def _format_pending_reload_detail(raw_pending: object) -> str | None:
+    """Formats unexpired pending_reload metadata, or returns None when absent or malformed."""
+    if not isinstance(raw_pending, dict):
+        return None
+    raw_target = raw_pending.get("target_account")
+    if not isinstance(raw_target, str) or not raw_target.strip():
+        return None
+    target_acc = raw_target.strip()
+    raw_ttl = raw_pending.get("ttl_seconds")
+    ttl_part = ""
+    if (
+        isinstance(raw_ttl, (int, float))
+        and not isinstance(raw_ttl, bool)
+        and math.isfinite(raw_ttl)
+        and raw_ttl > 0
+    ):
+        ttl_part = f", TTL: {int(round(raw_ttl))}s"
+    return f"{target_acc} (awaiting safe-turn server reload{ttl_part})"
 
 
 def _parse_timestamp_defensive(val: Any) -> float:
@@ -234,13 +339,28 @@ def format_accounts_listicle(
             status = _format_account_status_label(acc)
             lines.append(f"{prefix} [{status}]")
 
-    active_acc = result.get("active")
+    _append_accounts_footer(lines, result)
+    return "\n".join(lines)
+
+
+def _append_accounts_footer(lines: list[str], result: dict[str, Any]) -> None:
+    """Appends active account, local desync warning, and pending reload footer lines."""
+    raw_active = result.get("active")
+    active_acc = raw_active.strip() if isinstance(raw_active, str) else ""
     if active_acc:
         lines.append(f"Active Account: {active_acc}")
+        sync_info = _parse_sync_status(result.get("sync_status"))
+        if sync_info is not None and not sync_info.in_sync:
+            lines.append(
+                f"Warning: {sync_info.surface_summary} out of sync with Vault active account "
+                f"'{active_acc}'. Run 'agy-switch doctor --fix' or 'agy-switch switch {active_acc}'."
+            )
     else:
         lines.append("No account currently active. Run: agy-switch switch <account>")
 
-    return "\n".join(lines)
+    pending_detail = _format_pending_reload_detail(result.get("pending_reload"))
+    if pending_detail is not None:
+        lines.append(f"Pending Reload: {pending_detail}")
 
 
 def format_accounts_table(
@@ -284,45 +404,55 @@ def format_accounts_table(
         lines.append(line)
 
     lines.append("-" * len(header))
-    active_acc = result.get("active")
-    if active_acc:
-        lines.append(f"Active Account: {active_acc}")
-    else:
-        lines.append("No account currently active. Run: agy-switch switch <account>")
-
+    _append_accounts_footer(lines, result)
     return "\n".join(lines)
 
 
-def format_status_report(status: dict[str, Any]) -> str:
+def format_status_report(status: dict[str, Any] | None) -> str:
     """Formats system and server status into a clean terminal report."""
+    payload: dict[str, Any] = status if isinstance(status, dict) else {}
     lines = [
         "Antigravity System Status:",
         "-------------------------------------------------------------",
     ]
-    active = status.get("active")
-    email = status.get("email") or "unknown"
+    raw_active = payload.get("active")
+    active = raw_active.strip() if isinstance(raw_active, str) else ""
+    raw_email = payload.get("email")
+    email = raw_email.strip() if isinstance(raw_email, str) and raw_email.strip() else "unknown"
     if active:
         lines.append(f"Active Account    : {active} ({email})")
-        if "cached_quota" in status and isinstance(status["cached_quota"], dict):
-            q_data = status["cached_quota"]
+        if "cached_quota" in payload and isinstance(payload["cached_quota"], dict):
+            q_data = payload["cached_quota"]
             if isinstance(q_data.get("gemini"), dict):
                 lines.append(f"Cached Quota      : {q_data['gemini'].get('quota', 0)}% (Gemini)")
             elif isinstance(q_data.get("claude"), dict):
                 lines.append(f"Cached Quota      : {q_data['claude'].get('quota', 0)}% (Claude)")
+
+        sync_info = _parse_sync_status(payload.get("sync_status"))
+        if sync_info is not None:
+            if sync_info.in_sync:
+                lines.append(f"Credential Sync   : Synced ({sync_info.surface_summary})")
+            else:
+                lines.append(
+                    f"Credential Sync   : WARNING - Out of sync with Vault '{active}' on {sync_info.surface_summary}"
+                )
+                lines.append(
+                    f"Remediation       : Run 'agy-switch doctor --fix' or 'agy-switch switch {active}'"
+                )
     else:
         lines.append("Active Account    : None (No account active)")
 
-    if status.get("server_running"):
-        pid = status.get("server_pid")
+    if payload.get("server_running"):
+        pid = payload.get("server_pid")
         lines.append(f"Language Server   : Running (PID: {pid})")
-        if status.get("server_busy"):
+        if payload.get("server_busy"):
             lines.append("Server State      : Busy (Active task running - requires --force to restart)")
         else:
             lines.append("Server State      : Idle (Safe to restart)")
     else:
         lines.append("Language Server   : Stopped / Not Found")
 
-    last_failover = status.get("last_failover")
+    last_failover = payload.get("last_failover")
     if isinstance(last_failover, dict):
         from_acc = str(last_failover.get("from_account") or "").strip()
         to_acc = str(last_failover.get("to_account") or "").strip()
@@ -332,20 +462,9 @@ def format_status_report(status: dict[str, Any]) -> str:
             trigger_suffix = f" (trigger: {trigger})" if trigger else ""
             lines.append(f"Last Failover     : {route}{trigger_suffix}")
 
-    pending_reload = status.get("pending_reload")
-    if isinstance(pending_reload, dict):
-        target_acc = str(pending_reload.get("target_account") or "").strip()
-        if target_acc:
-            raw_ttl = pending_reload.get("ttl_seconds")
-            ttl_part = ""
-            if (
-                isinstance(raw_ttl, (int, float))
-                and not isinstance(raw_ttl, bool)
-                and math.isfinite(raw_ttl)
-                and raw_ttl > 0
-            ):
-                ttl_part = f", TTL: {int(round(raw_ttl))}s"
-            lines.append(f"Pending Reload    : {target_acc} (awaiting safe-turn server reload{ttl_part})")
+    pending_detail = _format_pending_reload_detail(payload.get("pending_reload"))
+    if pending_detail is not None:
+        lines.append(f"Pending Reload    : {pending_detail}")
 
     lines.append("-------------------------------------------------------------")
     return "\n".join(lines)

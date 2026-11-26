@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import email.message
+import errno
 import io
 import itertools
 import json
@@ -1456,7 +1457,7 @@ class TestAgySwitchEngine(unittest.TestCase):
             ttl_seconds=True,  # type: ignore[arg-type]
             requested_at=True,  # type: ignore[arg-type]
         )
-        self.assertEqual(bool_guarded["ttl_seconds"], 120)
+        self.assertEqual(bool_guarded["ttl_seconds"], 1800)
         self.assertGreater(bool_guarded["requested_at"], 1_000_000.0)
 
         # Write valid marker and inspect on-disk schema & 0600 mode
@@ -1953,7 +1954,7 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
         pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
         self.assertEqual(pending_data["target_account"], "work-acc")
-        self.assertEqual(pending_data["ttl_seconds"], 120)
+        self.assertEqual(pending_data["ttl_seconds"], 1800)
         self.assertIsInstance(pending_data["requested_at"], (int, float))
         self.assertGreater(pending_data["requested_at"], 0)
         self.assertIsInstance(pending_data["reason"], str)
@@ -2769,6 +2770,834 @@ class TestAgySwitchEngine(unittest.TestCase):
         state_after_manual = engine.load_failover_state()
         self.assertIsNone(state_after_manual["last_failover"])
         self.assertIn("automator", state_after_manual["auth_errors"])
+
+
+class TestLayer0PendingReloadAndJsonlReader(unittest.TestCase):
+    """[CONVERGE-RELOAD-EDGE-002 / CONVERGE-RELOAD-ERR-002] Layer 0 TTL, TypedDicts, and JSONL reader tests."""
+
+    def test_pending_reload_default_1800s_ttl_and_override_CONVERGE_RELOAD_EDGE_002(self) -> None:
+        """[CONVERGE-RELOAD-EDGE-002] Omitted ttl_seconds normalizes to 1800 while explicit 300 is preserved."""
+        from agy_switcher import models as models_mod
+        from agy_switcher import security as security_mod
+
+        self.assertEqual(models_mod.DEFAULT_PENDING_RELOAD_TTL_SECONDS, 1800)
+        self.assertTrue(hasattr(models_mod, "TokenIdentity"))
+        self.assertTrue(hasattr(models_mod, "TargetSyncSnapshot"))
+        self.assertTrue(hasattr(models_mod, "TokenSyncStatus"))
+
+        legacy_payload = {"target_account": "work-acc", "requested_at": 1_700_000_000.0}
+        parsed_legacy = security_mod.parse_pending_reload_payload(legacy_payload)
+        self.assertIsNotNone(parsed_legacy)
+        assert parsed_legacy is not None
+        self.assertEqual(parsed_legacy["target_account"], "work-acc")
+        self.assertEqual(parsed_legacy["requested_at"], 1_700_000_000.0)
+        self.assertEqual(parsed_legacy["ttl_seconds"], 1800)
+        self.assertEqual(parsed_legacy["reason"], "in_turn_deferred_reload")
+
+        override_payload = {
+            "target_account": "work-acc",
+            "requested_at": 1_700_000_000.0,
+            "ttl_seconds": 300,
+            "reason": "sdk_disk_only_swap",
+        }
+        parsed_override = security_mod.parse_pending_reload_payload(override_payload)
+        self.assertIsNotNone(parsed_override)
+        assert parsed_override is not None
+        self.assertEqual(parsed_override["ttl_seconds"], 300)
+        self.assertEqual(parsed_override["reason"], "sdk_disk_only_swap")
+
+    def test_pending_reload_invalid_ttl_and_layer0_jsonl_reader_CONVERGE_RELOAD_ERR_002(self) -> None:
+        """[CONVERGE-RELOAD-ERR-002] Invalid TTLs return None and Layer 0 read_latest_jsonl_record handles valid/corrupt/missing files."""
+        from agy_switcher import security as security_mod
+
+        invalid_ttls: list[object] = [
+            0,
+            -60,
+            True,
+            False,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "300",
+            [],
+            {},
+        ]
+        for bad_ttl in invalid_ttls:
+            with self.subTest(bad_ttl=bad_ttl):
+                payload = {
+                    "target_account": "work-acc",
+                    "requested_at": 1_700_000_000.0,
+                    "ttl_seconds": bad_ttl,
+                }
+                self.assertIsNone(security_mod.parse_pending_reload_payload(payload))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            missing_file = tmp / "missing.jsonl"
+            self.assertIsNone(security_mod.read_latest_jsonl_record(missing_file))
+
+            empty_file = tmp / "empty.jsonl"
+            empty_file.write_text("", encoding="utf-8")
+            self.assertIsNone(security_mod.read_latest_jsonl_record(empty_file))
+
+            valid_file = tmp / "valid.jsonl"
+            valid_file.write_text(
+                json.dumps({"type": "USER_INPUT", "content": "hi"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n\n",
+                encoding="utf-8",
+            )
+            latest = security_mod.read_latest_jsonl_record(valid_file)
+            self.assertEqual(latest, {"type": "PLANNER_RESPONSE", "status": "DONE"})
+
+            corrupt_tail = tmp / "corrupt_tail.jsonl"
+            corrupt_tail.write_text(
+                json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n"
+                + '{"type": "PLANNER_RESPONSE", "status": ',
+                encoding="utf-8",
+            )
+            self.assertIsNone(security_mod.read_latest_jsonl_record(corrupt_tail))
+
+            non_dict_tail = tmp / "non_dict.jsonl"
+            non_dict_tail.write_text("[1, 2, 3]\n", encoding="utf-8")
+            self.assertIsNone(security_mod.read_latest_jsonl_record(non_dict_tail))
+
+            # Large single trailing JSON line (>64 KiB) forces chunk expansion in read_latest_jsonl_record
+            large_line_file = tmp / "large_line.jsonl"
+            large_payload = {"type": "PLANNER_RESPONSE", "status": "DONE", "padding": "x" * 80000}
+            large_line_file.write_text(json.dumps(large_payload) + "\n", encoding="utf-8")
+            self.assertEqual(security_mod.read_latest_jsonl_record(large_line_file), large_payload)
+
+            # Directory / OSError path returns None safely
+            self.assertIsNone(security_mod.read_latest_jsonl_record(tmp))
+
+
+class TestTokenIdentityExtractorAndMatcher(unittest.TestCase):
+    """[VAULT-SYNC-001 / VAULT-SYNC-EDGE-004] Pure token identity extraction and matching tests."""
+
+    def test_token_identity_and_credentials_match_with_go_metadata_VAULT_SYNC_001(self) -> None:
+        """[VAULT-SYNC-001] Matching refresh_token, auth_method, and email match despite Desktop Go metadata with zero I/O or HTTP."""
+        from agy_switcher.security import extract_token_identity, token_credentials_match
+
+        vault_data = make_valid_token_payload("primary@example.com")
+        vault_token = cast(dict[str, object], vault_data["token"])
+        vault_token["refresh_token"] = "rt-primary"
+        vault_data["auth_method"] = "oauth"
+
+        desktop_data: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.freshly_rotated_desktop_access_token",
+                "token_type": "Bearer",
+                "refresh_token": "rt-primary",
+                "expiry": "2026-12-31T23:59:59.123456789Z",
+            },
+            "auth_method": "oauth",
+            "id_token": vault_data["id_token"],
+            "writer_id": "ls-991",
+        }
+
+        with (
+            patch("urllib.request.urlopen", side_effect=AssertionError("HTTP call must not happen")),
+            patch("pathlib.Path.write_text", side_effect=AssertionError("Disk write must not happen")),
+            patch("os.replace", side_effect=AssertionError("Atomic write must not happen")),
+        ):
+            vault_identity = extract_token_identity(vault_data)
+            desktop_identity = extract_token_identity(desktop_data)
+            matched = token_credentials_match(vault_data, desktop_data)
+
+        self.assertEqual(
+            vault_identity,
+            {
+                "refresh_token": "rt-primary",
+                "auth_method": "oauth",
+                "email": "primary@example.com",
+            },
+        )
+        self.assertEqual(desktop_identity, vault_identity)
+        self.assertTrue(matched)
+
+    def test_token_credentials_match_email_normalization_and_missing_fields_VAULT_SYNC_EDGE_004(self) -> None:
+        """[VAULT-SYNC-EDGE-004] Normalizes email case/whitespace, tolerates one-sided missing email, and rejects mismatched or missing fields."""
+        from agy_switcher.security import extract_token_identity, token_credentials_match
+
+        vault_data = make_valid_token_payload("Honey@Example.COM")
+        vault_token = cast(dict[str, object], vault_data["token"])
+        vault_token["refresh_token"] = "rt-1"
+        vault_data["auth_method"] = "oauth"
+
+        # (a) Case/whitespace email difference with matching refresh_token & auth_method -> True
+        case_whitespace_target: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.target",
+                "token_type": "Bearer",
+                "refresh_token": "rt-1",
+                "expiry": "2026-12-31T23:59:59Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": " honey@example.com ",
+        }
+        self.assertTrue(token_credentials_match(vault_data, case_whitespace_target))
+
+        # (b) One-sided omitted email (both directions) with matching refresh_token & auth_method -> True
+        omitted_email_target: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.target",
+                "token_type": "Bearer",
+                "refresh_token": "rt-1",
+                "expiry": "2026-12-31T23:59:59Z",
+            },
+            "auth_method": "oauth",
+        }
+        self.assertTrue(token_credentials_match(vault_data, omitted_email_target))
+        self.assertTrue(token_credentials_match(omitted_email_target, vault_data))
+
+        # (c) Mismatched email even with matching refresh_token & auth_method -> False
+        mismatched_email_target = make_valid_token_payload("other@example.com")
+        mismatched_token = cast(dict[str, object], mismatched_email_target["token"])
+        mismatched_token["refresh_token"] = "rt-1"
+        mismatched_email_target["auth_method"] = "oauth"
+        self.assertFalse(token_credentials_match(vault_data, mismatched_email_target))
+
+        # (d) Missing, empty, whitespace-only, or non-string refresh_token / auth_method -> False
+        invalid_targets: list[object] = [
+            None,
+            [],
+            "not-a-dict",
+            {"auth_method": "oauth"},
+            {"token": "not-a-dict", "auth_method": "oauth"},
+            {"token": {"refresh_token": ""}, "auth_method": "oauth"},
+            {"token": {"refresh_token": "   "}, "auth_method": "oauth"},
+            {"token": {"refresh_token": 12345}, "auth_method": "oauth"},
+            {"token": {}, "auth_method": "oauth"},
+            {"token": {"refresh_token": "rt-1"}, "auth_method": ""},
+            {"token": {"refresh_token": "rt-1"}, "auth_method": "   "},
+            {"token": {"refresh_token": "rt-1"}, "auth_method": None},
+            {"token": {"refresh_token": "rt-1"}},
+        ]
+        for bad_target in invalid_targets:
+            with self.subTest(bad_target=bad_target):
+                self.assertIsNone(extract_token_identity(bad_target))
+                self.assertFalse(token_credentials_match(vault_data, bad_target))
+                self.assertFalse(token_credentials_match(bad_target, vault_data))
+
+    def test_extract_token_identity_trims_required_fields_and_rejects_mismatched_credentials(self) -> None:
+        """extract_token_identity trims refresh_token and auth_method; mismatches return False."""
+        from agy_switcher.security import extract_token_identity, token_credentials_match
+
+        padded_payload: dict[str, object] = {
+            "token": {"refresh_token": "  rt-trimmed  "},
+            "auth_method": "  oauth  ",
+            "id_token_email": "  USER@Example.COM ",
+        }
+        self.assertEqual(
+            extract_token_identity(padded_payload),
+            {
+                "refresh_token": "rt-trimmed",
+                "auth_method": "oauth",
+                "email": "user@example.com",
+            },
+        )
+        self.assertTrue(
+            token_credentials_match(
+                padded_payload,
+                {"token": {"refresh_token": "rt-trimmed"}, "auth_method": "oauth"},
+            )
+        )
+        self.assertFalse(
+            token_credentials_match(
+                padded_payload,
+                {"token": {"refresh_token": "rt-other"}, "auth_method": "oauth"},
+            )
+        )
+        self.assertFalse(
+            token_credentials_match(
+                padded_payload,
+                {"token": {"refresh_token": "rt-trimmed"}, "auth_method": "api_key"},
+            )
+        )
+
+
+class TestVaultAuthoritativeSyncCheckAndRepair(unittest.TestCase):
+    """[VAULT-SYNC-001 / VAULT-SYNC-002 / VAULT-SYNC-ERR-001..004] Vault sync check and atomic repair tests."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.gemini_dir = self.base_path / ".gemini"
+        self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _register_account(
+        self,
+        alias: str,
+        email: str,
+        *,
+        refresh_token: str | None = None,
+        set_active: bool = False,
+    ) -> dict[str, object]:
+        payload = make_valid_token_payload(email)
+        if refresh_token is not None:
+            cast(dict[str, object], payload["token"])["refresh_token"] = refresh_token
+        acc_dir = self.vault_dir / "accounts" / alias
+        acc_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        if set_active:
+            self.engine.set_active_name(alias)
+        return payload
+
+    def test_sync_status_matches_benign_go_runtime_metadata_zero_io_or_http_VAULT_SYNC_001(self) -> None:
+        """[VAULT-SYNC-001] Benign Go runtime metadata (writer_id, ns expiry, refreshed access_token) stays synced with zero writes or HTTP."""
+        vault_data = self._register_account(
+            "primary-acc",
+            "primary@example.com",
+            refresh_token="rt-primary",
+            set_active=True,
+        )
+        desktop_payload: dict[str, object] = {
+            "token": {
+                "access_token": "ya29.freshly_rotated_desktop_access_token",
+                "token_type": "Bearer",
+                "refresh_token": "rt-primary",
+                "expiry": "2026-12-31T23:59:59.987654321Z",
+            },
+            "auth_method": "oauth",
+            "id_token": vault_data["id_token"],
+            "writer_id": "ls-991",
+        }
+        self.engine.desktop_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.desktop_token_file.write_text(json.dumps(desktop_payload), encoding="utf-8")
+        self.engine.cli_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.cli_token_file.write_text(json.dumps(vault_data), encoding="utf-8")
+
+        with (
+            patch("urllib.request.urlopen", side_effect=AssertionError("HTTP call must not happen")),
+            patch("pathlib.Path.write_text", side_effect=AssertionError("Disk write must not happen")),
+            patch("os.replace", side_effect=AssertionError("Atomic write must not happen")),
+        ):
+            status = self.engine.check_target_sync_status()
+
+        self.assertTrue(status["in_sync"])
+        self.assertTrue(status["desktop_synced"])
+        self.assertTrue(status["cli_synced"])
+        self.assertEqual(status["drifted_targets"], [])
+        self.assertEqual(status["desktop_email"], "primary@example.com")
+        self.assertEqual(status["cli_email"], "primary@example.com")
+
+    def test_sync_status_and_sync_active_tokens_heal_zombie_write_back_and_corrupt_targets_VAULT_SYNC_002(self) -> None:
+        """[VAULT-SYNC-002 / VAULT-SYNC-ERR-001 / VAULT-SYNC-ERR-002] Detects Zombie Write-Back, corrupt JSON, and symlinks; repairs atomically."""
+        work_data = self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            set_active=True,
+        )
+        self.engine.cli_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.cli_token_file.write_text(json.dumps(work_data), encoding="utf-8")
+
+        # 1. Zombie Write-Back overwrite on Desktop
+        old_payload = make_valid_token_payload("old@example.com")
+        cast(dict[str, object], old_payload["token"])["refresh_token"] = "rt-old"
+        old_payload["writer_id"] = "go-ls"
+        self.engine.desktop_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.desktop_token_file.write_text(json.dumps(old_payload), encoding="utf-8")
+
+        drift_status = self.engine.check_target_sync_status()
+        self.assertFalse(drift_status["in_sync"])
+        self.assertFalse(drift_status["desktop_synced"])
+        self.assertTrue(drift_status["cli_synced"])
+        self.assertEqual(drift_status["drifted_targets"], ["desktop"])
+        self.assertEqual(drift_status["desktop_email"], "old@example.com")
+        self.assertEqual(drift_status["cli_email"], "work@example.com")
+
+        self.assertTrue(self.engine.sync_active_tokens_from_vault())
+        self.assertEqual(self.engine.active_file.read_text(encoding="utf-8").strip(), "work-acc")
+        self.assertEqual(stat.S_IMODE(self.engine.desktop_token_file.stat().st_mode), 0o600)
+        restored_desktop = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(restored_desktop, work_data)
+
+        healed_status = self.engine.check_target_sync_status()
+        self.assertTrue(healed_status["in_sync"])
+        self.assertEqual(healed_status["drifted_targets"], [])
+
+        # 2. [VAULT-SYNC-ERR-001] Truncated JSON & non-dict JSON on Desktop
+        for bad_raw in ('{"token":', "[]"):
+            with self.subTest(bad_raw=bad_raw):
+                self.engine.desktop_token_file.write_text(bad_raw, encoding="utf-8")
+                corrupt_status = self.engine.check_target_sync_status()
+                self.assertFalse(corrupt_status["in_sync"])
+                self.assertFalse(corrupt_status["desktop_synced"])
+                self.assertTrue(corrupt_status["cli_synced"])
+                self.assertEqual(corrupt_status["drifted_targets"], ["desktop"])
+                self.assertIsNone(corrupt_status["desktop_email"])
+                self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=("desktop",)))
+                self.assertEqual(
+                    json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8")),
+                    work_data,
+                )
+
+        # 3. [VAULT-SYNC-ERR-002] External symlink & missing & unreadable target
+        external_secret = self.base_path / "external-secret"
+        external_secret.write_text('{"secret": "do-not-read-or-mutate"}', encoding="utf-8")
+        self.engine.desktop_token_file.unlink()
+        self.engine.desktop_token_file.symlink_to(external_secret)
+
+        symlink_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_status["in_sync"])
+        self.assertFalse(symlink_status["desktop_synced"])
+        self.assertIn("desktop", symlink_status["drifted_targets"])
+        self.assertIsNone(symlink_status["desktop_email"])
+        self.assertEqual(external_secret.read_text(encoding="utf-8"), '{"secret": "do-not-read-or-mutate"}')
+
+        # Missing target
+        self.engine.desktop_token_file.unlink()
+        missing_status = self.engine.check_target_sync_status()
+        self.assertFalse(missing_status["in_sync"])
+        self.assertFalse(missing_status["desktop_synced"])
+        self.assertEqual(missing_status["drifted_targets"], ["desktop"])
+
+        # Unreadable target (PermissionError via chmod 0000 when non-root, plus deterministic os.open OSError)
+        self.engine.desktop_token_file.write_text(json.dumps(work_data), encoding="utf-8")
+        if os.geteuid() != 0:
+            os.chmod(self.engine.desktop_token_file, 0o000)
+            try:
+                unreadable_status = self.engine.check_target_sync_status()
+            finally:
+                os.chmod(self.engine.desktop_token_file, 0o600)
+            self.assertFalse(unreadable_status["in_sync"])
+            self.assertFalse(unreadable_status["desktop_synced"])
+            self.assertEqual(unreadable_status["drifted_targets"], ["desktop"])
+
+        with patch("os.open", side_effect=PermissionError("Permission denied")):
+            io_err_status = self.engine.check_target_sync_status()
+        self.assertFalse(io_err_status["in_sync"])
+        self.assertFalse(io_err_status["desktop_synced"])
+        self.assertFalse(io_err_status["cli_synced"])
+        self.assertEqual(io_err_status["drifted_targets"], ["desktop", "cli"])
+
+    def test_sync_active_tokens_error_paths_invalid_vault_symlink_replace_and_oserror_VAULT_SYNC_ERR_004(self) -> None:
+        """[VAULT-SYNC-ERR-003 / VAULT-SYNC-ERR-004] Invalid Vault token aborts; symlink replaced atomically; PermissionError/ENOSPC logged to stderr."""
+        self.engine.desktop_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.cli_token_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.engine.desktop_token_file.write_text('{"live": "desktop-sentinel"}', encoding="utf-8")
+        self.engine.cli_token_file.write_text('{"live": "cli-sentinel"}', encoding="utf-8")
+
+        # Case 1a: [VAULT-SYNC-ERR-003] Active points to broken-acc with missing token.json
+        (self.vault_dir / "accounts" / "broken-acc").mkdir(parents=True, mode=0o700)
+        self.engine.set_active_name("broken-acc")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+        self.assertEqual(self.engine.desktop_token_file.read_text(encoding="utf-8"), '{"live": "desktop-sentinel"}')
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), '{"live": "cli-sentinel"}')
+
+        # Case 1b: [VAULT-SYNC-ERR-003] broken-acc token.json fails validate_token_file()
+        (self.vault_dir / "accounts" / "broken-acc" / "token.json").write_text(
+            json.dumps({"token": {"access_token": ""}, "auth_method": "oauth"}),
+            encoding="utf-8",
+        )
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+        self.assertEqual(self.engine.desktop_token_file.read_text(encoding="utf-8"), '{"live": "desktop-sentinel"}')
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), '{"live": "cli-sentinel"}')
+
+        # Case 2: [VAULT-SYNC-ERR-004] Valid work-acc replaces symlinked Desktop target without mutating external target
+        work_data = self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            set_active=True,
+        )
+        external_secret = self.base_path / "external-secret"
+        external_secret.write_text("EXTERNAL_SECRET_DATA", encoding="utf-8")
+        self.engine.desktop_token_file.unlink()
+        self.engine.desktop_token_file.symlink_to(external_secret)
+
+        self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=("desktop",)))
+        self.assertFalse(self.engine.desktop_token_file.is_symlink())
+        self.assertTrue(self.engine.desktop_token_file.is_file())
+        self.assertEqual(stat.S_IMODE(self.engine.desktop_token_file.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8")), work_data)
+        self.assertEqual(external_secret.read_text(encoding="utf-8"), "EXTERNAL_SECRET_DATA")
+        # CLI was not in targets=("desktop",), so remains untouched
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), '{"live": "cli-sentinel"}')
+        self.assertEqual(self.engine.active_file.read_text(encoding="utf-8").strip(), "work-acc")
+
+        # Case 3: [VAULT-SYNC-ERR-004] PermissionError / ENOSPC on os.replace logs to stderr and returns False
+        for err in (
+            PermissionError("Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        ):
+            with self.subTest(err=err):
+                stderr_buf = io.StringIO()
+                with patch("os.replace", side_effect=err), patch("sys.stderr", stderr_buf):
+                    result = self.engine.sync_active_tokens_from_vault(targets=("desktop",))
+                self.assertFalse(result)
+                self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Invalid target name rejected safely
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault(targets=("unknown",)))
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+    def test_sync_status_and_sync_active_tokens_edge_cases_active_symlink_corrupt_and_targets_VAULT_SYNC_EDGE(
+        self,
+    ) -> None:
+        """Edge cases: symlinked/corrupt/empty active file, symlinked account dir, empty/non-iterable targets, missing parent dir."""
+        work_data = self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            set_active=True,
+        )
+        # Missing parent directory for both targets is created atomically (0700 dir, 0600 file)
+        self.assertFalse(self.engine.desktop_token_file.parent.exists())
+        self.assertFalse(self.engine.cli_token_file.parent.exists())
+        self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=["desktop", "cli"]))
+        self.assertTrue(self.engine.desktop_token_file.is_file())
+        self.assertTrue(self.engine.cli_token_file.is_file())
+        self.assertEqual(stat.S_IMODE(self.engine.desktop_token_file.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.engine.cli_token_file.stat().st_mode), 0o600)
+
+        # Empty targets is a safe no-op when vault is valid, and does not touch files
+        with patch.object(self.engine, "_atomic_write_file", side_effect=AssertionError("Must not write")):
+            self.assertTrue(self.engine.sync_active_tokens_from_vault(targets=()))
+
+        # Non-iterable / string targets rejected cleanly with stderr warning
+        for bad_targets in (None, 123, "desktop"):
+            with self.subTest(bad_targets=bad_targets):
+                stderr_buf = io.StringIO()
+                with patch("sys.stderr", stderr_buf):
+                    self.assertFalse(self.engine.sync_active_tokens_from_vault(targets=bad_targets))  # type: ignore[arg-type]
+                self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Empty / whitespace active file
+        self.engine.active_file.write_text("   \n", encoding="utf-8")
+        empty_status = self.engine.check_target_sync_status()
+        self.assertFalse(empty_status["in_sync"])
+        self.assertIsNone(empty_status["active_account"])
+        self.assertEqual(empty_status["drifted_targets"], ["desktop", "cli"])
+        self.assertEqual(empty_status["desktop"]["status"], "no_active_account")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Corrupt binary (non-UTF8) active file does not crash
+        self.engine.active_file.write_bytes(b"\xff\xfe\x00\x80")
+        corrupt_active_status = self.engine.check_target_sync_status()
+        self.assertFalse(corrupt_active_status["in_sync"])
+        self.assertIsNone(corrupt_active_status["active_account"])
+        self.assertEqual(corrupt_active_status["drifted_targets"], ["desktop", "cli"])
+        self.assertEqual(corrupt_active_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Symlinked active file is refused without following external target
+        ext_active = self.base_path / "external-active"
+        ext_active.write_text("work-acc\n", encoding="utf-8")
+        self.engine.active_file.unlink()
+        self.engine.active_file.symlink_to(ext_active)
+        symlink_active_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_active_status["in_sync"])
+        self.assertIsNone(symlink_active_status["active_account"])
+        self.assertEqual(symlink_active_status["drifted_targets"], ["desktop", "cli"])
+        self.assertEqual(symlink_active_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Symlinked vault token.json is refused
+        self.engine.active_file.unlink()
+        self.engine.set_active_name("work-acc")
+        ext_token = self.base_path / "external-vault-token.json"
+        ext_token.write_text(json.dumps(work_data), encoding="utf-8")
+        vault_token = self.vault_dir / "accounts" / "work-acc" / "token.json"
+        vault_token.unlink()
+        vault_token.symlink_to(ext_token)
+        symlink_vault_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_vault_status["in_sync"])
+        self.assertEqual(symlink_vault_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+        # Symlinked vault account directory is refused
+        vault_token.unlink()
+        (self.vault_dir / "accounts" / "work-acc").rmdir()
+        ext_acc_dir = self.base_path / "external-acc-dir"
+        ext_acc_dir.mkdir(parents=True)
+        (ext_acc_dir / "token.json").write_text(json.dumps(work_data), encoding="utf-8")
+        (self.vault_dir / "accounts" / "work-acc").symlink_to(ext_acc_dir)
+        symlink_dir_status = self.engine.check_target_sync_status()
+        self.assertFalse(symlink_dir_status["in_sync"])
+        self.assertEqual(symlink_dir_status["desktop"]["status"], "vault_invalid")
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            self.assertFalse(self.engine.sync_active_tokens_from_vault())
+        self.assertTrue(stderr_buf.getvalue().strip())
+
+
+class TestVaultTtlRefreshAndStatusMetadata(unittest.TestCase):
+    """[VAULT-SYNC-005 / VAULT-SYNC-EDGE-003 / SYNC-VIS-001 / SYNC-VIS-003 / SYNC-VIS-ERR-002 / CONVERGE-RELOAD-ERR-002]."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.vault_dir = self.base_path / ".antigravity-vault"
+        self.gemini_dir = self.base_path / ".gemini"
+        self.legacy_root = self.base_path / ".agy-cli-manager"
+        self.proc_dir = self.base_path / "proc"
+        self.proc_dir.mkdir(parents=True, mode=0o700)
+        self.engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=self.proc_dir,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _register_account(
+        self,
+        alias: str,
+        email: str,
+        *,
+        refresh_token: str,
+        access_token: str = "ya29.initial",
+        set_active: bool = False,
+    ) -> dict[str, object]:
+        payload = make_valid_token_payload(email=email)
+        token_obj = cast(dict[str, object], payload["token"])
+        token_obj["refresh_token"] = refresh_token
+        token_obj["access_token"] = access_token
+        acc_dir = self.vault_dir / "accounts" / alias
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.chmod(acc_dir / "token.json", 0o600)
+        if set_active:
+            self.engine.set_active_name(alias)
+        return payload
+
+    def test_write_pending_reload_default_and_invalid_ttl_sanitization_CONVERGE_RELOAD_ERR_002(self) -> None:
+        """[CONVERGE-RELOAD-ERR-002] write_pending_reload defaults and sanitizes invalid TTLs to 1800, while switch_tokens(--no-restart) skips it."""
+        default_payload = self.engine.write_pending_reload("work-acc", requested_at=1_700_000_000.0)
+        self.assertEqual(default_payload["ttl_seconds"], 1800)
+
+        for bad_ttl in (0, -60, True, False, float("nan"), float("inf"), float("-inf"), "120", None):
+            with self.subTest(bad_ttl=bad_ttl):
+                sanitized = self.engine.write_pending_reload(
+                    "work-acc",
+                    ttl_seconds=bad_ttl,  # type: ignore[arg-type]
+                    requested_at=1_700_000_000.0,
+                )
+                self.assertEqual(sanitized["ttl_seconds"], 1800)
+                on_disk = json.loads(self.engine.pending_reload_file.read_text(encoding="utf-8"))
+                self.assertEqual(on_disk["ttl_seconds"], 1800)
+
+        # Explicit valid TTL override is preserved
+        explicit = self.engine.write_pending_reload("work-acc", ttl_seconds=300, requested_at=1_700_000_000.0)
+        self.assertEqual(explicit["ttl_seconds"], 300)
+        self.engine.clear_pending_reload()
+
+        # switch_tokens(..., restart_server=False) never creates pending_reload.json
+        self._register_account("work-acc", "work@example.com", refresh_token="rt-work", set_active=True)
+        with patch.object(self.engine, "is_invoked_by_language_server", return_value=True):
+            res = self.engine.switch_tokens("work-acc", restart_server=False)
+        self.assertFalse(res["restart_deferred"])
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+    def test_update_account_access_token_active_drift_enqueues_pending_reload_VAULT_SYNC_005(self) -> None:
+        """[VAULT-SYNC-005] Active token refresh detects pre-existing Desktop drift and writes 1800s pending_reload."""
+        self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            access_token="ya29.work-old",
+            set_active=True,
+        )
+        self.engine.sync_active_tokens_from_vault()
+
+        # Case 1: Desktop has Zombie Write-Back credentials for "old-acc" while language_server is running
+        zombie_payload = make_valid_token_payload(email="old@example.com")
+        zombie_token = cast(dict[str, object], zombie_payload["token"])
+        zombie_token["refresh_token"] = "rt-old"
+        zombie_token["access_token"] = "ya29.zombie-old"
+        zombie_payload["writer_id"] = "go-ls"
+        self.engine.desktop_token_file.write_text(json.dumps(zombie_payload, indent=2) + "\n", encoding="utf-8")
+
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242):
+            ok = self.engine.update_account_access_token(
+                "work-acc",
+                "ya29.fresh-token",
+                expiry="2027-01-01T00:00:00Z",
+            )
+        self.assertTrue(ok)
+
+        for target_path in (
+            self.vault_dir / "accounts" / "work-acc" / "token.json",
+            self.engine.desktop_token_file,
+            self.engine.cli_token_file,
+        ):
+            loaded = json.loads(target_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["token"]["access_token"], "ya29.fresh-token")
+            self.assertEqual(loaded["token"]["expiry"], "2027-01-01T00:00:00Z")
+            self.assertEqual(loaded["token"]["refresh_token"], "rt-work")
+            self.assertEqual(stat.S_IMODE(target_path.stat().st_mode), 0o600)
+
+        self.assertTrue(self.engine.pending_reload_file.is_file())
+        self.assertEqual(stat.S_IMODE(self.engine.pending_reload_file.stat().st_mode), 0o600)
+        pending = json.loads(self.engine.pending_reload_file.read_text(encoding="utf-8"))
+        self.assertEqual(pending["target_account"], "work-acc")
+        self.assertEqual(pending["ttl_seconds"], 1800)
+        self.assertEqual(pending["reason"], "desktop_drift_on_token_refresh")
+
+        # Case 2: Desktop already matches "work-acc" identity (even with Go writer_id) -> no pending_reload
+        self.engine.clear_pending_reload()
+        same_id_desktop = json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))
+        same_id_desktop["writer_id"] = "go-ls"
+        same_id_desktop["token"]["access_token"] = "ya29.ls-refreshed-same-acc"
+        self.engine.desktop_token_file.write_text(json.dumps(same_id_desktop, indent=2) + "\n", encoding="utf-8")
+
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242):
+            self.assertTrue(self.engine.update_account_access_token("work-acc", "ya29.fresh-2"))
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+        # Case 3: Desktop drifted to "old-acc" while language_server is stopped -> heals disk, no pending_reload
+        self.engine.desktop_token_file.write_text(json.dumps(zombie_payload, indent=2) + "\n", encoding="utf-8")
+        with patch.object(self.engine, "locate_language_server_pid", return_value=None):
+            self.assertTrue(self.engine.update_account_access_token("work-acc", "ya29.fresh-3"))
+        self.assertEqual(
+            json.loads(self.engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+            "ya29.fresh-3",
+        )
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+    def test_update_account_access_token_standby_never_touches_live_targets_VAULT_SYNC_EDGE_003(self) -> None:
+        """[VAULT-SYNC-EDGE-003] Standby refresh updates only accounts/<alias>/token.json without touching Desktop, CLI, or pending_reload."""
+        self._register_account(
+            "work-acc",
+            "work@example.com",
+            refresh_token="rt-work",
+            access_token="ya29.work-live",
+            set_active=True,
+        )
+        self._register_account(
+            "standby-acc",
+            "standby@example.com",
+            refresh_token="rt-standby",
+            access_token="ya29.standby-old",
+            set_active=False,
+        )
+        self.engine.sync_active_tokens_from_vault()
+
+        desktop_before = self.engine.desktop_token_file.read_text(encoding="utf-8")
+        cli_before = self.engine.cli_token_file.read_text(encoding="utf-8")
+
+        with patch.object(self.engine, "locate_language_server_pid", return_value=4242):
+            ok = self.engine.update_account_access_token(
+                "standby-acc",
+                "ya29.standby-fresh",
+                expiry="2027-02-02T00:00:00Z",
+            )
+        self.assertTrue(ok)
+
+        standby_vault = json.loads((self.vault_dir / "accounts" / "standby-acc" / "token.json").read_text(encoding="utf-8"))
+        self.assertEqual(standby_vault["token"]["access_token"], "ya29.standby-fresh")
+        self.assertEqual(standby_vault["token"]["expiry"], "2027-02-02T00:00:00Z")
+        self.assertEqual(self.engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+        self.assertEqual(self.engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+        self.assertFalse(self.engine.pending_reload_file.exists())
+
+    def test_get_status_and_list_accounts_sync_status_pending_reload_zero_http_SYNC_VIS(self) -> None:
+        """[SYNC-VIS-001 / SYNC-VIS-003 / SYNC-VIS-ERR-002] get_status() and list_accounts() expose local-only sync_status and unexpired pending_reload."""
+        self._register_account(
+            "honey",
+            "honey@example.com",
+            refresh_token="rt-honey",
+            access_token="ya29.honey",
+            set_active=True,
+        )
+        self.engine.sync_active_tokens_from_vault()
+
+        # 1. In-sync + no pending_reload, strictly zero HTTP/socket calls
+        with patch("urllib.request.urlopen", side_effect=AssertionError("HTTP must not be called")), \
+             patch("socket.create_connection", side_effect=AssertionError("Network socket must not be opened")):
+            status_synced = self.engine.get_status()
+            listed_synced = self.engine.list_accounts()
+
+        for payload in (status_synced, listed_synced):
+            sync_info = payload.get("sync_status")
+            self.assertIsInstance(sync_info, dict)
+            assert isinstance(sync_info, dict)
+            self.assertIs(sync_info["in_sync"], True)
+            self.assertIs(sync_info["desktop_synced"], True)
+            self.assertIs(sync_info["cli_synced"], True)
+            self.assertEqual(sync_info["drifted_targets"], [])
+            self.assertNotIn("pending_reload", payload)
+            # JSON serializable & backward-compatible top-level keys
+            dumped = json.dumps(payload)
+            self.assertIsInstance(json.loads(dumped), dict)
+
+        self.assertEqual(listed_synced["active"], "honey")
+        self.assertEqual(len(listed_synced["accounts"]), 1)
+        self.assertEqual(listed_synced["accounts"][0]["name"], "honey")
+        self.assertTrue(listed_synced["accounts"][0]["is_active"])
+
+        # 2. Desktop drift + unexpired 1800s pending_reload surfaced in both get_status() and list_accounts()
+        drifted_desktop = make_valid_token_payload(email="old@example.com")
+        cast(dict[str, object], drifted_desktop["token"])["refresh_token"] = "rt-old"
+        self.engine.desktop_token_file.write_text(json.dumps(drifted_desktop, indent=2) + "\n", encoding="utf-8")
+        now = 1_800_000_000.0
+        self.engine.write_pending_reload(
+            "honey",
+            reason="desktop_drift_on_token_refresh",
+            requested_at=now - 30.0,
+        )
+
+        with patch("agy_switcher.vault.time.time", return_value=now), \
+             patch("urllib.request.urlopen", side_effect=AssertionError("HTTP must not be called")), \
+             patch("socket.create_connection", side_effect=AssertionError("Network socket must not be opened")):
+            status_drifted = self.engine.get_status()
+            listed_drifted = self.engine.list_accounts()
+
+        for payload in (status_drifted, listed_drifted):
+            sync_info = payload["sync_status"]
+            self.assertIs(sync_info["in_sync"], False)
+            self.assertIs(sync_info["desktop_synced"], False)
+            self.assertIs(sync_info["cli_synced"], True)
+            self.assertEqual(sync_info["drifted_targets"], ["desktop"])
+            self.assertEqual(sync_info["desktop_email"], "old@example.com")
+            self.assertEqual(sync_info["cli_email"], "honey@example.com")
+            pending = payload.get("pending_reload")
+            self.assertIsInstance(pending, dict)
+            assert isinstance(pending, dict)
+            self.assertEqual(pending["target_account"], "honey")
+            self.assertEqual(pending["ttl_seconds"], 1800)
+            self.assertEqual(pending["reason"], "desktop_drift_on_token_refresh")
+
+        # 3. Expired pending_reload is omitted from both get_status() and list_accounts()
+        with patch("agy_switcher.vault.time.time", return_value=now + 5000.0), \
+             patch("urllib.request.urlopen", side_effect=AssertionError("HTTP must not be called")):
+            status_expired = self.engine.get_status()
+            listed_expired = self.engine.list_accounts()
+        self.assertNotIn("pending_reload", status_expired)
+        self.assertNotIn("pending_reload", listed_expired)
 
 
 if __name__ == "__main__":

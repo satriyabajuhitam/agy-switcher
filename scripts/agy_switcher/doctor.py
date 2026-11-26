@@ -20,14 +20,23 @@ import time
 from typing import Any, Callable, cast
 
 from agy_switcher.exceptions import InvalidTokenError
-from agy_switcher.models import DiagnosticItem, DiagnosticReport
+from agy_switcher.models import (
+    DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    DiagnosticItem,
+    DiagnosticReport,
+)
 from agy_switcher.security import (
     _atomic_write_file,
     _atomic_write_json,
+    enqueue_pending_reload_fail_safe,
     extract_email_from_jwt,
+    extract_token_identity,
     has_valid_id_token_or_fallback,
+    is_safe_account_alias,
+    read_json_dict_nofollow,
     read_json_dict_safe,
     resolve_token_email,
+    token_credentials_match,
     validate_token_dict,
     validate_token_file,
 )
@@ -881,10 +890,43 @@ class DoctorEngine:
             can_fix=False,
         )
 
+    def _locate_language_server_pid(self) -> int | None:
+        """Locates the running language_server PID via engine delegate or ProcessSupervisor."""
+        if self.engine is not None and hasattr(self.engine, "locate_language_server_pid"):
+            raw_pid = self.engine.locate_language_server_pid()
+            return raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
+        return self.supervisor.locate_language_server_pid()
+
+    def _enqueue_pending_reload(
+        self,
+        target_account: str,
+        *,
+        reason: str = "doctor_dual_sync_repair",
+        ttl_seconds: int = DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    ) -> bool:
+        """Atomically writes cache/pending_reload.json at mode 0600 without restarting language_server."""
+        return enqueue_pending_reload_fail_safe(
+            self.engine if self._cache_dir is None else None,
+            target_account,
+            reason=reason,
+            ttl_seconds=ttl_seconds,
+            pending_file=self.cache_dir / "pending_reload.json",
+            log_prefix="[agy-switch]",
+            catch_all_engine_errors=True,
+        )
+
     def _check_dual_sync(self) -> DiagnosticItem:
-        """Layer 3: Compares semantic JSON credentials of Desktop and CLI tokens against active vault account."""
-        active = self.get_active_name()
-        if not active or not (self.accounts_dir / active).is_dir():
+        """Layer 3: Compares Vault-Authoritative credential identities of Desktop and CLI tokens."""
+        raw_active = self.get_active_name()
+        active = raw_active.strip() if isinstance(raw_active, str) else ""
+        account_dir = self.accounts_dir / active if active else None
+        if (
+            not active
+            or not is_safe_account_alias(active)
+            or account_dir is None
+            or account_dir.is_symlink()
+            or not account_dir.is_dir()
+        ):
             return DiagnosticItem(
                 category="dual_sync",
                 name="Dual-Destination Credential Sync",
@@ -893,8 +935,9 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        vault_token_path = self.accounts_dir / active / "token.json"
-        if not vault_token_path.is_file():
+        vault_token_path = account_dir / "token.json"
+        vault_data, vault_status = read_json_dict_nofollow(vault_token_path)
+        if vault_status == "missing":
             return DiagnosticItem(
                 category="dual_sync",
                 name="Dual-Destination Credential Sync",
@@ -902,10 +945,7 @@ class DoctorEngine:
                 message=f"Active account '{active}' token file is missing.",
                 can_fix=False,
             )
-
-        try:
-            vault_data = json.loads(vault_token_path.read_text(encoding="utf-8"))
-        except Exception:
+        if vault_status in ("parse_error", "io_error", "non_regular"):
             return DiagnosticItem(
                 category="dual_sync",
                 name="Dual-Destination Credential Sync",
@@ -913,8 +953,7 @@ class DoctorEngine:
                 message=f"Active account '{active}' token JSON is corrupt.",
                 can_fix=False,
             )
-
-        if not isinstance(vault_data, dict):
+        if vault_status == "not_dict" or vault_data is None:
             return DiagnosticItem(
                 category="dual_sync",
                 name="Dual-Destination Credential Sync",
@@ -923,12 +962,13 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        vault_tok = vault_data.get("token", {}) if isinstance(vault_data.get("token"), dict) else {}
-        v_access = vault_tok.get("access_token")
-        v_refresh = vault_tok.get("refresh_token")
-        v_auth = vault_data.get("auth_method")
-
-        if not v_access or not v_refresh or not v_auth:
+        vault_tok = vault_data.get("token")
+        v_access = vault_tok.get("access_token") if isinstance(vault_tok, dict) else None
+        if (
+            not isinstance(v_access, str)
+            or not v_access.strip()
+            or extract_token_identity(vault_data) is None
+        ):
             return DiagnosticItem(
                 category="dual_sync",
                 name="Dual-Destination Credential Sync",
@@ -937,39 +977,10 @@ class DoctorEngine:
                 can_fix=False,
             )
 
-        desktop_file = self.desktop_token_file
-        cli_file = self.cli_token_file
+        desktop_data, desktop_status = read_json_dict_nofollow(self.desktop_token_file)
+        cli_data, cli_status = read_json_dict_nofollow(self.cli_token_file)
 
-        desktop_exists = desktop_file.is_file()
-        cli_exists = cli_file.is_file()
-
-        if not desktop_exists or not cli_exists:
-            missing: list[str] = []
-            if not desktop_exists:
-                missing.append("Desktop")
-            if not cli_exists:
-                missing.append("CLI")
-            return DiagnosticItem(
-                category="dual_sync",
-                name="Dual-Destination Credential Sync",
-                status="WARN",
-                message=f"{' and '.join(missing)} token file missing from disk.",
-                can_fix=True,
-            )
-
-        try:
-            desktop_data = json.loads(desktop_file.read_text(encoding="utf-8"))
-            cli_data = json.loads(cli_file.read_text(encoding="utf-8"))
-        except Exception:
-            return DiagnosticItem(
-                category="dual_sync",
-                name="Dual-Destination Credential Sync",
-                status="FAIL",
-                message="Desktop or CLI token file contains corrupt or malformed JSON.",
-                can_fix=True,
-            )
-
-        if not isinstance(desktop_data, dict) or not isinstance(cli_data, dict):
+        if desktop_status == "not_dict" or cli_status == "not_dict":
             return DiagnosticItem(
                 category="dual_sync",
                 name="Dual-Destination Credential Sync",
@@ -978,19 +989,52 @@ class DoctorEngine:
                 can_fix=True,
             )
 
-        d_tok = desktop_data.get("token", {}) if isinstance(desktop_data.get("token"), dict) else {}
-        c_tok = cli_data.get("token", {}) if isinstance(cli_data.get("token"), dict) else {}
+        if desktop_status in ("parse_error", "io_error", "non_regular") or cli_status in (
+            "parse_error",
+            "io_error",
+            "non_regular",
+        ):
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="FAIL",
+                message="Desktop or CLI token file contains corrupt or malformed JSON.",
+                can_fix=True,
+            )
 
-        d_match = (
-            d_tok.get("access_token") == v_access
-            and d_tok.get("refresh_token") == v_refresh
-            and desktop_data.get("auth_method") == v_auth
-        )
-        c_match = (
-            c_tok.get("access_token") == v_access
-            and c_tok.get("refresh_token") == v_refresh
-            and cli_data.get("auth_method") == v_auth
-        )
+        d_match = desktop_status == "ok" and token_credentials_match(vault_data, desktop_data)
+        c_match = cli_status == "ok" and token_credentials_match(vault_data, cli_data)
+
+        if desktop_status == "missing" or cli_status == "missing":
+            missing: list[str] = []
+            desynced_present: list[str] = []
+            if desktop_status == "missing":
+                missing.append("Desktop")
+            elif not d_match:
+                desynced_present.append("Desktop")
+            if cli_status == "missing":
+                missing.append("CLI")
+            elif not c_match:
+                desynced_present.append("CLI")
+
+            if desynced_present:
+                return DiagnosticItem(
+                    category="dual_sync",
+                    name="Dual-Destination Credential Sync",
+                    status="FAIL",
+                    message=(
+                        f"{' and '.join(desynced_present)} token credentials desynchronized from active account '{active}'; "
+                        f"{' and '.join(missing)} token file missing from disk."
+                    ),
+                    can_fix=True,
+                )
+            return DiagnosticItem(
+                category="dual_sync",
+                name="Dual-Destination Credential Sync",
+                status="WARN",
+                message=f"{' and '.join(missing)} token file missing from disk.",
+                can_fix=True,
+            )
 
         if d_match and c_match:
             return DiagnosticItem(
@@ -1014,6 +1058,89 @@ class DoctorEngine:
             message=f"{' and '.join(mismatched)} token credentials desynchronized from active account '{active}'.",
             can_fix=True,
         )
+
+    def _repair_dual_sync(self, item: DiagnosticItem) -> str | None:
+        """Atomically restores live Desktop/CLI tokens from Vault and enqueues deferred reload if needed."""
+        raw_active = self.get_active_name()
+        active = raw_active.strip() if isinstance(raw_active, str) else ""
+        if not active or not is_safe_account_alias(active):
+            item.fixed = False
+            item.status = "FAIL"
+            item.fix_action = "Failed to re-sync tokens: no valid active account configured in vault."
+            return None
+
+        account_dir = self.accounts_dir / active
+        tok_file = account_dir / "token.json"
+        if account_dir.is_symlink() or not account_dir.is_dir() or tok_file.is_symlink() or not tok_file.is_file():
+            item.fixed = False
+            item.status = "FAIL"
+            item.fix_action = (
+                f"Failed to re-sync Desktop and CLI tokens from active vault account '{active}': "
+                "vault token file is missing or invalid."
+            )
+            return None
+
+        try:
+            token_data = self.validate_token_file(tok_file)
+            if not isinstance(token_data, dict):
+                raise InvalidTokenError("Validated token payload must be a JSON object.")
+        except Exception as exc:
+            item.fixed = False
+            item.status = "FAIL"
+            item.fix_action = f"Failed to re-sync Desktop and CLI tokens from active vault account '{active}': {exc}"
+            return None
+
+        desktop_data, desktop_status = read_json_dict_nofollow(self.desktop_token_file)
+        desktop_needs_repair = (
+            desktop_status != "ok"
+            or desktop_data is None
+            or not token_credentials_match(token_data, desktop_data)
+        )
+
+        engine = self.engine
+        use_engine_sync = (
+            self.sync_tokens_callback is None
+            and self.get_active_account_callback is None
+            and self._accounts_dir is None
+            and self._desktop_token_file is None
+            and self._cli_token_file is None
+            and engine is not None
+            and hasattr(engine, "sync_active_tokens_from_vault")
+        )
+        try:
+            if use_engine_sync and engine is not None:
+                sync_ok = bool(engine.sync_active_tokens_from_vault())
+                if not sync_ok:
+                    item.fixed = False
+                    item.status = "FAIL"
+                    item.fix_action = (
+                        f"Failed to re-sync Desktop and CLI tokens from active vault account '{active}'."
+                    )
+                    return None
+            else:
+                payload_str = json.dumps(token_data, indent=2) + "\n"
+                self._sync_tokens_to_targets(payload_str)
+        except Exception as exc:
+            item.fixed = False
+            item.status = "FAIL"
+            item.fix_action = f"Failed to re-sync Desktop and CLI tokens from active vault account '{active}': {exc}"
+            return None
+
+        queued_reload = False
+        if desktop_needs_repair and self._locate_language_server_pid() is not None:
+            queued_reload = self._enqueue_pending_reload(
+                active,
+                reason="doctor_dual_sync_repair",
+                ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+            )
+
+        action_str = f"Re-synced Desktop and CLI tokens from active vault account '{active}'"
+        if queued_reload:
+            action_str += " and queued deferred language_server reload"
+        item.fixed = True
+        item.status = "PASS"
+        item.fix_action = action_str
+        return action_str
 
     def _check_lifecycle_hooks(self) -> DiagnosticItem:
         """Layer 4: Checks ~/.gemini/config/hooks.json for PreInvocation lifecycle hook."""
@@ -1175,11 +1302,7 @@ class DoctorEngine:
 
     def _check_process_health(self) -> DiagnosticItem:
         """Layer 5: Inspects language_server and watch daemon via /proc/<pid>/cmdline."""
-        # Locate language_server
-        if self.engine is not None and hasattr(self.engine, "locate_language_server_pid"):
-            ls_pid = self.engine.locate_language_server_pid()
-        else:
-            ls_pid = self.supervisor.locate_language_server_pid()
+        ls_pid = self._locate_language_server_pid()
 
         ls_running = ls_pid is not None
 
@@ -1384,21 +1507,9 @@ class DoctorEngine:
                     item.fix_action = f"Failed to restore permissions: {e}"
 
             elif item.category == "dual_sync":
-                active = self.get_active_name()
-                if active:
-                    tok_file = self.accounts_dir / active / "token.json"
-                    if tok_file.is_file():
-                        try:
-                            token_data = self.validate_token_file(tok_file)
-                            payload_str = json.dumps(token_data, indent=2) + "\n"
-                            self._sync_tokens_to_targets(payload_str)
-                            action_str = f"Re-synced Desktop and CLI tokens from active vault account '{active}'"
-                            item.fixed = True
-                            item.status = "PASS"
-                            item.fix_action = action_str
-                            fixes.append(action_str)
-                        except Exception:
-                            pass
+                repair_action = self._repair_dual_sync(item)
+                if repair_action is not None:
+                    fixes.append(repair_action)
 
             elif item.category == "hooks":
                 hooks_file = self.gemini_dir / "config" / "hooks.json"
