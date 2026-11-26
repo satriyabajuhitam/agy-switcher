@@ -37,6 +37,7 @@ from agy_switch import (
     sort_accounts_by_quota,
     format_accounts_listicle,
     format_accounts_table,
+    format_status_report,
     _parse_timestamp_defensive,
     fetch_account_quota,
     QuotaClient,
@@ -1436,6 +1437,140 @@ class TestFormatAccountsTable(unittest.TestCase):
         res = format_accounts_table(data, show_quota=False)
         self.assertIn("* ok", res)
         self.assertIn("-", res)  # whitespace email falls back to '-'
+
+
+class TestFailoverStatusAndAuthBadgeFormatters(unittest.TestCase):
+    """Tests for [AUDIT-HOOK-003] and [AUDIT-HOOK-004] formatter extensions."""
+
+    def test_failover_status_and_auth_badge_renders_last_failover_and_pending_reload(self):
+        """[AUDIT-HOOK-003] format_status_report renders Last Failover and Pending Reload lines."""
+        status = {
+            "active": "honey",
+            "email": "honey@example.com",
+            "server_running": True,
+            "server_pid": 4321,
+            "server_busy": False,
+            "last_failover": {
+                "from_account": "automator",
+                "to_account": "honey",
+                "trigger": "auth_corruption",
+            },
+            "pending_reload": {
+                "target_account": "honey",
+                "ttl_seconds": 120,
+            },
+        }
+        report = format_status_report(status)
+        lines = report.splitlines()
+
+        failover_lines = [line for line in lines if "Last Failover" in line]
+        self.assertEqual(len(failover_lines), 1)
+        self.assertIn("automator -> honey", failover_lines[0])
+        self.assertIn("auth_corruption", failover_lines[0])
+
+        reload_lines = [line for line in lines if "Pending Reload" in line]
+        self.assertEqual(len(reload_lines), 1)
+        self.assertIn("honey", reload_lines[0])
+        self.assertIn("awaiting safe-turn server reload", reload_lines[0])
+        self.assertIn("120", reload_lines[0])
+
+    def test_failover_status_and_auth_badge_omits_absent_or_empty_failover_and_reload(self):
+        """format_status_report omits Last Failover and Pending Reload when absent, None, or malformed."""
+        cases = [
+            {"active": "honey", "email": "honey@example.com", "server_running": False},
+            {
+                "active": "honey",
+                "email": "honey@example.com",
+                "server_running": False,
+                "last_failover": None,
+                "pending_reload": None,
+            },
+            {
+                "active": "honey",
+                "email": "honey@example.com",
+                "server_running": False,
+                "last_failover": {},
+                "pending_reload": {"target_account": "  "},
+            },
+            {
+                "active": "honey",
+                "email": "honey@example.com",
+                "server_running": False,
+                "last_failover": "invalid",
+                "pending_reload": [],
+            },
+        ]
+        for idx, status in enumerate(cases):
+            with self.subTest(case=idx):
+                report = format_status_report(status)
+                self.assertNotIn("Last Failover", report)
+                self.assertNotIn("Pending Reload", report)
+                self.assertIn("Active Account    : honey (honey@example.com)", report)
+
+    def test_failover_status_and_auth_badge_renders_auth_error_in_table_and_listicle(self):
+        """[AUDIT-HOOK-004] format_accounts_table and format_accounts_listicle display (Auth Error) badge."""
+        data = {
+            "active": "honey",
+            "accounts": [
+                {
+                    "name": "honey",
+                    "email": "honey@example.com",
+                    "is_active": True,
+                    "valid": True,
+                    "quota": {"gemini": {"quota": 85, "cached": False}},
+                },
+                {
+                    "name": "automator",
+                    "email": "automator@example.com",
+                    "is_active": False,
+                    "valid": True,
+                    "auth_error": {
+                        "timestamp": 1791201000.0,
+                        "error": "HTTP 403 Forbidden",
+                        "error_type": "auth",
+                    },
+                    "quota": {"error": "HTTP 403 Forbidden", "error_type": "auth"},
+                },
+            ],
+        }
+
+        table_no_quota = format_accounts_table(data, show_quota=False)
+        table_with_quota = format_accounts_table(data, show_quota=True)
+        listicle_no_quota = format_accounts_listicle(data, show_quota=False)
+        listicle_with_quota = format_accounts_listicle(data, show_quota=True)
+
+        for label, output in (
+            ("table_no_quota", table_no_quota),
+            ("table_with_quota", table_with_quota),
+            ("listicle_no_quota", listicle_no_quota),
+            ("listicle_with_quota", listicle_with_quota),
+        ):
+            with self.subTest(view=label):
+                honey_lines = [line for line in output.splitlines() if "honey (" in line or "honey " in line]
+                # Exclude summary footer line "Active Account: honey"
+                honey_account_lines = [line for line in honey_lines if not line.startswith("Active Account:")]
+                self.assertEqual(len(honey_account_lines), 1)
+                self.assertNotIn("(Auth Error)", honey_account_lines[0])
+
+                automator_lines = [line for line in output.splitlines() if "automator" in line]
+                self.assertEqual(len(automator_lines), 1)
+                self.assertIn("(Auth Error)", automator_lines[0])
+
+    def test_failover_status_and_auth_badge_omits_badge_for_healthy_or_falsy_auth_error(self):
+        """Accounts with absent, None, empty, or False auth_error do not display (Auth Error)."""
+        data = {
+            "active": "honey",
+            "accounts": [
+                {"name": "honey", "email": "h@example.com", "is_active": True, "valid": True},
+                {"name": "none-acc", "email": "n@example.com", "is_active": False, "valid": True, "auth_error": None},
+                {"name": "empty-dict", "email": "d@example.com", "is_active": False, "valid": True, "auth_error": {}},
+                {"name": "empty-str", "email": "s@example.com", "is_active": False, "valid": True, "auth_error": "  "},
+                {"name": "false-acc", "email": "f@example.com", "is_active": False, "valid": True, "auth_error": False},
+            ],
+        }
+        for show_quota in (False, True):
+            self.assertNotIn("(Auth Error)", format_accounts_table(data, show_quota=show_quota))
+            self.assertNotIn("(Auth Error)", format_accounts_listicle(data, show_quota=show_quota))
 
 
 class TestTokenExpiryAndUnpacking(unittest.TestCase):
