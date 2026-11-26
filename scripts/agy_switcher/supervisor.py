@@ -1,6 +1,6 @@
 """Process supervisor for language_server and active turn safety enforcement.
 
-Layer 1 Core Services module: Depends only on Layer 0 (exceptions) and standard library.
+Layer 1 Core Services module: Depends only on Layer 0 (exceptions, security) and standard library.
 Pure Python 3.10+ standard library. Zero external dependencies.
 """
 
@@ -14,6 +14,7 @@ import sys
 import time
 
 from agy_switcher.exceptions import ActiveTurnRunningError
+from agy_switcher.security import read_latest_jsonl_record
 
 
 def is_transcript_record_quiescent(record: object) -> bool:
@@ -41,6 +42,7 @@ class ProcessSupervisor:
     """Supervises the Antigravity language_server process, enforcing turn safety."""
 
     _MAX_ANCESTRY_HOPS = 64
+    _PRESENCE_ROOTS = ("antigravity", "antigravity-cli")
     _NODE_BIN_NAMES = frozenset({"node", "nodejs"})
     _SIDECAR_ENTRYPOINT_FILES = frozenset(
         {"sidecar_sdk", "sidecar_sdk.js", "sidecar_sdk.mjs", "sidecar_sdk.cjs"}
@@ -202,17 +204,26 @@ class ProcessSupervisor:
 
         return None
 
-    def _get_active_presence_lock_paths(self) -> set[Path]:
+    def _presence_to_brain_dirs(self) -> dict[Path, Path]:
+        """Maps resolved presence directories to their corresponding brain directories."""
+        mapping: dict[Path, Path] = {}
+        for rel_root in self._PRESENCE_ROOTS:
+            presence_dir = self.gemini_dir / rel_root / "presence"
+            brain_dir = self.gemini_dir / rel_root / "brain"
+            try:
+                mapping[presence_dir.resolve()] = brain_dir
+            except OSError:
+                mapping[presence_dir] = brain_dir
+        return mapping
+
+    def get_active_presence_lock_paths(self) -> set[Path]:
         """Scans proc_dir/*/fd/* for open file descriptors pointing to presence locks."""
         active_locks: set[Path] = set()
         proc_path = self.proc_dir
         if not proc_path.is_dir():
             return active_locks
 
-        presence_dirs = {
-            (self.gemini_dir / "antigravity" / "presence").resolve(),
-            (self.gemini_dir / "antigravity-cli" / "presence").resolve(),
-        }
+        presence_dirs = set(self._presence_to_brain_dirs().keys())
 
         try:
             for pid_dir in proc_path.iterdir():
@@ -247,15 +258,72 @@ class ProcessSupervisor:
 
         return active_locks
 
-    def is_server_busy(self, pid: int | None = None) -> bool:
-        """Checks if language_server has active child processes or presence locks."""
-        active_locks = self._get_active_presence_lock_paths()
+    def _get_active_presence_lock_paths(self) -> set[Path]:
+        """Backward-compatible alias for get_active_presence_lock_paths()."""
+        return self.get_active_presence_lock_paths()
 
-        presence_dirs = [
-            self.gemini_dir / "antigravity" / "presence",
-            self.gemini_dir / "antigravity-cli" / "presence",
-        ]
-        for p_dir in presence_dirs:
+    def _deduplicate_active_locks(
+        self,
+        active_locks: set[Path],
+        known_presence_dirs: set[Path],
+    ) -> list[Path]:
+        """Deduplicates resolved/unresolved presence lock pairs while preferring canonical dirs."""
+        if not active_locks:
+            return []
+
+        preferred: list[Path] = []
+        fallback: list[Path] = []
+        for lock_path in sorted(active_locks):
+            try:
+                parent_resolved = lock_path.parent.resolve()
+            except OSError:
+                parent_resolved = lock_path.parent
+            if parent_resolved in known_presence_dirs:
+                preferred.append(lock_path)
+            else:
+                fallback.append(lock_path)
+
+        seen_resolved: set[Path] = set()
+        deduped: list[Path] = []
+        for lock_path in preferred + fallback:
+            try:
+                resolved_lock = lock_path.resolve()
+            except OSError:
+                resolved_lock = lock_path
+            if resolved_lock in seen_resolved:
+                continue
+            seen_resolved.add(resolved_lock)
+            deduped.append(lock_path)
+        return deduped
+
+    @staticmethod
+    def _is_presence_lock_quiescent(
+        lock_path: Path,
+        presence_to_brain: dict[Path, Path],
+    ) -> bool:
+        """Returns True only when the lock's session transcript ends with a quiescent record."""
+        session_id = lock_path.stem
+        if not session_id or session_id in (".", "..") or "/" in session_id or "\\" in session_id:
+            return False
+
+        try:
+            resolved_parent = lock_path.parent.resolve()
+        except OSError:
+            return False
+
+        brain_dir = presence_to_brain.get(resolved_parent, lock_path.parent.parent / "brain")
+        transcript_path = (
+            brain_dir / session_id / ".system_generated" / "logs" / "transcript.jsonl"
+        )
+        record = read_latest_jsonl_record(transcript_path)
+        return is_transcript_record_quiescent(record)
+
+    def is_server_busy(self, pid: int | None = None) -> bool:
+        """Checks if language_server has active non-sidecar children or non-quiescent presence locks."""
+        active_locks = self.get_active_presence_lock_paths()
+
+        for rel_root in self._PRESENCE_ROOTS:
+            p_dir = self.gemini_dir / rel_root / "presence"
             if not p_dir.is_dir():
                 continue
             try:
@@ -279,10 +347,18 @@ class ProcessSupervisor:
             except OSError:
                 pass
 
-        if active_locks:
+        if self.has_active_child_processes(pid):
             return True
 
-        return self.has_active_child_processes(pid)
+        if not active_locks:
+            return False
+
+        presence_to_brain = self._presence_to_brain_dirs()
+        for lock_path in self._deduplicate_active_locks(active_locks, set(presence_to_brain.keys())):
+            if not self._is_presence_lock_quiescent(lock_path, presence_to_brain):
+                return True
+
+        return False
 
     @staticmethod
     def _read_cmdline_tokens(cmdline_file: Path) -> list[str] | None:

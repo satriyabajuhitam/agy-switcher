@@ -1213,6 +1213,223 @@ class TestProcessSupervisor(unittest.TestCase):
                 self._write_proc_node(551, ppid=500, comm="node", cmdline=cmdline)
                 self.assertTrue(self.supervisor.has_active_child_processes(500))
 
+    def _write_session_transcript(
+        self,
+        session_id: str,
+        lines: list[str],
+        *,
+        cli: bool = False,
+    ) -> Path:
+        root_name = "antigravity-cli" if cli else "antigravity"
+        transcript_path = (
+            self.gemini_dir
+            / root_name
+            / "brain"
+            / session_id
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        content = "\n".join(lines) + ("\n" if lines else "")
+        transcript_path.write_text(content, encoding="utf-8")
+        return transcript_path
+
+    def test_get_active_presence_lock_paths_public_and_alias(self):
+        """Public get_active_presence_lock_paths() and _get_active_presence_lock_paths() alias return identical live locks."""
+        desk_presence = self.gemini_dir / "antigravity" / "presence"
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        desk_presence.mkdir(parents=True, exist_ok=True)
+        cli_presence.mkdir(parents=True, exist_ok=True)
+
+        desk_lock = desk_presence / "tab-desk.lock"
+        cli_lock = cli_presence / "tab-cli.lock"
+        stale_lock = desk_presence / "stale.lock"
+        desk_lock.touch()
+        cli_lock.touch()
+        stale_lock.touch()
+
+        fd_dir = self.proc_dir / "500" / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (fd_dir / "3").symlink_to(desk_lock)
+        (fd_dir / "4").symlink_to(cli_lock)
+
+        public_locks = self.supervisor.get_active_presence_lock_paths()
+        alias_locks = self.supervisor._get_active_presence_lock_paths()
+
+        self.assertEqual(public_locks, alias_locks)
+        self.assertIn(desk_lock.resolve(), public_locks)
+        self.assertIn(cli_lock.resolve(), public_locks)
+        self.assertNotIn(stale_lock.resolve(), public_locks)
+        self.assertNotIn(stale_lock, public_locks)
+
+    def test_is_server_busy_global_quiescence_002_idle_tabs_with_sidecar(self):
+        """[GLOBAL-QUIESCENCE-002]: Open idle tabs with PLANNER_RESPONSE DONE + sidecar_sdk return False."""
+        self._write_proc_node(
+            500,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00--enable_sidecars\x00",
+        )
+        self._write_proc_node(
+            501,
+            ppid=500,
+            comm="node",
+            cmdline=b"node\x00/opt/antigravity/sidecar_sdk/index.js\x00",
+        )
+
+        desk_presence = self.gemini_dir / "antigravity" / "presence"
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        desk_presence.mkdir(parents=True, exist_ok=True)
+        cli_presence.mkdir(parents=True, exist_ok=True)
+
+        tab_a_lock = desk_presence / "tab-a.lock"
+        tab_b_lock = desk_presence / "tab-b.lock"
+        cli_tab_lock = cli_presence / "tab-cli.lock"
+        for lock in (tab_a_lock, tab_b_lock, cli_tab_lock):
+            lock.touch()
+
+        fd_dir = self.proc_dir / "500" / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (fd_dir / "10").symlink_to(tab_a_lock)
+        (fd_dir / "11").symlink_to(tab_b_lock)
+        (fd_dir / "12").symlink_to(cli_tab_lock)
+
+        self._write_session_transcript(
+            "tab-a",
+            [
+                '{"type": "USER_INPUT", "content": "Hello"}',
+                '{"type": "PLANNER_RESPONSE", "status": "DONE"}',
+            ],
+        )
+        self._write_session_transcript(
+            "tab-b",
+            [
+                '{"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": []}',
+            ],
+        )
+        self._write_session_transcript(
+            "tab-cli",
+            [
+                '{"type": "PLANNER_RESPONSE", "status": "DONE"}',
+            ],
+            cli=True,
+        )
+
+        self.assertFalse(self.supervisor.is_server_busy())
+        self.assertFalse(self.supervisor.is_server_busy(500))
+        self.assertTrue(tab_a_lock.exists())
+        self.assertTrue(tab_b_lock.exists())
+        self.assertTrue(cli_tab_lock.exists())
+
+    def test_is_server_busy_global_quiescence_003_mixed_idle_and_busy_tabs(self):
+        """[GLOBAL-QUIESCENCE-003]: One idle tab and one mid-turn tab marks server busy (True)."""
+        self._write_proc_node(
+            500,
+            ppid=1,
+            comm="language_server",
+            cmdline=b"/opt/antigravity/language_server\x00--standalone\x00",
+        )
+        desk_presence = self.gemini_dir / "antigravity" / "presence"
+        desk_presence.mkdir(parents=True, exist_ok=True)
+        tab_a_lock = desk_presence / "tab-a.lock"
+        tab_b_lock = desk_presence / "tab-b.lock"
+        tab_a_lock.touch()
+        tab_b_lock.touch()
+
+        fd_dir = self.proc_dir / "500" / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (fd_dir / "10").symlink_to(tab_a_lock)
+        (fd_dir / "11").symlink_to(tab_b_lock)
+
+        self._write_session_transcript(
+            "tab-a",
+            ['{"type": "PLANNER_RESPONSE", "status": "DONE"}'],
+        )
+
+        non_quiescent_payloads = [
+            ("user_input", '{"type": "USER_INPUT", "content": "Deploy"}'),
+            ("generic_done", '{"type": "GENERIC", "status": "DONE"}'),
+            (
+                "planner_with_tool_calls",
+                '{"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{"name": "run_command"}]}',
+            ),
+            ("planner_in_progress", '{"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS"}'),
+        ]
+        for label, line in non_quiescent_payloads:
+            with self.subTest(case=label):
+                self._write_session_transcript("tab-b", [line])
+                self.assertTrue(self.supervisor.is_server_busy())
+
+    def test_is_server_busy_global_quiescence_err_001_and_edge_002_fail_safe(self):
+        """[GLOBAL-QUIESCENCE-ERR-001][GLOBAL-QUIESCENCE-EDGE-002]: Fail safe busy on missing/empty/unreadable/partial/active transcript while pruning stale locks."""
+        desk_presence = self.gemini_dir / "antigravity" / "presence"
+        cli_presence = self.gemini_dir / "antigravity-cli" / "presence"
+        desk_presence.mkdir(parents=True, exist_ok=True)
+        cli_presence.mkdir(parents=True, exist_ok=True)
+
+        live_lock = desk_presence / "session-new.lock"
+        live_lock.touch()
+
+        fd_dir = self.proc_dir / "5100" / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        (fd_dir / "11").symlink_to(live_lock)
+
+        # 1. Missing transcript + stale locks across Desktop and CLI
+        stale_desk = desk_presence / "stale.lock"
+        stale_cli = cli_presence / "stale-cli.lock"
+        stale_desk.touch()
+        stale_cli.touch()
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertFalse(stale_desk.exists())
+        self.assertFalse(stale_cli.exists())
+        self.assertTrue(live_lock.exists())
+
+        # 2. Empty (0-byte) transcript
+        transcript_path = self._write_session_transcript("session-new", [])
+        stale_desk.touch()
+        self.assertTrue(self.supervisor.is_server_busy())
+        self.assertFalse(stale_desk.exists())
+        self.assertTrue(live_lock.exists())
+
+        # 3. Truncated streaming JSON after an earlier DONE record
+        self._write_session_transcript(
+            "session-new",
+            [
+                '{"type": "PLANNER_RESPONSE", "status": "DONE"}',
+                '{"type": "PLANNER_RESPONSE", "stat',
+            ],
+        )
+        self.assertTrue(self.supervisor.is_server_busy())
+
+        # 4. Unreadable transcript (PermissionError) even if contents would be DONE
+        self._write_session_transcript(
+            "session-new",
+            ['{"type": "PLANNER_RESPONSE", "status": "DONE"}'],
+        )
+        orig_open = open
+
+        def mock_open(file, *args, **kwargs):
+            if Path(file) == transcript_path:
+                raise PermissionError(13, "Permission denied")
+            return orig_open(file, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=mock_open):
+            self.assertTrue(self.supervisor.is_server_busy())
+
+        # Sanity: without PermissionError, the same DONE transcript returns False
+        self.assertFalse(self.supervisor.is_server_busy())
+
+        # 5. Non-quiescent records on live lock fail safe to True
+        for label, line in (
+            ("user_input", '{"type": "USER_INPUT", "content": "Run"}'),
+            ("generic", '{"type": "GENERIC", "status": "DONE"}'),
+            ("tool_calls", '{"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{"name": "sh"}]}'),
+        ):
+            with self.subTest(case=label):
+                self._write_session_transcript("session-new", [line])
+                self.assertTrue(self.supervisor.is_server_busy())
+
 
 
 
