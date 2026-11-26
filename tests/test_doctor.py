@@ -994,26 +994,482 @@ class TestDiagnosticsCoreEngine(unittest.TestCase):
         self.assertTrue(sync_item.fixed)
 
     def test_layer3_token_payload_mismatch_and_atomic_fix(self):
-        """Mismatched access_token triggers FAIL (can_fix=True) and re-syncs atomically without touching language_server."""
+        """Drifted identity (refresh_token/email/auth_method) triggers FAIL and heals atomically; access_token-only refresh passes."""
         self._setup_pristine_environment()
+        vault_token_path = self.vault_dir / "accounts" / "acc_primary" / "token.json"
+        vault_data = json.loads(vault_token_path.read_text(encoding="utf-8"))
+        desktop_token = self.gemini_dir / "jetski-standalone-oauth-token"
         cli_token = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
-        bad_token = create_sample_token(access_token="ya29.old_desynced_token")
+
+        # Same-account access_token refresh with Go runtime metadata passes Layer 3
+        refreshed_desktop = json.loads(json.dumps(vault_data))
+        refreshed_desktop["token"]["access_token"] = "ya29.same_account_refreshed_access_token"
+        refreshed_desktop["token"]["expiry"] = "2027-01-01T00:00:00.123456789Z"
+        refreshed_desktop["writer_id"] = "go-ls-refresh"
+        desktop_token.write_text(json.dumps(refreshed_desktop), encoding="utf-8")
+
+        pass_report = self.engine.run_diagnostics()
+        pass_sync = next(it for it in pass_report.items if it.category == "dual_sync")
+        self.assertEqual(pass_sync.status, "PASS")
+        self.assertFalse(pass_sync.can_fix)
+
+        # Restore desktop to exact vault payload, then drift CLI credential identity
+        desktop_token.write_text(json.dumps(vault_data), encoding="utf-8")
+        bad_token = create_sample_token(
+            email="drifted@example.com",
+            refresh_token="1//drifted_refresh_token",
+            access_token="ya29.old_desynced_token",
+        )
         cli_token.write_text(json.dumps(bad_token), encoding="utf-8")
 
         report = self.engine.run_diagnostics()
         sync_item = next(it for it in report.items if it.category == "dual_sync")
         self.assertEqual(sync_item.status, "FAIL")
         self.assertTrue(sync_item.can_fix)
+        self.assertIn("CLI", sync_item.message)
 
-        # Run fix
+        from unittest.mock import patch
+
+        with patch.object(
+            self.engine.supervisor,
+            "restart_language_server",
+            side_effect=AssertionError("fix_diagnostics must never synchronously restart language_server"),
+        ):
+            fixes = self.engine.fix_diagnostics(report)
+        self.assertTrue(len(fixes) > 0)
+        self.assertTrue(sync_item.fixed)
+
+        # Verify CLI token updated to match active vault account without queueing Desktop reload
+        fixed_cli_data = json.loads(cli_token.read_text(encoding="utf-8"))
+        self.assertEqual(fixed_cli_data["token"]["refresh_token"], vault_data["token"]["refresh_token"])
+        self.assertEqual(fixed_cli_data["token"]["access_token"], vault_data["token"]["access_token"])
+        self.assertFalse((self.vault_dir / "cache" / "pending_reload.json").exists())
+
+    def test_VAULT_SYNC_003_and_EDGE_005_desktop_identity_sync_and_deferred_reload(self) -> None:
+        """[VAULT-SYNC-003] & [VAULT-SYNC-EDGE-005] Same-account refresh passes; Desktop drift repairs atomically and queues pending_reload.json without restarting language_server."""
+        from unittest.mock import patch
+
+        def _setup_work_acc(busy: bool = False) -> dict[str, Any]:
+            shutil.rmtree(self.vault_dir, ignore_errors=True)
+            shutil.rmtree(self.gemini_dir, ignore_errors=True)
+            shutil.rmtree(self.proc_dir, ignore_errors=True)
+            self.proc_dir.mkdir(parents=True, exist_ok=True)
+            self._setup_pristine_environment()
+
+            acc_dir = self.vault_dir / "accounts" / "work-acc"
+            acc_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(acc_dir, 0o700)
+            work_tok = create_sample_token(
+                email="work@example.com",
+                refresh_token="rt-work",
+                access_token="ya29.work-vault",
+            )
+            (acc_dir / "token.json").write_text(json.dumps(work_tok, indent=2), encoding="utf-8")
+            os.chmod(acc_dir / "token.json", 0o600)
+            self.engine.set_active_name("work-acc")
+            os.chmod(self.engine.active_file, 0o600)
+
+            desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+            cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+            desktop_file.write_text(json.dumps(work_tok), encoding="utf-8")
+            os.chmod(desktop_file, 0o600)
+            cli_file.write_text(json.dumps(work_tok), encoding="utf-8")
+            os.chmod(cli_file, 0o600)
+
+            if busy:
+                # Non-sidecar child process under language_server PID 101 marks server busy
+                child_dir = self.proc_dir / "303"
+                child_dir.mkdir(parents=True, exist_ok=True)
+                (child_dir / "cmdline").write_bytes(b"/bin/bash\x00-c\x00sleep 10\x00")
+                (child_dir / "stat").write_text("303 (bash) S 101 101 101 0 0 0 0 0 0 0 0 0")
+                (child_dir / "status").write_text("Name:\tbash\nState:\tS (sleeping)\nPPid:\t101\n")
+
+            return work_tok
+
+        # Case 1 ([VAULT-SYNC-EDGE-005]): Same-account Desktop access_token refresh + writer_id passes
+        work_tok = _setup_work_acc(busy=False)
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+        refreshed = json.loads(json.dumps(work_tok))
+        refreshed["token"]["access_token"] = "ya29.refreshed-by-go"
+        refreshed["token"]["expiry"] = "2027-01-01T00:00:00.987654321Z"
+        refreshed["writer_id"] = "go-ls"
+        desktop_file.write_text(json.dumps(refreshed), encoding="utf-8")
+
+        pass_report = self.engine.run_diagnostics()
+        pass_item = next(it for it in pass_report.items if it.category == "dual_sync")
+        self.assertEqual(pass_item.status, "PASS")
+        self.assertFalse(pass_item.can_fix)
+
+        # Case 2 ([VAULT-SYNC-003] & [VAULT-SYNC-EDGE-005]): Drifted Desktop token while running (idle and busy)
+        for is_busy in (False, True):
+            with self.subTest(server_busy=is_busy):
+                work_tok = _setup_work_acc(busy=is_busy)
+                self.assertEqual(self.engine.supervisor.is_server_busy(101), is_busy)
+
+                desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+                cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+                stale_tok = create_sample_token(
+                    email="old@example.com",
+                    refresh_token="rt-old",
+                    access_token="ya29.old-zombie",
+                )
+                stale_tok["writer_id"] = "go-ls"
+                desktop_file.write_text(json.dumps(stale_tok), encoding="utf-8")
+
+                report = self.engine.run_diagnostics()
+                sync_item = next(it for it in report.items if it.category == "dual_sync")
+                self.assertEqual(sync_item.status, "FAIL")
+                self.assertTrue(sync_item.can_fix)
+                self.assertIn("Desktop", sync_item.message)
+
+                with (
+                    patch.object(
+                        self.engine.supervisor,
+                        "restart_language_server",
+                        side_effect=AssertionError("restart_language_server must not be called"),
+                    ),
+                    patch.object(
+                        self.engine,
+                        "restart_language_server",
+                        side_effect=AssertionError("engine.restart_language_server must not be called"),
+                    ),
+                ):
+                    fixes = self.engine.fix_diagnostics(report)
+
+                self.assertTrue(len(fixes) > 0)
+                self.assertTrue(sync_item.fixed)
+                self.assertEqual(sync_item.status, "PASS")
+
+                fixed_desktop = json.loads(desktop_file.read_text(encoding="utf-8"))
+                fixed_cli = json.loads(cli_file.read_text(encoding="utf-8"))
+                self.assertEqual(fixed_desktop["token"]["refresh_token"], "rt-work")
+                self.assertEqual(fixed_desktop["token"]["access_token"], "ya29.work-vault")
+                self.assertEqual(fixed_cli["token"]["refresh_token"], "rt-work")
+                self.assertEqual(stat.S_IMODE(desktop_file.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(cli_file.stat().st_mode), 0o600)
+
+                pending_file = self.vault_dir / "cache" / "pending_reload.json"
+                self.assertTrue(pending_file.is_file())
+                self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
+                pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+                self.assertEqual(pending_data["target_account"], "work-acc")
+                self.assertEqual(pending_data["ttl_seconds"], 1800)
+                self.assertEqual(pending_data["reason"], "doctor_dual_sync_repair")
+                self.assertIsInstance(pending_data["requested_at"], (int, float))
+                self.assertGreater(pending_data["requested_at"], 0)
+
+                post_report = self.engine.run_diagnostics()
+                self.assertEqual(post_report.overall_status, "PASS")
+
+    def test_VAULT_SYNC_EDGE_001_cli_only_drift_omits_pending_reload(self) -> None:
+        """[VAULT-SYNC-EDGE-001] CLI-only drift repaired by fix_diagnostics() does not create pending_reload.json."""
+        self._setup_pristine_environment()
+        acc_dir = self.vault_dir / "accounts" / "work-acc"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(acc_dir, 0o700)
+        work_tok = create_sample_token(
+            email="work@example.com",
+            refresh_token="rt-work",
+            access_token="ya29.work-vault",
+        )
+        (acc_dir / "token.json").write_text(json.dumps(work_tok, indent=2), encoding="utf-8")
+        os.chmod(acc_dir / "token.json", 0o600)
+        self.engine.set_active_name("work-acc")
+        os.chmod(self.engine.active_file, 0o600)
+
+        # Desktop matches work-acc (even with a refreshed access_token & writer_id)
+        desktop_tok = json.loads(json.dumps(work_tok))
+        desktop_tok["token"]["access_token"] = "ya29.work-desktop-fresh"
+        desktop_tok["writer_id"] = "go-ls"
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+        desktop_file.write_text(json.dumps(desktop_tok), encoding="utf-8")
+        os.chmod(desktop_file, 0o600)
+
+        # Only CLI drifted to old-acc
+        cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        old_tok = create_sample_token(email="old@example.com", refresh_token="rt-old")
+        cli_file.write_text(json.dumps(old_tok), encoding="utf-8")
+        os.chmod(cli_file, 0o600)
+
+        report = self.engine.run_diagnostics()
+        sync_item = next(it for it in report.items if it.category == "dual_sync")
+        self.assertEqual(sync_item.status, "FAIL")
+        self.assertTrue(sync_item.can_fix)
+        self.assertIn("CLI", sync_item.message)
+        self.assertNotIn("Desktop", sync_item.message)
+
         fixes = self.engine.fix_diagnostics(report)
         self.assertTrue(len(fixes) > 0)
         self.assertTrue(sync_item.fixed)
 
-        # Verify CLI token updated to match active vault account
+        fixed_cli = json.loads(cli_file.read_text(encoding="utf-8"))
+        self.assertEqual(fixed_cli["token"]["refresh_token"], "rt-work")
+        self.assertEqual(stat.S_IMODE(cli_file.stat().st_mode), 0o600)
+        self.assertFalse((self.vault_dir / "cache" / "pending_reload.json").exists())
+
+    def test_VAULT_SYNC_EDGE_002_desktop_drift_with_stopped_server_omits_pending_reload(self) -> None:
+        """[VAULT-SYNC-EDGE-002] Desktop drift repaired while language_server is stopped omits pending_reload.json."""
+        self._setup_pristine_environment()
+        # Stop language_server in mock proc_dir
+        shutil.rmtree(self.proc_dir / "101")
+        self.assertIsNone(self.engine.locate_language_server_pid())
+
+        acc_dir = self.vault_dir / "accounts" / "work-acc"
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(acc_dir, 0o700)
+        work_tok = create_sample_token(
+            email="work@example.com",
+            refresh_token="rt-work",
+            access_token="ya29.work-vault",
+        )
+        (acc_dir / "token.json").write_text(json.dumps(work_tok, indent=2), encoding="utf-8")
+        os.chmod(acc_dir / "token.json", 0o600)
+        self.engine.set_active_name("work-acc")
+        os.chmod(self.engine.active_file, 0o600)
+
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+        cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        old_tok = create_sample_token(email="old@example.com", refresh_token="rt-old")
+        desktop_file.write_text(json.dumps(old_tok), encoding="utf-8")
+        cli_file.write_text(json.dumps(work_tok), encoding="utf-8")
+
+        report = self.engine.run_diagnostics()
+        sync_item = next(it for it in report.items if it.category == "dual_sync")
+        self.assertEqual(sync_item.status, "FAIL")
+        self.assertTrue(sync_item.can_fix)
+
+        fixes = self.engine.fix_diagnostics(report)
+        self.assertTrue(len(fixes) > 0)
+        self.assertTrue(sync_item.fixed)
+
+        fixed_desktop = json.loads(desktop_file.read_text(encoding="utf-8"))
+        fixed_cli = json.loads(cli_file.read_text(encoding="utf-8"))
+        self.assertEqual(fixed_desktop["token"]["refresh_token"], "rt-work")
+        self.assertEqual(fixed_cli["token"]["refresh_token"], "rt-work")
+        self.assertEqual(stat.S_IMODE(desktop_file.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(cli_file.stat().st_mode), 0o600)
+        self.assertFalse((self.vault_dir / "cache" / "pending_reload.json").exists())
+
+    def test_VAULT_SYNC_003_desktop_missing_corrupt_symlink_identity_variants_and_standalone_doctor(self) -> None:
+        """Desktop missing/corrupt/symlinked repairs enqueue pending_reload.json; auth_method/email drift caught; standalone DoctorEngine supported."""
+        from agy_switcher.doctor import DoctorEngine
+
+        # 1. auth_method and email-only drift detected by Layer 3
+        self._setup_pristine_environment()
         vault_data = json.loads((self.vault_dir / "accounts" / "acc_primary" / "token.json").read_text(encoding="utf-8"))
-        fixed_cli_data = json.loads(cli_token.read_text(encoding="utf-8"))
-        self.assertEqual(fixed_cli_data["token"]["access_token"], vault_data["token"]["access_token"])
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+
+        bad_auth = json.loads(json.dumps(vault_data))
+        bad_auth["auth_method"] = "apikey"
+        desktop_file.write_text(json.dumps(bad_auth), encoding="utf-8")
+        rep_auth = self.engine.run_diagnostics()
+        self.assertEqual(next(it for it in rep_auth.items if it.category == "dual_sync").status, "FAIL")
+
+        bad_email = create_sample_token(
+            email="other@example.com",
+            refresh_token=vault_data["token"]["refresh_token"],
+            access_token=vault_data["token"]["access_token"],
+        )
+        desktop_file.write_text(json.dumps(bad_email), encoding="utf-8")
+        rep_email = self.engine.run_diagnostics()
+        self.assertEqual(next(it for it in rep_email.items if it.category == "dual_sync").status, "FAIL")
+
+        # 2. Missing, corrupt, and symlinked Desktop token while language_server is running -> enqueues pending_reload.json
+        external_secret = self.base_path / "external_secret.json"
+        external_secret.write_text(json.dumps({"secret": "do-not-touch"}), encoding="utf-8")
+
+        for mode_case in ("missing", "corrupt", "symlink"):
+            with self.subTest(desktop_anomaly=mode_case):
+                pending_file = self.vault_dir / "cache" / "pending_reload.json"
+                if pending_file.exists():
+                    pending_file.unlink()
+                if desktop_file.is_symlink() or desktop_file.exists():
+                    desktop_file.unlink()
+
+                if mode_case == "corrupt":
+                    desktop_file.write_text('{"token":', encoding="utf-8")
+                elif mode_case == "symlink":
+                    desktop_file.symlink_to(external_secret)
+
+                report = self.engine.run_diagnostics()
+                sync_item = next(it for it in report.items if it.category == "dual_sync")
+                self.assertIn(sync_item.status, ("WARN", "FAIL"))
+                self.assertTrue(sync_item.can_fix)
+
+                self.engine.fix_diagnostics(report)
+                self.assertTrue(sync_item.fixed)
+                self.assertFalse(desktop_file.is_symlink())
+                self.assertEqual(json.loads(external_secret.read_text(encoding="utf-8")), {"secret": "do-not-touch"})
+                self.assertTrue(pending_file.is_file())
+                pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+                self.assertEqual(pending_data["target_account"], "acc_primary")
+                self.assertEqual(pending_data["ttl_seconds"], 1800)
+                self.assertEqual(pending_data["reason"], "doctor_dual_sync_repair")
+
+        # 3. Standalone DoctorEngine with custom cache_dir enqueues pending_reload.json directly
+        custom_cache = self.base_path / "custom_doctor_cache"
+        custom_cache.mkdir(parents=True, exist_ok=True)
+        os.chmod(custom_cache, 0o700)
+        desktop_file.write_text(
+            json.dumps(create_sample_token(email="drifted@example.com", refresh_token="rt-drifted")),
+            encoding="utf-8",
+        )
+        standalone = DoctorEngine(
+            vault_dir=self.vault_dir,
+            cache_dir=custom_cache,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
+        )
+        rep = standalone.run_diagnostics()
+        sync_item = next(it for it in rep.items if it.category == "dual_sync")
+        self.assertEqual(sync_item.status, "FAIL")
+        standalone.fix_diagnostics(rep)
+        self.assertTrue(sync_item.fixed)
+        custom_pending = custom_cache / "pending_reload.json"
+        self.assertTrue(custom_pending.is_file())
+        self.assertEqual(stat.S_IMODE(custom_pending.stat().st_mode), 0o600)
+        custom_pending_data = json.loads(custom_pending.read_text(encoding="utf-8"))
+        self.assertEqual(custom_pending_data["target_account"], "acc_primary")
+        self.assertEqual(custom_pending_data["ttl_seconds"], 1800)
+        self.assertEqual(custom_pending_data["reason"], "doctor_dual_sync_repair")
+
+    def test_VAULT_SYNC_ERR_failed_sync_omits_pending_reload_and_reports_failure(self) -> None:
+        """Failed sync (sync_active_tokens_from_vault() -> False or OSError) must not write pending_reload.json and reports failure."""
+        from unittest.mock import patch
+        from agy_switcher.doctor import DoctorEngine
+
+        # 1. AgySwitchEngine.sync_active_tokens_from_vault() returning False
+        self._setup_pristine_environment()
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+        desktop_file.write_text(
+            json.dumps(create_sample_token(email="drifted@example.com", refresh_token="rt-drifted")),
+            encoding="utf-8",
+        )
+        report = self.engine.run_diagnostics()
+        sync_item = next(it for it in report.items if it.category == "dual_sync")
+        self.assertEqual(sync_item.status, "FAIL")
+        self.assertTrue(sync_item.can_fix)
+
+        with patch.object(self.engine, "sync_active_tokens_from_vault", return_value=False) as mock_sync:
+            fixes = self.engine.fix_diagnostics(report)
+
+        mock_sync.assert_called_once()
+        self.assertEqual(fixes, [])
+        self.assertFalse(sync_item.fixed)
+        self.assertEqual(sync_item.status, "FAIL")
+        self.assertIsNotNone(sync_item.fix_action)
+        self.assertIn("Failed", str(sync_item.fix_action))
+        self.assertEqual(report.overall_status, "FAIL")
+        self.assertEqual(report.exit_code, 2)
+        self.assertFalse((self.vault_dir / "cache" / "pending_reload.json").exists())
+
+        # 2. Standalone DoctorEngine encountering OSError on sync when Desktop is missing (WARN -> FAIL)
+        desktop_file.unlink()
+        standalone = DoctorEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
+        )
+        standalone_report = standalone.run_diagnostics()
+        standalone_item = next(it for it in standalone_report.items if it.category == "dual_sync")
+        self.assertEqual(standalone_item.status, "WARN")
+        self.assertTrue(standalone_item.can_fix)
+
+        with patch.object(standalone, "_sync_tokens_to_targets", side_effect=OSError("ENOSPC: disk full")):
+            standalone_fixes = standalone.fix_diagnostics(standalone_report)
+
+        self.assertEqual(standalone_fixes, [])
+        self.assertFalse(standalone_item.fixed)
+        self.assertEqual(standalone_item.status, "FAIL")
+        self.assertIn("ENOSPC", str(standalone_item.fix_action))
+        self.assertEqual(standalone_report.overall_status, "FAIL")
+        self.assertEqual(standalone_report.exit_code, 2)
+        self.assertFalse((self.vault_dir / "cache" / "pending_reload.json").exists())
+
+    def test_VAULT_SYNC_EDGE_mixed_missing_and_drifted_targets_and_unsafe_active_alias(self) -> None:
+        """Missing one target while the other drifted flags FAIL; unsafe active alias or symlinked vault fails safely."""
+        from agy_switcher.doctor import DoctorEngine
+
+        # Case A: Desktop drifted + CLI missing -> FAIL (not WARN) and fix queues pending_reload.json
+        self._setup_pristine_environment()
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+        cli_file = self.gemini_dir / "antigravity-cli" / "antigravity-oauth-token"
+        desktop_file.write_text(
+            json.dumps(create_sample_token(email="old@example.com", refresh_token="rt-old")),
+            encoding="utf-8",
+        )
+        cli_file.unlink()
+
+        rep_a = self.engine.run_diagnostics()
+        item_a = next(it for it in rep_a.items if it.category == "dual_sync")
+        self.assertEqual(item_a.status, "FAIL")
+        self.assertTrue(item_a.can_fix)
+        self.assertIn("Desktop", item_a.message)
+        self.assertIn("CLI", item_a.message)
+
+        self.engine.fix_diagnostics(rep_a)
+        self.assertTrue(item_a.fixed)
+        self.assertTrue((self.vault_dir / "cache" / "pending_reload.json").is_file())
+
+        # Case B: CLI drifted + Desktop missing -> FAIL and fix queues pending_reload.json
+        shutil.rmtree(self.vault_dir, ignore_errors=True)
+        self._setup_pristine_environment()
+        desktop_file.unlink()
+        cli_file.write_text(
+            json.dumps(create_sample_token(email="old@example.com", refresh_token="rt-old")),
+            encoding="utf-8",
+        )
+        rep_b = self.engine.run_diagnostics()
+        item_b = next(it for it in rep_b.items if it.category == "dual_sync")
+        self.assertEqual(item_b.status, "FAIL")
+        self.assertTrue(item_b.can_fix)
+        self.engine.fix_diagnostics(rep_b)
+        self.assertTrue(item_b.fixed)
+        self.assertTrue((self.vault_dir / "cache" / "pending_reload.json").is_file())
+
+        # Case C: Unsafe traversal active alias rejected cleanly
+        doc_traversal = DoctorEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
+            get_active_account_callback=lambda: "../outside",
+        )
+        rep_c = doc_traversal.run_diagnostics()
+        item_c = next(it for it in rep_c.items if it.category == "dual_sync")
+        self.assertEqual(item_c.status, "FAIL")
+        self.assertFalse(item_c.can_fix)
+
+    def test_VAULT_SYNC_003_cli_doctor_fix_repairs_desktop_drift_with_deferred_reload(self) -> None:
+        """CLI 'doctor --fix' repairs Desktop drift, writes pending_reload.json, and exits 0 without restarting server."""
+        from unittest.mock import patch
+
+        self._setup_pristine_environment()
+        desktop_file = self.gemini_dir / "jetski-standalone-oauth-token"
+        desktop_file.write_text(
+            json.dumps(create_sample_token(email="zombie@example.com", refresh_token="rt-zombie")),
+            encoding="utf-8",
+        )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                self.engine.supervisor,
+                "restart_language_server",
+                side_effect=AssertionError("restart_language_server must not be called"),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = main(["doctor", "--fix"], engine=self.engine)
+
+        self.assertEqual(exit_code, 0)
+        pending_file = self.vault_dir / "cache" / "pending_reload.json"
+        self.assertTrue(pending_file.is_file())
+        pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(pending_data["target_account"], "acc_primary")
+        self.assertEqual(pending_data["reason"], "doctor_dual_sync_repair")
+        self.assertEqual(pending_data["ttl_seconds"], 1800)
 
     # ---------------------------------------------------------
     # Layer 4: Lifecycle Hook
