@@ -19,6 +19,7 @@ _EXPORTS: dict[str, str] = {
     "ActiveTurnRunningError": "agy_switcher.exceptions",
     "DaemonError": "agy_switcher.exceptions",
     "DaemonAlreadyRunningError": "agy_switcher.exceptions",
+    "AccountAuthError": "agy_switcher.exceptions",
     # Layer 0: Models
     "DiagnosticItem": "agy_switcher.models",
     "DiagnosticReport": "agy_switcher.models",
@@ -52,6 +53,7 @@ _EXPORTS: dict[str, str] = {
     "DEFAULT_FALLBACK_QUOTA_ENDPOINT": "agy_switcher.telemetry",
     "resolve_quota_endpoint": "agy_switcher.telemetry",
     "QuotaClient": "agy_switcher.telemetry",
+    "probe_account_auth": "agy_switcher.telemetry",
     "fetch_account_quota": "agy_switcher.telemetry",
     "fetch_all_accounts_quota": "agy_switcher.telemetry",
     "sort_accounts_by_quota": "agy_switcher.telemetry",

@@ -40,6 +40,10 @@ class InvalidThresholdError(AgySwitchError):
     """Raised when an invalid quota threshold value is specified."""
 
 
+class AccountAuthError(AgySwitchError):
+    """Raised when account credentials fail CloudCode authentication (401/403 or invalid_grant)."""
+
+
 __all__ = [
     "AgySwitchError",
     "InvalidTokenError",
@@ -48,4 +52,5 @@ __all__ = [
     "DaemonError",
     "DaemonAlreadyRunningError",
     "InvalidThresholdError",
+    "AccountAuthError",
 ]
