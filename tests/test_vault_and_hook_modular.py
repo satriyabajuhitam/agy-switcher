@@ -345,6 +345,149 @@ class TestHookLifecycleModular(unittest.TestCase):
                             if isinstance(kw.value, ast.Constant) and kw.value.value is True:
                                 self.fail("Found switch_tokens(..., restart_server=True) in hook.py! Violates ADR 0010.")
 
+    def _register_account(self, name: str) -> None:
+        acc_dir = self.engine.accounts_dir / name
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        (acc_dir / "token.json").write_text(
+            json.dumps(create_sample_token(f"{name}@example.com")),
+            encoding="utf-8",
+        )
+
+    def test_hook_rotation_writes_pending_reload_and_tier1_skips_CONVERGE_RELOAD_001_EDGE_003(self):
+        """[CONVERGE-RELOAD-001 & EDGE-003] Hook rotation enqueues pending_reload.json (0600, 1800s); Tier 1/non-rotating skips it."""
+        import agy_switch
+
+        self.engine.set_auto_switch(True)
+        self._register_account("primary-acc")
+        self._register_account("standby-acc")
+        self.engine.set_active_name("primary-acc")
+
+        # 1. [CONVERGE-RELOAD-001]: Active rotation writes pending_reload.json without /proc or server restart
+        mock_fetch_acc = MagicMock(return_value=("primary-acc", {"gemini": {"quota": 5}}))
+        mock_fetch_all = MagicMock(return_value={"standby-acc": {"gemini": {"quota": 85}}})
+
+        with patch.object(agy_switch, "fetch_account_quota", mock_fetch_acc), \
+             patch.object(agy_switch, "fetch_all_accounts_quota", mock_fetch_all), \
+             patch.object(self.engine, "write_pending_reload", wraps=self.engine.write_pending_reload) as spy_pending, \
+             patch.object(self.engine, "restart_language_server") as spy_restart, \
+             patch.object(self.engine, "locate_language_server_pid") as spy_locate, \
+             patch.object(self.engine, "is_server_busy") as spy_busy:
+            out = io.StringIO()
+            with patch("sys.stdin", io.StringIO('{"modelName": "gemini-3.8-pro"}')), \
+                 patch("sys.stdout", out):
+                ret = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.engine.get_active_name(), "standby-acc")
+        spy_restart.assert_not_called()
+        spy_locate.assert_not_called()
+        spy_busy.assert_not_called()
+        spy_pending.assert_called_once_with(
+            "standby-acc",
+            reason="hook_pre_invocation_rotation",
+            ttl_seconds=1800,
+        )
+
+        pending_path = self.engine.pending_reload_file
+        self.assertTrue(pending_path.is_file(), "pending_reload.json must exist after hook rotation")
+        self.assertEqual(stat.S_IMODE(pending_path.stat().st_mode), 0o600)
+        payload = json.loads(pending_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["target_account"], "standby-acc")
+        self.assertEqual(payload["ttl_seconds"], 1800)
+        self.assertEqual(payload["reason"], "hook_pre_invocation_rotation")
+        self.assertIsInstance(payload["requested_at"], (int, float))
+        self.assertGreater(payload["requested_at"], 0)
+        out_json = json.loads(out.getvalue())
+        self.assertIn("injectSteps", out_json)
+
+        # 2. [CONVERGE-RELOAD-EDGE-003]: Tier 1 healthy fast-path and non-rotating outcomes never create/modify marker
+        pending_path.unlink()
+        self.engine.set_active_name("primary-acc")
+        now_ts = time.time()
+        self.engine.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self.engine.cache_file.write_text(
+            json.dumps({
+                "timestamp": now_ts,
+                "accounts": {
+                    "primary-acc": {
+                        "cached_at": now_ts,
+                        "gemini": {"quota": 85, "reset_time": int(now_ts + 3600)},
+                    }
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        with patch("time.time", return_value=now_ts + 5.0), \
+             patch.object(self.engine, "write_pending_reload", wraps=self.engine.write_pending_reload) as spy_pending_t1:
+            out_t1 = io.StringIO()
+            with patch("sys.stdin", io.StringIO('{"modelName": "gemini-3.8-pro"}')), \
+                 patch("sys.stdout", out_t1):
+                ret_t1 = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret_t1, 0)
+        self.assertEqual(json.loads(out_t1.getvalue()), {})
+        spy_pending_t1.assert_not_called()
+        self.assertFalse(pending_path.exists())
+
+        # Non-rotating Tier 2 healthy retention with sentinel marker must leave marker untouched
+        sentinel = json.dumps({"target_account": "keep-me", "requested_at": 1700000000.0, "ttl_seconds": 1800})
+        pending_path.write_text(sentinel, encoding="utf-8")
+        mock_healthy_acc = MagicMock(return_value=("primary-acc", {"gemini": {"quota": 80}}))
+        with patch("time.time", return_value=now_ts + 600.0), \
+             patch.object(agy_switch, "fetch_account_quota", mock_healthy_acc), \
+             patch.object(self.engine, "write_pending_reload", wraps=self.engine.write_pending_reload) as spy_pending_t2:
+            out_t2 = io.StringIO()
+            with patch("sys.stdin", io.StringIO('{"modelName": "gemini-3.8-pro"}')), \
+                 patch("sys.stdout", out_t2):
+                ret_t2 = handle_pre_invocation_hook(self.engine)
+
+        self.assertEqual(ret_t2, 0)
+        self.assertEqual(json.loads(out_t2.getvalue()), {})
+        spy_pending_t2.assert_not_called()
+        self.assertEqual(pending_path.read_text(encoding="utf-8"), sentinel)
+
+    def test_hook_pending_reload_write_error_degrades_gracefully_CONVERGE_RELOAD_ERR_001(self):
+        """[CONVERGE-RELOAD-ERR-001] PermissionError/OSError on write_pending_reload warns to stderr without failing rotation."""
+        import errno
+        import agy_switch
+
+        for exc in (
+            PermissionError("Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        ):
+            with self.subTest(error=type(exc).__name__, errno=getattr(exc, "errno", None)):
+                self.engine.set_auto_switch(True)
+                self._register_account("primary-acc")
+                self._register_account("standby-acc")
+                self.engine.set_active_name("primary-acc")
+                if self.engine.cache_file.exists():
+                    self.engine.cache_file.unlink()
+                if self.engine.pending_reload_file.exists():
+                    self.engine.pending_reload_file.unlink()
+
+                mock_fetch_acc = MagicMock(return_value=("primary-acc", {"gemini": {"quota": 5}}))
+                mock_fetch_all = MagicMock(return_value={"standby-acc": {"gemini": {"quota": 85}}})
+
+                with patch.object(agy_switch, "fetch_account_quota", mock_fetch_acc), \
+                     patch.object(agy_switch, "fetch_all_accounts_quota", mock_fetch_all), \
+                     patch.object(self.engine, "write_pending_reload", side_effect=exc):
+                    out = io.StringIO()
+                    err = io.StringIO()
+                    with patch("sys.stdin", io.StringIO('{"modelName": "gemini-3.8-pro"}')), \
+                         patch("sys.stdout", out), \
+                         patch("sys.stderr", err):
+                        ret = handle_pre_invocation_hook(self.engine)
+
+                self.assertEqual(ret, 0)
+                self.assertEqual(self.engine.get_active_name(), "standby-acc")
+                self.assertIn("Warning", err.getvalue())
+                self.assertIn("pending reload", err.getvalue().lower())
+                out_json = json.loads(out.getvalue())
+                self.assertIn("injectSteps", out_json)
+                self.assertIn("standby-acc", out_json["injectSteps"][0]["ephemeralMessage"])
+
+
 
 class TestSecurityLayer0(unittest.TestCase):
     """Unit tests for Layer 0 security.py module and token primitives."""
