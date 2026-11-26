@@ -607,7 +607,7 @@ The `LogWatcher` module MUST execute a **Pre-Switch Quota Probe** prior to initi
 - AND suppresses reactive rotation, preventing double-switching cascades.
 
 ### Requirement: Proactive Threshold Failover and Safe Turn Boundary in LogWatcher
-The `LogWatcher` daemon MUST actively evaluate the active account's remaining quota in `poll_once()`, trigger proactive credential rotation when the quota falls at or below the configured quota threshold (defaulting to 20% or `AgySwitchEngine.get_quota_threshold()`), ensure candidate standby accounts have healthy quota (>= 70%), evaluate the drain window heuristic (retaining active accounts if reset is within 30 minutes and remaining quota exceeds 5%), and execute account rotation and Language Server reloading (`restart_server=True, force=True`) EXCLUSIVELY at a verified **Safe Turn Boundary** where the structured conversation transcript indicates turn completion (`status == "DONE"` or `type == "USER_INPUT"`) and `ProcessSupervisor.is_server_busy()` confirms the language server is quiescent, guaranteeing that in-flight prompts, streaming inferences, and tool executions are never interrupted.
+The `LogWatcher` daemon MUST actively evaluate the active account's remaining quota in `poll_once()`, trigger proactive credential rotation when the quota falls at or below the configured quota threshold (defaulting to 20% or `AgySwitchEngine.get_quota_threshold()`), ensure candidate standby accounts have healthy quota (>= 70%), evaluate the drain window heuristic (retaining active accounts if reset is within 30 minutes and remaining quota exceeds 5%), and execute account rotation and Language Server reloading (`restart_server=True, force=True`) EXCLUSIVELY at a verified **Safe Turn Boundary** where the structured conversation transcript indicates turn completion (`status == "DONE"` or `type == "USER_INPUT"`) and `ProcessSupervisor.is_server_busy()` confirms the language server is quiescent, guaranteeing that in-flight prompts, streaming inferences, and tool executions are never interrupted. In addition, `LogWatcher.poll_once()` SHALL inspect `cache/pending_reload.json` (written by **Deferred Safe-Turn Reload**): if a valid unexpired marker exists (`now - requested_at <= ttl_seconds`), `poll_once()` MUST wait until `_is_turn_quiescent()` confirms a verified **Safe Turn Boundary**, execute `restart_language_server(force=True)`, append a structured audit log entry to `watch.log`, and unlink `pending_reload.json`. While `_is_turn_quiescent()` is `False`, the reload MUST remain deferred; if `pending_reload.json` is expired (`now - requested_at > ttl_seconds`) or malformed/corrupt, `LogWatcher` MUST unlink and ignore it safely without crashing or restarting the server.
 
 #### Scenario: [WATCH-PROACTIVE-001] Proactive rotation triggered when active account quota reaches or falls below threshold at Safe Turn Boundary
 - GIVEN active account `"primary-acc"` with remaining Gemini quota at 14% (`fraction = 0.14 <= 0.20`)
@@ -696,6 +696,32 @@ The `LogWatcher` daemon MUST actively evaluate the active account's remaining qu
 - WHEN `LogWatcher.poll_once()` checks proactive rotation eligibility
 - THEN it enforces the 60-second damping interval
 - AND suppresses rotation until `elapsed >= 60.0` seconds.
+
+#### Scenario: [WATCH-RELOAD-001] Valid `pending_reload.json` consumed at verified Safe Turn Boundary reloads `language_server`, logs audit entry, and unlinks marker
+- GIVEN `cache/pending_reload.json` contains a valid unexpired marker (`target_account: "work-acc"`, `requested_at` within `ttl_seconds: 120`)
+- AND `LogWatcher._is_turn_quiescent()` returns `True`
+- WHEN `LogWatcher.poll_once()` runs
+- THEN it calls `engine.restart_language_server(force=True)`
+- AND appends a structured deferred-reload audit entry to `watch.log`
+- AND unlinks `cache/pending_reload.json` from disk.
+
+#### Scenario: [WATCH-RELOAD-002] Valid `pending_reload.json` deferred without restart while `_is_turn_quiescent()` is `False`
+- GIVEN `cache/pending_reload.json` contains a valid unexpired marker
+- AND `LogWatcher._is_turn_quiescent()` returns `False` because an agent turn is still running
+- WHEN `LogWatcher.poll_once()` executes
+- THEN it does NOT call `restart_language_server()`
+- AND preserves `cache/pending_reload.json` intact for the next polling cycle.
+
+#### Scenario: [WATCH-RELOAD-ERR-001] Malformed or corrupt `pending_reload.json` unlinked safely without crashing `poll_once()`
+- GIVEN `cache/pending_reload.json` contains invalid JSON, non-dict payload, or non-numeric `requested_at`
+- WHEN `LogWatcher.poll_once()` inspects the pending reload marker
+- THEN it unlinks the corrupt marker safely without raising an unhandled exception and does not restart `language_server`.
+
+#### Scenario: [WATCH-RELOAD-EDGE-001] Expired `pending_reload.json` exceeding `ttl_seconds` unlinked and ignored without restarting server
+- GIVEN `cache/pending_reload.json` has `requested_at` older than `ttl_seconds` (`now - requested_at > ttl_seconds`)
+- AND `LogWatcher._is_turn_quiescent()` returns `True`
+- WHEN `LogWatcher.poll_once()` executes
+- THEN it unlinks the expired `cache/pending_reload.json` without restarting `language_server` or writing a reload audit entry.
 
 ### Requirement: Telemetry-Aware Cooldown Immunity and 5-Hour Duration Clamping
 The `LogWatcher` and `CooldownManager` modules MUST implement **Telemetry-Aware Cooldown Immunity**, eliminating unconditional exclusions of accounts in `cooldown.json` when fresh telemetry or cached data demonstrates quota recovery (>= 70%), and MUST clamp reactive cooldown durations resulting from HTTP 429 quota exhaustion strictly to the 5-hour rolling bucket reset timestamp (or default 30-minute fallback), explicitly prohibiting the application of multi-day weekly reset timestamps to cooldown records.
@@ -916,7 +942,7 @@ The installer script `install.sh` and hook registration APIs in `scripts/agy_swi
 - AND completes all other installation steps successfully with exit code 0 rather than aborting.
 
 ### Requirement: Refresh-Aware Standby Account Validation in Diagnostics
-The Layer 2 token diagnostics in `agy-switch doctor` (`DoctorEngine._check_token_integrity` and `DoctorEngine.run_diagnostics` in `scripts/agy_switcher/doctor.py`) SHALL distinguish between the currently active account and secondary standby accounts while enforcing resilient **Token Identity** and **Refresh-Aware Standby Viability**. For the active account, access token expiry continues to be verified strictly (`[FAIL]` if expired). For standby accounts, if the access token timestamp has expired, the engine inspects `refresh_token`; if a non-empty string `refresh_token` is present, the account is validated as `[PASS]` (Standby Ready), whereas missing, empty, whitespace-only, or non-string `refresh_token` on an expired secondary account returns `[WARN]`. For **Token Identity** across both active and standby accounts: (a) accounts resolving a valid email via `id_token` JWT claim or `id_token_email` evaluate cleanly to `[PASS]` (when unexpired or standby-ready); (b) valid OAuth accounts lacking all email identity (both `id_token` and `id_token_email` absent, `None`, empty `""`, or `id_token` valid JWT lacking an `"email"` claim without `id_token_email`) emit a non-fatal `[WARN]` advisory (never `[FAIL]`) unless superseded by a higher-severity `[FAIL]` such as an expired active token; and (c) accounts containing a present, non-empty `id_token` that fails JWT payload parsing with no valid `id_token_email` remain flagged as corrupt (`[FAIL]` for active, `[WARN]` for secondary).
+The Layer 2 token diagnostics in `agy-switch doctor` (`DoctorEngine._check_token_integrity` and `DoctorEngine.run_diagnostics` in `scripts/agy_switcher/doctor.py`) SHALL distinguish between the currently active account and secondary standby accounts while enforcing resilient **Token Identity**, **Refresh-Aware Standby Viability**, and **Failover Audit & Auth Quarantine** checks. For the active account, access token expiry continues to be verified strictly (`[FAIL]` if expired). For standby accounts, if the access token timestamp has expired, the engine inspects `refresh_token`; if a non-empty string `refresh_token` is present, the account is validated as `[PASS]` (Standby Ready), whereas missing, empty, whitespace-only, or non-string `refresh_token` on an expired secondary account returns `[WARN]`. For **Token Identity** across both active and standby accounts: (a) accounts resolving a valid email via `id_token` JWT claim or `id_token_email` evaluate cleanly to `[PASS]` (when unexpired or standby-ready); (b) valid OAuth accounts lacking all email identity (both `id_token` and `id_token_email` absent, `None`, empty `""`, or `id_token` valid JWT lacking an `"email"` claim without `id_token_email`) emit a non-fatal `[WARN]` advisory (never `[FAIL]`) unless superseded by a higher-severity `[FAIL]` such as an expired active token; and (c) accounts containing a present, non-empty `id_token` that fails JWT payload parsing with no valid `id_token_email` remain flagged as corrupt (`[FAIL]` for active, `[WARN]` for secondary). Additionally, `DoctorEngine._check_token_integrity()` SHALL inspect `cache/failover_state.json["auth_errors"]`: if the active account is quarantined in `auth_errors`, it MUST return `[FAIL]` with `agy-switch login <alias>` remediation; if only standby accounts are quarantined in `auth_errors`, it MUST emit `[WARN]` with `agy-switch login <alias>` remediation; and corrupt or unreadable `failover_state.json` MUST be ignored safely without crashing. Finally, `DoctorEngine._check_permissions()` and `DoctorEngine.fix_diagnostics()` SHALL audit and enforce POSIX `0600` permissions on `cache/failover_state.json` and `cache/pending_reload.json` alongside existing vault cache files.
 
 #### Scenario: [DOCTOR-REFRESH-001] Standby accounts with expired access token but valid refresh token pass Layer 2 diagnosis
 - GIVEN a registered standby account `"standby-1"` whose `token.json` has an expired access token timestamp (`expiry` in the past)
@@ -988,6 +1014,28 @@ The Layer 2 token diagnostics in `agy-switch doctor` (`DoctorEngine._check_token
 - WHEN `DoctorEngine.run_diagnostics()` (`_check_token_integrity`) evaluates token integrity
 - THEN invalid `id_token_email` values are ignored safely without crashing
 - AND the missing **Token Identity** emits `[WARN]` (never `[FAIL]` and not `[PASS]`).
+
+#### Scenario: [DOCTOR-QUARANTINE-001] Active account listed in `failover_state.json["auth_errors"]` flagged as `[FAIL]` with login remediation
+- GIVEN active account `"automator"` has valid local `token.json` schema and expiry
+- AND `cache/failover_state.json` contains `"automator"` under `"auth_errors"`
+- WHEN `DoctorEngine._check_token_integrity()` runs Layer 2 diagnostics
+- THEN it returns status `[FAIL]` (`can_fix=False`) referencing `'automator'` and advising `'agy-switch login automator'`.
+
+#### Scenario: [DOCTOR-QUARANTINE-002] Standby account listed in `failover_state.json["auth_errors"]` flagged as `[WARN]` with login remediation
+- GIVEN active account `"honey"` is healthy and standby account `"automator"` is listed under `cache/failover_state.json["auth_errors"]`
+- WHEN `DoctorEngine._check_token_integrity()` runs Layer 2 diagnostics
+- THEN it returns status `[WARN]` (`can_fix=False`) referencing `'automator'` and advising `'agy-switch login automator'`.
+
+#### Scenario: [DOCTOR-QUARANTINE-003] `DoctorEngine._check_permissions()` and `fix_diagnostics()` audit and repair POSIX `0600` permissions on `failover_state.json` and `pending_reload.json`
+- GIVEN `cache/failover_state.json` or `cache/pending_reload.json` exists with permissive mode `0644`
+- WHEN `DoctorEngine.run_diagnostics()` runs and `DoctorEngine.fix_diagnostics()` repairs fixable items
+- THEN `_check_permissions()` initially detects the insecure mode as `[FAIL]` (`can_fix=True`)
+- AND `fix_diagnostics()` restores both files to mode `0600` so re-running diagnostics passes Layer 1.
+
+#### Scenario: [DOCTOR-QUARANTINE-ERR-001] Corrupt or unreadable `cache/failover_state.json` ignored safely by `_check_token_integrity()` without crashing
+- GIVEN `cache/failover_state.json` contains invalid JSON or non-dict structure
+- WHEN `DoctorEngine._check_token_integrity()` evaluates vault accounts
+- THEN it ignores the corrupt `failover_state.json` safely without throwing an exception and evaluates token integrity normally.
 
 ### Requirement: Resilient Token Schema Validation and Corrupt JWT Distinction
 The Layer 0 credential validation primitives `validate_token_dict()` and `validate_token_file()` in `scripts/agy_switcher/security.py` MUST validate OAuth credential payloads against the `agy` 1.5.10 schema by requiring a JSON object with a non-empty `auth_method` string and a `token` dict containing non-empty `access_token`, `refresh_token`, `token_type`, and `expiry` fields, while treating `id_token` as optional (`omitempty`, `None`, or `""`). When `id_token` is omitted, `None`, or `""`, validation MUST succeed regardless of whether `id_token_email` is present. When `id_token` is present as a non-empty value, it MUST parse as a structurally valid JWT payload (at least two dot-separated segments where the second segment base64url-decodes into a JSON object, even if that JSON object omits an `"email"` claim); if `id_token` is non-empty and either non-string or fails JWT payload parsing when no valid trimmed non-empty string `id_token_email` is present, validation MUST reject the payload as corrupt by raising `InvalidTokenError` (or returning `(False, error_message)` when `return_tuple=True`).
@@ -1141,3 +1189,210 @@ The legacy Out-Of-Band OAuth URL builders `build_oauth_url()` in `scripts/agy_sw
 - GIVEN `agy-switch login fail-acc` fails because `agy` is missing or exits without creating a token file
 - WHEN `handle_login()` reports the failure to `stderr`
 - THEN neither `stdout` nor `stderr` contains `urn:ietf:wg:oauth:2.0:oob` or any statically constructed Google OAuth URL.
+
+### Requirement: Atomic Check-Before-Write and Pre-Flight Auth Gate in Account Switching
+The vault switching engine (`AgySwitchEngine.switch_tokens` in `scripts/agy_switcher/vault.py`), telemetry probe (`probe_account_auth` and `QuotaClient` in `scripts/agy_switcher/telemetry.py`), exception hierarchy (`AccountAuthError(AgySwitchError)` in `scripts/agy_switcher/exceptions.py`), In-Process SDK Facade (`switch_account` in `scripts/agy_switcher/api.py`), and CLI dispatcher (`build_parser` and `main` in `scripts/agy_switcher/cli.py`) MUST enforce atomic check-before-write ordering and a **Pre-Flight Auth Gate**. Before `AgySwitchEngine.switch_tokens(name, restart_server=True, force=False, verify_auth=False, force_restart_now=False)` calls `_sync_tokens_to_targets()`, `set_active_name()`, or updates legacy `state.json`, it MUST complete all pre-flight checks in order: (1) verify the target account directory and `token.json` exist (`AccountNotFoundError`); (2) validate token JSON schema via `validate_token_file()` (`InvalidTokenError`); (3) verify turn safety via `verify_turn_safety(force=force)` whenever `restart_server=True` and the switch is not downgraded to deferred safe-turn reload (`ActiveTurnRunningError`); and (4) when `verify_auth=True`, run `probe_account_auth(self, name)`. Any pre-flight rejection MUST leave live Desktop/CLI token files, `~/.antigravity-vault/active`, and legacy `state.json` unmodified. Manual CLI invocations (`agy-switch switch <name>`) MUST default `verify_auth=True`, whereas `AgySwitchEngine.switch_tokens(..., verify_auth=False)` and `api.py:switch_account()` MUST retain `verify_auth=False` by default so internal callers (`hook.py`, `watcher.py`) and SDK consumers avoid redundant HTTP round-trips. On HTTP `401` or `403`, `probe_account_auth` MUST execute 1x best-effort `QuotaClient.refresh_access_token()` if a non-empty `refresh_token` is present (persisting the updated access token via `update_account_access_token()` and re-probing); if still rejected with a confirmed authentication error (`401`/`403` or `invalid_grant`), `switch_tokens()` MUST fail closed by raising `AccountAuthError` instructing `agy-switch login <alias>`, persist `auth_errors[<alias>]` in `cache/failover_state.json`, and abort before disk mutation or server restart. Transient network, timeout, or HTTP `5xx` errors MUST emit a warning to `stderr` and fail-open so offline manual switching remains operational. The CLI MUST expose `--skip-auth-check` strictly decoupled from `--force` (which governs active-turn override only).
+
+#### Scenario: [AUTH-GATE-001] Healthy pre-flight auth probe permits atomic token switch and server reload
+- GIVEN vault account `"work-acc"` with a valid `token.json` whose CloudCode quota probe returns HTTP 200
+- AND `language_server` is idle outside an active turn
+- WHEN the operator runs `agy-switch switch work-acc` (defaulting `verify_auth=True`)
+- THEN `probe_account_auth()` validates `"work-acc"` against CloudCode before any disk write occurs
+- AND `AgySwitchEngine.switch_tokens()` atomically updates Desktop and CLI tokens, updates `active` to `"work-acc"`, and restarts `language_server`
+- AND the command exits with code `0`.
+
+#### Scenario: [AUTH-GATE-002] Expired access token auto-refreshed once during pre-flight auth check succeeds and persists updated token
+- GIVEN vault account `"work-acc"` has an expired `access_token` returning HTTP `401` on initial `QuotaClient.fetch_quota()` and a valid `refresh_token`
+- AND `QuotaClient.refresh_access_token()` succeeds with a fresh `access_token` that passes the subsequent quota probe
+- WHEN `agy-switch switch work-acc` executes with `verify_auth=True`
+- THEN `update_account_access_token()` persists the refreshed token to `"work-acc/token.json"`
+- AND `switch_tokens()` proceeds to activate `"work-acc"` across Desktop/CLI targets and returns exit code `0`.
+
+#### Scenario: [AUTH-GATE-003] Explicit `--skip-auth-check` bypasses live HTTP probe while preserving turn safety check
+- GIVEN vault account `"offline-acc"` with valid local token JSON schema
+- AND `QuotaClient.fetch_quota()` would fail with HTTP `403` if called
+- WHEN the operator runs `agy-switch switch offline-acc --skip-auth-check`
+- THEN `probe_account_auth()` is not invoked (`verify_auth=False`)
+- AND `verify_turn_safety()` is still enforced before writing tokens if `language_server` is busy without `--force`
+- AND when the server is idle, `"offline-acc"` is activated cleanly with exit code `0`.
+
+#### Scenario: [AUTH-GATE-004] SDK `api.py:switch_account()` and engine default `verify_auth=False` avoid redundant HTTP round-trips
+- GIVEN vault account `"standby-acc"` with valid local token JSON schema and an idle `language_server`
+- WHEN an in-process consumer calls `api.switch_account("standby-acc", reload_server=False)` or `engine.switch_tokens("standby-acc")` without `verify_auth=True`
+- THEN no live CloudCode HTTP request is issued by `switch_tokens()`
+- AND the atomic **Disk-Only Swap** or engine switch completes without extra network latency.
+
+#### Scenario: [AUTH-GATE-ERR-001] Atomic check-before-write prevents disk mutation when `ActiveTurnRunningError` rejects switch
+- GIVEN active account `"primary-acc"` with live Desktop and CLI token files matching `"primary-acc"` and legacy `state.json` active set to `"primary-acc"`
+- AND `ProcessSupervisor.is_server_busy()` returns `True`
+- WHEN `agy-switch switch standby-acc --skip-auth-check` is invoked without `--force` from an external terminal
+- THEN `AgySwitchEngine.switch_tokens()` raises `ActiveTurnRunningError` prior to mutating any live target files or vault state
+- AND live Desktop/CLI token files, `~/.antigravity-vault/active`, and legacy `state.json` remain unchanged pointing to `"primary-acc"`
+- AND the CLI exits with code `2`.
+
+#### Scenario: [AUTH-GATE-ERR-002] Confirmed HTTP 401/403 after 1x refresh failure raises `AccountAuthError`, quarantines alias, and leaves live tokens untouched
+- GIVEN active account `"healthy-acc"` and standby account `"revoked-acc"` whose `token.json` has valid schema
+- AND CloudCode returns HTTP `403` (or `401` followed by `invalid_grant` on the single `refresh_access_token()` attempt)
+- WHEN the operator runs `agy-switch switch revoked-acc`
+- THEN `switch_tokens()` raises `AccountAuthError` prior to mutating live Desktop/CLI tokens, `active`, or restarting `language_server`
+- AND `cache/failover_state.json` records `"revoked-acc"` under `auth_errors` with mode `0600`
+- AND stderr directs the operator to run `agy-switch login revoked-acc` and the CLI exits with code `1`.
+
+#### Scenario: [AUTH-GATE-ERR-003] `--force` alone does not bypass Pre-Flight Auth Gate on revoked credentials
+- GIVEN standby account `"revoked-acc"` whose credentials fail CloudCode auth with confirmed HTTP `403`
+- WHEN the operator runs `agy-switch switch revoked-acc --force` without `--skip-auth-check`
+- THEN `verify_auth=True` remains active because `--force` is strictly decoupled from `--skip-auth-check`
+- AND `switch_tokens()` fails closed with `AccountAuthError` (exit code `1`), leaving live tokens untouched and `language_server` running.
+
+#### Scenario: [AUTH-GATE-EDGE-001] Transient network timeout or HTTP 5xx during pre-flight probe fails open with stderr warning
+- GIVEN standby account `"work-acc"` with valid local token JSON schema
+- AND CloudCode raises `URLError`, `TimeoutError`, or returns HTTP `503` during `probe_account_auth()`
+- WHEN `agy-switch switch work-acc` executes
+- THEN `probe_account_auth()` emits a warning to `stderr` explaining the transient network failure and fails open
+- AND `switch_tokens()` proceeds to switch live tokens to `"work-acc"` and exits with code `0`.
+
+#### Scenario: [AUTH-GATE-EDGE-002] Missing `refresh_token` on HTTP 401/403 skips refresh attempt and fails closed immediately with `AccountAuthError`
+- GIVEN standby account `"no-refresh-acc"` whose `token.json` has an empty or whitespace-only `refresh_token` and returns HTTP `401`
+- WHEN `agy-switch switch no-refresh-acc` runs with `verify_auth=True`
+- THEN `QuotaClient.refresh_access_token()` is not called
+- AND `switch_tokens()` immediately fails closed with `AccountAuthError`, records `"no-refresh-acc"` in `cache/failover_state.json["auth_errors"]`, and leaves live tokens unchanged.
+
+### Requirement: Ancestor Lineage Self-Kill Guard and Deferred Safe-Turn Reload
+The process supervisor (`ProcessSupervisor.is_invoked_by_language_server` in `scripts/agy_switcher/supervisor.py`), vault engine (`AgySwitchEngine.switch_tokens` in `scripts/agy_switcher/vault.py`), CLI router (`scripts/agy_switcher/cli.py`), and agent documentation (`skills/agy-switch/SKILL.md`) MUST prevent in-turn synchronous parricide by implementing **Deferred Safe-Turn Reload** (amending ADR 0010 for in-turn sub-shell invocations). `ProcessSupervisor.is_invoked_by_language_server(pid=None, current_pid=None)` MUST walk the `ppid` ancestry chain starting from `current_pid or os.getpid()` via `self.proc_dir / str(cur_pid) / "stat"`, bounded to 64 hops with a visited-PID set for cycle protection, returning `True` if any ancestor matches the target `language_server` PID or has `cmdline` containing `language_server` and `--standalone`. When `switch_tokens(name, restart_server=True, force=True, ..., force_restart_now=False)` is invoked from an ancestor lineage of `language_server` (covering both `agy-switch switch <name> --force` and `agy-switch switch --auto`), it MUST automatically downgrade synchronous server kill into **Deferred Safe-Turn Reload**: execute an atomic **Disk-Only Swap** (updating Desktop/CLI tokens and `active`), atomically write `cache/pending_reload.json` (mode `0600`, JSON fields `target_account`, `requested_at`, `ttl_seconds: 120`, `reason`), and return `{"active": name, "email": email, "server_restarted": False, "restart_deferred": True}` without signaling `language_server`. When `LogWatcher` is inactive during an in-turn deferred switch, the CLI MUST still perform the Disk-Only Swap, write `cache/pending_reload.json` (TTL 120s), and print explicit reload guidance to stdout without spawning any ad-hoc background waiter subprocess. External terminal invocations (non-descendants of `language_server`) MUST preserve ADR 0010 synchronous `restart_language_server(force=force)` behavior (`restart_deferred=False`). An explicit `--force-restart-now` emergency flag (`force_restart_now=True`) MUST remain available to intentionally execute immediate synchronous termination mid-turn. `skills/agy-switch/SKILL.md` (Procedures C & D) MUST document the safe in-turn deferred reload behavior and prohibit forcing immediate mid-turn server kills.
+
+#### Scenario: [DEFER-RELOAD-001] In-turn `switch --force` downgrades synchronous kill to Deferred Safe-Turn Reload and writes `pending_reload.json`
+- GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True` (CLI executed inside an active turn sub-shell descendant of `language_server`)
+- AND standby account `"work-acc"` passes pre-flight validation
+- WHEN the agent executes `agy-switch switch work-acc --force`
+- THEN `switch_tokens()` does NOT send `SIGTERM` or `SIGKILL` to `language_server`
+- AND it completes an atomic **Disk-Only Swap** to `"work-acc"` and atomically writes `cache/pending_reload.json` with mode `0600`, `target_account: "work-acc"`, `ttl_seconds: 120`, `requested_at`, and `reason`
+- AND `switch_tokens()` returns `restart_deferred=True` with `server_restarted=False`, and the CLI exits `0` reporting deferred reload.
+
+#### Scenario: [DEFER-RELOAD-002] In-turn `switch --auto` selects optimal standby, performs Disk-Only Swap, and writes `pending_reload.json` without killing parent server
+- GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True`
+- AND `RotationEngine` selects `"best-standby"` as optimal for `"gemini"`
+- WHEN the agent executes `agy-switch switch --auto`
+- THEN `switch_tokens("best-standby", restart_server=True, force=True)` downgrades to **Deferred Safe-Turn Reload**
+- AND writes `cache/pending_reload.json` with `target_account: "best-standby"` and `ttl_seconds: 120` without interrupting the active agent turn.
+
+#### Scenario: [DEFER-RELOAD-003] External terminal `switch --force` preserves ADR 0010 synchronous `language_server` restart
+- GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `False` (invoked from an external user shell)
+- AND `language_server` is running and busy
+- WHEN the operator runs `agy-switch switch work-acc --force`
+- THEN `switch_tokens()` synchronously calls `restart_language_server(force=True)` after atomic disk swap
+- AND no `cache/pending_reload.json` marker is written and `switch_tokens()` returns `server_restarted=True` and `restart_deferred=False`.
+
+#### Scenario: [DEFER-RELOAD-004] In-turn deferred switch when `LogWatcher` is inactive writes TTL marker and prints stdout guidance without spawning waiter subprocess
+- GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True`
+- AND `DaemonManager.get_running_pid()` returns `None` and `is_systemd_active()` returns `False`
+- WHEN `agy-switch switch work-acc --force` executes in-turn
+- THEN `switch_tokens()` still executes the Disk-Only Swap and writes `cache/pending_reload.json` (`ttl_seconds: 120`)
+- AND stdout prints explicit guidance noting that `LogWatcher` is inactive and the Desktop server can be reloaded after the turn completes
+- AND zero background waiter subprocesses (`subprocess.Popen`) are spawned.
+
+#### Scenario: [DEFER-RELOAD-005] Explicit `--force-restart-now` overrides ancestor guard for emergency synchronous restart
+- GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True`
+- WHEN the operator explicitly runs `agy-switch switch work-acc --force --force-restart-now`
+- THEN `switch_tokens(..., force_restart_now=True)` bypasses the deferred downgrade and synchronously calls `restart_language_server(force=True)`
+- AND clears or omits `cache/pending_reload.json`.
+
+#### Scenario: [DEFER-RELOAD-ERR-001] Unreadable or missing `/proc/<pid>/stat` during ancestry walk fails safe to non-descendant without crashing
+- GIVEN `self.proc_dir / str(cur_pid) / "stat"` is missing, malformed (missing `)` delimiter), or raises `PermissionError`
+- WHEN `ProcessSupervisor.is_invoked_by_language_server()` walks the process ancestry
+- THEN it handles the error cleanly without raising an unhandled exception and returns `False`.
+
+#### Scenario: [DEFER-RELOAD-EDGE-001] Cyclic `ppid` chain or ancestry deeper than 64 hops terminates cleanly via visited set and depth bound
+- GIVEN a mock `/proc` fixture containing a cyclic `ppid` loop (`100 -> 101 -> 100`) or an ancestry chain exceeding 64 hops
+- WHEN `ProcessSupervisor.is_invoked_by_language_server(current_pid=100)` executes
+- THEN the traversal terminates deterministically upon revisiting a PID or hitting the 64-hop limit and returns `False`.
+
+#### Scenario: [DEFER-RELOAD-EDGE-002] In-turn `switch <name>` without `--force` respects Active Turn Safety Guard and `--no-restart` skips `pending_reload.json`
+- GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True` and `language_server` is busy
+- WHEN `agy-switch switch work-acc` is invoked without `--force` and without `--no-restart`
+- THEN `verify_turn_safety(force=False)` raises `ActiveTurnRunningError` (exit code `2`) without mutating disk or writing `pending_reload.json`
+- AND when invoked with `--no-restart`, `switch_tokens(..., restart_server=False)` performs a Disk-Only Swap without writing `pending_reload.json`.
+
+#### Scenario: [DEFER-RELOAD-EDGE-003] `/proc/<pid>/stat` process names containing spaces and parentheses parse `ppid` accurately via `rfind(")")`
+- GIVEN a mock `/proc` fixture where an intermediate process has `/proc/<pid>/stat` containing spaces and nested parentheses in `(comm)` (e.g., `200 (language server (v2)) S 100 200 200 ...`) and ancestor `100` has `cmdline` containing `language_server --standalone`
+- WHEN `ProcessSupervisor.is_invoked_by_language_server(current_pid=200)` walks the ancestry chain
+- THEN it anchors on the last `)` via `rfind(")")` to extract `ppid=100` cleanly and returns `True`.
+
+#### Scenario: [DEFER-RELOAD-EDGE-004] In-turn `switch --auto --force-restart-now` forces immediate restart while `switch <name> --force-restart-now` without `--force` still honors Active Turn Safety Guard
+- GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True` and `language_server` is busy
+- WHEN `agy-switch switch --auto --force-restart-now` executes in-turn with optimal standby `"best-standby"`, and separately `agy-switch switch work-acc --force-restart-now` executes without `--force`
+- THEN `switch --auto --force-restart-now` sets `force=True` and `force_restart_now=True`, performing synchronous `restart_language_server(force=True)` immediately
+- AND `switch work-acc --force-restart-now` without `--force` enforces `verify_turn_safety(force=False)`, raising `ActiveTurnRunningError` (exit code `2`) without mutating disk.
+
+### Requirement: Failover Audit Trail and Persistent Auth Quarantine in PreInvocation Hook
+The PreInvocation hook (`handle_pre_invocation_hook` in `scripts/agy_switcher/hook.py`), secure logger (`append_secure_log_entry` in `scripts/agy_switcher/presence.py`), vault engine (`AgySwitchEngine` in `scripts/agy_switcher/vault.py`), telemetry fetcher (`fetch_account_quota` in `scripts/agy_switcher/telemetry.py`), and CLI formatters (`format_status_report`, `format_accounts_table`, `format_accounts_listicle` in `scripts/agy_switcher/formatters.py`) MUST implement **Failover Audit & Auth Quarantine**. On every hook rotation/failover (`target_account != active_name`), `handle_pre_invocation_hook()` MUST perform dual persistence: (1) append a structured chronological audit line (`trigger: auth_corruption` or `trigger: quota_rotation`) to `watch.log` via `presence.py:append_secure_log_entry()` (mode `0600`, symlink-safe, isolated under **Mock Vault Isolation**); and (2) atomically update `cache/failover_state.json` (mode `0600`, separate from `last_known_quota.json` to preserve ADR 0020 `<40ms` Tier 1 fast-path and cache sanitization compatibility) recording `last_failover` (`timestamp`, `from_account`, `to_account`, `trigger`, `reason`) and, when `auth_corruption` occurred, persisting `auth_errors[<alias>]` (`timestamp`, `error`, `error_type`). On `auth_corruption`, the hook's `injectSteps[0].ephemeralMessage` MUST explicitly identify the failed account, the auth failure reason, and `agy-switch login <alias>` remediation while preserving the backward-compatible substring `"Auto-rotated to **{target_account}**"`. Entries in `auth_errors[<alias>]` MUST persist until explicitly cleared by a successful `login_account()`, `add_account()`, or a successful live quota probe (`fetch_account_quota()` returning valid quota without error). `AgySwitchEngine.get_status()` and `format_status_report()` MUST surface `Last Failover` whenever `last_failover` is `<= 24 hours` old and has not been superseded by a subsequent successful manual switch, and MUST surface `Pending Reload` whenever an active unexpired `cache/pending_reload.json` marker exists. `AgySwitchEngine.list_accounts()`, `format_accounts_table()`, and `format_accounts_listicle()` MUST expose `auth_error` status and render an `(Auth Error)` badge for quarantined accounts.
+
+#### Scenario: [AUDIT-HOOK-001] Auth corruption ejection appends `watch.log`, persists `failover_state.json`, and emits differentiated `ephemeralMessage`
+- GIVEN active account `"automator"` whose Tier 2 CloudCode probe returns `error_type: "auth"` (`HTTP 403 Forbidden`)
+- AND standby account `"honey"` has healthy Gemini quota (85%)
+- WHEN `handle_pre_invocation_hook(engine)` executes in an isolated vault
+- THEN it switches active tokens to `"honey"` (`restart_server=False`) and appends a structured `trigger: auth_corruption` audit entry to `watch.log` via `append_secure_log_entry()`
+- AND atomically writes `cache/failover_state.json` (mode `0600`) with `last_failover` (`from_account: "automator"`, `to_account: "honey"`, `trigger: "auth_corruption"`) and `auth_errors["automator"]`
+- AND `last_known_quota.json` contains no failover metadata keys
+- AND stdout JSON `ephemeralMessage` contains `"Auto-rotated to **honey**"`, names `"automator"`, and instructs `"agy-switch login automator"`.
+
+#### Scenario: [AUDIT-HOOK-002] Quota rotation ejection records `trigger: quota_rotation` in `watch.log` and `failover_state.json`
+- GIVEN active account `"primary-acc"` with remaining Gemini quota at 10% (`< threshold`) and no auth error
+- AND standby account `"standby-acc"` has 90% quota
+- WHEN `handle_pre_invocation_hook(engine)` rotates to `"standby-acc"`
+- THEN `watch.log` receives an audit entry with `trigger: quota_rotation`
+- AND `cache/failover_state.json` records `last_failover` with `trigger: "quota_rotation"` without adding `"primary-acc"` to `auth_errors`.
+
+#### Scenario: [AUDIT-HOOK-003] `agy-switch status` displays `Last Failover` within 24 hours and active `Pending Reload` state
+- GIVEN `cache/failover_state.json` contains a `last_failover` event recorded 2 hours ago (`from_account: "automator"`, `to_account: "honey"`, `trigger: "auth_corruption"`)
+- AND `cache/pending_reload.json` contains an unexpired marker (`target_account: "honey"`, `ttl_seconds: 120`)
+- WHEN `agy-switch status` executes (`get_status()` + `format_status_report()`)
+- THEN the output renders a `Last Failover` line summarizing the recent ejection (`automator -> honey`) and trigger
+- AND renders a `Pending Reload` line indicating `"honey"` is awaiting safe-turn server reload.
+
+#### Scenario: [AUDIT-HOOK-004] `agy-switch list` displays `(Auth Error)` badge for quarantined accounts in table and listicle formats
+- GIVEN vault accounts `"honey"` (active, healthy) and `"automator"` (standby, present in `cache/failover_state.json["auth_errors"]`)
+- WHEN `agy-switch list` (`--format table` and `--format list`) or `agy-switch list --json` executes
+- THEN `engine.list_accounts()` includes `"auth_error"` metadata on `"automator"`
+- AND both `format_accounts_table()` and `format_accounts_listicle()` display `(Auth Error)` on `"automator"`'s status line.
+
+#### Scenario: [AUDIT-HOOK-005] Quarantine clears automatically upon successful `login_account`, `add_account`, or healthy live `fetch_account_quota` probe
+- GIVEN `"automator"` is recorded in `cache/failover_state.json["auth_errors"]`
+- WHEN `"automator"` completes a successful `AgySwitchEngine.login_account("automator")`, `AgySwitchEngine.add_account("automator", ...)`, or `fetch_account_quota(engine, "automator")` returns a valid quota dict without `"error"`
+- THEN `"automator"` is removed from `cache/failover_state.json["auth_errors"]` atomically
+- AND subsequent `agy-switch list` no longer displays `(Auth Error)` for `"automator"`.
+
+#### Scenario: [AUDIT-HOOK-ERR-001] Corrupt or non-dict `cache/failover_state.json` recovers gracefully without breaking hook rotation or CLI output
+- GIVEN `cache/failover_state.json` contains truncated JSON or a JSON array `[]`
+- WHEN `handle_pre_invocation_hook()`, `engine.get_status()`, or `engine.list_accounts()` reads failover state
+- THEN it safely treats the corrupt payload as empty state without raising an unhandled exception
+- AND hook rotations overwrite it atomically with valid `0600` JSON schema.
+
+#### Scenario: [AUDIT-HOOK-ERR-002] Symlink tampering, read-only vault, or `ENOSPC` during audit log or `failover_state.json` write fails safe without breaking hook rotation
+- GIVEN `watch.log` or `cache/failover_state.json` is a pre-existing symlink to an external path, or the vault cache directory raises `OSError` (`EACCES` / `ENOSPC`) during failover persistence
+- WHEN `handle_pre_invocation_hook(engine)` rotates from `"automator"` to `"honey"`
+- THEN symlink targets are never followed (unlinked or atomically replaced via `os.replace`) and I/O failures log a warning to `stderr`
+- AND `handle_pre_invocation_hook()` still completes the token swap and emits valid `injectSteps` JSON to `stdout` with exit code `0`.
+
+#### Scenario: [AUDIT-HOOK-EDGE-001] `last_failover` older than 24 hours or superseded by successful manual switch is suppressed from `status` while `auth_errors` quarantine persists
+- GIVEN `cache/failover_state.json` contains `"automator"` in `auth_errors` and a `last_failover` event either older than 24 hours (`> 86400s`) OR followed by a successful manual `agy-switch switch honey`
+- WHEN `agy-switch status` and `agy-switch list` run
+- THEN `status` omits the stale or superseded `Last Failover` line
+- AND `"automator"` remains quarantined in `auth_errors` and flagged as `(Auth Error)` in `list` until re-authenticated or live-probed healthy.
+
+#### Scenario: [AUDIT-HOOK-EDGE-002] Tier 1 healthy cache fast-path in `hook-pre-invocation` performs zero writes to `watch.log` or `failover_state.json`
+- GIVEN active account `"honey"` has fresh `last_known_quota.json` cache above `tier1_threshold` (`>= 35%`)
+- WHEN `scripts/agy_switch.py:hook_pre_invocation_dispatch()` or `handle_pre_invocation_hook(engine)` executes
+- THEN it exits immediately via the Tier 1 fast-path returning `{}` without importing or reading `cache/failover_state.json`
+- AND performs zero writes to `watch.log` or `cache/failover_state.json`.
+
+#### Scenario: [AUDIT-HOOK-EDGE-003] Concurrent `failover_state.json` mutations serialize safely without truncated JSON or lost quarantine entries
+- GIVEN multiple threads concurrently invoke `record_auth_error()`, `clear_auth_error()`, and `record_last_failover()` on `AgySwitchEngine`
+- WHEN all concurrent updates complete
+- THEN `cache/failover_state.json` remains valid `0600` JSON with zero truncated writes or lost concurrent account entries.
+
+#### Scenario: [AUDIT-HOOK-EDGE-004] Rejected manual switch preserves `last_failover` and `status` ignores expired or malformed `pending_reload.json`
+- GIVEN `cache/failover_state.json` has a valid `last_failover` recorded 1 hour ago and `cache/pending_reload.json` is either expired (`now - requested_at > ttl_seconds`) or malformed JSON
+- AND a manual `agy-switch switch standby-acc` fails pre-flight with `ActiveTurnRunningError` or `AccountAuthError`
+- WHEN `agy-switch status` executes
+- THEN `Last Failover` remains surfaced because the failed manual switch did not supersede it
+- AND `Pending Reload` is omitted safely without crashing on the expired or malformed marker.
