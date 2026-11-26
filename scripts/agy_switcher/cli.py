@@ -180,6 +180,11 @@ def build_parser() -> argparse.ArgumentParser:
     switch_parser.add_argument(
         "--force", action="store_true", help="Force switch even if active turns are detected"
     )
+    switch_parser.add_argument(
+        "--skip-auth-check",
+        action="store_true",
+        help="Skip pre-flight CloudCode auth check before switching",
+    )
     switch_parser.add_argument("--auto", action="store_true", help="Auto-switch to optimal account")
     switch_parser.add_argument(
         "--model", type=str, default=None, help="Target model for auto-switch (strictly gemini)"
@@ -677,13 +682,22 @@ def main(argv: list[str] | None = None, engine: AgySwitchEngine | None = None) -
         # switch --auto automatically defaults force=True under ADR 0010; manual switch strictly requires --force
         force_flag = True if is_auto else getattr(args, "force", False)
         restart_flag = not getattr(args, "no_restart", False)
+        verify_auth_flag = not getattr(args, "skip_auth_check", False)
 
         try:
-            res = engine.switch_tokens(
-                args.account,
-                restart_server=restart_flag,
-                force=force_flag,
-            )
+            if is_auto:
+                res = engine.switch_tokens(
+                    args.account,
+                    restart_server=restart_flag,
+                    force=force_flag,
+                )
+            else:
+                res = engine.switch_tokens(
+                    args.account,
+                    restart_server=restart_flag,
+                    force=force_flag,
+                    verify_auth=verify_auth_flag,
+                )
             print(
                 f"[agy-switch] Successfully switched active account to '{res['active']}' ({res.get('email') or 'unknown'})."
             )
