@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -1247,6 +1248,279 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertTrue(existing_dir.is_dir())
         self.assertEqual(existing_token.read_text(encoding="utf-8"), prior_content)
         self.assertEqual([p.name for p in existing_dir.iterdir()], ["token.json"])
+
+    def test_failover_state_persistence_corrupt_and_nondict_recovery(self) -> None:
+        """[AUDIT-HOOK-ERR-001] Corrupt or non-dict failover_state.json recovers as empty state and overwrites atomically at 0600."""
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+
+        # Missing file yields clean default schema without creating file
+        initial = self.engine.load_failover_state()
+        self.assertEqual(initial, {"last_failover": None, "auth_errors": {}})
+        self.assertFalse(failover_file.exists())
+
+        # Truncated JSON, JSON array, and scalar payloads recover safely
+        for corrupt_payload in ('{"last_failover": ', "[]", '"string-payload"', "123"):
+            with self.subTest(corrupt_payload=corrupt_payload):
+                failover_file.write_text(corrupt_payload, encoding="utf-8")
+                os.chmod(failover_file, 0o644)
+
+                loaded = self.engine.load_failover_state()
+                self.assertEqual(loaded, {"last_failover": None, "auth_errors": {}})
+
+                # Mutating helper recovers cleanly and overwrites atomically with 0600 JSON
+                self.engine.record_auth_error(
+                    "automator",
+                    error="HTTP 403 Forbidden",
+                    error_type="auth",
+                    timestamp=1791201000.0,
+                )
+                self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+                disk_state = json.loads(failover_file.read_text(encoding="utf-8"))
+                self.assertIsNone(disk_state["last_failover"])
+                self.assertEqual(
+                    disk_state["auth_errors"]["automator"],
+                    {
+                        "timestamp": 1791201000.0,
+                        "error": "HTTP 403 Forbidden",
+                        "error_type": "auth",
+                    },
+                )
+
+                # Clear and re-test clear_last_failover / clear_auth_error preservation
+                self.engine.record_last_failover(
+                    from_account="automator",
+                    to_account="honey",
+                    trigger="auth_corruption",
+                    reason="HTTP 403 Forbidden",
+                    timestamp=1791201005.0,
+                )
+                self.assertTrue(self.engine.clear_auth_error("automator"))
+                self.assertFalse(self.engine.clear_auth_error("automator"))
+                after_clear_auth = self.engine.load_failover_state()
+                self.assertEqual(after_clear_auth["auth_errors"], {})
+                self.assertEqual(after_clear_auth["last_failover"]["from_account"], "automator")
+                self.assertEqual(after_clear_auth["last_failover"]["to_account"], "honey")
+                self.assertEqual(after_clear_auth["last_failover"]["trigger"], "auth_corruption")
+                self.assertEqual(after_clear_auth["last_failover"]["reason"], "HTTP 403 Forbidden")
+                self.assertEqual(after_clear_auth["last_failover"]["timestamp"], 1791201005.0)
+
+                self.engine.record_auth_error("other-acc", error="HTTP 401", timestamp=1791201010.0)
+                self.assertTrue(self.engine.clear_last_failover())
+                self.assertFalse(self.engine.clear_last_failover())
+                after_clear_lf = self.engine.load_failover_state()
+                self.assertIsNone(after_clear_lf["last_failover"])
+                self.assertIn("other-acc", after_clear_lf["auth_errors"])
+
+        # Symlink safety: never read or write through pre-existing symlink
+        victim_file = self.base_path / "external_victim.json"
+        victim_content = json.dumps({"auth_errors": {"victim": {"error": "should-not-leak"}}})
+        victim_file.write_text(victim_content, encoding="utf-8")
+        failover_file.unlink(missing_ok=True)
+        failover_file.symlink_to(victim_file)
+
+        self.assertEqual(self.engine.load_failover_state(), {"last_failover": None, "auth_errors": {}})
+        self.engine.record_auth_error("revoked-acc", error="HTTP 403", timestamp=1791201020.0)
+        self.assertFalse(failover_file.is_symlink())
+        self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+        self.assertEqual(victim_file.read_text(encoding="utf-8"), victim_content)
+
+    def test_failover_state_persistence_concurrent_mutations_and_oserror_resilience(self) -> None:
+        """[AUDIT-HOOK-EDGE-003] Concurrent failover_state mutations serialize cleanly at 0600 without lost entries."""
+        failover_file = self.vault_dir / "cache" / "failover_state.json"
+        total_threads = 14
+        barrier = threading.Barrier(total_threads)
+        errors: list[BaseException] = []
+        errors_lock = threading.Lock()
+
+        def _keep_worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for step in range(15):
+                    self.engine.record_auth_error(
+                        f"keep-{idx}",
+                        error=f"HTTP 403 step-{step}",
+                        error_type="auth",
+                    )
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        def _churn_worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                alias = f"ephemeral-{idx}"
+                for step in range(10):
+                    self.engine.record_auth_error(alias, error=f"HTTP 401 step-{step}")
+                    self.engine.clear_auth_error(alias)
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        def _failover_worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for step in range(10):
+                    self.engine.record_last_failover(
+                        from_account=f"src-{idx}",
+                        to_account=f"dst-{step}",
+                        trigger="auth_corruption",
+                        reason="HTTP 403",
+                    )
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        def _reader_worker() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for _ in range(20):
+                    snapshot = self.engine.load_failover_state()
+                    self.assertIn("last_failover", snapshot)
+                    self.assertIn("auth_errors", snapshot)
+                    self.assertIsInstance(snapshot["auth_errors"], dict)
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+        threads = (
+            [threading.Thread(target=_keep_worker, args=(i,)) for i in range(6)]
+            + [threading.Thread(target=_churn_worker, args=(i,)) for i in range(4)]
+            + [threading.Thread(target=_failover_worker, args=(i,)) for i in range(2)]
+            + [threading.Thread(target=_reader_worker) for _ in range(2)]
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertTrue(failover_file.is_file())
+        self.assertEqual(stat.S_IMODE(failover_file.stat().st_mode), 0o600)
+
+        disk_state = json.loads(failover_file.read_text(encoding="utf-8"))
+        self.assertIsInstance(disk_state, dict)
+        auth_errors = disk_state["auth_errors"]
+        for i in range(6):
+            self.assertIn(f"keep-{i}", auth_errors)
+            self.assertEqual(auth_errors[f"keep-{i}"]["error"], "HTTP 403 step-14")
+        for i in range(4):
+            self.assertNotIn(f"ephemeral-{i}", auth_errors)
+        last_failover = disk_state["last_failover"]
+        self.assertIsInstance(last_failover, dict)
+        self.assertEqual(last_failover["trigger"], "auth_corruption")
+        self.assertIn(last_failover["from_account"], {"src-0", "src-1"})
+
+        # bool-as-int guard on timestamp falls back to positive float epoch instead of 1.0
+        bool_state = self.engine.record_auth_error(
+            "bool-ts-acc",
+            error="HTTP 403",
+            timestamp=True,  # type: ignore[arg-type]
+        )
+        self.assertGreater(bool_state["auth_errors"]["bool-ts-acc"]["timestamp"], 1_000_000.0)
+
+        # OSError during persistence warns to stderr without raising unhandled exception
+        # and clear helpers return False when disk persistence fails
+        stderr_buf = io.StringIO()
+        with patch("agy_switcher.security.os.replace", side_effect=OSError("ENOSPC simulated")), \
+             patch("sys.stderr", stderr_buf):
+            self.engine.record_auth_error("io-fail-acc", error="HTTP 403")
+            self.assertFalse(self.engine.clear_auth_error("keep-0"))
+            self.assertFalse(self.engine.clear_last_failover())
+        self.assertIn("Warning:", stderr_buf.getvalue())
+        reloaded_after_io_err = self.engine.load_failover_state()
+        self.assertIn("keep-0", reloaded_after_io_err["auth_errors"])
+        self.assertIsNotNone(reloaded_after_io_err["last_failover"])
+
+    def test_failover_state_persistence_pending_reload_lifecycle_and_recovery(self) -> None:
+        """Pending reload write/load/clear enforces 0600 permissions, expiry filtering, symlink safety, and corrupt recovery."""
+        reload_file = self.vault_dir / "cache" / "pending_reload.json"
+
+        # Missing marker returns None and clear returns False
+        self.assertIsNone(self.engine.load_pending_reload())
+        self.assertFalse(self.engine.clear_pending_reload())
+
+        # Empty target_account raises AgySwitchError; bool ttl/requested_at fall back safely
+        with self.assertRaises(AgySwitchError):
+            self.engine.write_pending_reload("   ")
+        bool_guarded = self.engine.write_pending_reload(
+            "work-acc",
+            ttl_seconds=True,  # type: ignore[arg-type]
+            requested_at=True,  # type: ignore[arg-type]
+        )
+        self.assertEqual(bool_guarded["ttl_seconds"], 120)
+        self.assertGreater(bool_guarded["requested_at"], 1_000_000.0)
+
+        # Write valid marker and inspect on-disk schema & 0600 mode
+        written = self.engine.write_pending_reload(
+            "work-acc",
+            reason="in_turn_deferred_reload",
+            ttl_seconds=120,
+            requested_at=1000.0,
+        )
+        self.assertEqual(written["target_account"], "work-acc")
+        self.assertEqual(written["ttl_seconds"], 120)
+        self.assertEqual(written["requested_at"], 1000.0)
+        self.assertEqual(written["reason"], "in_turn_deferred_reload")
+        self.assertTrue(reload_file.is_file())
+        self.assertEqual(stat.S_IMODE(reload_file.stat().st_mode), 0o600)
+
+        # Unexpired load succeeds (including exact TTL boundary); expired load returns None unless include_expired=True
+        loaded = self.engine.load_pending_reload(now=1050.0)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded["target_account"], "work-acc")
+        self.assertIsNotNone(self.engine.load_pending_reload(now=1120.0))
+        self.assertIsNone(self.engine.load_pending_reload(now=1121.0))
+        loaded_expired = self.engine.load_pending_reload(include_expired=True, now=1121.0)
+        self.assertIsNotNone(loaded_expired)
+
+        # Clear removes file cleanly
+        self.assertTrue(self.engine.clear_pending_reload())
+        self.assertFalse(reload_file.exists())
+        self.assertFalse(self.engine.clear_pending_reload())
+
+        # Corrupt, non-dict, or non-numeric requested_at/ttl_seconds payloads recover safely as None
+        corrupt_cases = (
+            "{bad-json",
+            "[]",
+            json.dumps({"target_account": "work-acc", "requested_at": "not-a-number", "ttl_seconds": 120}),
+            json.dumps({"target_account": "work-acc", "requested_at": True, "ttl_seconds": 120}),
+            json.dumps({"target_account": "work-acc", "requested_at": 1000.0, "ttl_seconds": True}),
+            json.dumps({"target_account": "  ", "requested_at": 1000.0, "ttl_seconds": 120}),
+            json.dumps({"target_account": "work-acc", "requested_at": 1000.0, "ttl_seconds": -5}),
+        )
+        for idx, raw_payload in enumerate(corrupt_cases):
+            with self.subTest(case=idx):
+                reload_file.write_text(raw_payload, encoding="utf-8")
+                self.assertIsNone(self.engine.load_pending_reload(now=1010.0))
+
+        # Symlink safety: load ignores symlink, write replaces symlink without touching target,
+        # and clear_pending_reload unlinks symlink without touching target
+        victim = self.base_path / "reload_victim.json"
+        victim_payload = json.dumps({"target_account": "victim", "requested_at": 1000.0, "ttl_seconds": 120})
+        victim.write_text(victim_payload, encoding="utf-8")
+        reload_file.unlink(missing_ok=True)
+        reload_file.symlink_to(victim)
+
+        self.assertIsNone(self.engine.load_pending_reload(now=1010.0))
+        self.assertTrue(self.engine.clear_pending_reload())
+        self.assertFalse(reload_file.exists())
+        self.assertTrue(victim.exists())
+        self.assertEqual(victim.read_text(encoding="utf-8"), victim_payload)
+
+        reload_file.symlink_to(victim)
+        self.engine.write_pending_reload("safe-acc", requested_at=1000.0)
+        self.assertFalse(reload_file.is_symlink())
+        self.assertEqual(stat.S_IMODE(reload_file.stat().st_mode), 0o600)
+        self.assertEqual(victim.read_text(encoding="utf-8"), victim_payload)
+
+        # OSError during write_pending_reload warns to stderr without crashing
+        stderr_buf = io.StringIO()
+        with patch("agy_switcher.security.os.replace", side_effect=OSError("ENOSPC simulated")), \
+             patch("sys.stderr", stderr_buf):
+            self.engine.write_pending_reload("io-fail-acc", requested_at=1000.0)
+        self.assertIn("Warning:", stderr_buf.getvalue())
 
 
 if __name__ == "__main__":

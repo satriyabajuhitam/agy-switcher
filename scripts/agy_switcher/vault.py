@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from typing import Any, Callable, cast
 import urllib.error
@@ -61,6 +62,74 @@ DEFAULT_GEMINI_DIR = Path.home() / ".gemini"
 DEFAULT_LEGACY_ROOT = Path.home() / ".agy-cli-manager"
 GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
 USERINFO_TIMEOUT_SECONDS = 5.0
+_FAILOVER_STATE_LOCK = threading.RLock()
+
+
+def _coerce_positive_timestamp(timestamp: float | int | None) -> float:
+    """Returns a valid positive finite UNIX timestamp, defaulting to time.time()."""
+    if timestamp is None or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return time.time()
+    val = float(timestamp)
+    if not math.isfinite(val) or val <= 0:
+        return time.time()
+    return val
+
+
+def _read_json_dict_safe(path: Path) -> tuple[dict[str, Any] | None, bool]:
+    """Reads a regular JSON object file without following symlinks.
+
+    Returns (decoded_dict_or_none, path_exists_on_disk).
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None, False
+    except OSError:
+        return None, True
+
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None, True
+
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, open_flags)
+    except OSError:
+        return None, True
+
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None, True
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            loaded: object = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError, OverflowError):
+        return None, True
+
+    if not isinstance(loaded, dict):
+        return None, True
+    return cast(dict[str, Any], loaded), True
+
+
+def _normalize_failover_state(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalizes raw failover state payload into canonical schema."""
+    last_failover: dict[str, Any] | None = None
+    auth_errors: dict[str, dict[str, Any]] = {}
+
+    if isinstance(raw, dict):
+        raw_lf = raw.get("last_failover")
+        if isinstance(raw_lf, dict) and raw_lf:
+            last_failover = dict(raw_lf)
+
+        raw_ae = raw.get("auth_errors")
+        if isinstance(raw_ae, dict):
+            for key, val in raw_ae.items():
+                if isinstance(key, str) and key.strip() and isinstance(val, dict):
+                    auth_errors[key.strip()] = dict(val)
+
+    return {
+        "last_failover": last_failover,
+        "auth_errors": auth_errors,
+    }
 
 
 def _clean_email_str(value: object) -> str | None:
@@ -157,9 +226,12 @@ class AgySwitchEngine:
         self.cache_dir = self._vault_dir / "cache"
         self.cache_file = self.cache_dir / "last_known_quota.json"
         self.cooldown_file = self.cache_dir / "cooldown.json"
+        self.failover_state_file = self.cache_dir / "failover_state.json"
+        self.pending_reload_file = self.cache_dir / "pending_reload.json"
         self.config_file = self._vault_dir / "config.json"
         self.desktop_token_file = self._gemini_dir / "jetski-standalone-oauth-token"
         self.cli_token_file = self.cli_dir / "antigravity-oauth-token"
+        self._failover_lock = _FAILOVER_STATE_LOCK
 
         self.supervisor = ProcessSupervisor(gemini_dir=self._gemini_dir, proc_dir=self._proc_dir)
         self.doctor = DoctorEngine(engine=self)
@@ -178,6 +250,8 @@ class AgySwitchEngine:
         self.cache_dir = self._vault_dir / "cache"
         self.cache_file = self.cache_dir / "last_known_quota.json"
         self.cooldown_file = self.cache_dir / "cooldown.json"
+        self.failover_state_file = self.cache_dir / "failover_state.json"
+        self.pending_reload_file = self.cache_dir / "pending_reload.json"
         self.config_file = self._vault_dir / "config.json"
 
     @property
@@ -484,6 +558,202 @@ class AgySwitchEngine:
             return active
         except Exception:
             return {}
+
+    def _write_failover_state_unlocked(self, state: dict[str, Any]) -> bool:
+        """Atomically persists failover state with 0600 mode, warning on OSError."""
+        try:
+            self._atomic_write_json(self.failover_state_file, state)
+            return True
+        except OSError as exc:
+            print(
+                f"[agy-switch] Warning: Failed to persist failover state to '{self.failover_state_file}': {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+    def load_failover_state(self) -> dict[str, Any]:
+        """Loads cache/failover_state.json safely, recovering as empty state on error."""
+        with self._failover_lock:
+            raw, _ = _read_json_dict_safe(self.failover_state_file)
+            return _normalize_failover_state(raw)
+
+    def record_auth_error(
+        self,
+        account_name: str,
+        error: str = "Authentication failed",
+        error_type: str = "auth",
+        timestamp: float | None = None,
+    ) -> dict[str, Any]:
+        """Records an account auth error quarantine entry atomically at mode 0600."""
+        with self._failover_lock:
+            raw, _ = _read_json_dict_safe(self.failover_state_file)
+            state = _normalize_failover_state(raw)
+            alias = account_name.strip() if isinstance(account_name, str) else ""
+            if not alias:
+                return state
+            err_msg = error.strip() if isinstance(error, str) and error.strip() else "Authentication failed"
+            err_type = error_type.strip() if isinstance(error_type, str) and error_type.strip() else "auth"
+            ts = _coerce_positive_timestamp(timestamp)
+            auth_errors = cast(dict[str, dict[str, Any]], state["auth_errors"])
+            auth_errors[alias] = {
+                "timestamp": ts,
+                "error": err_msg,
+                "error_type": err_type,
+            }
+            self._write_failover_state_unlocked(state)
+            return state
+
+    def clear_auth_error(self, account_name: str) -> bool:
+        """Clears an account's auth quarantine entry atomically if present."""
+        with self._failover_lock:
+            alias = account_name.strip() if isinstance(account_name, str) else ""
+            if not alias:
+                return False
+            raw, exists = _read_json_dict_safe(self.failover_state_file)
+            if not exists:
+                return False
+            state = _normalize_failover_state(raw)
+            auth_errors = cast(dict[str, dict[str, Any]], state["auth_errors"])
+            removed = auth_errors.pop(alias, None) is not None
+            if removed:
+                return self._write_failover_state_unlocked(state)
+            return False
+
+    def record_last_failover(
+        self,
+        from_account: str,
+        to_account: str,
+        trigger: str,
+        reason: str = "",
+        timestamp: float | None = None,
+    ) -> dict[str, Any]:
+        """Records the most recent hook failover event atomically at mode 0600."""
+        with self._failover_lock:
+            raw, _ = _read_json_dict_safe(self.failover_state_file)
+            state = _normalize_failover_state(raw)
+            state["last_failover"] = {
+                "timestamp": _coerce_positive_timestamp(timestamp),
+                "from_account": from_account.strip() if isinstance(from_account, str) else "",
+                "to_account": to_account.strip() if isinstance(to_account, str) else "",
+                "trigger": trigger.strip() if isinstance(trigger, str) else "",
+                "reason": reason.strip() if isinstance(reason, str) else "",
+            }
+            self._write_failover_state_unlocked(state)
+            return state
+
+    def clear_last_failover(self) -> bool:
+        """Clears last_failover metadata atomically while preserving auth_errors."""
+        with self._failover_lock:
+            raw, exists = _read_json_dict_safe(self.failover_state_file)
+            if not exists:
+                return False
+            state = _normalize_failover_state(raw)
+            had_failover = state["last_failover"] is not None
+            if had_failover:
+                state["last_failover"] = None
+                return self._write_failover_state_unlocked(state)
+            return False
+
+    def write_pending_reload(
+        self,
+        target_account: str,
+        reason: str = "in_turn_deferred_reload",
+        ttl_seconds: float | int = 120,
+        requested_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically writes cache/pending_reload.json at mode 0600."""
+        clean_target = target_account.strip() if isinstance(target_account, str) else ""
+        if not clean_target:
+            raise AgySwitchError("Target account for pending reload cannot be empty.")
+
+        clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "in_turn_deferred_reload"
+        ttl_val: float | int = 120
+        if not isinstance(ttl_seconds, bool) and isinstance(ttl_seconds, (int, float)) and math.isfinite(ttl_seconds) and ttl_seconds > 0:
+            ttl_val = ttl_seconds
+
+        payload: dict[str, Any] = {
+            "target_account": clean_target,
+            "requested_at": _coerce_positive_timestamp(requested_at),
+            "ttl_seconds": ttl_val,
+            "reason": clean_reason,
+        }
+        with self._failover_lock:
+            try:
+                self._atomic_write_json(self.pending_reload_file, payload)
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to persist pending reload marker '{self.pending_reload_file}': {exc}",
+                    file=sys.stderr,
+                )
+        return payload
+
+    def load_pending_reload(
+        self,
+        *,
+        include_expired: bool = False,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Loads cache/pending_reload.json safely, returning None if missing, corrupt, or expired."""
+        with self._failover_lock:
+            raw, _ = _read_json_dict_safe(self.pending_reload_file)
+            if not isinstance(raw, dict):
+                return None
+
+            raw_target = raw.get("target_account")
+            if not isinstance(raw_target, str) or not raw_target.strip():
+                return None
+            target_account = raw_target.strip()
+
+            raw_req = raw.get("requested_at")
+            if isinstance(raw_req, bool) or not isinstance(raw_req, (int, float)) or not math.isfinite(raw_req) or raw_req <= 0:
+                return None
+            requested_at = float(raw_req)
+
+            raw_ttl = raw.get("ttl_seconds")
+            if raw_ttl is None:
+                ttl_val: float | int = 120
+            elif isinstance(raw_ttl, bool) or not isinstance(raw_ttl, (int, float)) or not math.isfinite(raw_ttl) or raw_ttl <= 0:
+                return None
+            else:
+                ttl_val = raw_ttl
+
+            if not include_expired:
+                curr_now = _coerce_positive_timestamp(now)
+                if curr_now - requested_at > float(ttl_val):
+                    return None
+
+            raw_reason = raw.get("reason")
+            reason = raw_reason.strip() if isinstance(raw_reason, str) and raw_reason.strip() else "in_turn_deferred_reload"
+            return {
+                "target_account": target_account,
+                "requested_at": requested_at,
+                "ttl_seconds": ttl_val,
+                "reason": reason,
+            }
+
+    def clear_pending_reload(self) -> bool:
+        """Unlinks cache/pending_reload.json safely without following symlinks."""
+        with self._failover_lock:
+            try:
+                os.lstat(self.pending_reload_file)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to inspect pending reload marker '{self.pending_reload_file}': {exc}",
+                    file=sys.stderr,
+                )
+                return False
+
+            try:
+                self.pending_reload_file.unlink(missing_ok=True)
+                return True
+            except OSError as exc:
+                print(
+                    f"[agy-switch] Warning: Failed to remove pending reload marker '{self.pending_reload_file}': {exc}",
+                    file=sys.stderr,
+                )
+                return False
 
     def install_hook(
         self,
