@@ -21,6 +21,7 @@ _EXPORTS: dict[str, str] = {
     "DaemonAlreadyRunningError": "agy_switcher.exceptions",
     "AccountAuthError": "agy_switcher.exceptions",
     # Layer 0: Models
+    "DEFAULT_PENDING_RELOAD_TTL_SECONDS": "agy_switcher.models",
     "DiagnosticItem": "agy_switcher.models",
     "DiagnosticReport": "agy_switcher.models",
     "QuotaStatus": "agy_switcher.models",
@@ -28,9 +29,15 @@ _EXPORTS: dict[str, str] = {
     "AccountInfo": "agy_switcher.models",
     "RotationResult": "agy_switcher.models",
     "FleetQuotaSummary": "agy_switcher.models",
+    "PendingReloadPayload": "agy_switcher.models",
+    "TokenIdentity": "agy_switcher.models",
+    "TargetSyncSnapshot": "agy_switcher.models",
+    "TokenSyncStatus": "agy_switcher.models",
     # Layer 0: Security
     "_atomic_write_file": "agy_switcher.security",
     "_atomic_write_json": "agy_switcher.security",
+    "parse_pending_reload_payload": "agy_switcher.security",
+    "read_latest_jsonl_record": "agy_switcher.security",
     "extract_email_from_jwt": "agy_switcher.security",
     "resolve_token_email": "agy_switcher.security",
     "validate_token_dict": "agy_switcher.security",

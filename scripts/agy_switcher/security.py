@@ -20,7 +20,10 @@ import tempfile
 from typing import Any, Mapping, cast
 
 from agy_switcher.exceptions import InvalidTokenError
-from agy_switcher.models import PendingReloadPayload
+from agy_switcher.models import (
+    DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    PendingReloadPayload,
+)
 
 
 def _atomic_write_file(target_path: Path | str, content: str | bytes, mode: int = 0o600) -> None:
@@ -160,7 +163,7 @@ def parse_pending_reload_payload(raw_payload: object) -> PendingReloadPayload | 
     raw_ttl = raw_payload.get("ttl_seconds")
     ttl_val: float | int
     if raw_ttl is None:
-        ttl_val = 120
+        ttl_val = DEFAULT_PENDING_RELOAD_TTL_SECONDS
     else:
         parsed_ttl = parse_positive_finite_float(raw_ttl)
         if parsed_ttl is None:
@@ -353,6 +356,47 @@ def check_token_file(token_path: Path | str) -> tuple[bool, str | None, dict[str
     return cast(tuple[bool, str | None, dict[str, Any] | None], validate_token_file(token_path, return_tuple=True))
 
 
+def read_latest_jsonl_record(target_path: Path | str) -> dict[str, Any] | None:
+    """Reads and parses the trailing JSON object record from a JSONL transcript file."""
+    path = Path(target_path)
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return None
+        max_read = 4 * 1024 * 1024
+        chunk_size = min(size, 65536)
+        with open(path, "rb") as f:
+            while True:
+                f.seek(max(0, size - chunk_size))
+                data = f.read(min(chunk_size, size))
+                last_line_str: str | None = None
+                for line in reversed(data.splitlines()):
+                    s = line.strip().decode("utf-8", errors="replace")
+                    if s:
+                        last_line_str = s
+                        break
+                if not last_line_str:
+                    if chunk_size < size and chunk_size < max_read:
+                        chunk_size = min(size, chunk_size * 4, max_read)
+                        continue
+                    return None
+                if not last_line_str.startswith("{") and chunk_size < size and chunk_size < max_read:
+                    chunk_size = min(size, chunk_size * 4, max_read)
+                    continue
+                if not last_line_str.startswith("{"):
+                    return None
+                try:
+                    parsed = json.loads(last_line_str)
+                    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    if chunk_size < size and chunk_size < max_read:
+                        chunk_size = min(size, chunk_size * 4, max_read)
+                        continue
+                    return None
+    except OSError:
+        return None
+
+
 __all__ = [
     "_atomic_write_file",
     "_atomic_write_json",
@@ -368,4 +412,5 @@ __all__ = [
     "validate_token_file",
     "check_token_dict",
     "check_token_file",
+    "read_latest_jsonl_record",
 ]

@@ -327,6 +327,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
 
 __all__ = [
     # Layer 0
+    "DEFAULT_PENDING_RELOAD_TTL_SECONDS",
     "AgySwitchError",
     "InvalidTokenError",
     "AccountNotFoundError",
@@ -342,6 +343,12 @@ __all__ = [
     "AccountInfo",
     "RotationResult",
     "FleetQuotaSummary",
+    "PendingReloadPayload",
+    "TokenIdentity",
+    "TargetSyncSnapshot",
+    "TokenSyncStatus",
+    "parse_pending_reload_payload",
+    "read_latest_jsonl_record",
     # Layer 1
     "ProcessSupervisor",
     "format_countdown",

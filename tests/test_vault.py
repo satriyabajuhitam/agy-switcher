@@ -2771,5 +2771,104 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertIn("automator", state_after_manual["auth_errors"])
 
 
+class TestLayer0PendingReloadAndJsonlReader(unittest.TestCase):
+    """[CONVERGE-RELOAD-EDGE-002 / CONVERGE-RELOAD-ERR-002] Layer 0 TTL, TypedDicts, and JSONL reader tests."""
+
+    def test_pending_reload_default_1800s_ttl_and_override_CONVERGE_RELOAD_EDGE_002(self) -> None:
+        """[CONVERGE-RELOAD-EDGE-002] Omitted ttl_seconds normalizes to 1800 while explicit 300 is preserved."""
+        from agy_switcher import models as models_mod
+        from agy_switcher import security as security_mod
+
+        self.assertEqual(models_mod.DEFAULT_PENDING_RELOAD_TTL_SECONDS, 1800)
+        self.assertTrue(hasattr(models_mod, "TokenIdentity"))
+        self.assertTrue(hasattr(models_mod, "TargetSyncSnapshot"))
+        self.assertTrue(hasattr(models_mod, "TokenSyncStatus"))
+
+        legacy_payload = {"target_account": "work-acc", "requested_at": 1_700_000_000.0}
+        parsed_legacy = security_mod.parse_pending_reload_payload(legacy_payload)
+        self.assertIsNotNone(parsed_legacy)
+        assert parsed_legacy is not None
+        self.assertEqual(parsed_legacy["target_account"], "work-acc")
+        self.assertEqual(parsed_legacy["requested_at"], 1_700_000_000.0)
+        self.assertEqual(parsed_legacy["ttl_seconds"], 1800)
+        self.assertEqual(parsed_legacy["reason"], "in_turn_deferred_reload")
+
+        override_payload = {
+            "target_account": "work-acc",
+            "requested_at": 1_700_000_000.0,
+            "ttl_seconds": 300,
+            "reason": "sdk_disk_only_swap",
+        }
+        parsed_override = security_mod.parse_pending_reload_payload(override_payload)
+        self.assertIsNotNone(parsed_override)
+        assert parsed_override is not None
+        self.assertEqual(parsed_override["ttl_seconds"], 300)
+        self.assertEqual(parsed_override["reason"], "sdk_disk_only_swap")
+
+    def test_pending_reload_invalid_ttl_and_layer0_jsonl_reader_CONVERGE_RELOAD_ERR_002(self) -> None:
+        """[CONVERGE-RELOAD-ERR-002] Invalid TTLs return None and Layer 0 read_latest_jsonl_record handles valid/corrupt/missing files."""
+        from agy_switcher import security as security_mod
+
+        invalid_ttls: list[object] = [
+            0,
+            -60,
+            True,
+            False,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "300",
+            [],
+            {},
+        ]
+        for bad_ttl in invalid_ttls:
+            with self.subTest(bad_ttl=bad_ttl):
+                payload = {
+                    "target_account": "work-acc",
+                    "requested_at": 1_700_000_000.0,
+                    "ttl_seconds": bad_ttl,
+                }
+                self.assertIsNone(security_mod.parse_pending_reload_payload(payload))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            missing_file = tmp / "missing.jsonl"
+            self.assertIsNone(security_mod.read_latest_jsonl_record(missing_file))
+
+            empty_file = tmp / "empty.jsonl"
+            empty_file.write_text("", encoding="utf-8")
+            self.assertIsNone(security_mod.read_latest_jsonl_record(empty_file))
+
+            valid_file = tmp / "valid.jsonl"
+            valid_file.write_text(
+                json.dumps({"type": "USER_INPUT", "content": "hi"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n\n",
+                encoding="utf-8",
+            )
+            latest = security_mod.read_latest_jsonl_record(valid_file)
+            self.assertEqual(latest, {"type": "PLANNER_RESPONSE", "status": "DONE"})
+
+            corrupt_tail = tmp / "corrupt_tail.jsonl"
+            corrupt_tail.write_text(
+                json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n"
+                + '{"type": "PLANNER_RESPONSE", "status": ',
+                encoding="utf-8",
+            )
+            self.assertIsNone(security_mod.read_latest_jsonl_record(corrupt_tail))
+
+            non_dict_tail = tmp / "non_dict.jsonl"
+            non_dict_tail.write_text("[1, 2, 3]\n", encoding="utf-8")
+            self.assertIsNone(security_mod.read_latest_jsonl_record(non_dict_tail))
+
+            # Large single trailing JSON line (>64 KiB) forces chunk expansion in read_latest_jsonl_record
+            large_line_file = tmp / "large_line.jsonl"
+            large_payload = {"type": "PLANNER_RESPONSE", "status": "DONE", "padding": "x" * 80000}
+            large_line_file.write_text(json.dumps(large_payload) + "\n", encoding="utf-8")
+            self.assertEqual(security_mod.read_latest_jsonl_record(large_line_file), large_payload)
+
+            # Directory / OSError path returns None safely
+            self.assertIsNone(security_mod.read_latest_jsonl_record(tmp))
+
+
 if __name__ == "__main__":
     unittest.main()

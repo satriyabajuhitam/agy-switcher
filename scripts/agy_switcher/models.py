@@ -27,6 +27,8 @@ _CATEGORY_TO_LAYER: dict[str, int] = {
     "process": 5,
 }
 
+DEFAULT_PENDING_RELOAD_TTL_SECONDS: int = 1800
+
 
 @dataclass
 class DiagnosticItem:
@@ -269,7 +271,47 @@ class AuthProbeResult(_AuthProbeResultBase, total=False):
     quota: dict[str, object]
 
 
+class TokenIdentity(TypedDict):
+    """Normalized credential identity extracted from a token JSON payload."""
+
+    refresh_token: str
+    auth_method: str
+    email: str | None
+
+
+class _TargetSyncSnapshotBase(TypedDict):
+    synced: bool
+    status: str
+    email: str | None
+
+
+class TargetSyncSnapshot(_TargetSyncSnapshotBase, total=False):
+    """Sync verification snapshot for an individual live token target (desktop or cli)."""
+
+    path: str
+    drifted: bool
+
+
+class _TokenSyncStatusBase(TypedDict):
+    in_sync: bool
+    desktop_synced: bool
+    cli_synced: bool
+    drifted_targets: list[str]
+    desktop_email: str | None
+    cli_email: str | None
+
+
+class TokenSyncStatus(_TokenSyncStatusBase, total=False):
+    """Aggregated local-only Vault-Authoritative Sync status across Desktop and CLI targets."""
+
+    active_account: str | None
+    desktop: TargetSyncSnapshot
+    cli: TargetSyncSnapshot
+    targets: dict[str, TargetSyncSnapshot]
+
+
 __all__ = [
+    "DEFAULT_PENDING_RELOAD_TTL_SECONDS",
     "DiagnosticItem",
     "DiagnosticReport",
     "QuotaStatus",
@@ -282,4 +324,7 @@ __all__ = [
     "FailoverStateDict",
     "PendingReloadPayload",
     "AuthProbeResult",
+    "TokenIdentity",
+    "TargetSyncSnapshot",
+    "TokenSyncStatus",
 ]
