@@ -2194,5 +2194,255 @@ class TestCLISwitchPreflightAuth(unittest.TestCase):
             self.assertEqual(signals_sent[0][0], server_pid)
 
 
+class TestCLIInTurnDeferredReload(unittest.TestCase):
+    """CLI public seam tests for Ancestor Lineage Self-Kill Guard and Deferred Safe-Turn Reload."""
+
+    @staticmethod
+    def _register_account(engine: AgySwitchEngine, alias: str, email_addr: str) -> None:
+        TestCLISwitchPreflightAuth._register_account(engine, alias, email_addr)
+
+    @staticmethod
+    def _setup_in_turn_proc_lineage(
+        proc_dir: Path,
+        gemini_dir: Path,
+        *,
+        server_pid: int = 49100,
+        child_pid: int = 49110,
+        busy: bool = True,
+    ) -> Path:
+        lock_file = TestCLISwitchPreflightAuth._setup_proc_server(
+            proc_dir, gemini_dir, server_pid=server_pid, busy=busy
+        )
+        init_dir = proc_dir / "1"
+        init_dir.mkdir(parents=True, exist_ok=True)
+        (init_dir / "cmdline").write_bytes(b"/sbin/init\x00")
+        (init_dir / "stat").write_text("1 (systemd) S 0 1 1 0 -1\n", encoding="utf-8")
+
+        child_dir = proc_dir / str(child_pid)
+        child_dir.mkdir(parents=True, exist_ok=True)
+        (child_dir / "cmdline").write_bytes(b"/bin/bash\x00-c\x00agy-switch\x00")
+        (child_dir / "stat").write_text(
+            f"{child_pid} (bash) S {server_pid} {child_pid} 1 0 -1\n",
+            encoding="utf-8",
+        )
+        return lock_file
+
+    @staticmethod
+    def _make_quota_response(fraction: float) -> object:
+        return TestCLISwitchPreflightAuth._make_quota_response(fraction=fraction)
+
+    def test_in_turn_deferred_reload_auto_switch_DEFER_RELOAD_002(self) -> None:
+        """[DEFER-RELOAD-002] In-turn switch --auto downgrades to Disk-Only Swap and writes pending_reload.json."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "best-standby", "best@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=49100, child_pid=49110, busy=True
+            )
+
+            def fake_urlopen(req: object, *_args: object, **_kwargs: object) -> object:
+                headers = getattr(req, "headers", {}) or {}
+                auth = headers.get("Authorization", "")
+                if "best@example.com" in auth:
+                    return self._make_quota_response(0.95)
+                return self._make_quota_response(0.05)
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch.object(engine, "switch_tokens", wraps=engine.switch_tokens) as spy_switch, \
+                 patch("os.getpid", return_value=49110), \
+                 patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not be called in-turn")), \
+                 patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not be spawned")), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(["switch", "--auto"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            spy_switch.assert_called_once_with("best-standby", restart_server=True, force=True)
+            self.assertEqual(engine.get_active_name(), "best-standby")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_best@example.com",
+            )
+
+            pending_file = engine.pending_reload_file
+            self.assertTrue(pending_file.is_file())
+            self.assertEqual(stat.S_IMODE(pending_file.stat().st_mode), 0o600)
+            pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+            self.assertEqual(pending_data["target_account"], "best-standby")
+            self.assertEqual(pending_data["ttl_seconds"], 120)
+
+            out = stdout_buf.getvalue()
+            self.assertIn("Deferred", out)
+            self.assertIn("pending_reload.json", out)
+            self.assertNotIn("not running or no restart needed", out)
+
+    def test_in_turn_deferred_reload_inactive_watcher_guidance_DEFER_RELOAD_004(self) -> None:
+        """[DEFER-RELOAD-004] In-turn deferred switch with inactive LogWatcher prints reload guidance without spawning waiter subprocess."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=49200, child_pid=49210, busy=True
+            )
+            from agy_switcher.watcher import DaemonManager
+
+            dm = DaemonManager(
+                vault_dir=engine.vault_dir,
+                proc_dir=proc_dir,
+                gemini_dir=gemini_dir,
+            )
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("os.getpid", return_value=49210), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not be called in-turn")), \
+                 patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not be spawned")) as mock_popen, \
+                 patch.dict(os.environ, {"AGY_DISABLE_HOST_SYSTEMD": "1"}), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                self.assertIsNone(dm.get_running_pid())
+                self.assertFalse(dm.is_systemd_active())
+                exit_code = main(["switch", "work-acc", "--force"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            mock_popen.assert_not_called()
+            self.assertEqual(engine.get_active_name(), "work-acc")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_work@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_work@example.com",
+            )
+
+            pending_file = engine.pending_reload_file
+            self.assertTrue(pending_file.is_file())
+            pending_data = json.loads(pending_file.read_text(encoding="utf-8"))
+            self.assertEqual(pending_data["target_account"], "work-acc")
+            self.assertEqual(pending_data["ttl_seconds"], 120)
+
+            out = stdout_buf.getvalue()
+            self.assertIn("Deferred", out)
+            self.assertIn("LogWatcher is inactive", out)
+            self.assertIn("after the turn completes", out)
+
+    def test_in_turn_deferred_reload_active_watcher_omits_inactive_guidance(self) -> None:
+        """When LogWatcher is active (systemd or PID), deferred reload output omits inactive watcher warning."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=49300, child_pid=49310, busy=True
+            )
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("os.getpid", return_value=49310), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=AssertionError("os.kill must not be called in-turn")), \
+                 patch("subprocess.Popen", side_effect=AssertionError("subprocess.Popen must not be spawned")), \
+                 patch("agy_switcher.watcher.DaemonManager.is_systemd_active", return_value=True), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(["switch", "work-acc", "--force"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            out = stdout_buf.getvalue()
+            self.assertIn("Deferred", out)
+            self.assertNotIn("LogWatcher is inactive", out)
+
+    def test_in_turn_deferred_reload_force_restart_now_override_DEFER_RELOAD_005(self) -> None:
+        """[DEFER-RELOAD-005] --force-restart-now bypasses in-turn deferred reload and restarts language_server synchronously."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "work-acc", "work@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            server_pid = 49400
+            self._setup_in_turn_proc_lineage(
+                proc_dir, gemini_dir, server_pid=server_pid, child_pid=49410, busy=True
+            )
+
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("os.getpid", return_value=49410), \
+                 patch("urllib.request.urlopen", return_value=self._make_quota_response(0.9)), \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(
+                    ["switch", "work-acc", "--force", "--force-restart-now"],
+                    engine=engine,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(signals_sent), 1)
+            self.assertEqual(signals_sent[0][0], server_pid)
+            self.assertFalse(engine.pending_reload_file.exists())
+            self.assertIn("Restarted language_server", stdout_buf.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main()
