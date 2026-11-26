@@ -5815,13 +5815,15 @@ class TestGlobalQuiescenceAndResyncGuard(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.orig_agy_vault_dir = os.environ.get("AGY_VAULT_DIR")
         self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.gemini_dir = Path(self.tmpdir) / ".gemini"
         self.proc_dir = Path(self.tmpdir) / "proc"
         self.vault_dir = Path(self.tmpdir) / "vault"
         self.cache_dir = self.vault_dir / "cache"
-        os.environ["AGY_VAULT_DIR"] = str(self.vault_dir)
+        env_patch = patch.dict(os.environ, {"AGY_VAULT_DIR": str(self.vault_dir)})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
         self.gemini_dir.mkdir(parents=True, exist_ok=True)
         self.proc_dir.mkdir(parents=True, exist_ok=True)
@@ -5839,13 +5841,6 @@ class TestGlobalQuiescenceAndResyncGuard(unittest.TestCase):
 
         self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
         self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
-
-    def tearDown(self) -> None:
-        if self.orig_agy_vault_dir is not None:
-            os.environ["AGY_VAULT_DIR"] = self.orig_agy_vault_dir
-        else:
-            os.environ.pop("AGY_VAULT_DIR", None)
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _setup_ls_with_sidecar(self, pid: int = 500, sidecar_pid: int = 501) -> Path:
         ls_proc = self.proc_dir / str(pid)
@@ -6209,18 +6204,96 @@ class TestGlobalQuiescenceAndResyncGuard(unittest.TestCase):
         self.assertEqual(desktop_written["token"]["refresh_token"], work_payload["token"]["refresh_token"])  # type: ignore[index]
         self.assertEqual(cli_written["token"]["refresh_token"], work_payload["token"]["refresh_token"])  # type: ignore[index]
 
+    def test_converge_reload_004_1800s_ttl_preserved_across_15min_turn_and_consumed_at_quiescence(self) -> None:
+        """[CONVERGE-RELOAD-004]: A 900s-old marker with default 1800s TTL passes
+        AgySwitchEngine.load_pending_reload() as unexpired (900 <= 1800) and is consumed
+        by LogWatcher._process_pending_reload() via poll_once() at Global Quiescence.
+        """
+        from agy_switcher.vault import AgySwitchEngine
+
+        self._write_vault_account("work-acc")
+        (self.vault_dir / "active").write_text("work-acc\n", encoding="utf-8")
+        ls_proc = self._setup_ls_with_sidecar(pid=4242, sidecar_pid=4243)
+        self._setup_live_tab(ls_proc, "10", "tab-900s", {"type": "PLANNER_RESPONSE", "status": "DONE"})
+
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
+        )
+        engine.sync_active_tokens_from_vault()
+
+        fixed_now = 1_700_000_900.0
+        written = engine.write_pending_reload(
+            "work-acc",
+            reason="hook_pre_invocation_rotation",
+            requested_at=fixed_now - 900.0,
+        )
+        self.assertEqual(written["ttl_seconds"], 1800)
+        self.assertTrue(engine.pending_reload_file.is_file())
+
+        loaded = engine.load_pending_reload(now=fixed_now)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded["target_account"], "work-acc")
+        self.assertEqual(loaded["ttl_seconds"], 1800)
+
+        restart_mock = MagicMock(return_value=True)
+        engine.restart_language_server = restart_mock  # type: ignore[method-assign]
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+        )
+        self.assertTrue(watcher._is_turn_quiescent())
+        with patch("agy_switcher.watcher.time.time", return_value=fixed_now):
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        restart_mock.assert_called_once_with(force=True)
+        self.assertFalse(engine.pending_reload_file.exists())
+        self.assertIsNone(engine.load_pending_reload(now=fixed_now))
+        self.assertTrue((self.vault_dir / "watch.log").is_file())
+
+    def test_locate_language_server_pid_logs_warning_and_falls_back_on_exception(self) -> None:
+        """_locate_language_server_pid logs warning and continues to fallback candidates if one raises."""
+        self._setup_ls_with_sidecar(pid=4242, sidecar_pid=4243)
+        failing_engine = MagicMock()
+        failing_engine.vault_dir = self.vault_dir
+        failing_engine.cache_dir = self.cache_dir
+        failing_engine.gemini_dir = self.gemini_dir
+        failing_engine.get_quota_threshold.return_value = None
+        failing_engine.locate_language_server_pid.side_effect = RuntimeError("mock pid lookup failure")
+
+        watcher = LogWatcher(
+            engine=failing_engine,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+        )
+        stderr_buf = io.StringIO()
+        with patch("sys.stderr", stderr_buf):
+            pid = watcher._locate_language_server_pid()
+
+        self.assertEqual(pid, 4242)
+        self.assertIn("Warning: Failed to locate language_server PID", stderr_buf.getvalue())
+
 
 class TestContinuousDriftGuard(unittest.TestCase):
     """Behavior tests for Continuous Drift Guard in LogWatcher (spec lines 168-249)."""
 
     def setUp(self) -> None:
-        self.orig_agy_vault_dir = os.environ.get("AGY_VAULT_DIR")
         self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.gemini_dir = Path(self.tmpdir) / ".gemini"
         self.proc_dir = Path(self.tmpdir) / "proc"
         self.vault_dir = Path(self.tmpdir) / "vault"
         self.cache_dir = self.vault_dir / "cache"
-        os.environ["AGY_VAULT_DIR"] = str(self.vault_dir)
+        env_patch = patch.dict(os.environ, {"AGY_VAULT_DIR": str(self.vault_dir)})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
         self.gemini_dir.mkdir(parents=True, exist_ok=True)
         self.proc_dir.mkdir(parents=True, exist_ok=True)
@@ -6229,13 +6302,6 @@ class TestContinuousDriftGuard(unittest.TestCase):
 
         self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
         self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
-
-    def tearDown(self) -> None:
-        if self.orig_agy_vault_dir is not None:
-            os.environ["AGY_VAULT_DIR"] = self.orig_agy_vault_dir
-        else:
-            os.environ.pop("AGY_VAULT_DIR", None)
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _make_token_payload(
         self,
@@ -6896,6 +6962,48 @@ class TestContinuousDriftGuard(unittest.TestCase):
         self.assertEqual(expired_replaced["target_account"], "honey")
         self.assertEqual(expired_replaced["reason"], "desktop_drift_guard")
         self.assertGreater(expired_replaced["requested_at"], time.time() - 60.0)
+
+    def test_execute_drift_guard_signature_dispatch_and_warning_logs(self) -> None:
+        """execute_drift_guard dispatches zero-arg sync callables via inspect.signature and logs warnings on get_active_name/locate_pid exceptions."""
+        from agy_switcher.presence import execute_drift_guard
+
+        class ZeroArgEngine:
+            def __init__(self) -> None:
+                self.synced = False
+
+            def check_target_sync_status(self) -> dict[str, object]:
+                return {
+                    "in_sync": False,
+                    "drifted_targets": ["desktop"],
+                    "active_account": "honey",
+                }
+
+            def sync_active_tokens_from_vault(self) -> bool:
+                self.synced = True
+                return True
+
+            def get_active_name(self) -> str:
+                raise OSError("active pointer unreadable")
+
+        engine = ZeroArgEngine()
+        warnings: list[str] = []
+
+        def failing_locate_pid() -> int | None:
+            raise RuntimeError("proc scan error")
+
+        result = execute_drift_guard(
+            engine,
+            1_700_000_000.0,
+            pending_path=self.cache_dir / "pending_reload.json",
+            locate_pid_fn=failing_locate_pid,
+            log_dir=self.vault_dir,
+            stderr_fn=warnings.append,
+        )
+        self.assertTrue(result)
+        self.assertTrue(engine.synced)
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        self.assertTrue(any("refresh active account name" in w for w in warnings))
+        self.assertTrue(any("locate language_server PID" in w for w in warnings))
 
 
 if __name__ == '__main__':

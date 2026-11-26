@@ -24,11 +24,11 @@ from agy_switcher.models import (
     DEFAULT_PENDING_RELOAD_TTL_SECONDS,
     DiagnosticItem,
     DiagnosticReport,
-    PendingReloadPayload,
 )
 from agy_switcher.security import (
     _atomic_write_file,
     _atomic_write_json,
+    enqueue_pending_reload_fail_safe,
     extract_email_from_jwt,
     extract_token_identity,
     has_valid_id_token_or_fallback,
@@ -893,7 +893,8 @@ class DoctorEngine:
     def _locate_language_server_pid(self) -> int | None:
         """Locates the running language_server PID via engine delegate or ProcessSupervisor."""
         if self.engine is not None and hasattr(self.engine, "locate_language_server_pid"):
-            return cast(int | None, self.engine.locate_language_server_pid())
+            raw_pid = self.engine.locate_language_server_pid()
+            return raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
         return self.supervisor.locate_language_server_pid()
 
     def _enqueue_pending_reload(
@@ -904,41 +905,15 @@ class DoctorEngine:
         ttl_seconds: int = DEFAULT_PENDING_RELOAD_TTL_SECONDS,
     ) -> bool:
         """Atomically writes cache/pending_reload.json at mode 0600 without restarting language_server."""
-        if (
-            self._cache_dir is None
-            and self.engine is not None
-            and hasattr(self.engine, "write_pending_reload")
-        ):
-            try:
-                self.engine.write_pending_reload(
-                    target_account,
-                    reason=reason,
-                    ttl_seconds=ttl_seconds,
-                )
-                return True
-            except Exception as exc:
-                print(
-                    f"[agy-switch] Warning: Failed to enqueue pending reload marker: {exc}",
-                    file=sys.stderr,
-                )
-                return False
-
-        payload: PendingReloadPayload = {
-            "target_account": target_account.strip(),
-            "requested_at": time.time(),
-            "ttl_seconds": ttl_seconds,
-            "reason": reason,
-        }
-        pending_file = self.cache_dir / "pending_reload.json"
-        try:
-            _atomic_write_json(pending_file, payload, mode=0o600)
-            return True
-        except OSError as exc:
-            print(
-                f"[agy-switch] Warning: Failed to persist pending reload marker '{pending_file}': {exc}",
-                file=sys.stderr,
-            )
-            return False
+        return enqueue_pending_reload_fail_safe(
+            self.engine if self._cache_dir is None else None,
+            target_account,
+            reason=reason,
+            ttl_seconds=ttl_seconds,
+            pending_file=self.cache_dir / "pending_reload.json",
+            log_prefix="[agy-switch]",
+            catch_all_engine_errors=True,
+        )
 
     def _check_dual_sync(self) -> DiagnosticItem:
         """Layer 3: Compares Vault-Authoritative credential identities of Desktop and CLI tokens."""

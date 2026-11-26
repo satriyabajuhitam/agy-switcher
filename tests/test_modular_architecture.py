@@ -226,6 +226,7 @@ class TestModularArchitectureDAG(unittest.TestCase):
             "gzip",
             "hashlib",
             "importlib",
+            "inspect",
             "io",
             "itertools",
             "json",

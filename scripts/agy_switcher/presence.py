@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import errno
+import inspect
 import math
 import os
 from pathlib import Path
@@ -785,8 +786,25 @@ def enqueue_drift_pending_reload(
         return False
 
 
+def _accepts_targets_kwarg(fn: Callable[..., object]) -> bool:
+    """Returns True if fn accepts a 'targets' keyword argument or **kwargs."""
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    for name, param in sig.parameters.items():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if name == "targets" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
 def execute_drift_guard(
-    engine: Any,
+    engine: object,
     now: float,
     *,
     pending_path: Path | None,
@@ -815,11 +833,9 @@ def execute_drift_guard(
     if not callable(sync_fn):
         return False
     try:
-        try:
+        if _accepts_targets_kwarg(sync_fn):
             repaired = bool(sync_fn(targets=tuple(drifted_targets)))
-        except TypeError as type_exc:
-            if "argument" not in str(type_exc) and "positional" not in str(type_exc):
-                raise
+        else:
             repaired = bool(sync_fn())
     except Exception as exc:
         stderr_fn(f"[watch] Warning: Drift guard failed to repair {drifted_targets}: {exc}")
@@ -835,15 +851,16 @@ def execute_drift_guard(
             fresh_active = get_active_fn()
             if isinstance(fresh_active, str) and fresh_active.strip() and not _is_mock_object(fresh_active):
                 target_account = fresh_active.strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            stderr_fn(f"[watch] Warning: Drift guard failed to refresh active account name: {exc}")
     clean_target = target_account or "active"
 
     queued_reload = False
     if "desktop" in drifted_targets:
         try:
             ls_pid = locate_pid_fn()
-        except Exception:
+        except Exception as exc:
+            stderr_fn(f"[watch] Warning: Drift guard failed to locate language_server PID: {exc}")
             ls_pid = None
         if ls_pid is not None:
             queued_reload = enqueue_drift_pending_reload(

@@ -768,8 +768,9 @@ class LogWatcher:
         for fn in candidates:
             try:
                 val = fn()
-            except Exception:
-                return None
+            except Exception as exc:
+                self._safe_stderr_write(f"[watch] Warning: Failed to locate language_server PID: {exc}")
+                continue
             if val is None or (isinstance(val, int) and not isinstance(val, bool)):
                 return val
         return None
@@ -1097,7 +1098,7 @@ class LogWatcher:
 
     def _get_latest_transcript_record(
         self, transcript_path: str | Path | None = None
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, object] | None:
         """Reads and parses the latest JSON record from the active transcript file."""
         target_path: Path | None = None
         if transcript_path is not None:

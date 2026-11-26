@@ -33,7 +33,7 @@ from agy_switcher.models import (
     RotationResult,
 )
 from agy_switcher.rotation import RotationEngine
-from agy_switcher.security import resolve_token_email
+from agy_switcher.security import enqueue_pending_reload_fail_safe, resolve_token_email
 from agy_switcher.telemetry import normalize_model_name
 from agy_switcher.vault import AgySwitchEngine
 
@@ -216,17 +216,13 @@ def handle_soft_import_rotation(
 
 def _enqueue_sdk_pending_reload(engine: AgySwitchEngine, target_account: str) -> None:
     """Enqueues a deferred safe-turn reload marker after a Disk-Only Swap without failing rotation."""
-    try:
-        engine.write_pending_reload(
-            target_account,
-            reason="sdk_disk_only_swap",
-            ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
-        )
-    except OSError as exc:
-        print(
-            f"[agy-switch] Warning: Failed to persist pending reload marker for '{target_account}': {exc}",
-            file=sys.stderr,
-        )
+    enqueue_pending_reload_fail_safe(
+        engine,
+        target_account,
+        reason="sdk_disk_only_swap",
+        ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+        log_prefix="[agy-switch]",
+    )
 
 
 def auto_rotate_on_exhaustion(

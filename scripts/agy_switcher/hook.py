@@ -19,6 +19,7 @@ from typing import Any, Callable, cast
 
 from agy_switcher.exceptions import AgySwitchError
 from agy_switcher.models import DEFAULT_PENDING_RELOAD_TTL_SECONDS, QuotaStatus
+from agy_switcher.security import enqueue_pending_reload_fail_safe
 from agy_switcher.telemetry import (
     HTTP_SERVER_ERROR_PATTERN,
     _has_auth_indicator,
@@ -193,17 +194,13 @@ def _save_cache_fail_safe(
 
 def _enqueue_pending_reload_fail_safe(engine: AgySwitchEngine, target_account: str) -> None:
     """Enqueues Deferred Safe-Turn Reload marker fail-safely so disk errors never abort hook rotation."""
-    try:
-        engine.write_pending_reload(
-            target_account,
-            reason="hook_pre_invocation_rotation",
-            ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
-        )
-    except OSError as reload_exc:
-        print(
-            f"[agy-switch hook] Warning: Failed to persist pending reload marker: {reload_exc}",
-            file=sys.stderr,
-        )
+    enqueue_pending_reload_fail_safe(
+        engine,
+        target_account,
+        reason="hook_pre_invocation_rotation",
+        ttl_seconds=DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+        log_prefix="[agy-switch hook]",
+    )
 
 
 def _persist_failover_audit(
