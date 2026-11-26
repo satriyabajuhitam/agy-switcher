@@ -2081,6 +2081,118 @@ class TestCLISwitchPreflightAuth(unittest.TestCase):
             self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
             self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
 
+    @staticmethod
+    def _make_http_403(*_args: object, **_kwargs: object) -> object:
+        raise urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+
+    def test_force_auth_decoupling_and_sdk_default_cli_force_preserves_verify_auth_AUTH_GATE_ERR_003(self) -> None:
+        """[AUTH-GATE-ERR-003] agy-switch switch revoked-acc --force keeps verify_auth=True, exits 1 on 403, leaves live tokens untouched, and keeps language_server running."""
+        for busy_state in (False, True):
+            for no_restart in (False, True):
+                with self.subTest(server_busy=busy_state, no_restart=no_restart), tempfile.TemporaryDirectory() as tmp_dir:
+                    base = Path(tmp_dir)
+                    proc_dir = base / "proc"
+                    gemini_dir = base / ".gemini"
+                    engine = AgySwitchEngine(
+                        vault_dir=base / ".antigravity-vault",
+                        gemini_dir=gemini_dir,
+                        legacy_root=base / ".agy-cli-manager",
+                        proc_dir=proc_dir,
+                    )
+                    self._register_account(engine, "healthy-acc", "healthy@example.com")
+                    self._register_account(engine, "revoked-acc", "revoked@example.com")
+                    engine.switch_tokens("healthy-acc", restart_server=False)
+
+                    desktop_before = engine.desktop_token_file.read_text(encoding="utf-8")
+                    cli_before = engine.cli_token_file.read_text(encoding="utf-8")
+                    server_pid = 48300
+                    self._setup_proc_server(proc_dir, gemini_dir, server_pid=server_pid, busy=busy_state)
+
+                    signals_sent: list[tuple[int, int]] = []
+
+                    def fake_kill(pid: int, sig: int) -> None:
+                        signals_sent.append((pid, sig))
+
+                    argv = ["switch", "revoked-acc", "--force"]
+                    if no_restart:
+                        argv.append("--no-restart")
+
+                    stderr_buf = io.StringIO()
+                    with patch("urllib.request.urlopen", side_effect=self._make_http_403) as mock_urlopen, \
+                         patch("os.kill", side_effect=fake_kill), \
+                         patch("sys.stderr", stderr_buf):
+                        exit_code = main(argv, engine=engine)
+
+                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(mock_urlopen.call_count, 2)  # initial 403 + 1x refresh 403
+                    self.assertIn("agy-switch login revoked-acc", stderr_buf.getvalue())
+                    self.assertEqual(engine.get_active_name(), "healthy-acc")
+                    self.assertEqual(engine.desktop_token_file.read_text(encoding="utf-8"), desktop_before)
+                    self.assertEqual(engine.cli_token_file.read_text(encoding="utf-8"), cli_before)
+                    self.assertEqual(signals_sent, [])
+                    self.assertEqual(engine.locate_language_server_pid(), server_pid)
+                    failover_state = json.loads(engine.failover_state_file.read_text(encoding="utf-8"))
+                    self.assertIn("revoked-acc", failover_state.get("auth_errors", {}))
+
+    def test_force_auth_decoupling_and_sdk_default_cli_force_with_skip_auth_check(self) -> None:
+        """Combining --force and --skip-auth-check overrides busy turn guard and skips CloudCode auth check independently."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            proc_dir = base / "proc"
+            gemini_dir = base / ".gemini"
+            engine = AgySwitchEngine(
+                vault_dir=base / ".antigravity-vault",
+                gemini_dir=gemini_dir,
+                legacy_root=base / ".agy-cli-manager",
+                proc_dir=proc_dir,
+            )
+            self._register_account(engine, "primary-acc", "primary@example.com")
+            self._register_account(engine, "offline-acc", "offline@example.com")
+            engine.switch_tokens("primary-acc", restart_server=False)
+
+            server_pid = 48301
+            self._setup_proc_server(proc_dir, gemini_dir, server_pid=server_pid, busy=True)
+
+            signals_sent: list[tuple[int, int]] = []
+            terminated = False
+
+            def fake_kill(pid: int, sig: int) -> None:
+                nonlocal terminated
+                if sig == 0:
+                    if terminated:
+                        raise ProcessLookupError()
+                    return
+                signals_sent.append((pid, sig))
+                terminated = True
+
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("urllib.request.urlopen", side_effect=self._make_http_403) as mock_urlopen, \
+                 patch("os.kill", side_effect=fake_kill), \
+                 patch("sys.stdout", stdout_buf), \
+                 patch("sys.stderr", stderr_buf):
+                exit_code = main(["switch", "offline-acc", "--force", "--skip-auth-check"], engine=engine)
+
+            self.assertEqual(exit_code, 0)
+            mock_urlopen.assert_not_called()
+            self.assertEqual(engine.get_active_name(), "offline-acc")
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_offline@example.com",
+            )
+            self.assertEqual(
+                json.loads(engine.cli_token_file.read_text(encoding="utf-8"))["token"]["access_token"],
+                "ya29.token_for_offline@example.com",
+            )
+            self.assertEqual(len(signals_sent), 1)
+            self.assertEqual(signals_sent[0][0], server_pid)
+
 
 if __name__ == '__main__':
     unittest.main()
