@@ -2550,6 +2550,129 @@ class TestAgySwitchEngine(unittest.TestCase):
         self.assertIn("auth_error", listed_superseded["automator"])
         self.assertNotIn("auth_error", listed_superseded["honey"])
 
+    def test_rejected_switch_preserves_last_failover_and_status_ignores_expired_or_malformed_pending_reload(
+        self,
+    ) -> None:
+        """[AUDIT-HOOK-EDGE-004] Rejected switches preserve last_failover and get_status() ignores expired/malformed pending_reload.json."""
+        proc_dir = self.base_path / "proc_edge_004"
+        proc_dir.mkdir(parents=True, mode=0o700)
+        engine = AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            legacy_root=self.legacy_root,
+            proc_dir=proc_dir,
+        )
+        self._register_test_account(engine, "primary-acc", "primary@example.com")
+        self._register_test_account(engine, "honey", "honey@example.com")
+        self._register_test_account(engine, "standby-acc", "standby@example.com")
+        corrupt_dir = engine.accounts_dir / "corrupt-acc"
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "token.json").write_text("{corrupt-token-json", encoding="utf-8")
+
+        engine.switch_tokens("honey", restart_server=False)
+        now = 1_800_000_000.0
+        one_hour_ago = now - 3600.0
+
+        engine.record_last_failover(
+            from_account="primary-acc",
+            to_account="honey",
+            trigger="quota_rotation",
+            reason="Remaining quota 8% <= 20%",
+            timestamp=one_hour_ago,
+        )
+
+        # Case 1: Expired pending_reload.json (now - requested_at > ttl_seconds) + ActiveTurnRunningError
+        self._setup_busy_proc_server(proc_dir, self.gemini_dir, server_pid=54000)
+        engine.write_pending_reload(
+            "honey",
+            reason="in_turn_deferred_reload",
+            ttl_seconds=120,
+            requested_at=now - 121.0,
+        )
+        with self.assertRaises(ActiveTurnRunningError):
+            engine.switch_tokens("standby-acc", restart_server=True, force=False)
+
+        self.assertEqual(engine.get_active_name(), "honey")
+        with patch("agy_switcher.vault.time.time", return_value=now):
+            status_expired = engine.get_status()
+        self.assertIsInstance(status_expired.get("last_failover"), dict)
+        self.assertEqual(status_expired["last_failover"]["from_account"], "primary-acc")
+        self.assertEqual(status_expired["last_failover"]["to_account"], "honey")
+        self.assertEqual(status_expired["last_failover"]["trigger"], "quota_rotation")
+        self.assertEqual(status_expired["last_failover"]["timestamp"], one_hour_ago)
+        self.assertNotIn("pending_reload", status_expired)
+        self.assertIsNone(status_expired.get("pending_reload"))
+
+        # Case 2: Malformed / invalid pending_reload.json markers + AccountAuthError and InvalidTokenError
+        external_target = self.base_path / "external_secret.json"
+        external_target.write_text(
+            json.dumps(
+                {
+                    "target_account": "standby-acc",
+                    "requested_at": now - 5.0,
+                    "ttl_seconds": 120,
+                }
+            ),
+            encoding="utf-8",
+        )
+        malformed_markers: list[tuple[str, bytes | None]] = [
+            ("truncated_json", b"{bad-json"),
+            ("non_dict_list", b"[]"),
+            ("non_utf8_bytes", b"\xff\xfe\x00"),
+            (
+                "nan_requested_at",
+                b'{"target_account": "honey", "requested_at": NaN, "ttl_seconds": 120}',
+            ),
+            (
+                "bool_ttl",
+                json.dumps(
+                    {
+                        "target_account": "honey",
+                        "requested_at": now - 5.0,
+                        "ttl_seconds": True,
+                    }
+                ).encode("utf-8"),
+            ),
+            (
+                "missing_target",
+                json.dumps({"requested_at": now - 5.0, "ttl_seconds": 120}).encode("utf-8"),
+            ),
+            ("symlink_marker", None),
+        ]
+
+        err_403 = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403,
+            "Forbidden",
+            email.message.Message(),
+            io.BytesIO(b"Forbidden"),
+        )
+        for label, marker_bytes in malformed_markers:
+            with self.subTest(pending_reload_variant=label):
+                engine.pending_reload_file.unlink(missing_ok=True)
+                if marker_bytes is None:
+                    engine.pending_reload_file.symlink_to(external_target)
+                else:
+                    engine.pending_reload_file.write_bytes(marker_bytes)
+
+                with patch("urllib.request.urlopen", side_effect=err_403):
+                    with self.assertRaises(AccountAuthError):
+                        engine.switch_tokens("standby-acc", restart_server=False, verify_auth=True)
+
+                with self.assertRaises(InvalidTokenError):
+                    engine.switch_tokens("corrupt-acc", restart_server=False)
+
+                self.assertEqual(engine.get_active_name(), "honey")
+                with patch("agy_switcher.vault.time.time", return_value=now):
+                    status_malformed = engine.get_status()
+                self.assertIsInstance(status_malformed.get("last_failover"), dict)
+                self.assertEqual(status_malformed["last_failover"]["from_account"], "primary-acc")
+                self.assertEqual(status_malformed["last_failover"]["to_account"], "honey")
+                self.assertEqual(status_malformed["last_failover"]["timestamp"], one_hour_ago)
+                self.assertNotIn("pending_reload", status_malformed)
+                self.assertIsNone(status_malformed.get("pending_reload"))
+                self.assertIn("standby-acc", engine.load_failover_state()["auth_errors"])
+
 
 if __name__ == "__main__":
     unittest.main()
