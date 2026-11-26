@@ -607,12 +607,12 @@ The `LogWatcher` module MUST execute a **Pre-Switch Quota Probe** prior to initi
 - AND suppresses reactive rotation, preventing double-switching cascades.
 
 ### Requirement: Proactive Threshold Failover and Safe Turn Boundary in LogWatcher
-The `LogWatcher` daemon MUST actively evaluate the active account's remaining quota in `poll_once()`, trigger proactive credential rotation when the quota falls at or below the configured quota threshold (defaulting to 20% or `AgySwitchEngine.get_quota_threshold()`), ensure candidate standby accounts have healthy quota (>= 70%), evaluate the drain window heuristic (retaining active accounts if reset is within 30 minutes and remaining quota exceeds 5%), and execute account rotation and Language Server reloading (`restart_server=True, force=True`) EXCLUSIVELY at a verified **Safe Turn Boundary** where the structured conversation transcript indicates turn completion (`status == "DONE"` or `type == "USER_INPUT"`) and `ProcessSupervisor.is_server_busy()` confirms the language server is quiescent, guaranteeing that in-flight prompts, streaming inferences, and tool executions are never interrupted. In addition, `LogWatcher.poll_once()` SHALL inspect `cache/pending_reload.json` (written by **Deferred Safe-Turn Reload**): if a valid unexpired marker exists (`now - requested_at <= ttl_seconds`), `poll_once()` MUST wait until `_is_turn_quiescent()` confirms a verified **Safe Turn Boundary**, execute `restart_language_server(force=True)`, append a structured audit log entry to `watch.log`, and unlink `pending_reload.json`. While `_is_turn_quiescent()` is `False`, the reload MUST remain deferred; if `pending_reload.json` is expired (`now - requested_at > ttl_seconds`) or malformed/corrupt, `LogWatcher` MUST unlink and ignore it safely without crashing or restarting the server.
+The `LogWatcher` daemon (`scripts/agy_switcher/watcher.py`), presence detector (`scripts/agy_switcher/presence.py`), and process supervisor (`scripts/agy_switcher/supervisor.py`) MUST evaluate active account quota in `poll_once()`, trigger proactive credential rotation when quota falls at or below `AgySwitchEngine.get_quota_threshold()` (default 20%) with healthy standby quota (>= 70%) and drain-window retention (reset <= 30m and quota > 5%), and execute account rotation and Language Server reloading (`restart_server=True, force=True`) EXCLUSIVELY at a verified **Safe Turn Boundary** governed by **Global Quiescence** (amending ADR 0016 via ADR 0022). `ProcessSupervisor.has_active_child_processes(pid=None)` and `ProcessSupervisor.is_server_busy(pid=None)` SHALL exclude zombie (`Z`) processes and persistent Node.js `sidecar_sdk` child processes (`argv[0]` basename `node`/`nodejs` invoking a `sidecar_sdk` entrypoint path under `--enable_sidecars`) when detecting active turn child processes under `language_server`, while strictly classifying non-Node tool shells (such as `bash -c "grep sidecar_sdk"`) and unreadable `/proc/<pid>/cmdline` on non-zombie children as busy (`True`). When evaluating live `presence/*.lock` file descriptors held by running processes, `ProcessSupervisor.is_server_busy()` MUST inspect each locked session's `transcript.jsonl` via Layer 0 `read_latest_jsonl_record()` (preserving 5-Layer DAG independence): a locked open tab is idle ONLY when its latest JSONL record satisfies `is_transcript_record_quiescent(record)` (`dict` with trimmed case-insensitive `type == "PLANNER_RESPONSE"`, `status == "DONE"`, and absent/empty `tool_calls`), whereas any locked session with a missing, empty, unreadable, or non-quiescent transcript (`USER_INPUT`, `GENERIC`, `MESSAGE`, `IN_PROGRESS`/`RUNNING`/`STREAMING`, or `PLANNER_RESPONSE` with non-empty `tool_calls`) MUST fail safe to busy (`True`). `LogWatcher._is_turn_quiescent(transcript_path=None)` SHALL enforce **Global Quiescence**: (a) when an explicit `transcript_path` is passed, it MUST require that transcript file to exist and satisfy `is_transcript_record_quiescent()` alongside `not is_server_busy()`; (b) when live `presence/*.lock` sessions exist, EVERY open session's latest `transcript.jsonl` record MUST satisfy `is_transcript_record_quiescent(record)` AND `language_server` MUST have zero active non-sidecar child processes; and (c) when zero live `presence/*.lock` descriptors exist and zero non-sidecar child processes exist, if a fallback active transcript discovered via `PresenceDetector` exists on disk and is non-quiescent (e.g., restricted `/proc/*/fd` environments), `_is_turn_quiescent()` MUST still fail safe to `False`, whereas when zero live locks and no non-quiescent active transcript exist, the server is globally quiescent for **Deferred Safe-Turn Reload** (while `_evaluate_proactive_rotation()` still skips safely when no active session transcript exists). In addition, `LogWatcher._process_pending_reload()` SHALL consume `cache/pending_reload.json` (default TTL **1800 seconds** / 30 minutes) at a verified **Global Quiescence** boundary and enforce the **Pre/Post-Restart Re-Sync Guard**: immediately BEFORE restarting `language_server` and immediately AFTER `restart_language_server(force=True)` returns `True`, re-verify and atomically re-sync Desktop and CLI token files from the current Vault active account to eliminate shutdown **Zombie Write-Back** races, append a structured audit log entry to `watch.log`, and unlink `cache/pending_reload.json`. If `locate_language_server_pid()` explicitly returns `None` (`language_server` is stopped) when consuming a valid marker, `_process_pending_reload()` MUST atomically re-sync tokens from Vault and unlink `cache/pending_reload.json` cleanly without retrying indefinitely; conversely, if `language_server` IS running (`pid is not None`) and `restart_language_server(force=True)` returns `False` or raises an exception, `_process_pending_reload()` MUST log to `stderr`, preserve `cache/pending_reload.json` for retry, and avoid writing a false audit entry. Expired (`now - requested_at > ttl_seconds`) or malformed/corrupt `pending_reload.json` markers MUST be unlinked and ignored safely.
 
 #### Scenario: [WATCH-PROACTIVE-001] Proactive rotation triggered when active account quota reaches or falls below threshold at Safe Turn Boundary
 - GIVEN active account `"primary-acc"` with remaining Gemini quota at 14% (`fraction = 0.14 <= 0.20`)
 - AND standby account `"standby-acc"` has healthy Gemini quota (85% >= 70%)
-- AND the active transcript `transcript.jsonl` has recorded a completed turn event with `status == "DONE"`
+- AND the active transcript `transcript.jsonl` has recorded a completed turn event with `type == "PLANNER_RESPONSE"`, `status == "DONE"`, and no `tool_calls`
 - AND `ProcessSupervisor.is_server_busy()` returns `False` indicating the Language Server is idle
 - WHEN `LogWatcher.poll_once()` evaluates proactive rotation eligibility
 - THEN it recognizes the Safe Turn Boundary and initiates credential rotation to `"standby-acc"`
@@ -644,12 +644,12 @@ The `LogWatcher` daemon MUST actively evaluate the active account's remaining qu
 - THEN it evaluates that no standby account meets the 70% healthy standby threshold
 - AND suppresses proactive rotation, retaining `"primary-acc"` until actual exhaustion occurs or healthy standby quota becomes available.
 
-#### Scenario: [WATCH-PROACTIVE-005] Safe Turn Boundary verified via structured transcript record and process supervisor quiescence
-- GIVEN an active transcript tailing loop where the latest record has `type == "USER_INPUT"`
-- AND no open presence locks or active child processes exist in `/proc` for `language_server`
-- WHEN `LogWatcher._is_turn_quiescent()` or `ProcessSupervisor.is_server_busy()` is evaluated
-- THEN it confirms that the agent turn has completed and the system is waiting for user input
-- AND certifies the state as a verified Safe Turn Boundary.
+#### Scenario: [WATCH-PROACTIVE-005] Safe Turn Boundary verified via Global Quiescence (`PLANNER_RESPONSE` DONE without `tool_calls` and zero non-sidecar children)
+- GIVEN all open Antigravity sessions tracked via live `presence/*.lock` fds have latest `transcript.jsonl` records with `type == "PLANNER_RESPONSE"`, `status == "DONE"`, and no `tool_calls`
+- AND `language_server` has zero active non-sidecar child processes (persistent `sidecar_sdk` Node child ignored)
+- WHEN `LogWatcher._is_turn_quiescent()` and `ProcessSupervisor.is_server_busy()` are evaluated
+- THEN `ProcessSupervisor.is_server_busy()` returns `False`
+- AND `LogWatcher._is_turn_quiescent()` returns `True`, certifying the state as a verified **Safe Turn Boundary** under **Global Quiescence**.
 
 #### Scenario: [WATCH-PROACTIVE-ERR-001] Telemetry fetch failure during proactive quota check retains active account without false rotation
 - GIVEN `LogWatcher.poll_once()` attempts to evaluate active account quota
@@ -697,13 +697,13 @@ The `LogWatcher` daemon MUST actively evaluate the active account's remaining qu
 - THEN it enforces the 60-second damping interval
 - AND suppresses rotation until `elapsed >= 60.0` seconds.
 
-#### Scenario: [WATCH-RELOAD-001] Valid `pending_reload.json` consumed at verified Safe Turn Boundary reloads `language_server`, logs audit entry, and unlinks marker
-- GIVEN `cache/pending_reload.json` contains a valid unexpired marker (`target_account: "work-acc"`, `requested_at` within `ttl_seconds: 120`)
-- AND `LogWatcher._is_turn_quiescent()` returns `True`
-- WHEN `LogWatcher.poll_once()` runs
-- THEN it calls `engine.restart_language_server(force=True)`
-- AND appends a structured deferred-reload audit entry to `watch.log`
-- AND unlinks `cache/pending_reload.json` from disk.
+#### Scenario: [WATCH-RELOAD-001] Valid `pending_reload.json` consumed at Global Quiescence executes Pre/Post-Restart Re-Sync Guard, reloads server, logs audit entry, and unlinks marker
+- GIVEN `cache/pending_reload.json` contains a valid unexpired marker (`target_account: "work-acc"`, `requested_at` within `ttl_seconds: 1800`)
+- AND `LogWatcher._is_turn_quiescent()` returns `True` under **Global Quiescence** and `language_server` is running
+- WHEN `LogWatcher.poll_once()` runs `_process_pending_reload()`
+- THEN it atomically re-syncs Desktop and CLI tokens from the current Vault active account BEFORE calling `engine.restart_language_server(force=True)`
+- AND atomically re-syncs Desktop and CLI tokens again AFTER `restart_language_server(force=True)` completes
+- AND appends a structured deferred-reload audit entry to `watch.log` and unlinks `cache/pending_reload.json`.
 
 #### Scenario: [WATCH-RELOAD-002] Valid `pending_reload.json` deferred without restart while `_is_turn_quiescent()` is `False`
 - GIVEN `cache/pending_reload.json` contains a valid unexpired marker
@@ -722,6 +722,93 @@ The `LogWatcher` daemon MUST actively evaluate the active account's remaining qu
 - AND `LogWatcher._is_turn_quiescent()` returns `True`
 - WHEN `LogWatcher.poll_once()` executes
 - THEN it unlinks the expired `cache/pending_reload.json` without restarting `language_server` or writing a reload audit entry.
+
+#### Scenario: [GLOBAL-QUIESCENCE-001] Persistent `sidecar_sdk` child process excluded while active non-sidecar tool child marks server busy
+- GIVEN `language_server` (PID 500) has a persistent non-zombie child PID 501 whose `/proc/501/cmdline` invokes `node /opt/antigravity/sidecar_sdk/index.js`
+- AND separately a test adds non-zombie child PID 502 whose `/proc/502/cmdline` invokes `/bin/bash -c pytest`
+- WHEN `ProcessSupervisor.has_active_child_processes(500)` and `ProcessSupervisor.is_server_busy(500)` are evaluated
+- THEN with only PID 501 (`sidecar_sdk`) present, both return `False`
+- AND with PID 502 (`/bin/bash`) present, both return `True`.
+
+#### Scenario: [GLOBAL-QUIESCENCE-002] Multiple open Desktop tabs with live presence locks certify quiescent only when ALL tabs end with `PLANNER_RESPONSE` DONE and no `tool_calls`
+- GIVEN `language_server` holds open file descriptors to BOTH `presence/tab-a.lock` and `presence/tab-b.lock` plus a persistent `sidecar_sdk` child
+- AND both `brain/tab-a/.../transcript.jsonl` and `brain/tab-b/.../transcript.jsonl` end with `{"type": "PLANNER_RESPONSE", "status": "DONE"}` without `tool_calls`
+- WHEN `ProcessSupervisor.is_server_busy()` and `LogWatcher._is_turn_quiescent()` execute
+- THEN `ProcessSupervisor.is_server_busy()` returns `False` and `LogWatcher._is_turn_quiescent()` returns `True`.
+
+#### Scenario: [GLOBAL-QUIESCENCE-003] Multi-tab Global Quiescence blocks reload when one tab is idle and another open tab is mid-turn
+- GIVEN `language_server` holds open file descriptors to `presence/tab-a.lock` (latest record: `PLANNER_RESPONSE`, `DONE`, no `tool_calls`) and `presence/tab-b.lock`
+- AND `brain/tab-b/.../transcript.jsonl` ends with `{"type": "USER_INPUT", "content": "Deploy"}` OR `{"type": "GENERIC", "status": "DONE"}` OR `{"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{"name": "run_command"}]}` OR `{"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS"}`
+- WHEN `ProcessSupervisor.is_server_busy()` and `LogWatcher._is_turn_quiescent()` execute
+- THEN `ProcessSupervisor.is_server_busy()` returns `True` and `LogWatcher._is_turn_quiescent()` returns `False`, blocking reload until Tab B finishes its turn.
+
+#### Scenario: [GLOBAL-QUIESCENCE-004] Zero active presence locks and zero non-sidecar child processes certify globally quiescent for pending reload
+- GIVEN `language_server` is running with zero open `presence/*.lock` file descriptors (all Desktop tabs closed) and only a persistent `sidecar_sdk` child
+- AND `cache/pending_reload.json` contains a valid unexpired marker for `"work-acc"`
+- WHEN `LogWatcher._is_turn_quiescent()` and `LogWatcher._process_pending_reload()` execute
+- THEN `_is_turn_quiescent()` returns `True`
+- AND `_process_pending_reload()` re-syncs tokens from Vault, reloads `language_server`, logs the audit entry, and unlinks `pending_reload.json`.
+
+#### Scenario: [GLOBAL-QUIESCENCE-ERR-001] Open presence lock with missing, empty, unreadable, or partial transcript fails safe to busy
+- GIVEN a live process holds an open fd to `presence/session-new.lock`
+- AND `brain/session-new/.system_generated/logs/transcript.jsonl` is missing, 0 bytes, unreadable (`PermissionError`), or ends with truncated streaming JSON
+- WHEN `ProcessSupervisor.is_server_busy()` and `LogWatcher._is_turn_quiescent()` evaluate quiescence
+- THEN `is_server_busy()` fails safe to `True` and `_is_turn_quiescent()` returns `False`.
+
+#### Scenario: [GLOBAL-QUIESCENCE-ERR-002] Unreadable `/proc/<child_pid>/cmdline` on non-zombie child process fails safe to busy
+- GIVEN `language_server` (PID 500) has a non-zombie child PID 550 whose `/proc/550/cmdline` raises `PermissionError` or is missing
+- WHEN `ProcessSupervisor.has_active_child_processes(500)` and `ProcessSupervisor.is_server_busy(500)` execute
+- THEN PID 550 is NOT misclassified as `sidecar_sdk` and both methods fail safe returning `True`.
+
+#### Scenario: [GLOBAL-QUIESCENCE-EDGE-001] `USER_INPUT`, `GENERIC` (`DONE`), `MESSAGE` (`DONE`), and non-dict records strictly rejected as non-quiescent
+- GIVEN transcript records `{"type": "USER_INPUT", "content": "Analyze bug"}`, `{"type": "GENERIC", "status": "DONE", "content": "Tool stdout"}`, `{"type": "MESSAGE", "status": "DONE", "content": "Legacy"}`, or non-dict values (`None`, `[]`)
+- WHEN `is_transcript_record_quiescent(record)` and `LogWatcher._is_turn_quiescent(transcript_path=...)` evaluate each record
+- THEN all return `False` because none represents a completed `PLANNER_RESPONSE` (`status == "DONE"`) without `tool_calls`.
+
+#### Scenario: [GLOBAL-QUIESCENCE-EDGE-002] Legacy open presence lock without transcript preserves fail-safe busy while stale locks are still pruned
+- GIVEN `antigravity/presence/stale.lock` has no open fd in `/proc` and `antigravity-cli/presence/active.lock` has a live fd in `/proc/5100/fd/11` with no corresponding `transcript.jsonl`
+- WHEN `ProcessSupervisor.is_server_busy()` executes
+- THEN `stale.lock` is unlinked from disk, `active.lock` is preserved, and `is_server_busy()` returns `True`.
+
+#### Scenario: [GLOBAL-QUIESCENCE-EDGE-003] Non-Node shell tool child mentioning `"sidecar_sdk"` in its arguments is NOT excluded as sidecar and marks server busy
+- GIVEN `language_server` (PID 500) has a non-zombie child PID 503 whose `/proc/503/cmdline` is `/bin/bash -c "grep -r sidecar_sdk scripts/"`
+- WHEN `ProcessSupervisor.has_active_child_processes(500)` and `ProcessSupervisor.is_server_busy(500)` execute
+- THEN PID 503 is classified as an active non-sidecar tool process (`True`) so agent commands referencing `"sidecar_sdk"` are never killed mid-turn.
+
+#### Scenario: [GLOBAL-QUIESCENCE-EDGE-004] Restricted `/proc` fallback with non-quiescent active transcript and missing explicit `transcript_path` fail safe to `False`
+- GIVEN Case 1: `/proc/*/fd` returns zero live presence locks (e.g., restricted permissions or unlocked session fixture) while `PresenceDetector` discovers an active transcript ending with `{"type": "PLANNER_RESPONSE", "status": "IN_PROGRESS"}`
+- AND Case 2: `LogWatcher._is_turn_quiescent(transcript_path=nonexistent_or_empty_path)` is called explicitly
+- WHEN `LogWatcher._is_turn_quiescent()` evaluates both cases
+- THEN both return `False` safely without prematurely restarting `language_server`.
+
+#### Scenario: [RESYNC-GUARD-001] Pre/Post-Restart Re-Sync Guard runs atomic Vault sync immediately before and after server restart
+- GIVEN `cache/pending_reload.json` is valid and unexpired and `LogWatcher._is_turn_quiescent()` returns `True`
+- AND `language_server` is running
+- WHEN `LogWatcher._process_pending_reload()` executes
+- THEN `sync_active_tokens_from_vault()` (or equivalent Vault atomic re-sync) is invoked BEFORE `restart_language_server(force=True)` and invoked a second time AFTER `restart_language_server(force=True)` succeeds.
+
+#### Scenario: [RESYNC-GUARD-ERR-001] Pre-restart Vault re-sync failure aborts server restart safely without crashing watcher
+- GIVEN `cache/pending_reload.json` is valid and `_is_turn_quiescent()` returns `True`
+- AND `sync_active_tokens_from_vault()` fails (`False` or raises `OSError`) because Vault active token is missing or unreadable
+- WHEN `LogWatcher._process_pending_reload()` executes
+- THEN it logs a warning to `stderr`, aborts `restart_language_server(force=True)`, and returns `False` without crashing `poll_once()`.
+
+#### Scenario: [RESYNC-GUARD-ERR-002] Running `language_server` failing `restart_language_server(force=True)` preserves `pending_reload.json` for retry without false audit log
+- GIVEN `cache/pending_reload.json` is valid and unexpired, `_is_turn_quiescent()` returns `True`, and `locate_language_server_pid()` returns a running PID (`4242`)
+- AND `restart_language_server(force=True)` returns `False` (e.g., `PermissionError` or exit timeout) or raises an exception
+- WHEN `LogWatcher._process_pending_reload()` executes
+- THEN it logs a warning to `stderr`, preserves `cache/pending_reload.json` intact for the next polling cycle, writes NO reload audit entry to `watch.log`, and returns `False` cleanly.
+
+#### Scenario: [RESYNC-GUARD-EDGE-001] Shutdown Zombie Write-Back occurring during `restart_language_server()` is immediately healed by post-restart re-sync using latest Vault active account
+- GIVEN `cache/pending_reload.json` originally targeted `"acc1"`, Vault active has since switched to `"acc2"`, and during `restart_language_server(force=True)` the exiting server overwrites `~/.gemini/jetski-standalone-oauth-token` with stale `"acc0"`
+- WHEN `LogWatcher._process_pending_reload()` completes
+- THEN the post-restart re-sync atomically overwrites Desktop and CLI token files with `"acc2"` (the current Vault active account), eliminating the shutdown write-back race.
+
+#### Scenario: [RESYNC-GUARD-EDGE-002] Valid `pending_reload.json` when `language_server` is not running re-syncs tokens from Vault and unlinks marker cleanly
+- GIVEN `cache/pending_reload.json` contains a valid unexpired marker for `"work-acc"`
+- AND `ProcessSupervisor.locate_language_server_pid()` returns `None` (`language_server` is stopped)
+- WHEN `LogWatcher._process_pending_reload()` executes
+- THEN it atomically re-syncs Desktop and CLI tokens from Vault active account and unlinks `cache/pending_reload.json` without emitting endless retry loops.
 
 ### Requirement: Telemetry-Aware Cooldown Immunity and 5-Hour Duration Clamping
 The `LogWatcher` and `CooldownManager` modules MUST implement **Telemetry-Aware Cooldown Immunity**, eliminating unconditional exclusions of accounts in `cooldown.json` when fresh telemetry or cached data demonstrates quota recovery (>= 70%), and MUST clamp reactive cooldown durations resulting from HTTP 429 quota exhaustion strictly to the 5-hour rolling bucket reset timestamp (or default 30-minute fallback), explicitly prohibiting the application of multi-day weekly reset timestamps to cooldown records.
@@ -1258,22 +1345,22 @@ The vault switching engine (`AgySwitchEngine.switch_tokens` in `scripts/agy_swit
 - AND `switch_tokens()` immediately fails closed with `AccountAuthError`, records `"no-refresh-acc"` in `cache/failover_state.json["auth_errors"]`, and leaves live tokens unchanged.
 
 ### Requirement: Ancestor Lineage Self-Kill Guard and Deferred Safe-Turn Reload
-The process supervisor (`ProcessSupervisor.is_invoked_by_language_server` in `scripts/agy_switcher/supervisor.py`), vault engine (`AgySwitchEngine.switch_tokens` in `scripts/agy_switcher/vault.py`), CLI router (`scripts/agy_switcher/cli.py`), and agent documentation (`skills/agy-switch/SKILL.md`) MUST prevent in-turn synchronous parricide by implementing **Deferred Safe-Turn Reload** (amending ADR 0010 for in-turn sub-shell invocations). `ProcessSupervisor.is_invoked_by_language_server(pid=None, current_pid=None)` MUST walk the `ppid` ancestry chain starting from `current_pid or os.getpid()` via `self.proc_dir / str(cur_pid) / "stat"`, bounded to 64 hops with a visited-PID set for cycle protection, returning `True` if any ancestor matches the target `language_server` PID or has `cmdline` containing `language_server` and `--standalone`. When `switch_tokens(name, restart_server=True, force=True, ..., force_restart_now=False)` is invoked from an ancestor lineage of `language_server` (covering both `agy-switch switch <name> --force` and `agy-switch switch --auto`), it MUST automatically downgrade synchronous server kill into **Deferred Safe-Turn Reload**: execute an atomic **Disk-Only Swap** (updating Desktop/CLI tokens and `active`), atomically write `cache/pending_reload.json` (mode `0600`, JSON fields `target_account`, `requested_at`, `ttl_seconds: 120`, `reason`), and return `{"active": name, "email": email, "server_restarted": False, "restart_deferred": True}` without signaling `language_server`. When `LogWatcher` is inactive during an in-turn deferred switch, the CLI MUST still perform the Disk-Only Swap, write `cache/pending_reload.json` (TTL 120s), and print explicit reload guidance to stdout without spawning any ad-hoc background waiter subprocess. External terminal invocations (non-descendants of `language_server`) MUST preserve ADR 0010 synchronous `restart_language_server(force=force)` behavior (`restart_deferred=False`). An explicit `--force-restart-now` emergency flag (`force_restart_now=True`) MUST remain available to intentionally execute immediate synchronous termination mid-turn. `skills/agy-switch/SKILL.md` (Procedures C & D) MUST document the safe in-turn deferred reload behavior and prohibit forcing immediate mid-turn server kills.
+The process supervisor (`ProcessSupervisor.is_invoked_by_language_server` in `scripts/agy_switcher/supervisor.py`), security parser (`parse_pending_reload_payload` in `scripts/agy_switcher/security.py`), vault engine (`AgySwitchEngine.switch_tokens`, `AgySwitchEngine.write_pending_reload` in `scripts/agy_switcher/vault.py`), PreInvocation hook (`handle_pre_invocation_hook` in `scripts/agy_switcher/hook.py`), In-Process SDK Facade (`auto_rotate_on_exhaustion`, `switch_account` in `scripts/agy_switcher/api.py`), CLI router (`scripts/agy_switcher/cli.py`), and agent documentation (`skills/agy-switch/SKILL.md`) MUST prevent in-turn synchronous parricide and guarantee Desktop–CLI convergence via **Deferred Safe-Turn Reload** (amending ADR 0021 via ADR 0022). The default TTL for `cache/pending_reload.json` MUST be extended from `120` seconds to **`1800` seconds (30 minutes)** (`DEFAULT_PENDING_RELOAD_TTL_SECONDS = 1800`) across `write_pending_reload()`, `parse_pending_reload_payload()`, and CLI output messages so long-running agent turns do not prematurely expire queued reloads. `cache/pending_reload.json` (mode `0600`, TTL `1800` seconds) MUST be enqueued across ALL non-immediate-restart switch paths: (1) in-turn manual/auto CLI switches (`is_invoked_by_language_server() == True`, `reason="in_turn_deferred_reload"`); (2) `PreInvocation` hook rotations in `handle_pre_invocation_hook()` (`reason="hook_pre_invocation_rotation"`); and (3) In-Process SDK swaps in `api.auto_rotate_on_exhaustion()` and `api.switch_account()` when `reload_server=False` (`reason="sdk_disk_only_swap"`), keeping SDK consumers (such as `agy-telemote`) completely non-blocking (`reloaded_server=False`, zero process signals) while ensuring Desktop converges at the next **Global Quiescence** boundary via `LogWatcher`. Explicit CLI `--no-restart` MUST remain the sole opt-out suppressing `cache/pending_reload.json` creation. External terminal invocations (non-descendants of `language_server`) without `--no-restart` MUST preserve ADR 0010 synchronous `restart_language_server(force=force)` behavior (`restart_deferred=False`), and `--force-restart-now` MUST remain available as an explicit emergency mid-turn override.
 
-#### Scenario: [DEFER-RELOAD-001] In-turn `switch --force` downgrades synchronous kill to Deferred Safe-Turn Reload and writes `pending_reload.json`
+#### Scenario: [DEFER-RELOAD-001] In-turn `switch --force` downgrades synchronous kill to Deferred Safe-Turn Reload and writes `pending_reload.json` with 1800s TTL
 - GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True` (CLI executed inside an active turn sub-shell descendant of `language_server`)
 - AND standby account `"work-acc"` passes pre-flight validation
 - WHEN the agent executes `agy-switch switch work-acc --force`
 - THEN `switch_tokens()` does NOT send `SIGTERM` or `SIGKILL` to `language_server`
-- AND it completes an atomic **Disk-Only Swap** to `"work-acc"` and atomically writes `cache/pending_reload.json` with mode `0600`, `target_account: "work-acc"`, `ttl_seconds: 120`, `requested_at`, and `reason`
-- AND `switch_tokens()` returns `restart_deferred=True` with `server_restarted=False`, and the CLI exits `0` reporting deferred reload.
+- AND it completes an atomic **Disk-Only Swap** to `"work-acc"` and atomically writes `cache/pending_reload.json` with mode `0600`, `target_account: "work-acc"`, `ttl_seconds: 1800`, `requested_at`, and `reason: "in_turn_deferred_reload"`
+- AND `switch_tokens()` returns `restart_deferred=True` with `server_restarted=False`, and the CLI exits `0` reporting deferred reload with 30-minute (1800s) TTL.
 
-#### Scenario: [DEFER-RELOAD-002] In-turn `switch --auto` selects optimal standby, performs Disk-Only Swap, and writes `pending_reload.json` without killing parent server
+#### Scenario: [DEFER-RELOAD-002] In-turn `switch --auto` selects optimal standby, performs Disk-Only Swap, and writes `pending_reload.json` with 1800s TTL without killing parent server
 - GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True`
 - AND `RotationEngine` selects `"best-standby"` as optimal for `"gemini"`
 - WHEN the agent executes `agy-switch switch --auto`
 - THEN `switch_tokens("best-standby", restart_server=True, force=True)` downgrades to **Deferred Safe-Turn Reload**
-- AND writes `cache/pending_reload.json` with `target_account: "best-standby"` and `ttl_seconds: 120` without interrupting the active agent turn.
+- AND writes `cache/pending_reload.json` with `target_account: "best-standby"` and `ttl_seconds: 1800` without interrupting the active agent turn.
 
 #### Scenario: [DEFER-RELOAD-003] External terminal `switch --force` preserves ADR 0010 synchronous `language_server` restart
 - GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `False` (invoked from an external user shell)
@@ -1282,11 +1369,11 @@ The process supervisor (`ProcessSupervisor.is_invoked_by_language_server` in `sc
 - THEN `switch_tokens()` synchronously calls `restart_language_server(force=True)` after atomic disk swap
 - AND no `cache/pending_reload.json` marker is written and `switch_tokens()` returns `server_restarted=True` and `restart_deferred=False`.
 
-#### Scenario: [DEFER-RELOAD-004] In-turn deferred switch when `LogWatcher` is inactive writes TTL marker and prints stdout guidance without spawning waiter subprocess
+#### Scenario: [DEFER-RELOAD-004] In-turn deferred switch when `LogWatcher` is inactive writes 1800s TTL marker and prints stdout guidance without spawning waiter subprocess
 - GIVEN `ProcessSupervisor.is_invoked_by_language_server()` returns `True`
 - AND `DaemonManager.get_running_pid()` returns `None` and `is_systemd_active()` returns `False`
 - WHEN `agy-switch switch work-acc --force` executes in-turn
-- THEN `switch_tokens()` still executes the Disk-Only Swap and writes `cache/pending_reload.json` (`ttl_seconds: 120`)
+- THEN `switch_tokens()` still executes the Disk-Only Swap and writes `cache/pending_reload.json` (`ttl_seconds: 1800`)
 - AND stdout prints explicit guidance noting that `LogWatcher` is inactive and the Desktop server can be reloaded after the turn completes
 - AND zero background waiter subprocesses (`subprocess.Popen`) are spawned.
 
@@ -1322,6 +1409,59 @@ The process supervisor (`ProcessSupervisor.is_invoked_by_language_server` in `sc
 - WHEN `agy-switch switch --auto --force-restart-now` executes in-turn with optimal standby `"best-standby"`, and separately `agy-switch switch work-acc --force-restart-now` executes without `--force`
 - THEN `switch --auto --force-restart-now` sets `force=True` and `force_restart_now=True`, performing synchronous `restart_language_server(force=True)` immediately
 - AND `switch work-acc --force-restart-now` without `--force` enforces `verify_turn_safety(force=False)`, raising `ActiveTurnRunningError` (exit code `2`) without mutating disk.
+
+#### Scenario: [CONVERGE-RELOAD-001] `PreInvocation` hook enqueues `pending_reload.json` (1800s TTL) after rotating accounts
+- GIVEN active account `"primary-acc"` fails auth or drops below threshold and `handle_pre_invocation_hook(engine)` rotates to `"standby-acc"`
+- WHEN `handle_pre_invocation_hook(engine)` completes the atomic **Disk-Only Swap**
+- THEN it atomically writes `cache/pending_reload.json` (mode `0600`) with `target_account: "standby-acc"`, `ttl_seconds: 1800`, and `reason: "hook_pre_invocation_rotation"`
+- AND does NOT synchronously restart `language_server` mid-turn.
+
+#### Scenario: [CONVERGE-RELOAD-002] In-Process SDK `auto_rotate_on_exhaustion(reload_server=False)` enqueues `pending_reload.json` while remaining non-blocking and zero-`/proc`
+- GIVEN active account `"primary-acc"` is exhausted and standby account `"standby-acc"` has available Gemini quota
+- WHEN an external consumer invokes `api.auto_rotate_on_exhaustion(model="gemini", reload_server=False, engine=engine)`
+- THEN it performs the atomic **Disk-Only Swap** without calling `locate_language_server_pid()`, `is_server_busy()`, or `restart_language_server()`, without modifying presence locks (`RotationResult.reloaded_server == False`)
+- AND atomically writes `cache/pending_reload.json` (mode `0600`) with `target_account: "standby-acc"`, `ttl_seconds: 1800`, and `reason: "sdk_disk_only_swap"`.
+
+#### Scenario: [CONVERGE-RELOAD-003] In-Process SDK `switch_account(name, reload_server=False)` enqueues `pending_reload.json` while remaining non-blocking and zero-`/proc`
+- GIVEN vault account `"personal"` exists with valid credentials
+- WHEN an external consumer invokes `api.switch_account("personal", reload_server=False, engine=engine)`
+- THEN it performs the atomic **Disk-Only Swap** returning `True` without calling `locate_language_server_pid()`, `is_server_busy()`, or `restart_language_server()` and without modifying presence locks
+- AND atomically writes `cache/pending_reload.json` (mode `0600`) with `target_account: "personal"`, `ttl_seconds: 1800`, and `reason: "sdk_disk_only_swap"`.
+
+#### Scenario: [CONVERGE-RELOAD-004] Extended 1800-second TTL preserves pending reload across long-running 15-minute agent turns
+- GIVEN `cache/pending_reload.json` was written 900 seconds (15 minutes) ago with default `ttl_seconds: 1800`
+- WHEN `AgySwitchEngine.load_pending_reload()` and `LogWatcher._process_pending_reload()` evaluate the marker at a verified **Global Quiescence** boundary
+- THEN the marker is recognized as unexpired (`900 <= 1800`) and consumed normally to reload `language_server`.
+
+#### Scenario: [CONVERGE-RELOAD-ERR-001] Failure writing `pending_reload.json` during hook or SDK swap degrades gracefully without failing rotation
+- GIVEN `engine.write_pending_reload()` encounters `PermissionError` or `ENOSPC` on `cache/pending_reload.json`
+- WHEN `handle_pre_invocation_hook()`, `api.auto_rotate_on_exhaustion(reload_server=False)`, or `api.switch_account(..., reload_server=False)` executes
+- THEN the disk write warning is emitted to `stderr` without raising an uncaught exception
+- AND the atomic token swap still succeeds and returns its normal success result.
+
+#### Scenario: [CONVERGE-RELOAD-ERR-002] Invalid, negative, zero, boolean, or non-finite `ttl_seconds` sanitized on write and rejected on parse
+- GIVEN `ttl_seconds` values `0`, `-60`, `True`, `float("nan")`, or `float("inf")`
+- WHEN passed to `AgySwitchEngine.write_pending_reload()` or parsed from disk by `parse_pending_reload_payload()`
+- THEN `write_pending_reload()` falls back safely to `DEFAULT_PENDING_RELOAD_TTL_SECONDS` (`1800`)
+- AND `parse_pending_reload_payload()` rejects explicitly invalid `ttl_seconds` payloads by returning `None` so corrupt markers are pruned.
+
+#### Scenario: [CONVERGE-RELOAD-EDGE-001] Explicit CLI `--no-restart` suppresses `pending_reload.json` creation
+- GIVEN an operator invokes `agy-switch switch work-acc --no-restart` (either in-turn or from an external terminal)
+- WHEN `cli.main()` dispatches `engine.switch_tokens("work-acc", restart_server=False, ...)`
+- THEN live Desktop/CLI tokens and Vault active pointer are updated atomically
+- AND `cache/pending_reload.json` is NOT created.
+
+#### Scenario: [CONVERGE-RELOAD-EDGE-002] Legacy `pending_reload.json` omitting `ttl_seconds` normalizes to 1800s default while preserving explicit overrides
+- GIVEN a legacy `pending_reload.json` payload `{"target_account": "work-acc", "requested_at": 1700000000.0}` without `ttl_seconds` and a second payload specifying `"ttl_seconds": 300`
+- WHEN `parse_pending_reload_payload()` parses both payloads
+- THEN the first payload normalizes `ttl_seconds` to `1800`
+- AND the second payload preserves `ttl_seconds: 300`.
+
+#### Scenario: [CONVERGE-RELOAD-EDGE-003] Non-rotating hook Tier 1 pass and exhausted SDK `auto_rotate_on_exhaustion` never create spurious `pending_reload.json`
+- GIVEN Case 1: `handle_pre_invocation_hook(engine)` exits via Tier 1 healthy cache fast-path or retains the active account
+- AND Case 2: `api.auto_rotate_on_exhaustion(reload_server=False, engine=engine)` returns `success=False` (Fleet Exhaustion)
+- WHEN each operation completes
+- THEN `cache/pending_reload.json` is NOT created or modified.
 
 ### Requirement: Failover Audit Trail and Persistent Auth Quarantine in PreInvocation Hook
 The PreInvocation hook (`handle_pre_invocation_hook` in `scripts/agy_switcher/hook.py`), secure logger (`append_secure_log_entry` in `scripts/agy_switcher/presence.py`), vault engine (`AgySwitchEngine` in `scripts/agy_switcher/vault.py`), telemetry fetcher (`fetch_account_quota` in `scripts/agy_switcher/telemetry.py`), and CLI formatters (`format_status_report`, `format_accounts_table`, `format_accounts_listicle` in `scripts/agy_switcher/formatters.py`) MUST implement **Failover Audit & Auth Quarantine**. On every hook rotation/failover (`target_account != active_name`), `handle_pre_invocation_hook()` MUST perform dual persistence: (1) append a structured chronological audit line (`trigger: auth_corruption` or `trigger: quota_rotation`) to `watch.log` via `presence.py:append_secure_log_entry()` (mode `0600`, symlink-safe, isolated under **Mock Vault Isolation**); and (2) atomically update `cache/failover_state.json` (mode `0600`, separate from `last_known_quota.json` to preserve ADR 0020 `<40ms` Tier 1 fast-path and cache sanitization compatibility) recording `last_failover` (`timestamp`, `from_account`, `to_account`, `trigger`, `reason`) and, when `auth_corruption` occurred, persisting `auth_errors[<alias>]` (`timestamp`, `error`, `error_type`). On `auth_corruption`, the hook's `injectSteps[0].ephemeralMessage` MUST explicitly identify the failed account, the auth failure reason, and `agy-switch login <alias>` remediation while preserving the backward-compatible substring `"Auto-rotated to **{target_account}**"`. Entries in `auth_errors[<alias>]` MUST persist until explicitly cleared by a successful `login_account()`, `add_account()`, or a successful live quota probe (`fetch_account_quota()` returning valid quota without error). `AgySwitchEngine.get_status()` and `format_status_report()` MUST surface `Last Failover` whenever `last_failover` is `<= 24 hours` old and has not been superseded by a subsequent successful manual switch, and MUST surface `Pending Reload` whenever an active unexpired `cache/pending_reload.json` marker exists. `AgySwitchEngine.list_accounts()`, `format_accounts_table()`, and `format_accounts_listicle()` MUST expose `auth_error` status and render an `(Auth Error)` badge for quarantined accounts.
@@ -1396,3 +1536,241 @@ The PreInvocation hook (`handle_pre_invocation_hook` in `scripts/agy_switcher/ho
 - WHEN `agy-switch status` executes
 - THEN `Last Failover` remains surfaced because the failed manual switch did not supersede it
 - AND `Pending Reload` is omitted safely without crashing on the expired or malformed marker.
+
+### Requirement: Vault-Authoritative Sync and Token Identity Drift Detection
+The security primitives (`extract_token_identity`, `token_credentials_match` in `scripts/agy_switcher/security.py`), data models (`TokenIdentity`, `TokenSyncStatus`, `TargetSyncSnapshot` in `scripts/agy_switcher/models.py`), vault engine (`AgySwitchEngine.check_target_sync_status`, `AgySwitchEngine.sync_active_tokens_from_vault`, `AgySwitchEngine.update_account_access_token` in `scripts/agy_switcher/vault.py`), CLI parser (`build_parser` in `scripts/agy_switcher/cli.py`), and **Self-Healing Diagnostics** (`DoctorEngine.run_diagnostics`, `DoctorEngine.fix_diagnostics` in `scripts/agy_switcher/doctor.py`) MUST enforce **Vault-Authoritative Sync** as the single source of truth. `~/.antigravity-vault/active` and `accounts/<alias>/token.json` MUST be the sole canonical authority; bidirectional sync, implicit desktop-follow adoption, and any `adopt-desktop` CLI subcommand or flag MUST NOT exist. `token_credentials_match(vault_data, target_data)` MUST verify credential identity locally (zero HTTP) by comparing non-empty trimmed `token.refresh_token`, `auth_method`, and case-insensitive trimmed resolved email identity (`resolve_token_email()` when both sides expose an email), treating benign runtime differences (such as Desktop Go `writer_id`, nanosecond `expiry` formatting, a same-account refreshed `access_token`, or one-sided omitted email when `refresh_token` and `auth_method` match) as synced while classifying any missing/empty required identity field or `refresh_token`, `auth_method`, or email mismatch (including **Zombie Write-Back**) as drift. `AgySwitchEngine.check_target_sync_status()` MUST inspect `desktop_token_file` and `cli_token_file` via symlink-safe `read_json_dict_nofollow()` without following external symlinks or making HTTP requests. `AgySwitchEngine.sync_active_tokens_from_vault()` MUST validate the Vault active account's `token.json` before atomically repairing requested live target files (`0600`) via `os.replace` (replacing symlinked target paths without mutating external symlink targets, and returning `False` with a `stderr` warning on `OSError` / `PermissionError` / `ENOSPC`). `AgySwitchEngine.update_account_access_token()` MUST only sync live target files when `name == self.get_active_name()`, and if `desktop_token_file` had drifted to a different account identity while `language_server` is running prior to syncing, it MUST enqueue `cache/pending_reload.json` (`reason="desktop_drift_on_token_refresh"`, `ttl_seconds=1800`) so token refresh never masks in-memory Desktop drift. `DoctorEngine.run_diagnostics()` Layer 3 (`dual_sync`) MUST align with `token_credentials_match()` so routine same-account Desktop `access_token` refreshes report `[PASS]`, and when `DoctorEngine.fix_diagnostics()` repairs a `dual_sync` anomaly where Desktop credentials were missing, corrupt, or drifted from Vault and `language_server` is running (whether idle or busy), it MUST heal live targets from Vault via **Atomic Swap** and enqueue `cache/pending_reload.json` (`reason="doctor_dual_sync_repair"`, `ttl_seconds=1800`) without synchronously restarting or killing `language_server`.
+
+#### Scenario: [VAULT-SYNC-001] Matching Desktop and CLI credential identities report synced despite benign Go runtime metadata
+- GIVEN Vault active account `"primary-acc"` has `refresh_token="rt-primary"`, `auth_method="oauth"`, and email `"primary@example.com"`
+- AND `~/.gemini/jetski-standalone-oauth-token` contains the identical `refresh_token="rt-primary"`, `auth_method="oauth"`, and `"primary@example.com"` alongside extra Desktop Go fields (`"writer_id": "ls-991"`, nanosecond `expiry`, and a freshly rotated `access_token`)
+- AND `~/.gemini/antigravity-cli/antigravity-oauth-token` matches `"primary-acc"`
+- WHEN `token_credentials_match()` and `AgySwitchEngine.check_target_sync_status()` execute
+- THEN both Desktop and CLI targets are classified as synced (`in_sync=True`, `drifted_targets=[]`)
+- AND zero disk writes or HTTP calls occur.
+
+#### Scenario: [VAULT-SYNC-002] Desktop Zombie Write-Back detected as drift and healed atomically back to Vault
+- GIVEN Vault active account is `"work-acc"` (`refresh_token="rt-work"`, email `"work@example.com"`)
+- AND `~/.gemini/jetski-standalone-oauth-token` was overwritten by `language_server` **Zombie Write-Back** with stale account `"old-acc"` (`refresh_token="rt-old"`, email `"old@example.com"`, `"writer_id": "go-ls"`)
+- WHEN `AgySwitchEngine.check_target_sync_status()` runs followed by `AgySwitchEngine.sync_active_tokens_from_vault()`
+- THEN `check_target_sync_status()` reports `in_sync=False`, `desktop_synced=False`, `drifted_targets=["desktop"]`, and `desktop_email="old@example.com"`
+- AND `sync_active_tokens_from_vault()` atomically overwrites `~/.gemini/jetski-standalone-oauth-token` with `"work-acc"`'s Vault payload at mode `0600` without modifying `~/.antigravity-vault/active`.
+
+#### Scenario: [VAULT-SYNC-003] `DoctorEngine.fix_diagnostics()` repairs Desktop drift from Vault and enqueues `pending_reload.json` when `language_server` is running
+- GIVEN Vault active account is `"work-acc"` and `language_server` is running (`locate_language_server_pid()` returns PID `4242`)
+- AND `~/.gemini/jetski-standalone-oauth-token` drifted to stale account `"old-acc"` while CLI matches `"work-acc"`
+- WHEN `DoctorEngine.run_diagnostics()` and `DoctorEngine.fix_diagnostics(report)` execute
+- THEN the `dual_sync` `DiagnosticItem` initially flags `[FAIL]` (`can_fix=True`) naming Desktop desync
+- AND `fix_diagnostics()` atomically re-syncs Desktop and CLI from Vault `"work-acc"` without calling `restart_language_server()`
+- AND writes `cache/pending_reload.json` (mode `0600`) with `target_account="work-acc"`, `ttl_seconds=1800`, and `reason="doctor_dual_sync_repair"`.
+
+#### Scenario: [VAULT-SYNC-004] Strict `agy-switch` workflow exposes zero `adopt-desktop` or bidirectional sync CLI surfaces
+- GIVEN the `agy_switcher.cli` argument parser built by `build_parser()`
+- WHEN callers inspect registered subcommands and flags or invoke `agy-switch adopt-desktop`
+- THEN no `adopt-desktop` or `sync --from-desktop` subcommand or flag exists in `build_parser()`
+- AND invoking `agy-switch adopt-desktop` fails cleanly via `argparse` with exit code `2`.
+
+#### Scenario: [VAULT-SYNC-005] `update_account_access_token()` detects pre-existing Desktop drift on active account refresh and enqueues `pending_reload.json`
+- GIVEN Vault active account is `"work-acc"` and `language_server` is running
+- AND `~/.gemini/jetski-standalone-oauth-token` currently contains drifted **Zombie Write-Back** credentials for `"old-acc"` (`refresh_token="rt-old"`)
+- WHEN `AgySwitchEngine.update_account_access_token("work-acc", "ya29.fresh-token", expiry="2027-01-01T00:00:00Z")` executes
+- THEN `accounts/work-acc/token.json`, Desktop token, and CLI token are all updated atomically with `"work-acc"`'s refreshed access token
+- AND `cache/pending_reload.json` is atomically written (`target_account="work-acc"`, `ttl_seconds=1800`, `reason="desktop_drift_on_token_refresh"`) so `language_server` RAM drift is not masked.
+
+#### Scenario: [VAULT-SYNC-ERR-001] Corrupt, truncated, or non-dict Desktop/CLI token JSON flagged as drift without crashing
+- GIVEN Vault active account `"work-acc"` has valid `token.json`
+- AND `~/.gemini/jetski-standalone-oauth-token` contains truncated JSON `{"token":` or a JSON list `[]`
+- WHEN `AgySwitchEngine.check_target_sync_status()` executes
+- THEN it catches parse errors cleanly without raising exceptions
+- AND reports `in_sync=False`, `desktop_synced=False`, and `drifted_targets=["desktop"]`.
+
+#### Scenario: [VAULT-SYNC-ERR-002] Symlinked or unreadable target token files rejected via `O_NOFOLLOW` without reading or writing external targets
+- GIVEN `~/.gemini/jetski-standalone-oauth-token` is a symlink pointing to an external file `/tmp/external-secret` (or has mode `0000` raising `PermissionError`)
+- WHEN `AgySwitchEngine.check_target_sync_status()` runs
+- THEN `read_json_dict_nofollow()` refuses to follow the symlink and catches `OSError` safely
+- AND reports `desktop_synced=False` with `"desktop"` in `drifted_targets` without leaking or mutating `/tmp/external-secret`.
+
+#### Scenario: [VAULT-SYNC-ERR-003] `sync_active_tokens_from_vault()` aborts without mutating live targets when Vault active token is missing or invalid
+- GIVEN `~/.antigravity-vault/active` points to `"broken-acc"` whose `token.json` is missing or fails `validate_token_file()`
+- AND existing live Desktop and CLI token files exist on disk
+- WHEN `AgySwitchEngine.sync_active_tokens_from_vault()` is invoked
+- THEN it returns `False` without overwriting or deleting the live Desktop or CLI token files.
+
+#### Scenario: [VAULT-SYNC-ERR-004] `sync_active_tokens_from_vault()` handles `PermissionError` / `ENOSPC` safely and replaces symlinked targets atomically without mutating external files
+- GIVEN Vault active account `"work-acc"` has valid `token.json`
+- AND Case 1: `~/.gemini/jetski-standalone-oauth-token` is a symlink pointing to `/tmp/external-secret`
+- AND Case 2: writing `~/.gemini/jetski-standalone-oauth-token` raises `PermissionError` or `OSError(ENOSPC)`
+- WHEN `AgySwitchEngine.sync_active_tokens_from_vault()` executes
+- THEN in Case 1 `os.replace()` replaces the symlink itself with a regular `0600` file for `"work-acc"` while leaving `/tmp/external-secret` completely unmodified
+- AND in Case 2 it logs a diagnostic warning to `stderr` and returns `False` without raising an unhandled exception.
+
+#### Scenario: [VAULT-SYNC-EDGE-001] CLI-only drift repaired by `DoctorEngine.fix_diagnostics()` does not enqueue Desktop `pending_reload.json`
+- GIVEN Vault active account `"work-acc"` matches `~/.gemini/jetski-standalone-oauth-token` and `language_server` is running
+- AND only `~/.gemini/antigravity-cli/antigravity-oauth-token` drifted to `"old-acc"`
+- WHEN `DoctorEngine.run_diagnostics()` and `DoctorEngine.fix_diagnostics(report)` execute
+- THEN CLI token is atomically restored to `"work-acc"`
+- AND `cache/pending_reload.json` is NOT created because Desktop credentials were already synchronized.
+
+#### Scenario: [VAULT-SYNC-EDGE-002] `DoctorEngine.fix_diagnostics()` omits `pending_reload.json` when Desktop drifted while `language_server` is stopped
+- GIVEN Vault active account `"work-acc"` has drifted Desktop token on disk
+- AND `locate_language_server_pid()` returns `None` (`language_server` is not running)
+- WHEN `DoctorEngine.fix_diagnostics(report)` repairs `dual_sync`
+- THEN Desktop and CLI tokens are atomically restored from Vault `"work-acc"`
+- AND no `cache/pending_reload.json` marker is written because no running server holds stale memory.
+
+#### Scenario: [VAULT-SYNC-EDGE-003] Refreshing a standby account via `update_account_access_token()` never mutates live Desktop or CLI tokens
+- GIVEN Vault active account is `"work-acc"` and standby account is `"standby-acc"`
+- WHEN `AgySwitchEngine.update_account_access_token("standby-acc", "ya29.standby-fresh")` executes
+- THEN only `accounts/standby-acc/token.json` is updated atomically
+- AND live Desktop token, live CLI token, and `cache/pending_reload.json` remain completely untouched.
+
+#### Scenario: [VAULT-SYNC-EDGE-004] `token_credentials_match()` normalizes email case/whitespace, tolerates one-sided missing email, and rejects missing required identity fields
+- GIVEN a Vault token with `refresh_token="rt-1"`, `auth_method="oauth"`, and email `"Honey@Example.COM"`
+- WHEN `token_credentials_match()` compares it against (a) a target with `" honey@example.com "` and matching `refresh_token`/`auth_method`, (b) a target omitting both `id_token` and `id_token_email` with matching `refresh_token`/`auth_method`, (c) a target with matching `refresh_token`/`auth_method` but differing email `"other@example.com"`, and (d) a target with empty/missing `refresh_token` or `auth_method`
+- THEN cases (a) and (b) return `True`
+- AND cases (c) and (d) return `False`.
+
+#### Scenario: [VAULT-SYNC-EDGE-005] `DoctorEngine.run_diagnostics()` passes on same-account refreshed `access_token` and `fix_diagnostics()` never synchronously restarts a busy `language_server`
+- GIVEN Vault active account `"work-acc"` (`refresh_token="rt-work"`, `auth_method="oauth"`, `"work@example.com"`)
+- AND Case 1: Desktop token contains the same `refresh_token`, `auth_method`, and email with a newer `access_token` and `"writer_id"`
+- AND Case 2: Desktop token drifted to `"old-acc"` while `language_server` is running and busy (`is_server_busy() == True`)
+- WHEN `DoctorEngine.run_diagnostics()` and `DoctorEngine.fix_diagnostics(report)` execute
+- THEN Case 1 reports `dual_sync` status `[PASS]` (`can_fix=False`)
+- AND Case 2 repairs disk atomically, enqueues `cache/pending_reload.json` (`reason="doctor_dual_sync_repair"`, `ttl_seconds=1800`), and NEVER invokes `restart_language_server()` mid-turn.
+
+### Requirement: Continuous Drift Guard in LogWatcher
+The background watcher daemon (`LogWatcher.check_and_heal_token_drift` and `LogWatcher.poll_once` in `scripts/agy_switcher/watcher.py`, plus `format_drift_guard_audit_line` in `scripts/agy_switcher/presence.py`) MUST implement a lightweight, throttled, local-only (zero HTTP) **Continuous Drift Guard**. On each `poll_once()` iteration, once `drift_check_interval` seconds have elapsed since the previous check (default `5.0` seconds, configurable via constructor parameter; non-finite, negative, or boolean values sanitized safely to `5.0`, while `0.0` disables throttling for deterministic tests), `LogWatcher.check_and_heal_token_drift(force=False)` MUST compare Desktop (`jetski-standalone-oauth-token`) and CLI (`antigravity-oauth-token`) credential identities against the current Vault active account via `check_target_sync_status()` / `token_credentials_match()`. When `engine` lacks `check_target_sync_status()` or returns a non-mapping/mocked status lacking concrete `in_sync` (`bool`) and `drifted_targets` (`list`/`tuple`), `check_and_heal_token_drift()` MUST no-op safely without modifying files or writing `watch.log`. When concrete drift is detected (including **Zombie Write-Back**), `LogWatcher` MUST: (1) re-verify the current Vault active account immediately before writing so concurrent switches (including same-cycle reactive 429 failovers) are never reverted; (2) atomically repair only the diverged live file(s) via **Atomic Swap** (`0600`) from Vault without following symlinks; (3) if the Desktop token drifted and `language_server` is running (`locate_language_server_pid() is not None`), atomically enqueue `cache/pending_reload.json` with `target_account=active`, `reason="desktop_drift_guard"`, and `ttl_seconds=1800` without interrupting active turns; (4) if only the CLI token drifted while Desktop remains in sync, repair CLI without enqueueing a Desktop server reload; and (5) append a structured drift-healing audit line to `watch.log` (mode `0600`, strictly honoring **Mock Vault Isolation**). Missing/corrupt/unreadable target files, symlink tampering, `PermissionError`/`ENOSPC`, or an unconfigured Vault active account MUST fail safe with `stderr` warnings and MUST NEVER crash `LogWatcher.poll_once()`.
+
+#### Scenario: [DRIFT-GUARD-001] Desktop Zombie Write-Back healed atomically with `pending_reload.json` and `watch.log` audit entry
+- GIVEN `LogWatcher` is monitoring an isolated vault with active account `"honey"` and `language_server` is running
+- AND `~/.gemini/jetski-standalone-oauth-token` was overwritten by **Zombie Write-Back** containing `"automator"` (`refresh_token="rt-auto"`, `"writer_id": "go-ls"`)
+- WHEN `LogWatcher.poll_once()` runs after `drift_check_interval` has elapsed
+- THEN `check_and_heal_token_drift()` atomically restores `~/.gemini/jetski-standalone-oauth-token` to `"honey"` (mode `0600`)
+- AND writes `cache/pending_reload.json` with `target_account="honey"`, `reason="desktop_drift_guard"`, and `ttl_seconds=1800`
+- AND appends a structured drift-guard audit entry naming `"honey"` and `"desktop"` to the isolated `watch.log` (mode `0600`) without making any HTTP calls.
+
+#### Scenario: [DRIFT-GUARD-002] CLI-only token drift healed atomically without queueing Desktop server reload
+- GIVEN active account `"honey"` matches `~/.gemini/jetski-standalone-oauth-token` and `language_server` is running
+- AND `~/.gemini/antigravity-cli/antigravity-oauth-token` drifted to `"stale-acc"`
+- WHEN `LogWatcher.poll_once()` runs `check_and_heal_token_drift()`
+- THEN `~/.gemini/antigravity-cli/antigravity-oauth-token` is atomically repaired to `"honey"` (mode `0600`)
+- AND `watch.log` records the CLI drift repair
+- AND `cache/pending_reload.json` is NOT written and `language_server` is not restarted.
+
+#### Scenario: [DRIFT-GUARD-003] Drift guard throttling skips redundant filesystem checks within `drift_check_interval` with zero HTTP calls
+- GIVEN `LogWatcher` initialized with `drift_check_interval=5.0` has already completed a drift check 1.0 second ago
+- WHEN `LogWatcher.poll_once()` executes again before 5.0 seconds have elapsed
+- THEN `check_and_heal_token_drift()` exits immediately as a throttled no-op without re-reading Desktop/CLI token files or issuing any network requests.
+
+#### Scenario: [DRIFT-GUARD-004] Benign same-account Desktop access-token refresh triggers zero repairs and zero reloads
+- GIVEN active account `"honey"` has `refresh_token="rt-honey"` and email `"honey@example.com"`
+- AND `language_server` refreshed `"honey"`'s access token in `~/.gemini/jetski-standalone-oauth-token` with a new `access_token`, `"writer_id"`, and nanosecond `expiry` while preserving `refresh_token="rt-honey"` and `"honey@example.com"`
+- WHEN `LogWatcher.check_and_heal_token_drift()` executes
+- THEN it recognizes matching credential identity, returns `False`, performs zero token overwrites, writes no `pending_reload.json`, and appends no drift audit entry.
+
+#### Scenario: [DRIFT-GUARD-ERR-001] Missing or corrupt JSON target token files healed atomically without crashing `poll_once()`
+- GIVEN active account `"honey"` has valid `accounts/honey/token.json`
+- AND `~/.gemini/jetski-standalone-oauth-token` is missing or contains corrupt binary/truncated JSON
+- WHEN `LogWatcher.poll_once()` runs `check_and_heal_token_drift()`
+- THEN it heals the missing/corrupt Desktop token atomically from Vault `"honey"` without raising an uncaught exception.
+
+#### Scenario: [DRIFT-GUARD-ERR-002] Symlinked or read-only target token (`PermissionError` / `ENOSPC`) fails safe without terminating watcher daemon
+- GIVEN `~/.gemini/jetski-standalone-oauth-token` is a symlink pointing outside `~/.gemini` or atomic replacement raises `PermissionError` / `OSError(ENOSPC)`
+- WHEN `LogWatcher.poll_once()` executes `check_and_heal_token_drift()`
+- THEN external symlink targets are never written through, I/O errors are logged to `stderr`, and `poll_once()` completes cleanly without crashing the daemon.
+
+#### Scenario: [DRIFT-GUARD-ERR-003] Missing Vault active account or invalid Vault token causes drift guard to no-op safely
+- GIVEN `~/.antigravity-vault/active` is absent or points to an account with invalid `token.json`
+- WHEN `LogWatcher.check_and_heal_token_drift()` executes
+- THEN it returns `False` immediately without modifying Desktop or CLI files or writing `pending_reload.json`.
+
+#### Scenario: [DRIFT-GUARD-ERR-004] Invalid `drift_check_interval` sanitized and minimal/mocked engine degrades safely to no-op
+- GIVEN `LogWatcher` initialized with invalid `drift_check_interval` (`-5.0`, `float("nan")`, or `True`) OR bound to a `MagicMock` / minimal engine returning non-mapping sync status
+- WHEN `LogWatcher.check_and_heal_token_drift()` and `LogWatcher.poll_once()` execute
+- THEN invalid `drift_check_interval` falls back to `5.0`
+- AND non-mapping/mocked sync responses return `False` without raising exceptions, writing `pending_reload.json`, or appending spurious `watch.log` entries.
+
+#### Scenario: [DRIFT-GUARD-EDGE-001] Desktop drift while `language_server` is stopped heals disk without creating `pending_reload.json`
+- GIVEN active account `"honey"` has drifted Desktop token on disk
+- AND `ProcessSupervisor.locate_language_server_pid()` returns `None`
+- WHEN `LogWatcher.check_and_heal_token_drift()` runs
+- THEN `~/.gemini/jetski-standalone-oauth-token` is atomically repaired from Vault `"honey"`
+- AND `cache/pending_reload.json` is NOT written.
+
+#### Scenario: [DRIFT-GUARD-EDGE-002] Repeated Desktop Zombie Write-Back during active turn heals disk and preserves deferred reload without killing active turn
+- GIVEN `language_server` is executing an **Active Turn** (`_is_turn_quiescent() == False`) and repeatedly rewrites `~/.gemini/jetski-standalone-oauth-token` with stale `"automator"` credentials
+- WHEN `LogWatcher.poll_once()` runs across successive drift intervals
+- THEN each check heals `~/.gemini/jetski-standalone-oauth-token` back to `"honey"` and maintains a valid `cache/pending_reload.json` (`ttl_seconds=1800`)
+- AND `language_server` is NOT restarted until **Global Quiescence** is reached.
+
+#### Scenario: [DRIFT-GUARD-EDGE-003] Drift guard audit logging strictly respects Mock Vault Isolation during test execution
+- GIVEN `LogWatcher` executes `check_and_heal_token_drift()` inside `unittest` with an isolated sandbox vault or mocked engine
+- WHEN a drift repair is logged
+- THEN the audit entry is written strictly inside the isolated sandbox vault (or suppressed when no isolated vault is configured) and NEVER touches `~/.antigravity-vault/watch.log`.
+
+#### Scenario: [DRIFT-GUARD-EDGE-004] Concurrent account switch during drift inspection uses fresh Vault active pointer and never reverts newer switch
+- GIVEN Vault active account transitions concurrently from `"acc1"` to `"acc2"` immediately before drift healing writes to disk
+- WHEN `check_and_heal_token_drift()` invokes `sync_active_tokens_from_vault()`
+- THEN the repair re-reads the current Vault active pointer (`"acc2"`) before performing the **Atomic Swap**, ensuring `"acc2"` is written and never reverted to `"acc1"`.
+
+#### Scenario: [DRIFT-GUARD-EDGE-005] Drift guard skips same-cycle interference after reactive 429 failover and avoids thrashing existing `pending_reload.json`
+- GIVEN Case 1: a reactive 429 error triggers account rotation in `poll_once()` during the same polling cycle
+- AND Case 2: Desktop drifted during an active turn when an unexpired `cache/pending_reload.json` for `"honey"` already exists
+- WHEN `LogWatcher.poll_once()` executes
+- THEN in Case 1 `check_and_heal_token_drift()` does not overwrite or revert the newly rotated account
+- AND in Case 2 the Desktop token is healed and `pending_reload.json` remains valid for `"honey"` (`ttl_seconds=1800`) without triggering duplicate server restarts.
+
+### Requirement: CLI Desync Visibility in Status and List Commands
+The vault read surfaces (`AgySwitchEngine.get_status` and `AgySwitchEngine.list_accounts` in `scripts/agy_switcher/vault.py`) and terminal formatters (`format_status_report`, `format_accounts_table`, `format_accounts_listicle` in `scripts/agy_switcher/formatters.py`) MUST perform local-only (zero HTTP) **Vault-Authoritative Sync** verification comparing `~/.gemini/jetski-standalone-oauth-token` (Desktop) and `~/.gemini/antigravity-cli/antigravity-oauth-token` (CLI) against the Vault active account. `AgySwitchEngine.get_status()` and `AgySwitchEngine.list_accounts()` MUST include structured `sync_status` metadata (`in_sync`, `desktop_synced`, `cli_synced`, `drifted_targets`, `desktop_email`, `cli_email`), include unexpired `pending_reload` metadata when `cache/pending_reload.json` is active, and preserve JSON compatibility for `agy-switch list --json`. Whenever any target surface is out of sync with Vault, `format_status_report()`, `format_accounts_table()`, and `format_accounts_listicle()` MUST render an explicit desync warning naming the diverged surface(s) (e.g., `Desktop`, `CLI`), detected drifted email when available, remediation guidance (`agy-switch doctor --fix` or `agy-switch switch <active>`), and any queued `Pending Reload` state rather than silently presenting only `~/.antigravity-vault/active`. Formatters MUST also degrade gracefully without crashing or emitting spurious warnings when `sync_status` or `pending_reload` is omitted, `None`, or malformed.
+
+#### Scenario: [SYNC-VIS-001] `agy-switch status` verifies local sync and displays synced indicator with zero HTTP calls
+- GIVEN Vault active account `"honey"` matches both Desktop and CLI token credential identities on disk
+- WHEN `AgySwitchEngine.get_status()` and `format_status_report()` run
+- THEN `status["sync_status"]["in_sync"]` is `True` with `drifted_targets=[]`
+- AND formatted output displays synced credential status without emitting any desync warning or performing HTTP requests.
+
+#### Scenario: [SYNC-VIS-002] `agy-switch status` displays explicit Desktop desync warning, drifted identity, remediation, and `Pending Reload`
+- GIVEN Vault active account is `"honey"` (`honey@example.com`)
+- AND `~/.gemini/jetski-standalone-oauth-token` drifted to `"automator@example.com"` while CLI matches `"honey"`
+- AND `cache/pending_reload.json` holds an unexpired reload marker for `"honey"` (`ttl_seconds=1800`)
+- WHEN `agy-switch status` runs (`get_status()` + `format_status_report()`)
+- THEN output renders an explicit desync warning naming `Desktop` and `automator@example.com`, recommends `agy-switch doctor --fix` (or `agy-switch switch honey`), and renders the `Pending Reload` line for `"honey"`.
+
+#### Scenario: [SYNC-VIS-003] `agy-switch list` surfaces structured `sync_status` in JSON and explicit desync warning in table and listicle formats
+- GIVEN Vault active account `"honey"` with drifted Desktop token (`"old@example.com"`)
+- WHEN `agy-switch list` (`--format table`, `--format list`) and `agy-switch list --json` execute
+- THEN `engine.list_accounts()` and `--json` output include `"sync_status"` with `"in_sync": false` and `"drifted_targets": ["desktop"]`
+- AND both `format_accounts_table()` and `format_accounts_listicle()` display an explicit desync warning naming `Desktop` and remediation guidance.
+
+#### Scenario: [SYNC-VIS-ERR-001] Corrupt, missing, or symlinked Desktop/CLI token files emit clear desync warning without crashing `status` or `list`
+- GIVEN Vault active account `"honey"` where `~/.gemini/jetski-standalone-oauth-token` is corrupt JSON and `~/.gemini/antigravity-cli/antigravity-oauth-token` is missing or a symlink
+- WHEN `agy-switch status` and `agy-switch list` execute
+- THEN both commands exit cleanly with code `0` without unhandled exceptions
+- AND display explicit desync warnings identifying the affected surface(s).
+
+#### Scenario: [SYNC-VIS-ERR-002] Local desync verification in `status` and `list` performs strictly zero network calls even when offline
+- GIVEN network/HTTP sockets are blocked or unavailable in the runtime environment
+- WHEN `engine.get_status()`, `engine.list_accounts()`, `format_status_report()`, and `format_accounts_table()` execute
+- THEN sync verification completes strictly via local file reads with zero `urllib` or network calls.
+
+#### Scenario: [SYNC-VIS-ERR-003] Omitted, `None`, or malformed `sync_status` / `pending_reload` payloads handled gracefully by formatters
+- GIVEN caller dictionaries passed to `format_status_report()`, `format_accounts_table()`, or `format_accounts_listicle()` omit `"sync_status"` / `"pending_reload"` or set them to `None`, `"invalid"`, or `{"in_sync": "bad", "drifted_targets": 123}`
+- WHEN each formatter executes
+- THEN it renders cleanly without raising `AttributeError`/`TypeError` and emits no spurious desync warning.
+
+#### Scenario: [SYNC-VIS-EDGE-001] Vault with no active account omits spurious desync warnings in `status` and `list`
+- GIVEN a vault with no active account configured (`active` file absent or empty)
+- WHEN `agy-switch status` and `agy-switch list` run
+- THEN no false desync warning is rendered and output gracefully indicates no account is currently active.
+
+#### Scenario: [SYNC-VIS-EDGE-002] Dual-surface drift names both Desktop and CLI explicitly across `status`, table, listicle, and JSON outputs
+- GIVEN Vault active account `"honey"` where BOTH `~/.gemini/jetski-standalone-oauth-token` and `~/.gemini/antigravity-cli/antigravity-oauth-token` hold credentials from `"stale-acc"`
+- WHEN `agy-switch status`, `agy-switch list --format table`, `agy-switch list --format list`, and `agy-switch list --json` execute
+- THEN `sync_status["drifted_targets"]` includes both `"desktop"` and `"cli"`
+- AND every human-readable output explicitly warns that both `Desktop` and `CLI` are out of sync with `"honey"`.
+
+#### Scenario: [SYNC-VIS-EDGE-003] `agy-switch list` surfaces queued `Pending Reload` across table, listicle, and JSON even after disk tokens are healed
+- GIVEN Vault active account `"honey"` matches both Desktop and CLI tokens on disk (`in_sync=True`)
+- AND `cache/pending_reload.json` contains an unexpired reload marker (`target_account="honey"`, `ttl_seconds=1800`) awaiting Desktop safe-turn reload
+- WHEN `agy-switch list --format table`, `agy-switch list --format list`, and `agy-switch list --json` execute
+- THEN `list --json` includes `"pending_reload"` with `"target_account": "honey"`
+- AND both table and listicle views render the queued `Pending Reload` notice for `"honey"` without emitting a false disk desync warning.
