@@ -40,14 +40,13 @@ from agy_switcher.presence import (
     _EXHAUSTION_REGEX,
     _extract_text_fragments,
     _is_mock_object,
-    _is_prod_vault_path,
     _is_scalar_code,
-    _is_test_runner,
     _open_secure_log_file,
     _resolve_log_file_target,
     _resolve_vault_log_path,
     _write_atomic_file_secure,
     append_secure_log_entry,
+    execute_drift_guard,
     extract_5h_rolling_reset,
     format_audit_log_line,
     format_deferred_reload_audit_line,
@@ -55,7 +54,10 @@ from agy_switcher.presence import (
     parse_pending_reload_payload,
     read_json_dict_nofollow,
     read_latest_jsonl_record,
+    resolve_pending_reload_path,
     safe_stderr_write,
+    sanitize_drift_check_interval,
+    unlink_pending_reload_safe,
     write_watch_log_line,
 )
 
@@ -347,8 +349,11 @@ class LogWatcher:
         max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
         supervisor: ProcessSupervisor | None = None,
         daemon_manager: DaemonManager | None = None,
+        drift_check_interval: float = 5.0,
     ):
         self.engine = engine
+        self.drift_check_interval = sanitize_drift_check_interval(drift_check_interval)
+        self._last_drift_check_time: float | None = None
         if damping_seconds is None:
             damping_seconds = DEFAULT_DAMPING_SECONDS
         elif isinstance(damping_seconds, list):
@@ -716,42 +721,22 @@ class LogWatcher:
 
     def _write_watch_log_line(self, log_line: str) -> None:
         """Appends a formatted audit line to watch.log with mode 0600 and safe error handling."""
-        write_watch_log_line(
-            self._resolve_audit_log_dir(),
-            log_line,
-            append_fn=append_secure_log_entry,
-        )
+        write_watch_log_line(self._resolve_audit_log_dir(), log_line, append_fn=append_secure_log_entry)
 
     def _append_audit_log(
-        self,
-        target_account: str,
-        old_account: str | None = None,
-        reason: str = "",
-        reloaded: bool = False,
-        clean_reason: str = "",
+        self, target_account: str, old_account: str | None = None, reason: str = "", reloaded: bool = False, clean_reason: str = "",
     ) -> None:
         """Appends structured audit entry to watch.log with mode 0600."""
         try:
-            log_line = format_audit_log_line(
-                target_account=target_account,
-                old_account=old_account,
-                reason=reason,
-                reloaded=reloaded,
-                clean_reason=clean_reason,
+            self._write_watch_log_line(
+                format_audit_log_line(target_account, old_account, reason, reloaded, clean_reason)
             )
-            self._write_watch_log_line(log_line)
         except Exception as e:
             safe_stderr_write(f"[watch] Error appending audit log: {e}")
 
-    def _append_deferred_reload_audit_log(
-        self,
-        target_account: str,
-        reason: str = "in_turn_deferred_reload",
-    ) -> None:
+    def _append_deferred_reload_audit_log(self, target_account: str, reason: str = "in_turn_deferred_reload") -> None:
         """Appends structured deferred-reload audit entry to watch.log with mode 0600."""
-        self._write_watch_log_line(
-            format_deferred_reload_audit_line(target_account=target_account, reason=reason)
-        )
+        self._write_watch_log_line(format_deferred_reload_audit_line(target_account=target_account, reason=reason))
 
     @staticmethod
     def _safe_stderr_write(message: str) -> None:
@@ -760,30 +745,13 @@ class LogWatcher:
 
     def _resolve_pending_reload_path(self) -> Path | None:
         """Resolves cache/pending_reload.json path, guarding production paths under test runners."""
-        raw_prf = getattr(self.engine, "pending_reload_file", None)
-        if isinstance(raw_prf, (str, Path)) and not _is_mock_object(raw_prf):
-            cleaned = str(raw_prf).strip()
-            if not cleaned or cleaned == ".":
-                return None
-            candidate = Path(cleaned).expanduser()
-        else:
-            candidate = self._resolve_cache_dir() / "pending_reload.json"
-        if _is_test_runner() and _is_prod_vault_path(candidate):
-            return None
-        return candidate
+        return resolve_pending_reload_path(self.engine, self._resolve_cache_dir())
 
     def _unlink_pending_reload_safe(
-        self,
-        pending_path: Path,
-        warning_context: str = "pending reload marker",
+        self, pending_path: Path, warning_context: str = "pending reload marker"
     ) -> None:
         """Best-effort unlink of cache/pending_reload.json without raising on OSError."""
-        try:
-            pending_path.unlink(missing_ok=True)
-        except OSError as exc:
-            self._safe_stderr_write(
-                f"[watch] Warning: Failed to unlink {warning_context} '{pending_path}': {exc}"
-            )
+        unlink_pending_reload_safe(pending_path, warning_context, stderr_fn=self._safe_stderr_write)
 
     def _locate_language_server_pid(self) -> int | None:
         """Locates running language_server PID via mocked engine override, supervisor, or engine."""
@@ -1372,6 +1340,22 @@ class LogWatcher:
             print(f"[watch] Error evaluating proactive rotation: {e}", file=sys.stderr)
             return False
 
+    def check_and_heal_token_drift(self, force: bool = False) -> bool:
+        """Throttled local-only Continuous Drift Guard comparing live tokens against Vault."""
+        interval = sanitize_drift_check_interval(getattr(self, "drift_check_interval", 5.0))
+        self.drift_check_interval = interval
+        now = float(_get_time().time())
+        last_check = getattr(self, "_last_drift_check_time", None)
+        if not force and interval > 0.0 and last_check is not None:
+            elapsed = now - last_check
+            if 0.0 <= elapsed < interval:
+                return False
+        self._last_drift_check_time = now
+        return execute_drift_guard(
+            self.engine, now, pending_path=self._resolve_pending_reload_path(),
+            locate_pid_fn=self._locate_language_server_pid, log_dir=self._resolve_audit_log_dir(),
+        )
+
     def poll_once(self) -> int:
         """
         Polls active targets once for new lines and processes them.
@@ -1461,6 +1445,11 @@ class LogWatcher:
                         switches_triggered += 1
                 except Exception as e:
                     print(f"[watch] Error evaluating proactive rotation: {e}", file=sys.stderr)
+                if switches_triggered == 0:
+                    try:
+                        self.check_and_heal_token_drift()
+                    except Exception as e:
+                        print(f"[watch] Error in Continuous Drift Guard: {e}", file=sys.stderr)
         return switches_triggered
 
     def watch_loop(self, poll_interval: float = 0.5, max_iterations: int | None = None) -> None:

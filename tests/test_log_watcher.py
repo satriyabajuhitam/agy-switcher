@@ -3163,6 +3163,22 @@ class TestLogWatcherProcessing(unittest.TestCase):
         with patch.object(self.watcher, "scan_active_targets", side_effect=PermissionError(13, "Permission denied")):
             self.assertEqual(self.watcher.poll_once(), 0)
 
+    def test_poll_once_continuous_drift_guard_integration(self):
+        """poll_once executes Continuous Drift Guard when no reactive or proactive switch occurs."""
+        with patch.object(self.watcher, "scan_active_targets", return_value=[]), \
+             patch.object(self.watcher, "_process_pending_reload", return_value=False), \
+             patch.object(self.watcher, "_evaluate_proactive_rotation", return_value=False), \
+             patch.object(self.watcher, "check_and_heal_token_drift", return_value=True) as mock_drift:
+            self.assertEqual(self.watcher.poll_once(), 0)
+            mock_drift.assert_called_once_with()
+
+        with patch.object(self.watcher, "scan_active_targets", return_value=[]), \
+             patch.object(self.watcher, "_process_pending_reload", return_value=False), \
+             patch.object(self.watcher, "_evaluate_proactive_rotation", return_value=True), \
+             patch.object(self.watcher, "check_and_heal_token_drift") as mock_drift:
+            self.assertEqual(self.watcher.poll_once(), 1)
+            mock_drift.assert_not_called()
+
 
 
 class TestDaemonLifecycle(unittest.TestCase):

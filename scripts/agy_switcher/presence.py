@@ -15,10 +15,12 @@ from pathlib import Path
 import re
 import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
+from agy_switcher.models import DEFAULT_PENDING_RELOAD_TTL_SECONDS, PendingReloadPayload
 from agy_switcher.security import (
     _atomic_write_file,
+    _atomic_write_json,
     parse_pending_reload_payload,
     read_json_dict_nofollow,
     read_latest_jsonl_record,
@@ -668,6 +670,198 @@ def format_drift_guard_audit_line(
     )
 
 
+def sanitize_drift_check_interval(interval: object, default: float = 5.0) -> float:
+    """Normalizes drift check interval, rejecting booleans, negatives, and non-finite numbers."""
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+        return default
+    val = float(interval)
+    return val if math.isfinite(val) and val >= 0.0 else default
+
+
+def parse_drift_sync_status(status: object) -> tuple[list[str], str | None] | None:
+    """Validates engine sync status mapping, returning (drifted_targets, active_account) or None on mock/malformed status."""
+    if _is_mock_object(status) or not isinstance(status, Mapping):
+        return None
+    in_sync = status.get("in_sync")
+    drifted_raw = status.get("drifted_targets")
+    if not isinstance(in_sync, bool) or _is_mock_object(drifted_raw) or not isinstance(drifted_raw, (list, tuple)):
+        return None
+
+    has_active_key = "active_account" in status
+    raw_active = status.get("active_account") if has_active_key else None
+    if has_active_key and (_is_mock_object(raw_active) or not isinstance(raw_active, str) or not raw_active.strip()):
+        return [], None
+
+    snapshots: list[object] = [status.get("desktop"), status.get("cli")]
+    targets_map = status.get("targets")
+    if isinstance(targets_map, Mapping):
+        snapshots.extend([targets_map.get("desktop"), targets_map.get("cli")])
+    for snap in snapshots:
+        if isinstance(snap, Mapping) and snap.get("status") in ("no_active_account", "vault_invalid"):
+            return [], None
+
+    active_name = raw_active.strip() if isinstance(raw_active, str) and raw_active.strip() else None
+    if in_sync:
+        return [], active_name
+
+    drifted: list[str] = []
+    for item in drifted_raw:
+        if isinstance(item, str) and not _is_mock_object(item):
+            norm = item.strip().lower()
+            if norm in ("desktop", "cli") and norm not in drifted:
+                drifted.append(norm)
+    return drifted, active_name
+
+
+def resolve_pending_reload_path(engine: object, cache_dir: Path) -> Path | None:
+    """Resolves cache/pending_reload.json path, guarding production paths under test runners."""
+    raw_prf = getattr(engine, "pending_reload_file", None)
+    if isinstance(raw_prf, (str, Path)) and not _is_mock_object(raw_prf):
+        cleaned = str(raw_prf).strip()
+        if not cleaned or cleaned == ".":
+            return None
+        candidate = Path(cleaned).expanduser()
+    else:
+        candidate = cache_dir / "pending_reload.json"
+    if _is_test_runner() and _is_prod_vault_path(candidate):
+        return None
+    return candidate
+
+
+def unlink_pending_reload_safe(
+    pending_path: Path,
+    warning_context: str = "pending reload marker",
+    stderr_fn: Callable[[str], None] = safe_stderr_write,
+) -> None:
+    """Best-effort unlink of cache/pending_reload.json without raising on OSError."""
+    try:
+        pending_path.unlink(missing_ok=True)
+    except OSError as exc:
+        stderr_fn(f"[watch] Warning: Failed to unlink {warning_context} '{pending_path}': {exc}")
+
+
+def enqueue_drift_pending_reload(
+    pending_path: Path | None,
+    target_account: str,
+    now: float,
+    *,
+    reason: str = "desktop_drift_guard",
+    ttl_seconds: int = DEFAULT_PENDING_RELOAD_TTL_SECONDS,
+    write_fn: Callable[..., object] | None = None,
+    stderr_fn: Callable[[str], None] = safe_stderr_write,
+) -> bool:
+    """Atomically writes pending_reload.json unless an unexpired marker for target_account already exists."""
+    if pending_path is None:
+        return False
+    raw_existing, io_status = read_json_dict_nofollow(pending_path)
+    parsed_existing = parse_pending_reload_payload(raw_existing) if io_status == "ok" else None
+    if parsed_existing is not None:
+        age = now - float(parsed_existing["requested_at"])
+        if age <= float(parsed_existing["ttl_seconds"]) and parsed_existing["target_account"] == target_account:
+            return True
+
+    payload: PendingReloadPayload = {
+        "target_account": target_account,
+        "requested_at": float(now),
+        "ttl_seconds": ttl_seconds,
+        "reason": reason,
+    }
+    try:
+        if callable(write_fn) and not _is_mock_object(write_fn):
+            try:
+                write_fn(target_account, reason=reason, ttl_seconds=ttl_seconds, requested_at=float(now))
+            except TypeError:
+                write_fn(target_account, reason=reason, ttl_seconds=ttl_seconds)
+            raw_after, io_after = read_json_dict_nofollow(pending_path)
+            parsed_after = parse_pending_reload_payload(raw_after) if io_after == "ok" else None
+            if parsed_after is None or parsed_after["target_account"] != target_account:
+                return False
+            return (now - float(parsed_after["requested_at"])) <= float(parsed_after["ttl_seconds"])
+        else:
+            _atomic_write_json(pending_path, dict(payload), mode=0o600)
+        return True
+    except Exception as exc:
+        stderr_fn(f"[watch] Warning: Failed to persist pending reload marker '{pending_path}': {exc}")
+        return False
+
+
+def execute_drift_guard(
+    engine: Any,
+    now: float,
+    *,
+    pending_path: Path | None,
+    locate_pid_fn: Callable[[], int | None],
+    log_dir: Path | None,
+    stderr_fn: Callable[[str], None] = safe_stderr_write,
+) -> bool:
+    """Executes local-only drift inspection, atomic repair, deferred reload queueing, and audit logging."""
+    check_fn = getattr(engine, "check_target_sync_status", None)
+    if not callable(check_fn):
+        return False
+    try:
+        raw_status = check_fn()
+    except Exception as exc:
+        stderr_fn(f"[watch] Warning: Drift guard sync check failed: {exc}")
+        return False
+
+    parsed = parse_drift_sync_status(raw_status)
+    if parsed is None:
+        return False
+    drifted_targets, status_active = parsed
+    if not drifted_targets:
+        return False
+
+    sync_fn = getattr(engine, "sync_active_tokens_from_vault", None)
+    if not callable(sync_fn):
+        return False
+    try:
+        try:
+            repaired = bool(sync_fn(targets=tuple(drifted_targets)))
+        except TypeError as type_exc:
+            if "argument" not in str(type_exc) and "positional" not in str(type_exc):
+                raise
+            repaired = bool(sync_fn())
+    except Exception as exc:
+        stderr_fn(f"[watch] Warning: Drift guard failed to repair {drifted_targets}: {exc}")
+        return False
+    if not repaired:
+        stderr_fn(f"[watch] Warning: Drift guard failed to repair {drifted_targets} from Vault.")
+        return False
+
+    target_account = status_active
+    get_active_fn = getattr(engine, "get_active_name", None)
+    if callable(get_active_fn):
+        try:
+            fresh_active = get_active_fn()
+            if isinstance(fresh_active, str) and fresh_active.strip() and not _is_mock_object(fresh_active):
+                target_account = fresh_active.strip()
+        except Exception:
+            pass
+    clean_target = target_account or "active"
+
+    queued_reload = False
+    if "desktop" in drifted_targets:
+        try:
+            ls_pid = locate_pid_fn()
+        except Exception:
+            ls_pid = None
+        if ls_pid is not None:
+            queued_reload = enqueue_drift_pending_reload(
+                pending_path,
+                clean_target,
+                now,
+                write_fn=getattr(engine, "write_pending_reload", None),
+                stderr_fn=stderr_fn,
+            )
+
+    write_watch_log_line(
+        log_dir,
+        format_drift_guard_audit_line(clean_target, drifted_targets, queued_reload=queued_reload),
+        append_fn=append_secure_log_entry,
+    )
+    return True
+
+
 def is_watch_process_cmdline(proc_dir: Path, pid: int, watch_script: Path | None) -> bool:
     """Validates /proc/<pid>/cmdline if accessible to prevent signaling arbitrary processes."""
     if not proc_dir.is_dir():
@@ -788,6 +982,12 @@ __all__ = [
     "format_audit_log_line",
     "format_deferred_reload_audit_line",
     "format_drift_guard_audit_line",
+    "sanitize_drift_check_interval",
+    "parse_drift_sync_status",
+    "resolve_pending_reload_path",
+    "unlink_pending_reload_safe",
+    "enqueue_drift_pending_reload",
+    "execute_drift_guard",
     "is_watch_process_cmdline",
     "PresenceDetector",
     "DEFAULT_GEMINI_DIR",

@@ -6210,6 +6210,694 @@ class TestGlobalQuiescenceAndResyncGuard(unittest.TestCase):
         self.assertEqual(cli_written["token"]["refresh_token"], work_payload["token"]["refresh_token"])  # type: ignore[index]
 
 
+class TestContinuousDriftGuard(unittest.TestCase):
+    """Behavior tests for Continuous Drift Guard in LogWatcher (spec lines 168-249)."""
+
+    def setUp(self) -> None:
+        self.orig_agy_vault_dir = os.environ.get("AGY_VAULT_DIR")
+        self.tmpdir = tempfile.mkdtemp()
+        self.gemini_dir = Path(self.tmpdir) / ".gemini"
+        self.proc_dir = Path(self.tmpdir) / "proc"
+        self.vault_dir = Path(self.tmpdir) / "vault"
+        self.cache_dir = self.vault_dir / "cache"
+        os.environ["AGY_VAULT_DIR"] = str(self.vault_dir)
+
+        self.gemini_dir.mkdir(parents=True, exist_ok=True)
+        self.proc_dir.mkdir(parents=True, exist_ok=True)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.detector = PresenceDetector(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+        self.supervisor = ProcessSupervisor(gemini_dir=self.gemini_dir, proc_dir=self.proc_dir)
+
+    def tearDown(self) -> None:
+        if self.orig_agy_vault_dir is not None:
+            os.environ["AGY_VAULT_DIR"] = self.orig_agy_vault_dir
+        else:
+            os.environ.pop("AGY_VAULT_DIR", None)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_token_payload(
+        self,
+        alias: str,
+        *,
+        access_token: str | None = None,
+        refresh_token: str | None = None,
+        email: str | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "token": {
+                "access_token": access_token or f"ya29.{alias}",
+                "refresh_token": refresh_token or f"rt-{alias}",
+                "token_type": "Bearer",
+                "expiry": "2027-01-01T00:00:00Z",
+            },
+            "auth_method": "oauth",
+            "id_token_email": email or f"{alias}@example.com",
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _write_vault_account(self, alias: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+        data = payload or self._make_token_payload(alias)
+        acc_dir = self.vault_dir / "accounts" / alias
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        token_path = acc_dir / "token.json"
+        token_path.write_text(json.dumps(data), encoding="utf-8")
+        os.chmod(token_path, 0o600)
+        return data
+
+    def _create_engine(self, *, active: str | None = "honey"):
+        from agy_switcher.vault import AgySwitchEngine
+
+        if active is not None:
+            (self.vault_dir / "active").write_text(f"{active}\n", encoding="utf-8")
+        return AgySwitchEngine(
+            vault_dir=self.vault_dir,
+            gemini_dir=self.gemini_dir,
+            proc_dir=self.proc_dir,
+        )
+
+    def _setup_running_ls(self, pid: int = 500, *, active_turn: bool = False) -> Path:
+        ls_proc = self.proc_dir / str(pid)
+        ls_proc.mkdir(parents=True, exist_ok=True)
+        (ls_proc / "cmdline").write_bytes(b"/opt/antigravity/language_server\x00--standalone\x00")
+        (ls_proc / "stat").write_text(f"{pid} (language_server) S 1 {pid} {pid} 0 -1\n", encoding="utf-8")
+        fd_dir = ls_proc / "fd"
+        fd_dir.mkdir(parents=True, exist_ok=True)
+        if active_turn:
+            presence_dir = self.gemini_dir / "antigravity" / "presence"
+            presence_dir.mkdir(parents=True, exist_ok=True)
+            lock_file = presence_dir / "sess-active.lock"
+            lock_file.touch()
+            (fd_dir / "10").symlink_to(lock_file)
+            logs_dir = self.gemini_dir / "antigravity" / "brain" / "sess-active" / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            (logs_dir / "transcript.jsonl").write_text(
+                json.dumps({"type": "USER_INPUT", "status": "RUNNING"}) + "\n",
+                encoding="utf-8",
+            )
+        return ls_proc
+
+    def test_drift_guard_001_desktop_zombie_writeback_healed_with_pending_reload_and_audit(self) -> None:
+        """[DRIFT-GUARD-001]: Desktop Zombie Write-Back heals atomically (0600), queues pending_reload (1800s), and logs to watch.log with zero HTTP calls."""
+        import stat as stat_mod
+
+        honey = self._write_vault_account("honey")
+        zombie = self._make_token_payload("automator", refresh_token="rt-auto", extra={"writer_id": "go-ls"})
+        engine = self._create_engine(active="honey")
+        self._setup_running_ls(pid=500, active_turn=False)
+
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(zombie), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(honey), encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            switches = watcher.poll_once()
+
+        self.assertEqual(switches, 0)
+        mock_urlopen.assert_not_called()
+
+        desktop_written = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_written["token"]["refresh_token"], "rt-honey")
+        self.assertEqual(stat_mod.S_IMODE(engine.desktop_token_file.stat().st_mode), 0o600)
+
+        pending_path = self.cache_dir / "pending_reload.json"
+        self.assertTrue(pending_path.is_file())
+        self.assertEqual(stat_mod.S_IMODE(pending_path.stat().st_mode), 0o600)
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        self.assertEqual(pending["target_account"], "honey")
+        self.assertEqual(pending["reason"], "desktop_drift_guard")
+        self.assertEqual(pending["ttl_seconds"], 1800)
+
+        watch_log = self.vault_dir / "watch.log"
+        self.assertTrue(watch_log.is_file())
+        self.assertEqual(stat_mod.S_IMODE(watch_log.stat().st_mode), 0o600)
+        log_text = watch_log.read_text(encoding="utf-8").lower()
+        self.assertIn("honey", log_text)
+        self.assertIn("desktop", log_text)
+
+    def test_drift_guard_002_cli_only_drift_healed_without_desktop_reload(self) -> None:
+        """[DRIFT-GUARD-002]: CLI-only drift repairs CLI atomically and logs watch.log without writing pending_reload.json or restarting LS."""
+        import stat as stat_mod
+
+        honey = self._write_vault_account("honey")
+        stale = self._make_token_payload("stale-acc")
+        engine = self._create_engine(active="honey")
+        self._setup_running_ls(pid=500, active_turn=False)
+        engine.restart_language_server = MagicMock(return_value=True)  # type: ignore[method-assign]
+
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(honey), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(stale), encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        switches = watcher.poll_once()
+        self.assertEqual(switches, 0)
+
+        cli_written = json.loads(engine.cli_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(cli_written["token"]["refresh_token"], "rt-honey")
+        self.assertEqual(stat_mod.S_IMODE(engine.cli_token_file.stat().st_mode), 0o600)
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        engine.restart_language_server.assert_not_called()
+
+        watch_log = self.vault_dir / "watch.log"
+        self.assertTrue(watch_log.is_file())
+        log_text = watch_log.read_text(encoding="utf-8").lower()
+        self.assertIn("cli", log_text)
+        self.assertIn("honey", log_text)
+
+    def test_drift_guard_003_throttling_skips_redundant_checks_within_interval(self) -> None:
+        """[DRIFT-GUARD-003]: Within drift_check_interval (5.0s), poll_once skips redundant filesystem sync checks with zero HTTP calls."""
+        engine_mock = MagicMock()
+        engine_mock.vault_dir = self.vault_dir
+        engine_mock.cache_dir = self.cache_dir
+        engine_mock.gemini_dir = self.gemini_dir
+        engine_mock.get_quota_threshold.return_value = None
+        engine_mock.check_target_sync_status.return_value = {
+            "in_sync": True,
+            "desktop_synced": True,
+            "cli_synced": True,
+            "drifted_targets": [],
+            "desktop_email": "honey@example.com",
+            "cli_email": "honey@example.com",
+            "active_account": "honey",
+        }
+
+        watcher = LogWatcher(
+            engine=engine_mock,
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            log_dirs=[],
+            drift_check_interval=5.0,
+        )
+        now_box = [1000.0]
+        with patch("agy_switcher.watcher.time.time", side_effect=lambda: now_box[0]), \
+             patch("urllib.request.urlopen") as mock_urlopen:
+            watcher.poll_once()
+            self.assertEqual(engine_mock.check_target_sync_status.call_count, 1)
+
+            now_box[0] = 1001.0  # 1.0s elapsed < 5.0s
+            watcher.poll_once()
+            self.assertEqual(engine_mock.check_target_sync_status.call_count, 1)
+
+            # force=True bypasses throttling within interval
+            watcher.check_and_heal_token_drift(force=True)
+            self.assertEqual(engine_mock.check_target_sync_status.call_count, 2)
+
+            now_box[0] = 1005.1  # 4.1s after forced check < 5.0s -> throttled
+            watcher.poll_once()
+            self.assertEqual(engine_mock.check_target_sync_status.call_count, 2)
+
+            now_box[0] = 1006.2  # > 5.0s after forced check
+            watcher.poll_once()
+            self.assertEqual(engine_mock.check_target_sync_status.call_count, 3)
+            mock_urlopen.assert_not_called()
+
+    def test_drift_guard_004_benign_same_account_access_refresh_triggers_no_repair(self) -> None:
+        """[DRIFT-GUARD-004]: Same-account Desktop access_token refresh with writer_id & ns expiry triggers zero repairs/reloads."""
+        honey = self._write_vault_account("honey")
+        refreshed_desktop = self._make_token_payload(
+            "honey",
+            access_token="ya29.refreshed-new",
+            refresh_token="rt-honey",
+            email="honey@example.com",
+            extra={"writer_id": "go-ls"},
+        )
+        refreshed_desktop["token"]["expiry"] = "2027-01-01T00:00:00.123456789Z"  # type: ignore[index]
+
+        engine = self._create_engine(active="honey")
+        self._setup_running_ls(pid=500, active_turn=False)
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(refreshed_desktop), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(honey), encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        self.assertFalse(watcher.check_and_heal_token_drift())
+        desktop_after = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_after["token"]["access_token"], "ya29.refreshed-new")
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_drift_guard_err_001_missing_or_corrupt_target_healed_without_crashing(self) -> None:
+        """[DRIFT-GUARD-ERR-001]: Missing or corrupt JSON target token files heal atomically without crashing poll_once()."""
+        honey = self._write_vault_account("honey")
+        engine = self._create_engine(active="honey")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(honey), encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        # Missing desktop token file
+        self.assertEqual(watcher.poll_once(), 0)
+        self.assertEqual(
+            json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"],
+            "rt-honey",
+        )
+
+        # Corrupt binary/truncated JSON
+        engine.desktop_token_file.write_bytes(b"\xff\xfe{corrupt")
+        self.assertEqual(watcher.poll_once(), 0)
+        self.assertEqual(
+            json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"],
+            "rt-honey",
+        )
+
+    def test_drift_guard_err_002_symlink_and_io_errors_fail_safe(self) -> None:
+        """[DRIFT-GUARD-ERR-002]: External symlink targets are never written through; PermissionError/ENOSPC logs to stderr and never crashes poll_once."""
+        honey = self._write_vault_account("honey")
+        engine = self._create_engine(active="honey")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(honey), encoding="utf-8")
+
+        outside_secret = Path(self.tmpdir) / "outside_secret.json"
+        outside_secret.write_text('{"secret": "preserve"}', encoding="utf-8")
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.symlink_to(outside_secret)
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        self.assertEqual(watcher.poll_once(), 0)
+        self.assertEqual(outside_secret.read_text(encoding="utf-8"), '{"secret": "preserve"}')
+        self.assertFalse(engine.desktop_token_file.is_symlink())
+        self.assertEqual(
+            json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"],
+            "rt-honey",
+        )
+
+        # PermissionError / ENOSPC during repair
+        stale = self._make_token_payload("stale-acc")
+        engine.desktop_token_file.write_text(json.dumps(stale), encoding="utf-8")
+        for exc in (
+            OSError(errno.ENOSPC, "No space left on device"),
+            PermissionError(errno.EACCES, "Permission denied"),
+        ):
+            err_buf = io.StringIO()
+            with patch.object(engine, "sync_active_tokens_from_vault", side_effect=exc), \
+                 patch("sys.stderr", err_buf):
+                self.assertEqual(watcher.poll_once(), 0)
+            self.assertIn(exc.strerror or "", err_buf.getvalue())
+            self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+
+        # OSError inside real _atomic_write_json on pending_reload.json fails safe
+        self._setup_running_ls(pid=500, active_turn=True)
+        err_buf_pending = io.StringIO()
+        with patch("agy_switcher.vault._atomic_write_json", side_effect=OSError(errno.ENOSPC, "No space left on device")), \
+             patch("sys.stderr", err_buf_pending):
+            self.assertEqual(watcher.poll_once(), 0)
+        self.assertIn("No space left on device", err_buf_pending.getvalue())
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        watch_log = self.vault_dir / "watch.log"
+        if watch_log.exists():
+            self.assertIn("queued_reload=false", watch_log.read_text(encoding="utf-8"))
+
+    def test_drift_guard_err_003_missing_active_or_invalid_vault_token_noops_safely(self) -> None:
+        """[DRIFT-GUARD-ERR-003]: Absent active pointer or invalid Vault token causes drift guard to no-op safely."""
+        stale = self._make_token_payload("stale-acc")
+        engine = self._create_engine(active=None)
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(stale), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(stale), encoding="utf-8")
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        self.assertFalse(watcher.check_and_heal_token_drift())
+        self.assertEqual(json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"], "rt-stale-acc")
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Invalid Vault token
+        broken_dir = self.vault_dir / "accounts" / "broken"
+        broken_dir.mkdir(parents=True, exist_ok=True)
+        (broken_dir / "token.json").write_text("{corrupt", encoding="utf-8")
+        (self.vault_dir / "active").write_text("broken\n", encoding="utf-8")
+
+        self.assertFalse(watcher.check_and_heal_token_drift())
+        self.assertEqual(json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"], "rt-stale-acc")
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+    def test_drift_guard_err_004_invalid_interval_sanitized_and_mocked_engine_degrades_safely(self) -> None:
+        """[DRIFT-GUARD-ERR-004]: Invalid drift_check_interval falls back to 5.0 and mocked/minimal engines degrade safely to no-op."""
+        for bad_interval in (-5.0, float("nan"), float("inf"), True, False, "invalid"):  # type: ignore[arg-type]
+            mock_engine = MagicMock()
+            mock_engine.vault_dir = self.vault_dir
+            mock_engine.cache_dir = self.cache_dir
+            mock_engine.gemini_dir = self.gemini_dir
+            mock_engine.get_quota_threshold.return_value = None
+            w = LogWatcher(
+                engine=mock_engine,
+                presence_detector=self.detector,
+                supervisor=self.supervisor,
+                log_dirs=[],
+                drift_check_interval=bad_interval,  # type: ignore[arg-type]
+            )
+            self.assertEqual(w.drift_check_interval, 5.0, f"Failed to sanitize {bad_interval!r}")
+            self.assertFalse(w.check_and_heal_token_drift())
+            self.assertEqual(w.poll_once(), 0)
+
+        # Malformed mapping from check_target_sync_status
+        mock_engine2 = MagicMock()
+        mock_engine2.vault_dir = self.vault_dir
+        mock_engine2.cache_dir = self.cache_dir
+        mock_engine2.gemini_dir = self.gemini_dir
+        mock_engine2.get_quota_threshold.return_value = None
+        mock_engine2.check_target_sync_status.return_value = {"in_sync": "not-a-bool", "drifted_targets": MagicMock()}
+        w2 = LogWatcher(engine=mock_engine2, presence_detector=self.detector, supervisor=self.supervisor, log_dirs=[])
+        self.assertFalse(w2.check_and_heal_token_drift())
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # MagicMock(spec=str) active_account/drifted_targets and exception from check_target_sync_status
+        mock_engine2.check_target_sync_status.return_value = {
+            "in_sync": False,
+            "drifted_targets": [MagicMock(spec=str)],
+            "active_account": MagicMock(spec=str),
+        }
+        self.assertFalse(w2.check_and_heal_token_drift(force=True))
+        mock_engine2.check_target_sync_status.side_effect = RuntimeError("boom")
+        with patch("sys.stderr", io.StringIO()):
+            self.assertFalse(w2.check_and_heal_token_drift(force=True))
+            self.assertEqual(w2.poll_once(), 0)
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+        self.assertFalse((self.vault_dir / "watch.log").exists())
+
+        # Minimal engine lacking check_target_sync_status
+        class MinimalEngine:
+            vault_dir = self.vault_dir
+            cache_dir = self.cache_dir
+            gemini_dir = self.gemini_dir
+
+        w3 = LogWatcher(engine=MinimalEngine(), presence_detector=self.detector, supervisor=self.supervisor, log_dirs=[])
+        self.assertFalse(w3.check_and_heal_token_drift())
+        self.assertEqual(w3.poll_once(), 0)
+
+    def test_drift_guard_edge_001_stopped_server_heals_without_pending_reload(self) -> None:
+        """[DRIFT-GUARD-EDGE-001]: Desktop drift while language_server is stopped repairs disk without creating pending_reload.json."""
+        honey = self._write_vault_account("honey")
+        stale = self._make_token_payload("automator")
+        engine = self._create_engine(active="honey")
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(stale), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(honey), encoding="utf-8")
+
+        self.assertIsNone(engine.locate_language_server_pid())
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        self.assertTrue(watcher.check_and_heal_token_drift())
+        self.assertEqual(
+            json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"],
+            "rt-honey",
+        )
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+
+    def test_drift_guard_edge_002_repeated_writeback_during_active_turn_heals_without_killing_turn(self) -> None:
+        """[DRIFT-GUARD-EDGE-002]: Repeated Desktop Zombie Write-Back during active turn heals disk and defers restart until quiescence."""
+        honey = self._write_vault_account("honey")
+        zombie = self._make_token_payload("automator")
+        engine = self._create_engine(active="honey")
+        self._setup_running_ls(pid=500, active_turn=True)
+        restart_mock = MagicMock(return_value=True)
+        engine.restart_language_server = restart_mock  # type: ignore[method-assign]
+
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(honey), encoding="utf-8")
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        for _ in range(2):
+            engine.desktop_token_file.write_text(json.dumps(zombie), encoding="utf-8")
+            self.assertEqual(watcher.poll_once(), 0)
+            self.assertEqual(
+                json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"],
+                "rt-honey",
+            )
+            pending = json.loads((self.cache_dir / "pending_reload.json").read_text(encoding="utf-8"))
+            self.assertEqual(pending["target_account"], "honey")
+            self.assertEqual(pending["ttl_seconds"], 1800)
+            restart_mock.assert_not_called()
+
+        # Reach Global Quiescence
+        transcript = self.gemini_dir / "antigravity" / "brain" / "sess-active" / ".system_generated" / "logs" / "transcript.jsonl"
+        transcript.write_text(json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n", encoding="utf-8")
+        (self.proc_dir / "500" / "fd" / "10").unlink()
+        self.assertEqual(watcher.poll_once(), 0)
+        restart_mock.assert_called_once_with(force=True)
+        self.assertFalse((self.cache_dir / "pending_reload.json").exists())
+
+    def test_drift_guard_edge_003_audit_logging_respects_mock_vault_isolation(self) -> None:
+        """[DRIFT-GUARD-EDGE-003]: Drift guard audit logging never writes to ~/.antigravity-vault/watch.log during unittest."""
+        prod_watch_log = DEFAULT_VAULT_DIR / "watch.log"
+        prod_pending = DEFAULT_VAULT_DIR / "cache" / "pending_reload.json"
+        prod_log_before = prod_watch_log.read_bytes() if prod_watch_log.exists() else None
+        prod_pending_before = prod_pending.read_bytes() if prod_pending.exists() else None
+
+        os.environ.pop("AGY_VAULT_DIR", None)
+        mock_engine = MagicMock()
+        mock_engine.vault_dir = DEFAULT_VAULT_DIR
+        mock_engine.cache_dir = DEFAULT_VAULT_DIR / "cache"
+        mock_engine.pending_reload_file = prod_pending
+        mock_engine.get_quota_threshold.return_value = None
+        mock_engine.locate_language_server_pid.return_value = 500
+        mock_engine.get_active_name.return_value = "honey"
+        mock_engine.sync_active_tokens_from_vault.return_value = True
+        mock_engine.check_target_sync_status.return_value = {
+            "in_sync": False,
+            "desktop_synced": False,
+            "cli_synced": True,
+            "drifted_targets": ["desktop"],
+            "active_account": "honey",
+        }
+
+        watcher = LogWatcher(engine=mock_engine, presence_detector=self.detector, supervisor=self.supervisor, log_dirs=[])
+        self.assertTrue(watcher.check_and_heal_token_drift())
+
+        if prod_log_before is None:
+            self.assertFalse(prod_watch_log.exists())
+        else:
+            self.assertEqual(prod_watch_log.read_bytes(), prod_log_before)
+        if prod_pending_before is None:
+            self.assertFalse(prod_pending.exists())
+        else:
+            self.assertEqual(prod_pending.read_bytes(), prod_pending_before)
+
+    def test_drift_guard_edge_004_concurrent_switch_uses_fresh_vault_active_pointer(self) -> None:
+        """[DRIFT-GUARD-EDGE-004]: Concurrent Vault switch from acc1 to acc2 before write uses acc2 and never reverts to acc1."""
+        acc1 = self._write_vault_account("acc1")
+        acc2 = self._write_vault_account("acc2")
+        stale = self._make_token_payload("automator")
+        engine = self._create_engine(active="acc1")
+        self._setup_running_ls(pid=500, active_turn=False)
+
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(stale), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(acc1), encoding="utf-8")
+
+        orig_sync = engine.sync_active_tokens_from_vault
+
+        def concurrent_sync(targets=("desktop", "cli")):
+            (self.vault_dir / "active").write_text("acc2\n", encoding="utf-8")
+            return orig_sync(targets=targets)
+
+        engine.sync_active_tokens_from_vault = concurrent_sync  # type: ignore[method-assign]
+
+        watcher = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        self.assertTrue(watcher.check_and_heal_token_drift())
+        desktop_written = json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))
+        self.assertEqual(desktop_written["token"]["refresh_token"], acc2["token"]["refresh_token"])  # type: ignore[index]
+        pending = json.loads((self.cache_dir / "pending_reload.json").read_text(encoding="utf-8"))
+        self.assertEqual(pending["target_account"], "acc2")
+
+    def test_drift_guard_edge_005_skips_after_reactive_failover_and_avoids_thrashing_pending_reload(self) -> None:
+        """[DRIFT-GUARD-EDGE-005]: Skips drift guard on reactive 429 switch cycle and preserves valid pending_reload.json without thrashing."""
+        # Case 1: Reactive 429 triggers rotation in same poll_once() cycle
+        log_dir = Path(self.tmpdir) / "cli_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "cli.log"
+        log_file.write_text("", encoding="utf-8")
+
+        mock_engine = MagicMock()
+        mock_engine.vault_dir = self.vault_dir
+        mock_engine.cache_dir = self.cache_dir
+        mock_engine.gemini_dir = self.gemini_dir
+        mock_engine.get_active_name.return_value = "acc1"
+        mock_engine.list_accounts.return_value = {
+            "accounts": [{"name": "acc1", "valid": True}, {"name": "acc2", "valid": True}]
+        }
+        (self.cache_dir / "last_known_quota.json").write_text(
+            json.dumps({
+                "accounts": {
+                    "acc1": {"gemini": {"fraction": 0.0}, "cached_at": time.time()},
+                    "acc2": {"gemini": {"fraction": 0.95}, "cached_at": time.time()},
+                }
+            }),
+            encoding="utf-8",
+        )
+        mock_engine.get_quota_threshold.return_value = None
+        mock_engine.switch_tokens.return_value = {"success": True, "active": "acc2"}
+        mock_engine.check_target_sync_status.return_value = {
+            "in_sync": False,
+            "desktop_synced": False,
+            "cli_synced": True,
+            "drifted_targets": ["desktop"],
+            "active_account": "acc1",
+        }
+
+        watcher_case1 = LogWatcher(
+            engine=mock_engine,
+            log_dirs=[str(log_dir)],
+            presence_detector=self.detector,
+            supervisor=self.supervisor,
+            drift_check_interval=0.0,
+        )
+        watcher_case1.poll_once()
+        mock_engine.check_target_sync_status.reset_mock()
+        mock_engine.sync_active_tokens_from_vault.reset_mock()
+
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"status": "ERROR", "error": {"code": 429, "message": "RESOURCE_EXHAUSTED"}}) + "\n")
+
+        with patch("agy_switcher.watcher.LogWatcher._probe_active_quota", return_value=0.0):
+            switches = watcher_case1.poll_once()
+        self.assertEqual(switches, 1)
+        mock_engine.check_target_sync_status.assert_not_called()
+        mock_engine.sync_active_tokens_from_vault.assert_not_called()
+
+        # Case 2: Valid unexpired pending_reload.json for "honey" already exists during active turn
+        honey = self._write_vault_account("honey")
+        zombie = self._make_token_payload("automator")
+        engine = self._create_engine(active="honey")
+        self._setup_running_ls(pid=500, active_turn=True)
+        restart_mock = MagicMock(return_value=True)
+        engine.restart_language_server = restart_mock  # type: ignore[method-assign]
+        engine.desktop_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.desktop_token_file.write_text(json.dumps(zombie), encoding="utf-8")
+        engine.cli_token_file.parent.mkdir(parents=True, exist_ok=True)
+        engine.cli_token_file.write_text(json.dumps(honey), encoding="utf-8")
+
+        original_requested_at = time.time() - 42.0
+        pending_file = self.cache_dir / "pending_reload.json"
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "honey",
+                "requested_at": original_requested_at,
+                "ttl_seconds": 1800,
+                "reason": "in_turn_deferred_reload",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(pending_file, 0o600)
+
+        watcher_case2 = LogWatcher(
+            engine=engine,
+            presence_detector=self.detector,
+            supervisor=engine.supervisor,
+            log_dirs=[],
+            drift_check_interval=0.0,
+        )
+        self.assertEqual(watcher_case2.poll_once(), 0)
+        self.assertEqual(
+            json.loads(engine.desktop_token_file.read_text(encoding="utf-8"))["token"]["refresh_token"],
+            "rt-honey",
+        )
+        pending_after = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(pending_after["target_account"], "honey")
+        self.assertEqual(pending_after["ttl_seconds"], 1800)
+        self.assertAlmostEqual(pending_after["requested_at"], original_requested_at, places=3)
+        restart_mock.assert_not_called()
+
+        # Case 3: Expired or different-account pending_reload.json IS refreshed on Desktop drift
+        engine.desktop_token_file.write_text(json.dumps(zombie), encoding="utf-8")
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "stale-other",
+                "requested_at": time.time() - 10.0,
+                "ttl_seconds": 1800,
+                "reason": "in_turn_deferred_reload",
+            }),
+            encoding="utf-8",
+        )
+        self.assertTrue(watcher_case2.check_and_heal_token_drift(force=True))
+        refreshed_pending = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(refreshed_pending["target_account"], "honey")
+        self.assertEqual(refreshed_pending["reason"], "desktop_drift_guard")
+
+        engine.desktop_token_file.write_text(json.dumps(zombie), encoding="utf-8")
+        pending_file.write_text(
+            json.dumps({
+                "target_account": "honey",
+                "requested_at": time.time() - 3600.0,
+                "ttl_seconds": 1800,
+                "reason": "in_turn_deferred_reload",
+            }),
+            encoding="utf-8",
+        )
+        self.assertTrue(watcher_case2.check_and_heal_token_drift(force=True))
+        expired_replaced = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertEqual(expired_replaced["target_account"], "honey")
+        self.assertEqual(expired_replaced["reason"], "desktop_drift_guard")
+        self.assertGreater(expired_replaced["requested_at"], time.time() - 60.0)
+
+
 if __name__ == '__main__':
     unittest.main()
 
