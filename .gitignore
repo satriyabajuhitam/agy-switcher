@@ -8,6 +8,3 @@ __pycache__/
 .vault_cache/
 .agents/plugins/
 .agents/skills/
-
-# Machine-local agy-matt plugin symlink (ADR 0010)
-.agents/plugins/agy-matt
